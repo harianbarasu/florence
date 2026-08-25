@@ -16,6 +16,8 @@ COPY . .
 RUN pnpm build
 RUN find apps packages -path '*/dist/*' -type f \( -name '*.test.*' -o -name '*.integration.test.*' \) -delete
 RUN test -f apps/api/dist/server.js \
+  && test -f apps/api/dist/start.js \
+  && test -f apps/api/dist/reset-production.js \
   && test -f apps/api/dist/smoke-production.js \
   && test -f apps/web/dist/index.html \
   && test -f packages/database/dist/predeploy.js
@@ -43,4 +45,4 @@ COPY --chown=node:node --from=build /app/packages/database/sql ./packages/databa
 COPY --chown=node:node --from=build /app/packages/google/dist ./packages/google/dist
 COPY --chown=node:node --from=build /app/packages/linq/dist ./packages/linq/dist
 USER node
-CMD ["node", "apps/api/dist/server.js"]
+CMD ["node", "apps/api/dist/start.js"]

@@ -139,8 +139,8 @@ export const vaultFactSchema = z
     id: idSchema,
     statement: nonempty(4_000),
     visibility: vaultVisibilitySchema,
-    source: vaultSourceSchema,
-    recordedAt: timestampSchema,
+    source: vaultSourceSchema.nullable(),
+    recordedAt: timestampSchema.nullable(),
     editable: z.boolean(),
     deletable: z.boolean(),
   })
@@ -179,6 +179,7 @@ export const googleConnectionSummarySchema = z
     connectionId: idSchema,
     status: z.literal("active"),
     emailLabel: z.email(),
+    historyReviewReady: z.boolean(),
     lastError: nonempty(2_000).nullable(),
   })
   .strict();

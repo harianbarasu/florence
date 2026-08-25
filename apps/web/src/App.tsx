@@ -87,7 +87,11 @@ export function AppShell() {
   if (!workspace.data.workspace.setup.ownOnboardingComplete) {
     return <FamilySetupPage view={workspace.data} />;
   }
-  if (onboardingEntry.setupComplete || onboardingEntry.googleStatus === "connected") {
+  if (onboardingEntry.googleStatus && window.location.pathname !== "/preferences") {
+    window.location.replace(`/preferences?google=${encodeURIComponent(onboardingEntry.googleStatus)}`);
+    return <PageLoader />;
+  }
+  if (onboardingEntry.setupComplete) {
     return <GoogleSetupSuccess view={workspace.data} />;
   }
 
@@ -1334,9 +1338,13 @@ export function VaultPage() {
   const adults = vault.members.filter((member) => member.kind === "adult");
   const children = vault.members.filter((member) => member.kind === "child");
   const foundingAdult = adults.find((member) => member.postalCode !== undefined) ?? null;
+  const viewerName = view.viewer.displayName ? firstName(view.viewer.displayName) : "you";
 
   return (
-    <Page title="Vault" intro="The family knowledge Florence may use, with its source and visibility.">
+    <Page
+      title="Vault"
+      intro={`What Florence may use for ${viewerName} and the family. Shared household knowledge appears for both parents; private Google evidence stays visible only to its owner.`}
+    >
       {editing && (
         <MemberEditor
           {...(editing === "new" ? {} : { member: editing })}
@@ -1505,7 +1513,7 @@ export function PreferencesPage() {
       <PreferencesEditor initial={query.data.preferences} />
       <section className="preference-group">
         <SectionLabel>Your Google account</SectionLabel>
-        <GoogleConnector view={query.data} />
+        <GoogleConnector view={query.data} callbackStatus={onboardingEntry.googleStatus} />
       </section>
     </Page>
   );
@@ -1596,17 +1604,23 @@ function PermissionSetting({
   );
 }
 
-function GoogleConnector({ view }: { view: WorkspaceView }) {
+function GoogleConnector({ view, callbackStatus }: { view: WorkspaceView; callbackStatus: string | null }) {
   const start = useStartGoogleConnection();
   const disconnect = useDisconnectGoogleConnection();
   const deleteGoogleData = useDeleteGoogleDerivedData();
   const accounts = view.workspace.googleConnections;
   const [confirmation, setConfirmation] = useState<
-    { kind: "disconnect"; connectionId: string; emailLabel: string } | { kind: "delete" } | null
+    { kind: "disconnect" | "reconnect"; connectionId: string; emailLabel: string } | { kind: "delete" } | null
   >(null);
-  const [resultNotice, setResultNotice] = useState<string | null>(null);
+  const [resultNotice, setResultNotice] = useState<string | null>(() =>
+    callbackStatus === "connected"
+      ? "Google is reconnected. Florence is reviewing the last 90 days now; your existing family setup stayed in place."
+      : callbackStatus
+        ? googleSetupError(callbackStatus)
+        : null,
+  );
   const error = start.error ?? disconnect.error ?? deleteGoogleData.error;
-  const isPending = disconnect.isPending || deleteGoogleData.isPending;
+  const isPending = start.isPending || disconnect.isPending || deleteGoogleData.isPending;
 
   async function connect() {
     try {
@@ -1620,6 +1634,12 @@ function GoogleConnector({ view }: { view: WorkspaceView }) {
   async function confirmAction() {
     if (!confirmation) return;
     try {
+      if (confirmation.kind === "reconnect") {
+        setConfirmation(null);
+        const result = await start.mutateAsync();
+        window.location.assign(result.authorizationUrl);
+        return;
+      }
       if (confirmation.kind === "disconnect") {
         const result = await disconnect.mutateAsync(confirmation.connectionId);
         setConfirmation(null);
@@ -1646,6 +1666,12 @@ function GoogleConnector({ view }: { view: WorkspaceView }) {
             ? accounts.map((account) => account.emailLabel).join(", ")
             : "Connect the Gmail and Calendar account you want Florence to use for you."}
         </p>
+        {accounts.some((account) => !account.historyReviewReady) && (
+          <p>
+            Reconnect Google so Florence can finish reviewing the last 90 days across all of your calendars.
+            Your family setup will stay in place.
+          </p>
+        )}
         {error && <p className="form-error">{error.message}</p>}
       </div>
       <div className="connector-actions">
@@ -1659,6 +1685,26 @@ function GoogleConnector({ view }: { view: WorkspaceView }) {
             {start.isPending ? "Opening…" : "Connect"}
           </button>
         )}
+        {accounts
+          .filter((account) => !account.historyReviewReady)
+          .map((account) => (
+            <button
+              className="button pill"
+              type="button"
+              key={`reconnect-${account.connectionId}`}
+              onClick={() => {
+                setResultNotice(null);
+                setConfirmation({
+                  kind: "reconnect",
+                  connectionId: account.connectionId,
+                  emailLabel: account.emailLabel,
+                });
+              }}
+              disabled={isPending}
+            >
+              Reconnect Google
+            </button>
+          ))}
         {accounts.map((account) => (
           <button
             className="text-button danger"
@@ -1692,7 +1738,7 @@ function GoogleConnector({ view }: { view: WorkspaceView }) {
       {confirmation && (
         <GoogleActionConfirmation
           kind={confirmation.kind}
-          emailLabel={confirmation.kind === "disconnect" ? confirmation.emailLabel : undefined}
+          emailLabel={confirmation.kind !== "delete" ? confirmation.emailLabel : undefined}
           isPending={isPending}
           onCancel={() => setConfirmation(null)}
           onConfirm={() => void confirmAction()}
@@ -1781,13 +1827,14 @@ function GoogleActionConfirmation({
   onCancel,
   onConfirm,
 }: {
-  kind: "disconnect" | "delete";
+  kind: "disconnect" | "delete" | "reconnect";
   emailLabel?: string | undefined;
   isPending: boolean;
   onCancel: () => void;
   onConfirm: () => void;
 }) {
   const isDelete = kind === "delete";
+  const isReconnect = kind === "reconnect";
   const titleId = `google-${kind}-title`;
   const detailId = `google-${kind}-detail`;
 
@@ -1803,9 +1850,13 @@ function GoogleActionConfirmation({
         <strong id={titleId}>
           {isDelete
             ? "Delete Google-derived data?"
-            : emailLabel
-              ? `Disconnect ${emailLabel}?`
-              : "Disconnect Google?"}
+            : isReconnect
+              ? emailLabel
+                ? `Reconnect ${emailLabel}?`
+                : "Reconnect Google?"
+              : emailLabel
+                ? `Disconnect ${emailLabel}?`
+                : "Disconnect Google?"}
         </strong>
         {isDelete ? (
           <p id={detailId}>
@@ -1813,6 +1864,17 @@ function GoogleActionConfirmation({
             details from Gmail and Calendar, plus queued updates and actions based on that Google data.
             Messages already sent and events already added to the shared calendar remain.
           </p>
+        ) : isReconnect ? (
+          <div id={detailId}>
+            <p>
+              Florence will open Google so you can approve the access she needs to review your Gmail and all
+              of your calendars. Your current connection stays in place unless that succeeds with the same
+              account.
+            </p>
+            <p>
+              Your family, profile, group chat, and shared calendar will stay in place while you reconnect.
+            </p>
+          </div>
         ) : (
           <div id={detailId}>
             <p>
@@ -1840,10 +1902,14 @@ function GoogleActionConfirmation({
           {isPending
             ? isDelete
               ? "Deleting…"
-              : "Disconnecting…"
+              : isReconnect
+                ? "Reconnecting…"
+                : "Disconnecting…"
             : isDelete
               ? "Delete permanently"
-              : "Disconnect Google"}
+              : isReconnect
+                ? "Reconnect Google"
+                : "Disconnect Google"}
         </button>
       </div>
     </section>
@@ -1866,8 +1932,8 @@ function WatchList({
   if (!watches.length) {
     return (
       <EmptyVaultRow
-        title="Nothing being watched right now"
-        detail="When Florence keeps an eye on a deadline or family interest, it’ll appear here."
+        title="Nothing Florence is watching for you right now"
+        detail="Watches visible to you will appear here."
       />
     );
   }
@@ -1977,8 +2043,8 @@ function FactList({
   if (!facts.length) {
     return (
       <EmptyVaultRow
-        title="No retained facts yet"
-        detail="Useful facts Florence remembers will appear here."
+        title="No facts visible to you yet"
+        detail="Shared facts and your private facts will appear here."
       />
     );
   }
@@ -2048,7 +2114,11 @@ function FactRow({
         <>
           <div className="vault-data-copy">
             <strong>{fact.statement}</strong>
-            <p>{sourceSummary(fact.visibility, fact.source.label)}</p>
+            <p>
+              {fact.source
+                ? sourceSummary(fact.visibility, fact.source.label)
+                : "Shared with the household · Learned from connected family information"}
+            </p>
           </div>
           <div className="row-actions">
             {fact.editable && (
@@ -2517,6 +2587,9 @@ function setupError(cause: unknown): string {
 }
 
 function googleSetupError(status: string): string {
+  if (status === "identity_conflict") {
+    return "Reconnect the same Google account Florence already knows. To switch accounts, delete Google-derived data first, then connect the new account.";
+  }
   if (status === "missing_permissions") {
     return "Google gave Florence only some of the access she needs, so Florence did not save this connection. Google may still list the partial grant: open your Google Account’s third-party connections, select Florence, and remove access there. Then try again and allow both Gmail and Calendar, or choose another account where both are available.";
   }

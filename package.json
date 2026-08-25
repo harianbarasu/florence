@@ -16,8 +16,9 @@
     "format": "biome format --write .",
     "lint": "biome check .",
     "predeploy:production": "node packages/database/dist/predeploy.js",
+    "reset:production": "pnpm --filter @florence/api reset:production",
     "smoke:production": "node apps/api/dist/smoke-production.js",
-    "start": "node apps/api/dist/server.js",
+    "start": "node apps/api/dist/start.js",
     "test": "pnpm -r --if-present test",
     "typecheck": "pnpm -r --filter './packages/**' build && pnpm -r --if-present typecheck"
   },

@@ -11,6 +11,10 @@ const envelopeOverheadLimit = 16 * 1024;
 const imageEnvelopeMagic = Buffer.from("FIV1");
 const pdfEnvelopeMagic = Buffer.from("FPD1");
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const storedImageFilenamePattern =
+  /^([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.fiv$/;
+const storedImageTemporaryFilenamePattern =
+  /^\.([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.tmp$/;
 
 type StoredMimeType = Exclude<ImageReference["mimeType"], "image/heic">;
 type AcceptedMimeType = ImageReference["mimeType"];
@@ -48,6 +52,17 @@ export type EncryptedImageVaultOptions = {
   encryptionKey: Uint8Array;
   normalizeHeic?: HeicNormalizer;
 };
+
+export type ImageVaultProductionResetSnapshot = Readonly<{
+  guard: string;
+  encryptedImageArtifacts: number;
+  encryptedImageTemporaryArtifacts: number;
+}>;
+
+export type ImageVaultProductionResetResult = Readonly<{
+  encryptedImageArtifactsDeleted: number;
+  encryptedImageTemporaryArtifactsDeleted: number;
+}>;
 
 export type ImageVaultErrorCode =
   | "invalid_configuration"
@@ -339,6 +354,68 @@ export class EncryptedImageVault {
     return deleted;
   }
 
+  /**
+   * Inventories only canonical Florence image envelopes and exact atomic-write temporary files. It
+   * never follows arbitrary directories, accepts non-canonical filenames, or exposes artifact
+   * identities to the reset operator.
+   */
+  async inspectForProductionReset(): Promise<ImageVaultProductionResetSnapshot> {
+    const inventory = await this.#productionResetInventory();
+    return Object.freeze({
+      guard: inventory.guard,
+      encryptedImageArtifacts: inventory.artifacts.filter(({ kind }) => kind === "envelope").length,
+      encryptedImageTemporaryArtifacts: inventory.artifacts.filter(({ kind }) => kind === "temporary").length,
+    });
+  }
+
+  /**
+   * Deletes exactly the canonical `.fiv` files and Florence atomic-write temporary files represented
+   * by a previously inspected inventory. Shard directories, arbitrary `.tmp` files, and unrelated
+   * volume contents are deliberately retained.
+   */
+  async purgeForProductionReset(
+    expected: ImageVaultProductionResetSnapshot,
+  ): Promise<ImageVaultProductionResetResult> {
+    const current = await this.#productionResetInventory();
+    const encryptedImageArtifacts = current.artifacts.filter(({ kind }) => kind === "envelope").length;
+    const encryptedImageTemporaryArtifacts = current.artifacts.length - encryptedImageArtifacts;
+    if (
+      current.guard !== expected.guard ||
+      encryptedImageArtifacts !== expected.encryptedImageArtifacts ||
+      encryptedImageTemporaryArtifacts !== expected.encryptedImageTemporaryArtifacts
+    ) {
+      throw new ImageVaultError(
+        "asset_conflict",
+        "Image vault contents changed after the production reset inspection",
+      );
+    }
+    let encryptedImageArtifactsDeleted = 0;
+    let encryptedImageTemporaryArtifactsDeleted = 0;
+    for (const artifact of current.artifacts) {
+      try {
+        await unlink(path.join(this.#rootDirectory, artifact.relativePath));
+        if (artifact.kind === "envelope") encryptedImageArtifactsDeleted += 1;
+        else encryptedImageTemporaryArtifactsDeleted += 1;
+      } catch (error) {
+        if (isMissing(error)) {
+          throw new ImageVaultError(
+            "asset_conflict",
+            "Image vault contents changed during the production reset",
+          );
+        }
+        throw error;
+      }
+    }
+    const remaining = await this.#productionResetInventory();
+    if (remaining.artifacts.length !== 0) {
+      throw new ImageVaultError("asset_conflict", "Image vault contents changed during the production reset");
+    }
+    return Object.freeze({
+      encryptedImageArtifactsDeleted,
+      encryptedImageTemporaryArtifactsDeleted,
+    });
+  }
+
   async #loadAuthorized(input: {
     householdId: string;
     signalId: string;
@@ -358,6 +435,49 @@ export class EncryptedImageVault {
       throw new ImageVaultError("unauthorized_or_missing", "Image is unavailable");
     }
     return loaded;
+  }
+
+  async #productionResetInventory(): Promise<{
+    guard: string;
+    artifacts: readonly Readonly<{
+      kind: "envelope" | "temporary";
+      relativePath: string;
+    }>[];
+  }> {
+    const shards = await readdir(this.#rootDirectory, { withFileTypes: true }).catch((error: unknown) => {
+      if (isMissing(error)) return [];
+      throw error;
+    });
+    const artifacts: { kind: "envelope" | "temporary"; relativePath: string }[] = [];
+    for (const shard of shards) {
+      if (!shard.isDirectory() || !/^[0-9a-f]{2}$/.test(shard.name)) continue;
+      const entries = await readdir(path.join(this.#rootDirectory, shard.name), {
+        withFileTypes: true,
+      }).catch((error: unknown) => {
+        if (isMissing(error)) return [];
+        throw error;
+      });
+      for (const entry of entries) {
+        if (!entry.isFile()) continue;
+        const storedImageMatch = storedImageFilenamePattern.exec(entry.name);
+        if (storedImageMatch?.[1]?.slice(0, 2) === shard.name) {
+          artifacts.push({ kind: "envelope", relativePath: path.join(shard.name, entry.name) });
+          continue;
+        }
+        const temporaryImageMatch = storedImageTemporaryFilenamePattern.exec(entry.name);
+        if (temporaryImageMatch?.[1]?.slice(0, 2) === shard.name) {
+          artifacts.push({ kind: "temporary", relativePath: path.join(shard.name, entry.name) });
+        }
+      }
+    }
+    artifacts.sort((left, right) =>
+      left.relativePath < right.relativePath ? -1 : left.relativePath > right.relativePath ? 1 : 0,
+    );
+    const guard = createHash("sha256")
+      .update("florence-image-vault-production-reset-v2\0")
+      .update(artifacts.map(({ kind, relativePath }) => `${kind}\0${relativePath}`).join("\0"))
+      .digest("hex");
+    return { guard, artifacts: Object.freeze(artifacts) };
   }
 
   #assetPath(assetId: string): string {

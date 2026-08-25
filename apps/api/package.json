@@ -6,7 +6,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dev": "tsx watch src/server.ts",
-    "start": "node dist/server.js",
+    "reset:production": "node dist/reset-production.js",
+    "start": "node dist/start.js",
     "test": "vitest run src/florence.integration.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },

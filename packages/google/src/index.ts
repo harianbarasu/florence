@@ -4,17 +4,24 @@ import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID }
 const MAX_GMAIL_IMAGE_BYTES = 20 * 1024 * 1024;
 const MAX_GMAIL_PDF_BYTES = 20 * 1024 * 1024;
 const MAX_GMAIL_ATTACHMENTS_PER_MESSAGE = 20;
+const MAX_GMAIL_READABLE_TEXT_CHARACTERS = 50_000;
 const CALENDAR_CURSOR_OVERLAP_MS = 5 * 60_000;
 const GOOGLE_CHANGE_PAGE_SIZE = 100;
 const MAX_GOOGLE_CHANGE_PAGES = 20;
 const MAX_GMAIL_CHANGED_MESSAGES = 500;
 const CALENDAR_CHANGE_HORIZON_MS = 21 * 24 * 60 * 60_000;
+const GMAIL_BASELINE_PAGE_SIZE = 50;
+const CALENDAR_BASELINE_PAGE_SIZE = 50;
+const GMAIL_BASELINE_MAX_WINDOW_MS = 90 * 24 * 60 * 60_000;
+const CALENDAR_BASELINE_MAX_WINDOW_MS = 111 * 24 * 60 * 60_000;
+const MAX_GOOGLE_BASELINE_PAGE_TOKEN_LENGTH = 16_384;
 
 export const GOOGLE_SCOPES = [
   "openid",
   "email",
   "https://www.googleapis.com/auth/gmail.readonly",
   "https://www.googleapis.com/auth/calendar.events.owned",
+  "https://www.googleapis.com/auth/calendar.events.readonly",
   "https://www.googleapis.com/auth/calendar.app.created",
   "https://www.googleapis.com/auth/calendar.acls",
   "https://www.googleapis.com/auth/calendar.calendarlist",
@@ -202,6 +209,23 @@ export type GoogleFamilyCalendarRenameResult = {
   occurredAt: string;
 };
 
+export type GoogleProductionResetCalendarResult =
+  | Readonly<{
+      state: "present";
+      /** Exact provider identity; callers must keep it out of operator-facing reset output. */
+      calendarId: string;
+    }>
+  | Readonly<{
+      state: "absent";
+      /** Null only after a complete exact-marker scan proves an ambiguous create is absent. */
+      calendarId: string | null;
+    }>;
+
+export type GoogleProductionResetRevocationResult = Readonly<{
+  confirmed: number;
+  unconfirmed: number;
+}>;
+
 export type GoogleSupportedGmailAttachmentMimeType =
   | "application/pdf"
   | "image/jpeg"
@@ -240,6 +264,61 @@ export type GmailSearchResult = {
   messages: readonly GmailEvidence[];
 };
 
+/**
+ * One durable page of the application-owned Gmail baseline. The opaque page token is persistence
+ * state only: it must never be included in model context or operator-facing output.
+ */
+export type GoogleGmailBaselinePage =
+  | {
+      status: "more";
+      messages: readonly GmailEvidence[];
+      nextPageToken: string;
+    }
+  | {
+      status: "complete";
+      messages: readonly GmailEvidence[];
+      nextPageToken: null;
+    };
+
+export type GoogleCalendarReadableAccessRole = "reader" | "writerWithoutPrivateAccess" | "writer" | "owner";
+
+/** Stable Calendar identity needed to walk one baseline without exposing its display name. */
+export type GoogleCalendarBaselineTarget = {
+  calendarId: string;
+  timeZone: string;
+  accessRole: GoogleCalendarReadableAccessRole;
+  primary: boolean;
+};
+
+export type GoogleCalendarBaselineTargetsPage =
+  | {
+      status: "more";
+      targets: readonly GoogleCalendarBaselineTarget[];
+      nextPageToken: string;
+    }
+  | {
+      status: "complete";
+      targets: readonly GoogleCalendarBaselineTarget[];
+      nextPageToken: null;
+    };
+
+export type GoogleCalendarBaselineEventsPage =
+  | {
+      status: "more";
+      events: readonly GoogleCalendarWindowEvent[];
+      nextPageToken: string;
+    }
+  | {
+      status: "complete";
+      events: readonly GoogleCalendarWindowEvent[];
+      nextPageToken: null;
+    }
+  | {
+      status: "unavailable";
+      events: readonly [];
+      nextPageToken: null;
+    };
+
 /** Capture before the baseline Gmail reads, then persist only after that review commits. */
 export type GoogleGmailCursor = {
   kind: "gmail_history_v1";
@@ -252,6 +331,8 @@ export type GoogleGmailChangesRead =
       status: "complete";
       resyncRequired: false;
       messages: readonly GmailEvidence[];
+      /** Changed provider messages that no longer belong in retained received Gmail. */
+      removedMessageIds: readonly string[];
       cursor: GoogleGmailCursor;
     }
   | {
@@ -259,6 +340,8 @@ export type GoogleGmailChangesRead =
       resyncRequired: true;
       reason: "cursor_expired" | "change_volume_exceeded";
       messages: readonly GmailEvidence[];
+      /** Empty because a bounded resync, rather than an incomplete change page, owns removal closure. */
+      removedMessageIds: readonly string[];
       cursor: null;
     };
 
@@ -383,6 +466,27 @@ export class GoogleFamilyCalendarProvisioningError extends Error {
   ) {
     super(message);
     this.name = "GoogleFamilyCalendarProvisioningError";
+  }
+}
+
+export class GoogleProductionResetError extends Error {
+  constructor(
+    message: string,
+    readonly code:
+      | "missing_creator_credential"
+      | "credential_rejected"
+      | "provider_unavailable"
+      | "provider_rejected"
+      | "calendar_identity_mismatch"
+      | "calendar_marker_ambiguous"
+      | "calendar_marker_mismatch"
+      | "primary_calendar_rejected"
+      | "creator_not_data_owner"
+      | "creator_not_owner"
+      | "deletion_unconfirmed",
+  ) {
+    super(message);
+    this.name = "GoogleProductionResetError";
   }
 }
 
@@ -518,7 +622,7 @@ export class GoogleConnection {
           now,
         });
       } catch (error) {
-        if (isUniqueViolation(error)) {
+        if (isUniqueViolation(error) || isGoogleIdentityConflict(error)) {
           throw new GoogleConnectionError("This Google account is already connected", "identity_conflict");
         }
         throw error;
@@ -620,8 +724,6 @@ export class GoogleConnection {
 
     for (let page = 0; page < MAX_GOOGLE_CHANGE_PAGES; page += 1) {
       const query = new URLSearchParams({
-        historyTypes: "messageAdded",
-        labelId: "INBOX",
         maxResults: String(GOOGLE_CHANGE_PAGE_SIZE),
         startHistoryId: cursor.historyId,
       });
@@ -636,6 +738,7 @@ export class GoogleConnection {
           resyncRequired: true,
           reason: "cursor_expired",
           messages: [],
+          removedMessageIds: [],
           cursor: null,
         };
       }
@@ -648,8 +751,14 @@ export class GoogleConnection {
       nextHistoryId = pageHistoryId;
       for (const history of recordArray(body.history)) {
         gmailHistoryId(history.id);
-        for (const addition of recordArray(history.messagesAdded)) {
-          const identity = gmailHistoryMessageIdentity(addition);
+        const changedMessages = [
+          ...recordArray(history.messages).map(gmailHistoryMessageIdentity),
+          ...recordArray(history.messagesAdded).map(gmailHistoryChangeIdentity),
+          ...recordArray(history.messagesDeleted).map(gmailHistoryChangeIdentity),
+          ...recordArray(history.labelsAdded).map(gmailHistoryChangeIdentity),
+          ...recordArray(history.labelsRemoved).map(gmailHistoryChangeIdentity),
+        ];
+        for (const identity of changedMessages) {
           const existing = identities.get(identity.messageId);
           if (existing && existing.threadId !== identity.threadId) {
             throw providerError("Gmail reused a changed message ID in another thread");
@@ -661,6 +770,7 @@ export class GoogleConnection {
               resyncRequired: true,
               reason: "change_volume_exceeded",
               messages: [],
+              removedMessageIds: [],
               cursor: null,
             };
           }
@@ -669,18 +779,28 @@ export class GoogleConnection {
       const nextPageToken = optionalStringField(body, "nextPageToken");
       if (!nextPageToken) {
         const messages: GmailEvidence[] = [];
+        const removedMessageIds: string[] = [];
         for (const identity of identities.values()) {
-          const message = await this.#readCurrentGmailMessage(accessToken, identity);
-          if (message) messages.push(message);
+          const message = await this.#readCurrentGmailResource(accessToken, identity);
+          if (message && gmailMessageIsRetainedReceived(message)) {
+            messages.push(gmailEvidence(message));
+          } else {
+            // Current provider state wins over an intermediate history event. This closes both
+            // hard deletes and label transitions into sent, draft, spam, or trash without
+            // incorrectly removing a message that was restored later in the same history range.
+            removedMessageIds.push(identity.messageId);
+          }
         }
         messages.sort(
           (left, right) =>
             left.sentAt.localeCompare(right.sentAt) || left.messageId.localeCompare(right.messageId),
         );
+        removedMessageIds.sort();
         return {
           status: "complete",
           resyncRequired: false,
           messages,
+          removedMessageIds,
           cursor: {
             kind: "gmail_history_v1",
             historyId: nextHistoryId,
@@ -700,6 +820,7 @@ export class GoogleConnection {
       resyncRequired: true,
       reason: "change_volume_exceeded",
       messages: [],
+      removedMessageIds: [],
       cursor: null,
     };
   }
@@ -781,6 +902,78 @@ export class GoogleConnection {
         identities.map((identity) => this.#readGmailMessage(accessToken, identity)),
       ),
     };
+  }
+
+  /**
+   * Reads exactly one bounded provider page of retained received Gmail, including archived mail
+   * while excluding sent mail, drafts, spam, and trash. Coverage, bounds, and query semantics are
+   * application-owned; callers cannot supply a semantic query or page size.
+   */
+  async readGmailBaselinePage(input: {
+    householdId: string;
+    ownerAdultId: string;
+    connectionId: string;
+    after: string;
+    before: string;
+    pageToken?: string;
+  }): Promise<GoogleGmailBaselinePage> {
+    const bounds = gmailSearchBounds(input.after, input.before);
+    if (!bounds) throw new Error("Gmail baseline bounds are required");
+    const pageToken = googleBaselinePageToken(input.pageToken, "Gmail baseline page token");
+    const credential = await this.#store.readActiveGoogleCredential({
+      householdId: input.householdId,
+      ownerAdultId: input.ownerAdultId,
+      connectionId: input.connectionId,
+    });
+    if (!credential) throw new GoogleConnectionError("Active Google connection was not found", "not_found");
+    const accessToken = await this.#accessToken(credential);
+    const query = new URLSearchParams({
+      fields: "nextPageToken,messages(id,threadId)",
+      includeSpamTrash: "false",
+      maxResults: String(GMAIL_BASELINE_PAGE_SIZE),
+      // Gmail search timestamps have one-second precision. Widen by one second, then enforce the
+      // exact [after, before) millisecond interval against each message's provider timestamp.
+      q: `after:${Math.floor(bounds.after.getTime() / 1_000) - 1} before:${Math.ceil(bounds.before.getTime() / 1_000) + 1} -in:sent -is:draft -in:spam -in:trash`,
+    });
+    if (pageToken) query.set("pageToken", pageToken);
+    const list = await this.#gmailJson(`messages?${query}`, accessToken);
+    const listed = recordArray(list.messages);
+    if (listed.length > GMAIL_BASELINE_PAGE_SIZE) {
+      throw providerError("Gmail exceeded the baseline page size");
+    }
+    const identities = new Map<string, { messageId: string; threadId: string }>();
+    for (const item of listed) {
+      const messageId = boundedRequired(stringField(item, "id"), "Gmail baseline message ID", 500);
+      const threadId = boundedRequired(stringField(item, "threadId"), "Gmail baseline thread ID", 500);
+      const existing = identities.get(messageId);
+      if (existing && existing.threadId !== threadId) {
+        throw providerError("Gmail reused a baseline message ID in another thread");
+      }
+      if (existing) throw providerError("Gmail repeated a baseline message ID");
+      identities.set(messageId, { messageId, threadId });
+    }
+    const messages: GmailEvidence[] = [];
+    for (const identity of identities.values()) {
+      const message = await this.#readCurrentGmailResource(accessToken, identity);
+      // A message can be deleted after Gmail lists the page but before Florence fetches the full
+      // resource. The page token still represents complete provider progress, so omit only that
+      // now-absent item and commit the rest of the page.
+      if (!message) continue;
+      if (!gmailMessageIsRetainedReceived(message)) continue;
+      const evidence = gmailEvidence(message);
+      const sentAt = explicitInstant(evidence.sentAt);
+      if (sentAt >= bounds.after && sentAt < bounds.before) messages.push(evidence);
+    }
+    messages.sort(
+      (left, right) =>
+        left.sentAt.localeCompare(right.sentAt) ||
+        left.messageId.localeCompare(right.messageId) ||
+        left.threadId.localeCompare(right.threadId),
+    );
+    const nextPageToken = nextGoogleBaselinePageToken(list, pageToken, "Gmail baseline page token");
+    return nextPageToken
+      ? { status: "more", messages, nextPageToken }
+      : { status: "complete", messages, nextPageToken: null };
   }
 
   async provisionFamilyCalendar(input: {
@@ -924,6 +1117,188 @@ export class GoogleConnection {
     }
   }
 
+  /**
+   * Read-only in inspect mode. Delete mode permanently removes only the exact secondary Calendar
+   * carrying this household's deterministic Florence marker, then confirms it is absent.
+   */
+  async reconcileFamilyCalendarForProductionReset(input: {
+    householdId: string;
+    creatorAdultId: string;
+    creatorConnectionId: string;
+    /** Null means Calendar creation was attempted but its returned ID was never stored. */
+    calendarId: string | null;
+    mode: "inspect" | "delete";
+  }): Promise<GoogleProductionResetCalendarResult> {
+    const householdId = required(input.householdId, "production reset household ID");
+    const creatorAdultId = required(input.creatorAdultId, "production reset creator adult ID");
+    const creatorConnectionId = required(input.creatorConnectionId, "production reset creator connection ID");
+    const credential = await this.#store.readActiveGoogleCredential({
+      householdId,
+      ownerAdultId: creatorAdultId,
+      connectionId: creatorConnectionId,
+    });
+    if (!credential) {
+      throw new GoogleProductionResetError(
+        "The Florence Calendar creator credential is unavailable",
+        "missing_creator_credential",
+      );
+    }
+    const accessToken = await this.#productionResetAccessToken(credential);
+    const creatorEmail = await this.#productionResetAccountEmail(accessToken);
+    let calendarId: string;
+    if (input.calendarId === null) {
+      const discoveredCalendarId = await this.#findProductionResetCalendarByMarker(
+        accessToken,
+        householdId,
+        creatorEmail,
+      );
+      if (discoveredCalendarId === null) {
+        return Object.freeze({ state: "absent", calendarId: null });
+      }
+      calendarId = discoveredCalendarId;
+    } else {
+      try {
+        calendarId = secondaryCalendarTarget(input.calendarId);
+      } catch {
+        throw new GoogleProductionResetError(
+          "A production reset cannot target a primary Calendar",
+          "primary_calendar_rejected",
+        );
+      }
+    }
+    const calendar = await this.#readProductionResetCalendar(accessToken, calendarId);
+    if (calendar === null) return Object.freeze({ state: "absent", calendarId });
+    if (calendar.id !== calendarId) {
+      throw new GoogleProductionResetError(
+        "Google returned a different Calendar during reset verification",
+        "calendar_identity_mismatch",
+      );
+    }
+    if (calendar.description !== familyCalendarDescription(familyCalendarProvisioningMarker(householdId))) {
+      throw new GoogleProductionResetError(
+        "The Calendar does not carry the exact Florence household marker",
+        "calendar_marker_mismatch",
+      );
+    }
+    const listEntry = await this.#readProductionResetCalendarListEntry(accessToken, calendarId);
+    if (listEntry.id !== calendarId) {
+      throw new GoogleProductionResetError(
+        "Google returned a different Calendar-list entry during reset verification",
+        "calendar_identity_mismatch",
+      );
+    }
+    if (listEntry.primary === true) {
+      throw new GoogleProductionResetError(
+        "A production reset cannot target a primary Calendar",
+        "primary_calendar_rejected",
+      );
+    }
+    if (normalizedGoogleEmail(productionResetDataOwner(listEntry), "Calendar data owner") !== creatorEmail) {
+      throw new GoogleProductionResetError(
+        "The Florence Calendar creator credential is not the Calendar data owner",
+        "creator_not_data_owner",
+      );
+    }
+    if (listEntry.accessRole !== "owner") {
+      throw new GoogleProductionResetError(
+        "The Florence Calendar creator credential no longer owns the Calendar",
+        "creator_not_owner",
+      );
+    }
+    if (input.mode === "inspect") return Object.freeze({ state: "present", calendarId });
+
+    let deleted: Response;
+    try {
+      deleted = await this.#fetch(
+        `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}`,
+        {
+          method: "DELETE",
+          headers: { authorization: `Bearer ${accessToken}` },
+          signal: AbortSignal.timeout(15_000),
+        },
+      );
+    } catch {
+      throw new GoogleProductionResetError(
+        "Google Calendar deletion could not be confirmed",
+        "deletion_unconfirmed",
+      );
+    }
+    if (deleted.status !== 404 && deleted.status !== 410 && !deleted.ok) {
+      throw new GoogleProductionResetError(
+        "Google Calendar deletion could not be confirmed",
+        resetProviderUnavailableStatus(deleted.status) ? "provider_unavailable" : "provider_rejected",
+      );
+    }
+    const confirmation = await this.#readProductionResetCalendar(accessToken, calendarId);
+    if (confirmation !== null) {
+      throw new GoogleProductionResetError(
+        "Google still returns the Calendar after deletion",
+        "deletion_unconfirmed",
+      );
+    }
+    return Object.freeze({ state: "absent", calendarId });
+  }
+
+  /**
+   * Captures opaque revocation work while credential envelopes still exist. The returned function
+   * keeps plaintext inside this module and is called only after the guarded database truncate.
+   */
+  async prepareGoogleCredentialRevocationsForProductionReset(
+    inputs: readonly Readonly<{
+      householdId: string;
+      adultId: string;
+      connectionId: string;
+    }>[],
+  ): Promise<() => Promise<GoogleProductionResetRevocationResult>> {
+    const refreshTokens: (string | null)[] = [];
+    for (const input of inputs) {
+      const credential = await this.#store.readActiveGoogleCredential({
+        householdId: required(input.householdId, "production reset household ID"),
+        ownerAdultId: required(input.adultId, "production reset adult ID"),
+        connectionId: required(input.connectionId, "production reset connection ID"),
+      });
+      if (!credential) {
+        refreshTokens.push(null);
+        continue;
+      }
+      try {
+        refreshTokens.push(
+          decrypt(
+            credential.refreshTokenEnvelope,
+            this.#key,
+            aad(credential.connectionId, credential.householdId, credential.ownerAdultId),
+          ),
+        );
+      } catch {
+        refreshTokens.push(null);
+      }
+    }
+    return async () => {
+      let confirmed = 0;
+      let unconfirmed = 0;
+      for (const refreshToken of refreshTokens) {
+        if (refreshToken === null) {
+          unconfirmed += 1;
+          continue;
+        }
+        try {
+          const response = await this.#fetch("https://oauth2.googleapis.com/revoke", {
+            method: "POST",
+            headers: { "content-type": "application/x-www-form-urlencoded" },
+            body: new URLSearchParams({ token: refreshToken }),
+            signal: AbortSignal.timeout(15_000),
+          });
+          if (response.ok) confirmed += 1;
+          else unconfirmed += 1;
+        } catch {
+          unconfirmed += 1;
+        }
+      }
+      refreshTokens.fill(null);
+      return Object.freeze({ confirmed, unconfirmed });
+    };
+  }
+
   async renameFamilyCalendar(input: {
     householdId: string;
     ownerAdultId: string;
@@ -1015,6 +1390,128 @@ export class GoogleConnection {
       );
     }
     return { summary, occurredAt: new Date().toISOString() };
+  }
+
+  /**
+   * Reads one page of every event-readable Calendar in the account, including hidden and
+   * non-selected calendars. The one DB-bound Florence Family Calendar ID is excluded exactly.
+   */
+  async readCalendarBaselineTargetsPage(input: {
+    householdId: string;
+    ownerAdultId: string;
+    connectionId: string;
+    excludedFamilyCalendarId: string | null;
+    pageToken?: string;
+  }): Promise<GoogleCalendarBaselineTargetsPage> {
+    const excludedFamilyCalendarId =
+      input.excludedFamilyCalendarId === null
+        ? null
+        : secondaryCalendarTarget(input.excludedFamilyCalendarId);
+    const pageToken = googleBaselinePageToken(input.pageToken, "Calendar-list baseline page token");
+    const credential = await this.#store.readActiveGoogleCredential({
+      householdId: input.householdId,
+      ownerAdultId: input.ownerAdultId,
+      connectionId: input.connectionId,
+    });
+    if (!credential) throw new GoogleConnectionError("Active Google connection was not found", "not_found");
+    const accessToken = await this.#baselineCalendarAccessToken(credential);
+    const query = new URLSearchParams({
+      fields: "nextPageToken,items(id,timeZone,accessRole,primary,deleted)",
+      maxResults: String(CALENDAR_BASELINE_PAGE_SIZE),
+      showDeleted: "false",
+      showHidden: "true",
+    });
+    if (pageToken) query.set("pageToken", pageToken);
+    const body = await this.#calendarBaselineJson(
+      `users/me/calendarList?${query}`,
+      accessToken,
+      "Google Calendar-list baseline read",
+    );
+    if (!body) throw providerError("Google Calendar-list baseline read became unavailable");
+    const entries = recordArray(body.items);
+    if (entries.length > CALENDAR_BASELINE_PAGE_SIZE) {
+      throw providerError("Google exceeded the Calendar-list baseline page size");
+    }
+    const targets: GoogleCalendarBaselineTarget[] = [];
+    const seenCalendarIds = new Set<string>();
+    for (const entry of entries) {
+      const target = calendarBaselineTargetFromList(entry);
+      if (!target || target.calendarId === excludedFamilyCalendarId) continue;
+      if (seenCalendarIds.has(target.calendarId)) {
+        throw providerError("Google repeated a Calendar baseline target");
+      }
+      seenCalendarIds.add(target.calendarId);
+      targets.push(target);
+    }
+    targets.sort((left, right) => left.calendarId.localeCompare(right.calendarId));
+    const nextPageToken = nextGoogleBaselinePageToken(body, pageToken, "Calendar-list baseline page token");
+    return nextPageToken
+      ? { status: "more", targets, nextPageToken }
+      : { status: "complete", targets, nextPageToken: null };
+  }
+
+  /** Reads one fixed-size page of every event in a single baseline Calendar target. */
+  async readCalendarBaselineEventsPage(input: {
+    householdId: string;
+    ownerAdultId: string;
+    connectionId: string;
+    target: GoogleCalendarBaselineTarget;
+    timeMin: string;
+    timeMax: string;
+    pageToken?: string;
+  }): Promise<GoogleCalendarBaselineEventsPage> {
+    const target = calendarBaselineTarget(input.target);
+    const timeMin = explicitInstant(input.timeMin);
+    const timeMax = explicitInstant(input.timeMax);
+    if (timeMax <= timeMin) throw new Error("Calendar baseline end must follow start");
+    if (timeMax.getTime() - timeMin.getTime() > CALENDAR_BASELINE_MAX_WINDOW_MS) {
+      throw new Error("Calendar baseline window cannot exceed 111 days");
+    }
+    const pageToken = googleBaselinePageToken(input.pageToken, "Calendar-event baseline page token");
+    const credential = await this.#store.readActiveGoogleCredential({
+      householdId: input.householdId,
+      ownerAdultId: input.ownerAdultId,
+      connectionId: input.connectionId,
+    });
+    if (!credential) throw new GoogleConnectionError("Active Google connection was not found", "not_found");
+    const accessToken = await this.#baselineCalendarAccessToken(credential);
+    const query = new URLSearchParams({
+      fields:
+        "nextPageToken,timeZone,items(id,etag,updated,status,summary,location,start,end,transparency,attendees(self,responseStatus))",
+      maxResults: String(CALENDAR_BASELINE_PAGE_SIZE),
+      orderBy: "startTime",
+      showDeleted: "false",
+      singleEvents: "true",
+      timeZone: target.timeZone,
+      timeMax: timeMax.toISOString(),
+      timeMin: timeMin.toISOString(),
+    });
+    if (pageToken) query.set("pageToken", pageToken);
+    const body = await this.#calendarBaselineJson(
+      `calendars/${encodeURIComponent(target.calendarId)}/events?${query}`,
+      accessToken,
+      "Google Calendar-event baseline read",
+      true,
+    );
+    if (!body) return { status: "unavailable", events: [], nextPageToken: null };
+    const responseTimeZone = calendarTimeZone(stringField(body, "timeZone"));
+    if (responseTimeZone !== target.timeZone) {
+      throw providerError("Google changed a Calendar baseline target during the scan");
+    }
+    const listed = recordArray(body.items);
+    if (listed.length > CALENDAR_BASELINE_PAGE_SIZE) {
+      throw providerError("Google exceeded the Calendar-event baseline page size");
+    }
+    const events = listed.map((event) => {
+      const result = calendarWindowEvent(event, target.timeZone, timeMin, timeMax, "all");
+      if (!result) throw providerError("Google returned an out-of-window Calendar baseline event");
+      return result;
+    });
+    events.sort(compareCalendarWindowEvents);
+    const nextPageToken = nextGoogleBaselinePageToken(body, pageToken, "Calendar-event baseline page token");
+    return nextPageToken
+      ? { status: "more", events, nextPageToken }
+      : { status: "complete", events, nextPageToken: null };
   }
 
   async readInitialCalendarReview(input: {
@@ -1167,8 +1664,8 @@ export class GoogleConnection {
       );
       const scans = [
         {
-          timeMin,
-          timeMax,
+          timeMin: null,
+          timeMax: null,
           updatedMin: cursor.updatedMin,
           showDeleted: true,
         },
@@ -1204,9 +1701,9 @@ export class GoogleConnection {
             maxResults: String(GOOGLE_CHANGE_PAGE_SIZE),
             showDeleted: String(scan.showDeleted),
             singleEvents: "true",
-            timeMax: scan.timeMax.toISOString(),
-            timeMin: scan.timeMin.toISOString(),
           });
+          if (scan.timeMin) query.set("timeMin", scan.timeMin.toISOString());
+          if (scan.timeMax) query.set("timeMax", scan.timeMax.toISOString());
           if (scan.updatedMin) query.set("updatedMin", scan.updatedMin);
           if (pageToken) query.set("pageToken", pageToken);
           let response: Response;
@@ -1242,6 +1739,13 @@ export class GoogleConnection {
           observedCalendarTimeZone = pageTimeZone;
           for (const event of recordArray(body.items)) {
             const change = calendarChangedEvent(event, pageTimeZone);
+            if (
+              scan.timeMin !== null &&
+              (change.startsAt === null ||
+                explicitInstant(change.startsAt).getTime() < enteringTimeMin.getTime())
+            ) {
+              continue;
+            }
             const key = `${change.providerEventId}\0${change.providerRevision}`;
             events.set(key, change);
           }
@@ -1904,7 +2408,7 @@ export class GoogleConnection {
     } catch (error) {
       throw transientCalendarError("Google partner Calendar list verification failed", error);
     }
-    if (response.status === 404) return null;
+    if (response.status === 404 || response.status === 410) return null;
     if (transientHttpStatus(response.status)) {
       throw transientCalendarError(
         `Google partner Calendar list verification returned HTTP ${response.status}`,
@@ -1968,6 +2472,14 @@ export class GoogleConnection {
     accessToken: string,
     expected: { messageId: string; threadId: string },
   ): Promise<GmailEvidence | null> {
+    const message = await this.#readCurrentGmailResource(accessToken, expected);
+    return message ? gmailEvidence(message) : null;
+  }
+
+  async #readCurrentGmailResource(
+    accessToken: string,
+    expected: { messageId: string; threadId: string },
+  ): Promise<Record<string, unknown> | null> {
     const response = await this.#fetch(
       `https://gmail.googleapis.com/gmail/v1/users/me/messages/${encodeURIComponent(expected.messageId)}?format=full`,
       {
@@ -1975,7 +2487,7 @@ export class GoogleConnection {
         signal: AbortSignal.timeout(15_000),
       },
     );
-    if (response.status === 404) return null;
+    if (response.status === 404 || response.status === 410) return null;
     if (!response.ok) throw providerError("Gmail message could not be read");
     const message = await safeJson(response);
     const messageId = stringField(message, "id");
@@ -1983,7 +2495,7 @@ export class GoogleConnection {
     if (messageId !== expected.messageId || threadId !== expected.threadId) {
       throw providerError("Gmail returned evidence for a different message");
     }
-    return gmailEvidence(message);
+    return message;
   }
 
   async #readInlineGmailAttachmentBody(
@@ -2015,6 +2527,331 @@ export class GoogleConnection {
       throw providerError("Gmail inline attachment storage identity changed");
     }
     return body;
+  }
+
+  async #productionResetAccessToken(credential: ActiveGoogleCredential): Promise<string> {
+    let refreshToken: string;
+    try {
+      refreshToken = decrypt(
+        credential.refreshTokenEnvelope,
+        this.#key,
+        aad(credential.connectionId, credential.householdId, credential.ownerAdultId),
+      );
+    } catch {
+      throw new GoogleProductionResetError(
+        "The Florence Calendar creator credential could not be opened",
+        "credential_rejected",
+      );
+    }
+    let response: Response;
+    try {
+      response = await this.#fetch("https://oauth2.googleapis.com/token", {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          client_id: this.#clientId,
+          client_secret: this.#clientSecret,
+          grant_type: "refresh_token",
+          refresh_token: refreshToken,
+        }),
+        signal: AbortSignal.timeout(15_000),
+      });
+    } catch {
+      throw new GoogleProductionResetError(
+        "Google access-token refresh is unavailable",
+        "provider_unavailable",
+      );
+    }
+    if (!response.ok) {
+      throw new GoogleProductionResetError(
+        "Google rejected the Florence Calendar creator credential",
+        resetProviderUnavailableStatus(response.status) ? "provider_unavailable" : "credential_rejected",
+      );
+    }
+    try {
+      const token = await safeJson(response);
+      if (token.token_type !== "Bearer") throw new Error("unsupported token type");
+      return stringField(token, "access_token");
+    } catch {
+      throw new GoogleProductionResetError(
+        "Google returned an invalid Calendar access token",
+        "credential_rejected",
+      );
+    }
+  }
+
+  async #productionResetAccountEmail(accessToken: string): Promise<string> {
+    let response: Response;
+    try {
+      response = await this.#fetch("https://openidconnect.googleapis.com/v1/userinfo", {
+        headers: { authorization: `Bearer ${accessToken}` },
+        signal: AbortSignal.timeout(15_000),
+      });
+    } catch {
+      throw new GoogleProductionResetError(
+        "Google account identity verification is unavailable",
+        "provider_unavailable",
+      );
+    }
+    if (!response.ok) {
+      const code =
+        response.status === 401 || response.status === 403
+          ? "credential_rejected"
+          : resetProviderUnavailableStatus(response.status)
+            ? "provider_unavailable"
+            : "provider_rejected";
+      throw new GoogleProductionResetError("Google rejected account identity verification", code);
+    }
+    try {
+      const identity = await safeJson(response);
+      if (identity.email_verified !== true) throw new Error("Google email is unverified");
+      return normalizedGoogleEmail(stringField(identity, "email"), "production reset creator email");
+    } catch {
+      throw new GoogleProductionResetError(
+        "Google returned an invalid account identity",
+        "provider_rejected",
+      );
+    }
+  }
+
+  /**
+   * Resolves the only safe recovery key left by an ambiguous Calendar create. A reset may proceed
+   * only after a complete Calendar-list walk finds exactly one secondary Calendar with the exact
+   * household marker and proves that the founding Google account is its data owner.
+   */
+  async #findProductionResetCalendarByMarker(
+    accessToken: string,
+    householdId: string,
+    creatorEmail: string,
+  ): Promise<string | null> {
+    const expectedDescription = familyCalendarDescription(familyCalendarProvisioningMarker(householdId));
+    const matches = new Set<string>();
+    const seenPageTokens = new Set<string>();
+    let pageToken: string | null = null;
+    let pageCount = 0;
+    for (;;) {
+      pageCount += 1;
+      if (pageCount > 100) {
+        throw new GoogleProductionResetError(
+          "Google Calendar marker discovery exceeded its safe pagination bound",
+          "provider_rejected",
+        );
+      }
+      const query = new URLSearchParams({
+        fields: "nextPageToken,items(id,description,deleted,primary,accessRole,dataOwner)",
+        maxResults: "250",
+        showDeleted: "false",
+        showHidden: "true",
+      });
+      if (pageToken !== null) query.set("pageToken", pageToken);
+      let response: Response;
+      try {
+        response = await this.#fetch(
+          `https://www.googleapis.com/calendar/v3/users/me/calendarList?${query}`,
+          {
+            headers: { authorization: `Bearer ${accessToken}` },
+            signal: AbortSignal.timeout(15_000),
+          },
+        );
+      } catch {
+        throw new GoogleProductionResetError(
+          "Google Calendar marker discovery is unavailable",
+          "provider_unavailable",
+        );
+      }
+      if (!response.ok) {
+        const code =
+          response.status === 401 || response.status === 403
+            ? "credential_rejected"
+            : resetProviderUnavailableStatus(response.status)
+              ? "provider_unavailable"
+              : "provider_rejected";
+        throw new GoogleProductionResetError("Google rejected Calendar marker discovery", code);
+      }
+      let nextPageToken: string | null;
+      try {
+        const body = await safeJson(response);
+        nextPageToken = optionalStringField(body, "nextPageToken");
+        for (const entry of recordArray(body.items)) {
+          if (entry.description !== undefined && typeof entry.description !== "string") {
+            throw new Error("invalid Calendar description");
+          }
+          if (entry.deleted !== undefined && typeof entry.deleted !== "boolean") {
+            throw new Error("invalid Calendar deletion state");
+          }
+          if (entry.primary !== undefined && typeof entry.primary !== "boolean") {
+            throw new Error("invalid primary Calendar state");
+          }
+          if (entry.description !== expectedDescription || entry.deleted === true) continue;
+          if (entry.primary === true) {
+            throw new GoogleProductionResetError(
+              "A production reset marker appeared on a primary Calendar",
+              "primary_calendar_rejected",
+            );
+          }
+          if (entry.accessRole !== "owner") {
+            throw new GoogleProductionResetError(
+              "The Florence Calendar creator credential no longer owns the marked Calendar",
+              "creator_not_owner",
+            );
+          }
+          if (
+            normalizedGoogleEmail(productionResetDataOwner(entry), "Calendar data owner") !== creatorEmail
+          ) {
+            throw new GoogleProductionResetError(
+              "The Florence Calendar creator credential is not the marked Calendar data owner",
+              "creator_not_data_owner",
+            );
+          }
+          matches.add(secondaryCalendarTarget(stringField(entry, "id")));
+        }
+      } catch (error) {
+        if (error instanceof GoogleProductionResetError) throw error;
+        throw new GoogleProductionResetError(
+          "Google returned invalid Calendar marker discovery data",
+          "provider_rejected",
+        );
+      }
+      if (nextPageToken === null) break;
+      if (seenPageTokens.has(nextPageToken)) {
+        throw new GoogleProductionResetError(
+          "Google repeated a Calendar marker discovery page",
+          "provider_rejected",
+        );
+      }
+      seenPageTokens.add(nextPageToken);
+      pageToken = nextPageToken;
+    }
+    if (matches.size === 0) {
+      return null;
+    }
+    if (matches.size > 1) {
+      throw new GoogleProductionResetError(
+        "Google contains multiple Calendars with the exact Florence household marker",
+        "calendar_marker_ambiguous",
+      );
+    }
+    return matches.values().next().value ?? null;
+  }
+
+  async #readProductionResetCalendar(
+    accessToken: string,
+    calendarId: string,
+  ): Promise<Record<string, unknown> | null> {
+    let response: Response;
+    try {
+      response = await this.#fetch(
+        `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}`,
+        {
+          headers: { authorization: `Bearer ${accessToken}` },
+          signal: AbortSignal.timeout(15_000),
+        },
+      );
+    } catch {
+      throw new GoogleProductionResetError(
+        "Google Calendar verification is unavailable",
+        "provider_unavailable",
+      );
+    }
+    if (response.status === 404 || response.status === 410) return null;
+    if (!response.ok) {
+      const code =
+        response.status === 401 || response.status === 403
+          ? "credential_rejected"
+          : resetProviderUnavailableStatus(response.status)
+            ? "provider_unavailable"
+            : "provider_rejected";
+      throw new GoogleProductionResetError("Google rejected Calendar reset verification", code);
+    }
+    try {
+      return await safeJson(response);
+    } catch {
+      throw new GoogleProductionResetError("Google returned invalid Calendar metadata", "provider_rejected");
+    }
+  }
+
+  async #readProductionResetCalendarListEntry(
+    accessToken: string,
+    calendarId: string,
+  ): Promise<Record<string, unknown>> {
+    let response: Response;
+    try {
+      response = await this.#fetch(
+        `https://www.googleapis.com/calendar/v3/users/me/calendarList/${encodeURIComponent(calendarId)}`,
+        {
+          headers: { authorization: `Bearer ${accessToken}` },
+          signal: AbortSignal.timeout(15_000),
+        },
+      );
+    } catch {
+      throw new GoogleProductionResetError(
+        "Google Calendar-list verification is unavailable",
+        "provider_unavailable",
+      );
+    }
+    if (!response.ok) {
+      const code =
+        response.status === 401 || response.status === 403
+          ? "credential_rejected"
+          : resetProviderUnavailableStatus(response.status)
+            ? "provider_unavailable"
+            : "provider_rejected";
+      throw new GoogleProductionResetError("Google rejected Calendar-list reset verification", code);
+    }
+    let entry: Record<string, unknown>;
+    try {
+      entry = await safeJson(response);
+    } catch {
+      throw new GoogleProductionResetError(
+        "Google returned invalid Calendar-list metadata",
+        "provider_rejected",
+      );
+    }
+    if (
+      typeof entry.id !== "string" ||
+      typeof entry.accessRole !== "string" ||
+      typeof entry.dataOwner !== "string" ||
+      !entry.dataOwner.trim() ||
+      (entry.primary !== undefined && typeof entry.primary !== "boolean")
+    ) {
+      throw new GoogleProductionResetError(
+        "Google returned incomplete Calendar-list metadata",
+        "provider_rejected",
+      );
+    }
+    return entry;
+  }
+
+  async #baselineCalendarAccessToken(credential: ActiveGoogleCredential): Promise<string> {
+    try {
+      return await this.#calendarAccessToken(credential);
+    } catch (error) {
+      if (error instanceof DefinitiveCalendarError) throw providerError(error.message);
+      throw error;
+    }
+  }
+
+  async #calendarBaselineJson(
+    path: string,
+    accessToken: string,
+    operation: string,
+    inaccessibleIsUnavailable = false,
+  ): Promise<Record<string, unknown> | null> {
+    let response: Response;
+    try {
+      response = await this.#fetch(`https://www.googleapis.com/calendar/v3/${path}`, {
+        headers: { authorization: `Bearer ${accessToken}` },
+        signal: AbortSignal.timeout(15_000),
+      });
+    } catch (error) {
+      throw transientCalendarError(`${operation} failed`, error);
+    }
+    if (inaccessibleIsUnavailable && [403, 404, 410].includes(response.status)) return null;
+    if (transientHttpStatus(response.status)) {
+      throw transientCalendarError(`${operation} returned HTTP ${response.status}`);
+    }
+    if (!response.ok) throw providerError(`${operation} failed`);
+    return safeJson(response);
   }
 
   async #calendarAccessToken(credential: ActiveGoogleCredential): Promise<string> {
@@ -2127,6 +2964,24 @@ function transientCalendarError(message: string, cause?: unknown): GoogleCalenda
 
 function transientHttpStatus(status: number): boolean {
   return status === 403 || status === 408 || status === 425 || status === 429 || status >= 500;
+}
+
+function resetProviderUnavailableStatus(status: number): boolean {
+  return status === 408 || status === 425 || status === 429 || status >= 500;
+}
+
+function normalizedGoogleEmail(value: string, label: string): string {
+  return required(value, label).trim().toLowerCase();
+}
+
+function productionResetDataOwner(entry: Record<string, unknown>): string {
+  if (typeof entry.dataOwner !== "string" || !entry.dataOwner.trim()) {
+    throw new GoogleProductionResetError(
+      "Google did not identify the Calendar data owner",
+      "provider_rejected",
+    );
+  }
+  return entry.dataOwner;
 }
 
 function exactActiveConnection(
@@ -2639,6 +3494,99 @@ function calendarTarget(value: string | undefined): string {
   return calendarId;
 }
 
+function googleBaselinePageToken(value: string | undefined, label: string): string | null {
+  if (value === undefined) return null;
+  if (
+    !value ||
+    value !== value.trim() ||
+    value.length > MAX_GOOGLE_BASELINE_PAGE_TOKEN_LENGTH ||
+    [...value].some((character) => {
+      const code = character.charCodeAt(0);
+      return code < 32 || code === 127;
+    })
+  ) {
+    throw new Error(`${label} is invalid`);
+  }
+  return value;
+}
+
+function nextGoogleBaselinePageToken(
+  body: Record<string, unknown>,
+  currentPageToken: string | null,
+  label: string,
+): string | null {
+  const raw = optionalStringField(body, "nextPageToken");
+  if (raw === null) return null;
+  const next = googleBaselinePageToken(raw, label);
+  if (!next) throw providerError(`Google returned an invalid ${label}`);
+  if (next === currentPageToken) throw providerError(`Google repeated the ${label}`);
+  return next;
+}
+
+function calendarBaselineTargetFromList(entry: Record<string, unknown>): GoogleCalendarBaselineTarget | null {
+  if (entry.deleted !== undefined && typeof entry.deleted !== "boolean") {
+    throw providerError("Google returned an invalid Calendar baseline target");
+  }
+  if (entry.deleted === true) {
+    throw providerError("Google returned a deleted Calendar in the readable baseline");
+  }
+  const accessRole = entry.accessRole;
+  if (accessRole === "freeBusyReader") return null;
+  if (
+    accessRole !== "reader" &&
+    accessRole !== "writerWithoutPrivateAccess" &&
+    accessRole !== "writer" &&
+    accessRole !== "owner"
+  ) {
+    throw providerError("Google returned an invalid Calendar baseline access role");
+  }
+  if (entry.primary !== undefined && typeof entry.primary !== "boolean") {
+    throw providerError("Google returned an invalid Calendar baseline primary flag");
+  }
+  return {
+    calendarId: calendarTarget(stringField(entry, "id")),
+    timeZone: calendarTimeZone(stringField(entry, "timeZone")),
+    accessRole,
+    primary: entry.primary === true,
+  };
+}
+
+function calendarBaselineTarget(value: GoogleCalendarBaselineTarget): GoogleCalendarBaselineTarget {
+  if (!value || typeof value !== "object") {
+    throw new Error("Calendar baseline target is required");
+  }
+  if (
+    value.accessRole !== "reader" &&
+    value.accessRole !== "writerWithoutPrivateAccess" &&
+    value.accessRole !== "writer" &&
+    value.accessRole !== "owner"
+  ) {
+    throw new Error("Calendar baseline target access role is invalid");
+  }
+  if (typeof value.primary !== "boolean") {
+    throw new Error("Calendar baseline target primary flag is invalid");
+  }
+  return {
+    calendarId: calendarTarget(value.calendarId),
+    timeZone: calendarTimeZone(value.timeZone),
+    accessRole: value.accessRole,
+    primary: value.primary,
+  };
+}
+
+function compareCalendarWindowEvents(
+  left: GoogleCalendarWindowEvent,
+  right: GoogleCalendarWindowEvent,
+): number {
+  const leftStart = left.intervalKind === "timed" ? left.startsAt : left.startDate;
+  const rightStart = right.intervalKind === "timed" ? right.startsAt : right.startDate;
+  return (
+    leftStart.localeCompare(rightStart) ||
+    left.providerEventId.localeCompare(right.providerEventId) ||
+    left.providerRevision.localeCompare(right.providerRevision)
+  );
+}
+
 function calendarBoundedCursor(
   value: GoogleCalendarBoundedCursor,
   expectedCalendarId: string,
@@ -2807,7 +3755,11 @@ function recordArray(value: unknown): readonly Record<string, unknown>[] {
 function headerMap(value: unknown): Map<string, string> {
   const headers = new Map<string, string>();
   for (const header of recordArray(value)) {
-    headers.set(stringField(header, "name").toLowerCase(), stringField(header, "value"));
+    const headerValue = header.value;
+    if (typeof headerValue !== "string") {
+      throw providerError("Google returned an incomplete Gmail header");
+    }
+    headers.set(stringField(header, "name").toLowerCase(), headerValue);
   }
   return headers;
 }
@@ -2823,7 +3775,7 @@ function gmailSearchBounds(
   const after = explicitInstant(afterValue);
   const before = explicitInstant(beforeValue);
   if (before <= after) throw new Error("Gmail search before must follow after");
-  if (before.getTime() - after.getTime() > 90 * 24 * 60 * 60_000) {
+  if (before.getTime() - after.getTime() > GMAIL_BASELINE_MAX_WINDOW_MS) {
     throw new Error("Gmail search window cannot exceed 90 days");
   }
   return { after, before };
@@ -2845,15 +3797,13 @@ function gmailEvidence(message: Record<string, unknown>): GmailEvidence {
     historyId,
   });
   if (typeof message.snippet !== "string") throw providerError("Gmail returned an invalid snippet");
-  const plainText = collectPlainText(payload).trim();
-  const snippet = message.snippet.trim();
-  const readableBody = plainText || snippet;
-  if (!readableBody && supportedAttachments.attachments.length === 0) {
-    throw providerError("Gmail message has no readable text or supported attachment");
-  }
-  const text =
-    readableBody ||
-    `Attachment-only message: ${supportedAttachments.attachments.map((attachment) => attachment.filename).join(", ")}`;
+  const extractedText = collectGmailReadableText(payload);
+  const snippet = normalizeReadableText(message.snippet);
+  const readableBody = extractedText.text || snippet;
+  // Empty-body and attachment-only mail is still a valid received source. Metadata and supported
+  // attachment references carry the evidence; do not wedge a complete mailbox scan because the
+  // provider has no readable body or snippet.
+  const text = readableBody;
   return {
     messageId,
     threadId,
@@ -2861,17 +3811,32 @@ function gmailEvidence(message: Record<string, unknown>): GmailEvidence {
     from,
     subject,
     sentAt: new Date(timestamp).toISOString(),
-    text: bounded(text, 50_000),
-    textStatus: plainText
-      ? plainText.length > 50_000
-        ? "truncated"
-        : "complete"
+    text: boundedReadableText(text),
+    textStatus: extractedText.text
+      ? extractedText.complete
+        ? "complete"
+        : "truncated"
       : snippet
         ? "truncated"
         : "unavailable",
     attachments: supportedAttachments.attachments,
     attachmentsStatus: supportedAttachments.status,
   };
+}
+
+function gmailMessageIsRetainedReceived(message: Record<string, unknown>): boolean {
+  if (!Array.isArray(message.labelIds)) {
+    throw providerError("Google returned incomplete Gmail labels");
+  }
+  const labels = new Set<string>();
+  for (const value of message.labelIds) {
+    if (typeof value !== "string" || !value || value.length > 500) {
+      throw providerError("Google returned invalid Gmail labels");
+    }
+    if (labels.has(value)) throw providerError("Google repeated a Gmail label");
+    labels.add(value);
+  }
+  return !["SENT", "DRAFT", "SPAM", "TRASH"].some((label) => labels.has(label));
 }
 
 function gmailHistoryId(value: unknown): string {
@@ -2891,15 +3856,21 @@ function gmailCursor(value: GoogleGmailCursor): GoogleGmailCursor {
   };
 }
 
-function gmailHistoryMessageIdentity(addition: Record<string, unknown>): {
+function gmailHistoryMessageIdentity(message: Record<string, unknown>): {
   messageId: string;
   threadId: string;
 } {
-  const message = recordField(addition, "message");
   return {
     messageId: boundedRequired(stringField(message, "id"), "Gmail changed message ID", 500),
     threadId: boundedRequired(stringField(message, "threadId"), "Gmail changed thread ID", 500),
   };
+}
+
+function gmailHistoryChangeIdentity(change: Record<string, unknown>): {
+  messageId: string;
+  threadId: string;
+} {
+  return gmailHistoryMessageIdentity(recordField(change, "message"));
 }
 
 function nonNegativeIntegerField(value: Record<string, unknown>, field: string): number {
@@ -3083,16 +4054,269 @@ function gmailBytesMatchMimeType(
   );
 }
 
-function collectPlainText(part: Record<string, unknown>): string {
-  const own = part.mimeType === "text/plain" ? decodeBody(part.body) : "";
-  const nested = recordArray(part.parts).map(collectPlainText).filter(Boolean);
-  return [own, ...nested].filter(Boolean).join("\n");
+type GmailDecodedTextPart = { text: string; complete: boolean };
+
+function collectGmailReadableText(part: Record<string, unknown>): GmailDecodedTextPart {
+  const plain: GmailDecodedTextPart[] = [];
+  const html: GmailDecodedTextPart[] = [];
+  const visit = (current: Record<string, unknown>): void => {
+    if (current.mimeType === "text/plain" || current.mimeType === "text/html") {
+      const decoded = decodeGmailTextBody(current.body, gmailTextCharset(current));
+      const text =
+        current.mimeType === "text/html"
+          ? htmlToReadableText(decoded.text)
+          : normalizeReadableText(decoded.text);
+      (current.mimeType === "text/plain" ? plain : html).push({
+        text,
+        complete: decoded.complete,
+      });
+    }
+    for (const child of recordArray(current.parts)) visit(child);
+  };
+  visit(part);
+  const readablePlain = plain.filter((candidate) => candidate.text);
+  const selectedCandidates = readablePlain.length > 0 ? plain : html;
+  const selected = selectedCandidates.filter((candidate) => candidate.text);
+  if (selected.length === 0) {
+    return { text: "", complete: [...plain, ...html].every((candidate) => candidate.complete) };
+  }
+  const text = normalizeReadableText(selected.map((candidate) => candidate.text).join("\n\n"));
+  return {
+    text: boundedReadableText(text),
+    complete:
+      selectedCandidates.every((candidate) => candidate.complete) &&
+      text.length <= MAX_GMAIL_READABLE_TEXT_CHARACTERS,
+  };
 }
 
-function decodeBody(value: unknown): string {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return "";
-  const data = (value as Record<string, unknown>).data;
-  return typeof data === "string" ? Buffer.from(data, "base64url").toString("utf8") : "";
+function gmailTextCharset(part: Record<string, unknown>): string {
+  const contentType = headerMap(part.headers).get("content-type");
+  if (!contentType) return "utf-8";
+  const match = /(?:^|;)\s*charset\s*=\s*(?:"([^"]+)"|'([^']+)'|([^;\s]+))/i.exec(contentType);
+  const charset = (match?.[1] ?? match?.[2] ?? match?.[3] ?? "utf-8").trim().toLowerCase();
+  if (!charset || charset.length > 100) throw providerError("Google returned an invalid Gmail text charset");
+  return charset;
+}
+
+function decodeGmailTextBody(value: unknown, charset: string): GmailDecodedTextPart {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw providerError("Google returned an invalid Gmail text body");
+  }
+  const body = value as Record<string, unknown>;
+  if (body.data === undefined) {
+    if (body.size === 0) return { text: "", complete: true };
+    if (body.size !== undefined && (!Number.isSafeInteger(body.size) || (body.size as number) < 0)) {
+      throw providerError("Google returned an invalid Gmail text body size");
+    }
+    return { text: "", complete: false };
+  }
+  if (typeof body.data !== "string") {
+    throw providerError("Google returned an invalid Gmail text body encoding");
+  }
+  const encoded = body.data;
+  const unpadded = encoded.replace(/=+$/, "");
+  const paddingLength = encoded.length - unpadded.length;
+  const requiredPadding = (4 - (unpadded.length % 4)) % 4;
+  if (
+    (unpadded && !/^[A-Za-z0-9_-]+$/.test(unpadded)) ||
+    paddingLength > 2 ||
+    unpadded.length % 4 === 1 ||
+    (paddingLength !== 0 && paddingLength !== requiredPadding)
+  ) {
+    throw providerError("Google returned an invalid Gmail text body encoding");
+  }
+  const bytes = Buffer.from(unpadded, "base64url");
+  if (bytes.toString("base64url") !== unpadded) {
+    throw providerError("Google returned an invalid Gmail text body encoding");
+  }
+  try {
+    return { text: new TextDecoder(charset, { fatal: true }).decode(bytes), complete: true };
+  } catch {
+    try {
+      return { text: new TextDecoder(charset).decode(bytes), complete: false };
+    } catch {
+      return { text: new TextDecoder("utf-8").decode(bytes), complete: false };
+    }
+  }
+}
+
+const HTML_BLOCK_TAGS = new Set([
+  "address",
+  "article",
+  "aside",
+  "blockquote",
+  "dd",
+  "details",
+  "div",
+  "dl",
+  "dt",
+  "fieldset",
+  "figcaption",
+  "figure",
+  "footer",
+  "form",
+  "h1",
+  "h2",
+  "h3",
+  "h4",
+  "h5",
+  "h6",
+  "header",
+  "hr",
+  "li",
+  "main",
+  "nav",
+  "ol",
+  "p",
+  "pre",
+  "section",
+  "summary",
+  "table",
+  "tbody",
+  "tfoot",
+  "thead",
+  "tr",
+  "ul",
+]);
+
+function htmlToReadableText(html: string): string {
+  const output: string[] = [];
+  const lowerHtml = html.toLowerCase();
+  let index = 0;
+  let suppressedTag: "script" | "style" | null = null;
+  while (index < html.length) {
+    if (suppressedTag !== null) {
+      const closeStart = lowerHtml.indexOf(`</${suppressedTag}`, index);
+      if (closeStart < 0) break;
+      const closeEnd = htmlTagEnd(html, closeStart);
+      if (closeEnd < 0) break;
+      suppressedTag = null;
+      index = closeEnd + 1;
+      continue;
+    }
+    const tagStart = html.indexOf("<", index);
+    if (tagStart < 0) {
+      output.push(html.slice(index));
+      break;
+    }
+    output.push(html.slice(index, tagStart));
+    if (html.startsWith("<!--", tagStart)) {
+      const commentEnd = html.indexOf("-->", tagStart + 4);
+      if (commentEnd < 0) break;
+      index = commentEnd + 3;
+      continue;
+    }
+    const tagEnd = htmlTagEnd(html, tagStart);
+    if (tagEnd < 0) {
+      output.push(html.slice(tagStart));
+      break;
+    }
+    const rawTag = html.slice(tagStart, tagEnd + 1);
+    const parsed = /^<\s*(\/?)\s*([A-Za-z][A-Za-z0-9:-]*)/.exec(rawTag);
+    if (!parsed) {
+      if (!/^<\s*[!?]/.test(rawTag)) output.push(rawTag);
+      index = tagEnd + 1;
+      continue;
+    }
+    const closing = parsed[1] === "/";
+    const name = (parsed[2] ?? "").toLowerCase();
+    if (!closing && (name === "script" || name === "style")) {
+      suppressedTag = name;
+    } else if (name === "br" || name === "hr" || HTML_BLOCK_TAGS.has(name)) {
+      output.push("\n");
+    } else if (closing && (name === "td" || name === "th")) {
+      output.push(" ");
+    }
+    index = tagEnd + 1;
+  }
+  return normalizeReadableText(decodeHtmlEntities(output.join("")));
+}
+
+function htmlTagEnd(html: string, tagStart: number): number {
+  let quote: '"' | "'" | null = null;
+  for (let index = tagStart + 1; index < html.length; index += 1) {
+    const character = html[index];
+    if (quote !== null) {
+      if (character === quote) quote = null;
+      continue;
+    }
+    if (character === '"' || character === "'") {
+      quote = character;
+      continue;
+    }
+    if (character === ">") return index;
+  }
+  return -1;
+}
+
+const COMMON_HTML_ENTITIES: Readonly<Record<string, string>> = Object.freeze({
+  amp: "&",
+  apos: "'",
+  bull: "•",
+  cent: "¢",
+  copy: "©",
+  deg: "°",
+  divide: "÷",
+  emsp: " ",
+  ensp: " ",
+  euro: "€",
+  gt: ">",
+  hellip: "…",
+  laquo: "«",
+  ldquo: "“",
+  lsquo: "‘",
+  lt: "<",
+  mdash: "—",
+  middot: "·",
+  nbsp: " ",
+  ndash: "–",
+  plusmn: "±",
+  pound: "£",
+  quot: '"',
+  raquo: "»",
+  rdquo: "”",
+  reg: "®",
+  rsquo: "’",
+  times: "×",
+  trade: "™",
+  yen: "¥",
+});
+
+function decodeHtmlEntities(value: string): string {
+  return value.replace(/&(?:#([0-9]+)|#x([0-9a-f]+)|([a-z][a-z0-9]+));/gi, (entity, decimal, hex, name) => {
+    if (typeof decimal === "string" || typeof hex === "string") {
+      const codePoint = Number.parseInt(decimal ?? hex, decimal === undefined ? 16 : 10);
+      return Number.isSafeInteger(codePoint) &&
+        codePoint > 0 &&
+        codePoint <= 0x10ffff &&
+        (codePoint < 0xd800 || codePoint > 0xdfff)
+        ? String.fromCodePoint(codePoint)
+        : "�";
+    }
+    return COMMON_HTML_ENTITIES[String(name).toLowerCase()] ?? entity;
+  });
+}
+
+function normalizeReadableText(value: string): string {
+  const withoutControls = Array.from(value, (character) => {
+    const code = character.codePointAt(0) ?? 0;
+    return code === 10 || code === 13 || (code >= 32 && code !== 127) ? character : " ";
+  }).join("");
+  return withoutControls
+    .replace(/\r\n?/g, "\n")
+    .replace(/[\u00a0 ]+/g, " ")
+    .replace(/ *\n */g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function boundedReadableText(value: string): string {
+  if (value.length <= MAX_GMAIL_READABLE_TEXT_CHARACTERS) return value;
+  let end = MAX_GMAIL_READABLE_TEXT_CHARACTERS;
+  const last = value.charCodeAt(end - 1);
+  const next = value.charCodeAt(end);
+  if (last >= 0xd800 && last <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) end -= 1;
+  return value.slice(0, end);
 }
 
 function bounded(value: string, maximum: number): string {
@@ -3106,4 +4330,10 @@ function nullableBounded(value: string | undefined, maximum: number): string | n
 
 function isUniqueViolation(error: unknown): boolean {
   return Boolean(error && typeof error === "object" && "code" in error && error.code === "23505");
+}
+
+function isGoogleIdentityConflict(error: unknown): boolean {
+  return Boolean(
+    error && typeof error === "object" && "code" in error && error.code === "google_identity_conflict",
+  );
 }

@@ -21,7 +21,7 @@ The clean baseline intentionally does not translate the former Florence schema. 
 ## Topology
 
 - Config-as-code: `/railway.json`.
-- Start: `node apps/api/dist/server.js`.
+- Start: `node apps/api/dist/start.js`.
 - Predeploy: `node packages/database/dist/predeploy.js`.
 - Health: `GET /api/health`.
 - One replica for the pilot.
@@ -42,6 +42,10 @@ Required:
 | `FLORENCE_ENROLLMENT_SECRET` | At least 32 random bytes |
 | `FLORENCE_IMAGE_VAULT_DIRECTORY` | Absolute path on the attached persistent volume |
 | `FLORENCE_IMAGE_VAULT_KEY` | Canonical base64 encoding of exactly 32 random bytes |
+| `FLORENCE_RUNTIME_MODE` | `api` normally; `production_reset_maintenance` only during the guarded reset procedure below |
+| `FLORENCE_PRODUCTION_RESET_EXPECTED_RAILWAY_PROJECT_ID` | Exact Railway project ID recorded by the operator; required by both guarded reset modes |
+| `FLORENCE_PRODUCTION_RESET_EXPECTED_RAILWAY_ENVIRONMENT_ID` | Exact Railway production-environment ID recorded by the operator; required by both guarded reset modes |
+| `FLORENCE_PRODUCTION_RESET_EXPECTED_RAILWAY_SERVICE_ID` | Exact Railway API-service ID recorded by the operator; required by both guarded reset modes |
 | `FLORENCE_MESSAGES_URL` | Canonical link that returns the adult to Florence's iMessage thread |
 | `LINQ_API_KEY` | Linq partner API key |
 | `LINQ_WEBHOOK_SECRET` | Current Standard Webhooks signing secret |
@@ -92,20 +96,175 @@ docker run --rm --entrypoint node florence:release --version
 
 On a disposable empty database, run `pnpm db:migrate` twice. Both runs must pass, and `florence_schema_migrations` must contain the exact digest for `001_florence`.
 
+## Guarded production reset
+
+Never empty the production database with raw SQL. A database-only reset strands the
+shared Calendars Florence created in the adults' Google accounts and destroys the
+credentials needed to remove them safely. It also leaves encrypted image artifacts on
+the attached persistent volume.
+
+The reset must run inside a maintenance deployment of the existing Railway `api`
+service. `railway run` and `railway shell` execute locally: they do not mount `/data`
+or join Railway's private network. A pre-deploy command has the private network but no
+volume. Do not expose PostgreSQL publicly or copy the vault locally as a workaround.
+
+First disable autodeploy and record the exact clean release commit plus Railway project,
+production environment, API service, deployment, database, and volume IDs. Configure
+the three `FLORENCE_PRODUCTION_RESET_EXPECTED_RAILWAY_*_ID` variables from those
+recorded project, environment, and service IDs before starting maintenance. Do not
+derive the expected values from the runtime `RAILWAY_*` variables inside the reset
+command. If the service has a connected source, disconnect it for the maintenance
+window and record the source so it can be restored afterward:
+
+```bash
+railway service source disconnect --service api --environment production
+git status --short
+git rev-parse HEAD
+```
+
+`git status --short` must print nothing. Scale the API to zero and inspect the result.
+Do not proceed while any deployment instance is `RUNNING`:
+
+```bash
+railway scale --service api --environment production us-west2=0
+railway service status --service api --environment production --json
+```
+
+Stage maintenance mode without allowing the variable change to deploy the old API,
+then deploy the exact same clean release. `/railway.json` restores the one replica. The
+maintenance runtime starts only an inert `/api/health` endpoint; every product route,
+webhook, timer, and Florence dependency remains unavailable.
+
+```bash
+railway variable set --service api --environment production --skip-deploys \
+  FLORENCE_RUNTIME_MODE=production_reset_maintenance
+railway up --service api --environment production --detach --json \
+  --message "Enter Florence production reset maintenance"
+railway service status --service api --environment production --json
+curl --fail --silent --show-error --include \
+  https://<canonical-host>/api/health
+```
+
+Wait for exactly one `RUNNING` maintenance instance. The health response must include
+`x-florence-runtime-mode: production_reset_maintenance` and this exact JSON shape:
+
+```json
+{"status":"maintenance","service":"florence-production-reset-maintenance","mode":"production_reset_maintenance"}
+```
+
+Run the dry run over Railway SSH so the process has both the private PostgreSQL URL and
+the existing mounted volume:
+
+```bash
+railway ssh --service api --environment production -- \
+  node apps/api/dist/reset-production.js --dry-run
+```
+
+The dry run emits only aggregate counts and a 64-character `snapshotGuard`; it never
+prints a Calendar ID, artifact filename, credential, email address, or household
+content. The guard covers both the exact database snapshot and the exact inventory of
+canonical encrypted `.fiv` image artifacts plus exact Florence atomic-write temporary
+envelopes named `.<asset UUID>.<write UUID>.tmp` in the asset's two-hex shard. The reset
+ignores shard directories, arbitrary `.tmp` files, noncanonical filenames, and
+unrelated volume contents. `encryptedImageArtifacts` and
+`encryptedImageTemporaryArtifacts` report those two guarded inventories separately. It
+uses the founding adult's still-active Google credential to read every database-linked
+Family Calendar. It also includes every household where Calendar creation was durably
+attempted but the returned Calendar ID was never stored. For those ambiguous creates,
+it walks the complete Google Calendar list. Exactly one secondary Calendar with the
+deterministic Florence household marker is recovered; zero exact matches is the
+idempotent absent result for a create that never reached Google or a Calendar already
+removed manually. Multiple matches, malformed results, incomplete pagination, a
+missing creator credential, missing retained pre-attempt Google-account lineage,
+marker mismatch, primary Calendar, arbitrary Calendar, or unconfirmed provider read
+blocks the reset. A same-account reconnect is valid only when the active founding
+credential's subject digest matches a retained founder connection created no later
+than the Calendar creation attempt. Deleting Google-derived data erases that proof, so
+a later account connection cannot authorize Calendar absence or deletion.
+The founding account must be Google's single `dataOwner`; an `owner` sharing role is
+not sufficient deletion authority.
+
+Review the counts and keep the service in maintenance mode. Run the destructive
+command over SSH with the exact guard returned by the dry run:
+
+```bash
+railway ssh --service api --environment production -- \
+  node apps/api/dist/reset-production.js \
+  --confirm-production-reset "RESET FLORENCE PRODUCTION" \
+  --snapshot <snapshotGuard> \
+  --api-stopped
+```
+
+The CLI independently requires Railway project, environment, service, deployment,
+and replica identity variables to be present and UUID-shaped. In both dry-run and
+execute modes, it also compares the runtime project, environment, and service IDs
+exactly against the three operator-configured
+`FLORENCE_PRODUCTION_RESET_EXPECTED_RAILWAY_*_ID` values. Missing, malformed, or
+mismatched identities fail closed in one aggregate identity-check error without
+printing either the actual or expected IDs. The CLI also requires an existing
+configured vault directory inside `RAILWAY_VOLUME_MOUNT_PATH` and the exact localhost
+maintenance health signature. `--api-stopped` is an explicit operator confirmation,
+not the only exclusion control.
+
+The command repeats the provider preflight. Before deleting an exactly discovered
+ambiguous Calendar, it locks and rechecks the complete inspected database snapshot and
+durably records that provider ID. That makes a partially completed reset safe to rerun.
+It then permanently removes each marked Calendar with Google `Calendars.delete`,
+accepts `404`/`410` as an idempotent already-absent result, and confirms every Calendar
+is absent. It rechecks the inspected image inventory and unlinks only those canonical
+`.fiv` files and exact Florence atomic-write temporary envelopes, then confirms neither
+kind of canonical image artifact remains. The completion event reports separate
+`encryptedImageArtifactsDeleted` and `encryptedImageTemporaryArtifactsDeleted` counts.
+Finally it prepares revocation of each active Google credential, locks and rechecks the
+resulting exact database snapshot, truncates only household product data, and attempts
+the revocations. Migration history, the installed baseline, vault directories,
+arbitrary or noncanonical temporary files, and unrelated volume contents remain
+intact. An unconfirmed provider revocation is reported as an aggregate count; the
+destroyed credential envelopes still remove all Florence access.
+
+If any step fails, do not manually empty the database or restart the API. The command
+may already have removed some Calendars or image artifacts, and a fresh dry run plus
+rerun reconciles both as absent. A snapshot mismatch means database or canonical vault
+state changed after inspection: stop that writer, take a new dry-run snapshot, and
+review it again. Calendars orphaned by older database-only resets have no trustworthy
+database provenance and require one-time manual review; this command deliberately will
+not discover or guess at them. Never substitute `CalendarList.delete`, which only
+unsubscribes the current account rather than permanently deleting the Calendar.
+
+Only after a successful reset, stage normal API mode without deploying it separately,
+deploy the same recorded clean commit, wait for the normal health payload, and run the
+production smoke test:
+
+```bash
+railway variable set --service api --environment production --skip-deploys \
+  FLORENCE_RUNTIME_MODE=api
+git status --short
+git rev-parse HEAD
+railway up --service api --environment production --detach --json \
+  --message "Leave Florence production reset maintenance"
+railway service status --service api --environment production --json
+pnpm smoke:production -- https://<canonical-host>
+```
+
+Again, `git status --short` must be empty and `git rev-parse HEAD` must equal the commit
+recorded before maintenance. Restore the recorded source/autodeploy configuration only
+after the smoke test passes. If the reset failed, leave maintenance mode running and
+follow the reconciliation instructions above instead of starting the API.
+
 ## Clean pilot cutover
 
 1. Disable Railway autodeploy.
 2. Record the exact old API deployment, database, and volume IDs; take and verify a restorable backup.
-3. Stop the old API and worker and confirm no running instance can write.
-4. Create or explicitly empty the approved pilot PostgreSQL database. Verify it
-   contains no household or adult. Do not mix the new baseline with the old
-   schema.
+3. Stop the API and confirm no running instance can write.
+4. For a new pilot, create the approved PostgreSQL database. For an existing pilot,
+   use the guarded production reset above while Google credentials still exist.
+   Verify the result contains no household or adult. Do not mix the new baseline
+   with the old schema.
 5. Configure the variables and callbacks without starting a deployment.
 6. Attach the persistent image-vault directory to the API service.
-7. Delete or leave permanently stopped the obsolete worker service.
-8. Deploy the exact release commit through `/railway.json`.
-9. Wait for `/api/health`, then run `pnpm smoke:production -- https://<canonical-host>`.
-10. Before sharing the number more broadly, have the intended founding adult
+7. Deploy the exact release commit through `/railway.json`.
+8. Wait for `/api/health`, then run `pnpm smoke:production -- https://<canonical-host>`.
+9. Before sharing the number more broadly, have the intended founding adult
     text Florence, complete the fragment-link mobile setup, connect Google, add
     the partner and child age/grade/school/activity basics one screen at a time, and
     return to the exact private thread. No identity is configured ahead of that
@@ -119,7 +278,7 @@ On a disposable empty database, run `pnpm db:migrate` twice. Both runs must pass
     read-only web Calendar, and a Google disconnect/delete/reconnect that
     suppresses queued Google-derived output while preserving sent Messages and
     provider-created family Calendar events.
-11. Enable autodeploy only after the full synthetic journey and the two-phone experience pass.
+10. Enable autodeploy only after the full synthetic journey and the two-phone experience pass.
 
 ## Recovery
 

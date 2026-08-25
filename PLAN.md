@@ -23,7 +23,8 @@ and takes mental load away without making either parent manage a workflow.
 The emotional benchmark is relief for the parent carrying the invisible load.
 The interaction benchmark is Instinct: conversational from the first message,
 opinionated when judgment helps, capable of research and follow-through, and
-quiet when nothing useful should be said.
+always visibly responsive to an ordinary parent message. Background monitoring
+stays quiet when its conclusion has not changed.
 
 ## Pilot boundary
 
@@ -56,9 +57,9 @@ Calendar changes.
 
 Florence is warm, observant, concise, confident, lightly funny, and proactive
 when something genuinely matters. She behaves like a partner and near-member of
-the household without pretending to be human. She is comfortable saying
-nothing, recovers naturally after corrections or interruptions, and is honest
-when blocked or when an action is not yet complete.
+the household without pretending to be human. She always acknowledges ordinary
+parent messages, recovers naturally after corrections or interruptions, and is
+honest when blocked or when an action is not yet complete.
 
 Florence is not a corporate assistant, a workflow UI speaking through text, a
 dashboard that sends notifications, a source of blank “What can I help with?”
@@ -78,7 +79,8 @@ and the affected adult's detailed explanation.
 In the family group Florence:
 
 - responds when addressed, replied to, or given a task;
-- may react or stay silent during ordinary parent conversation;
+- may use a natural reaction as the whole acknowledgment during ordinary parent
+  conversation, but never chooses silence for a parent message;
 - steps in proactively for a useful conflict, handoff, deadline, unresolved
   decision, or unusually relevant opportunity;
 - sends household updates, reminders, decisions, follow-ups, Calendar changes,
@@ -183,15 +185,22 @@ The opening should be close to:
 > I made the Anbarasu Family calendar too. I’m doing a first pass on school
 > dates, schedule clashes, and loose ends now.
 
-Florence returns with at most three findings that deserve attention now. It asks
-“Did I get that right? If I missed something, tell me here.” If a real decision
-is blocked, it asks that one concrete question instead. It does not end with a
-generic delegation prompt.
+Each adult's private first pass surfaces at most three current, high-priority
+actions. The combined household docket includes every distinct household-safe
+conclusion among those surfaced actions once; concise wording may not omit one.
+Exact duplicate candidate tuples collapse to one visible line. Lower-priority
+deadlines, conflicts, handoffs, family dates, and loose ends remain durable and
+receive guaranteed private follow-up instead of crowding the first message.
+Florence ends with “Did I get that right? If I missed something, tell me here.”
+It does not end with a generic delegation prompt.
 
 The household briefing combines separately processed, permissioned context
 from both adults. Raw private contexts never enter one shared model call. Only
 minimum typed household conclusions cross into the group; owner-private details
-and provenance remain available to that adult.
+and provenance remain available to that adult. Each private output accounts for
+every actionable finding; a model-written summary cannot hide one. Durable
+context is retained quietly and surfaced later only when relevant or requested,
+not dumped back during the 90-day scan.
 
 If nothing needs attention in the one-time review, Florence says it checked both
 calendars and recent family email, nothing needs attention now, and it will keep
@@ -209,12 +218,27 @@ owns three behaviors:
 
 ### Initial and continuous Google review
 
-The first pass searches the previous 90 days for family-relevant material,
-including children, schools, activities, appointments, travel, forms,
-deadlines, and household logistics, while prioritizing the most recent two
-weeks. Promotions, social mail, and irrelevant personal correspondence are not
-summarized. Florence examines roughly the next three weeks of each adult's
-Calendar.
+The first pass enumerates and pages through every retained received Gmail
+message from the previous 90 days, including archived mail. Sent mail, drafts,
+spam, and trash are excluded. It also enumerates every Calendar for which Google
+grants event-read authority and every event in the exact interval from the
+review anchor minus 90 days through the anchor plus 21 days. Google's
+free/busy-only grants do not expose events and are not represented as event
+coverage. The exact Florence-created Family Calendar is excluded from each
+adult's private scan because Florence created it empty and follows it separately
+as household truth. There is no model-owned query, relevance search, sample, or
+item cap in this coverage pass.
+
+Every enumerated Gmail message and Calendar event is classified ephemerally as
+evidence for an eligible finding, evidence for durable household context or
+open work, an owner-private Calendar matter, or dismissed as adult-only or
+irrelevant. Dismissal does not persist irrelevant mail. Useful context is
+retained quietly; only current, high-priority actions surface immediately. A
+fact or monitor never substitutes for durably accounting for a distinct
+actionable thread. An all-clear is valid only after every page and replay has
+completed and the complete private review contains no current action. The
+household store refuses to advance its cursors past an unreviewed source or an
+omitted required outcome.
 
 Relevant Gmail PDF and image attachments are inspected automatically. Gmail
 bodies and raw attachment bytes are not retained as a shadow mailbox.
@@ -238,6 +262,15 @@ unresolved matter worth following. A monitor has a clear objective, current
 conclusion, next check, and real end condition. It rereads current sources when
 due and speaks only for a material change, correction, decision window, or
 failure requiring intervention. It never sends stale reminder copy blindly.
+
+An explicit one-time reminder is different. Florence confirms it immediately,
+then schedules one exact future Messages delivery at the time the parent chose.
+It does not reread evidence, ask the model to reconsider the time, wait on
+Google, or move the reminder into proactive quiet hours. The due message uses
+the exact action words the parent wrote, in Florence's application-owned
+“Reminder: …” voice; it never invents confirmation, completion, or outcome
+language. Updating or cancelling a pending one-time reminder is outside the
+pilot tranche.
 
 ### Interest discovery
 
@@ -332,23 +365,37 @@ archive of every attachment.
 
 Memory has temporary, adult-private, and household-shared scopes. Parent-stated
 facts, clearly extracted stable logistics, and useful inferences remain
-distinguishable. Every retained item explains what Florence believes, how it
-learned it, who can see it, and how to correct or delete it.
+distinguishable. The parental unit is the default audience for a validated
+stable Gmail-derived fact about child care, school, activities, household
+logistics, or enrolled-adult coordination. Raw Gmail sender, subject, body, and
+other provenance stay private to the connected account owner; the other parent
+sees the derived statement without those source details. Adult-only facts are
+rejected. Personal Calendar-derived facts stay owner-private unless they pass a
+separate explicit sharing authority.
 
 Florence automatically retains obvious stable family facts and creates useful
-monitors under the one-time proactive permission. Sensitive personal details
-remain private unless their owner directs sharing. An explicit no-retention
-instruction overrides automatic memory.
+monitors under the one-time proactive permission. Facts are quiet context, not
+an onboarding dump: Florence surfaces one later only when it is relevant or a
+parent asks. Sensitive personal details remain private unless their owner
+directs sharing. An explicit no-retention instruction overrides automatic
+memory.
 
 New evidence may replace an obviously superseded fact or date while retaining
-the current supporting source and telling the family what changed. Ambiguity or
-a consequential change preserves current state and asks one focused question.
+the current supporting source. The same household semantic slot remains one
+fact across both parents; corroborating private sources may support it without
+becoming mutually visible. A conflicting one-parent extraction cannot overwrite
+another parent's support, and background Google review cannot overwrite a
+parent's explicit correction. Deleting one adult's Google-derived data removes
+that adult's source links and deletes only facts left with no valid support.
+Ambiguity or a consequential change preserves current state and asks one focused
+question.
 
 The Vault shows and allows correction or deletion of:
 
 - adults, children, surnames, ZIP, schools, activities, caregivers, and useful
   household facts;
-- the current supporting source and who can see each fact;
+- the current supporting source when this viewer may see it, or neutral family
+  provenance when the raw source belongs to the other parent;
 - active finite monitors and interest discoveries;
 - what Florence is watching and its latest useful conclusion;
 - plain controls to pause, stop watching, or correct an item.
@@ -445,9 +492,10 @@ Keep exactly the minimum scenario suite:
 1. one complete two-parent setup journey: founder setup and Google, one partner
    invitation question, partner setup and Google, then automatic exact family
    group and shared family calendar creation without visible duplicates;
-2. one proactive-family journey: separate private reviews, a safe combined
-   briefing, a forwarded family input, current source-linked memory, a finite
-   monitor, one automatic family date, and the read-only Calendar page;
+2. one proactive-family journey: losslessly classified separate private
+   reviews, a complete deduplicated combined docket, a forwarded family input,
+   current source-linked memory, a finite monitor, one automatic family date,
+   and the read-only Calendar page;
 3. one equal-authority and privacy journey: private context stays private,
    either adult can correct household state and change the family calendar, and
    one changed-participant group is retired and replaced.

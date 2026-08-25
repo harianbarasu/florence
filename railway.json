@@ -6,7 +6,7 @@
   },
   "deploy": {
     "preDeployCommand": "node packages/database/dist/predeploy.js",
-    "startCommand": "node apps/api/dist/server.js",
+    "startCommand": "node apps/api/dist/start.js",
     "numReplicas": 1,
     "healthcheckPath": "/api/health",
     "healthcheckTimeout": 120,

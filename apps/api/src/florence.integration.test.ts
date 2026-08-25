@@ -26,13 +26,12 @@ import {
   type LinqSendReaction,
   linqIdentitySubjectDigest,
 } from "@florence/linq";
-import type { OpenAI } from "openai";
 import { describe, expect, onTestFinished, test } from "vitest";
 import { buildApp, createSessionCallerResolver } from "./app.js";
 import { EnrollmentCodes } from "./enrollment.js";
 import { Florence } from "./florence.js";
 import { createLinqIngress } from "./linq-ingress.js";
-import { type FlorenceDecision, FlorenceReasoner, FlorenceReasonerError } from "./reasoner.js";
+import { type FlorenceDecision, type FlorenceReasoner, FlorenceReasonerError } from "./reasoner.js";
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
 const NOW = Date.parse("2026-08-16T18:00:00.000Z");
@@ -63,6 +62,10 @@ const FOUNDER_GOOGLE = "44444444-4444-4444-8444-444444444444";
 const PARTNER_GOOGLE = "44444444-4444-4444-8444-444444444445";
 const RECONNECTED_FOUNDER_GOOGLE = "44444444-4444-4444-8444-444444444446";
 const POST_DELETION_FOUNDER_GOOGLE = "44444444-4444-4444-8444-444444444447";
+const WRONG_FOUNDER_GOOGLE = "44444444-4444-4444-8444-444444444448";
+const CANCELLED_FOUNDER_GOOGLE = "44444444-4444-4444-8444-444444444449";
+const SAFE_REAUTHORIZED_FOUNDER_GOOGLE = "44444444-4444-4444-8444-444444444450";
+const ABANDONED_FOUNDER_GOOGLE = "44444444-4444-4444-8444-444444444451";
 const LINQ_PARTNER = "partner-florence";
 const LINQ_SIGNING_KEY = Buffer.from("florence-release-webhook-key-32b", "utf8");
 const LINQ_SIGNING_SECRET = `whsec_${LINQ_SIGNING_KEY.toString("base64")}`;
@@ -92,6 +95,11 @@ const GROUP_REPAIR_NOTICE =
 const PRIVATE_SCHOOL_FACT_SLOT = "child:maya:school";
 const INITIAL_PRIVATE_SCHOOL_FACT = "Maya attends Muir Elementary.";
 const UPDATED_PRIVATE_SCHOOL_FACT = "Maya attends Muir Academy.";
+const SHARED_SCHOOL_CONTACT_SLOT = "child:maya:school_office_contact";
+const SHARED_SCHOOL_CONTACT_FACT = "Maya’s school office is the family’s primary school contact.";
+const GOOGLE_CORRECTION_SLOT = "child:maya:school_office_phone";
+const GOOGLE_CORRECTION_FACT = "Maya’s school office phone ends in 1000.";
+const GOOGLE_CORRECTED_FACT = "Maya’s school office phone ends in 2000.";
 const ORDINARY_UNUSED_GMAIL_QUERY = "ordinary-unused-family-email";
 const ORDINARY_UNUSED_GMAIL_QUESTION = "Is there anything useful in that family email?";
 const GOOGLE_CITED_REPLY_QUERY = "latest-school-office-update";
@@ -106,15 +114,29 @@ const INCOMPLETE_SETUP_FALSE_DENIAL =
   "I can’t resend a setup link from here. If you’re already on the setup page, keep going there.";
 const INCOMPLETE_SETUP_FRESH_LINK_ACKNOWLEDGEMENT = "Of course—here’s a fresh link to finish setup.";
 const PRIVATE_INITIAL_ALL_CLEAR =
-  "I checked your recent family email and the next three weeks of Calendar. Nothing needs attention right now.";
+  "I finished reviewing the last 90 days of your Gmail and Calendar. Nothing needs attention right now.";
+const PAGINATED_CALENDAR_TITLE = "Maya’s archived school open-house planning note";
+const PAGINATED_CALENDAR_FOLLOW_UP = "Maya’s school open-house plan still needs a family decision.";
 const HOUSEHOLD_INITIAL_ALL_CLEAR =
-  "I checked both calendars and recent family email. Nothing needs attention right now, and I’ll keep watching.";
+  "I finished reviewing both parents’ last 90 days of Gmail and Calendar. Nothing needs attention right now, and I’ll keep watching.";
 const CONVERSATION_RECOVERY_REPLY = "I’m here. I didn’t quite get that—say it one more way?";
 const STALE_RECEIPT_QUESTION = "Can you confirm this delivery is current?";
 const STALE_RECEIPT_REPLY = "This reply must have a current provider receipt.";
+const ONE_SHOT_REMINDER_REQUEST = "Remind me to pick up the kids at 2:45 today.";
+const ONE_SHOT_REMINDER_ACK = "Absolutely—I’ll remind you to pick up the kids at 2:45 PM.";
+const ONE_SHOT_REMINDER_ACTION = "pick up the kids";
+const ONE_SHOT_REMINDER_TEXT = "Reminder: pick up the kids.";
+const ONE_SHOT_REMINDER_AT = "2026-08-17T21:45:00.000Z";
 const PRIVATE_CALENDAR_ONLY_TITLE = "Maya’s soccer clinic";
 const PRIVATE_CALENDAR_CONFLICT_TITLE = "School volunteer shift";
+const PRIVATE_CALENDAR_ANNIVERSARY_TITLE = "Private anniversary dinner";
+const PRIVATE_CALENDAR_ADULT_TITLE = "Private medical appointment";
+const FAMILY_CALENDAR_MIXED_CHANGE_TITLE = "Maya’s school photo day";
+const FAMILY_CALENDAR_MIXED_CHANGE_SUMMARY = "Maya’s school photo day is September 3.";
+const PRIVATE_CALENDAR_OWNER_APPROVAL = "Yes, add that exact event.";
 const PRIVATE_CALENDAR_GENERIC_TODAY_REPLY = "I confirmed a private calendar commitment today.";
+const PRIVATE_CALENDAR_FACT_SLOT = "child:maya:private_soccer_clinic";
+const PRIVATE_CALENDAR_FACT = "Maya’s private soccer clinic is on the parent’s calendar.";
 const OVERLAP_GMAIL_SUBJECT = "School bus route reminder";
 const OVERLAP_GMAIL_FACT_SLOT = "child:maya:school_bus";
 const PARTNER_PRIVATE_GOOGLE_FACT_SLOT = "child:maya:partner_school_handoff";
@@ -130,6 +152,13 @@ const UNRELATED_ACCOUNT_MONITOR_OBJECTIVE =
   "Resolve whether the retail account password change was authorized.";
 const UNRELATED_ACCOUNT_FACT_SLOT = "adult:retail_account_security";
 const UNRELATED_ACCOUNT_FACT = "The retail account password changed.";
+const PRIVATE_INITIAL_ONLY_FINDING = "The school office contact stays private to this parent.";
+const DISTINCT_CANDIDATE_SHARED_SUMMARY = "Maya’s school item needs family attention.";
+const SHARED_DUPLICATE_CONFLICT_SUMMARY = DISTINCT_CANDIDATE_SHARED_SUMMARY;
+const FOUNDER_FORM_SUMMARY = DISTINCT_CANDIDATE_SHARED_SUMMARY;
+const PARTNER_PERMISSION_SUMMARY = DISTINCT_CANDIDATE_SHARED_SUMMARY;
+const FAMILY_MEETING_SUMMARY = "The family meeting is Tuesday at 8:00 PM.";
+const SCHOOL_HANDOFF_SUMMARY = "Friday’s school pickup handoff still needs an owner.";
 
 const AUTOMATIC_FAMILY_DATE = {
   intervalKind: "all_day" as const,
@@ -173,6 +202,34 @@ const PRIVATE_CALENDAR_CONFLICT_EVENT = {
   title: PRIVATE_CALENDAR_CONFLICT_TITLE,
   startsAt: "2026-08-24T15:00:00.000Z",
   endsAt: "2026-08-24T16:30:00.000Z",
+};
+const PRIVATE_CALENDAR_ANNIVERSARY_EVENT = {
+  ...PRIVATE_CALENDAR_ONLY_EVENT,
+  providerEventId: "private-calendar-anniversary-dinner",
+  providerRevision: "private-calendar-anniversary-revision-1",
+  title: PRIVATE_CALENDAR_ANNIVERSARY_TITLE,
+  busy: false,
+  startsAt: "2026-08-24T19:00:00.000Z",
+  endsAt: "2026-08-24T20:00:00.000Z",
+  location: "Private restaurant",
+};
+const PRIVATE_CALENDAR_ADULT_EVENT = {
+  ...PRIVATE_CALENDAR_ANNIVERSARY_EVENT,
+  providerEventId: "private-calendar-adult-appointment",
+  providerRevision: "private-calendar-adult-appointment-revision-1",
+  title: PRIVATE_CALENDAR_ADULT_TITLE,
+  startsAt: "2026-08-25T19:00:00.000Z",
+  endsAt: "2026-08-25T20:00:00.000Z",
+  location: "Private clinic",
+};
+const FAMILY_CALENDAR_MIXED_CHANGE_EVENT = {
+  ...PRIVATE_CALENDAR_ONLY_EVENT,
+  providerEventId: "family-calendar-school-photo-day",
+  providerRevision: "family-calendar-school-photo-day-revision-1",
+  title: FAMILY_CALENDAR_MIXED_CHANGE_TITLE,
+  startsAt: "2026-09-03T15:00:00.000Z",
+  endsAt: "2026-09-03T16:00:00.000Z",
+  location: "Muir Elementary",
 };
 const PRIVATE_INITIAL_CALENDAR_ONLY_EVENT = {
   ...PRIVATE_CALENDAR_ONLY_EVENT,
@@ -261,7 +318,7 @@ type FakeCalendarEvent = {
 );
 type HarnessState = {
   now: number;
-  privateReviews: Parameters<FlorenceReasoner["reviewPrivateGoogle"]>[0][];
+  privateReviews: Parameters<FlorenceReasoner["classifyPrivateGoogleBatch"]>[0][];
   googleAssessments: Parameters<FlorenceReasoner["assessGoogleChanges"]>[0][];
   briefings: Parameters<FlorenceReasoner["synthesizeHouseholdBriefing"]>[0][];
   provisionings: FamilyCalendarProvisioningInput[];
@@ -276,7 +333,18 @@ type HarnessState = {
   interestResearches: number;
   voiceTranscriptions: number;
   initialGoogleFailuresRemaining: number;
+  initialClassifierFailuresRemaining: number;
   initialGoogleFailureAdultId: string | null;
+  completeScanPaginationExercise: boolean;
+  wrongGoogleSubjectNext: boolean;
+  baselinePageReads: {
+    kind: "gmail" | "calendar_targets" | "calendar_events";
+    ownerAdultId: string;
+    connectionId: string;
+    pageToken: string | null;
+    calendarId: string | null;
+  }[];
+  initialHouseholdCalendarFailuresRemaining: number;
   privateFactUpdatePending: boolean;
   privateFactUpdateDelivered: boolean;
   overlapGmailReadsRemaining: number;
@@ -305,6 +373,16 @@ type HarnessState = {
   initialUnrelatedAccountFactOnlyReview: boolean;
   calendarOnlyChangePending: boolean;
   calendarOnlyChangeDelivered: boolean;
+  privateCalendarAnniversaryPending: boolean;
+  privateCalendarAnniversaryDelivered: boolean;
+  familyCalendarEchoPending: boolean;
+  familyCalendarEchoDelivered: boolean;
+  familyCalendarMixedChangePending: boolean;
+  familyCalendarMixedChangeDelivered: boolean;
+  familyCalendarRealOnlyOverlapPending: boolean;
+  familyCalendarRealOnlyOverlapDelivered: boolean;
+  privateCalendarAdultEventPending: boolean;
+  privateCalendarAdultEventDelivered: boolean;
   unrelatedAccountEmailPending: boolean;
   unrelatedAccountEmailDelivered: boolean;
 };
@@ -313,8 +391,6 @@ const release = TEST_DATABASE_URL ? describe : describe.skip;
 
 release("Florence parent journeys", () => {
   test("keeps private setup useful and recovers one two-parent family loop without duplicate work", async () => {
-    await assertFunctionCallContinuationIsWireSafe();
-    await assertNormalParentTurnsCannotDisappear();
     let accessFollowUpHistory: readonly string[] = [];
     let accessFollowUpAuthoredText: string | null = null;
     let failNextReinviteConversation = false;
@@ -342,6 +418,18 @@ release("Florence parent journeys", () => {
         return decision({
           bubbles: [{ text: "Here’s a fresh private link.", delayMs: 0 }],
           webAccessPath: "/calendar",
+        });
+      }
+      if (input.currentMessage.text === ONE_SHOT_REMINDER_REQUEST) {
+        return decision({
+          bubbles: [{ text: ONE_SHOT_REMINDER_ACK, delayMs: 0 }],
+          followUp: {
+            operation: "remind",
+            followUpId: null,
+            reminderAt: ONE_SHOT_REMINDER_AT,
+            reminderAction: ONE_SHOT_REMINDER_ACTION,
+            sourceIds: [input.currentMessage.sourceId],
+          },
         });
       }
       if (input.currentMessage.text.startsWith(WEB_ACCESS_FOLLOW_UP)) {
@@ -466,7 +554,8 @@ release("Florence parent journeys", () => {
       harness.linq.messages.filter(
         (message) =>
           message.providerConversationId === PRIVATE_FOUNDER &&
-          message.text === "Hari, I checked your side and found one family item worth tracking.",
+          message.text.includes("What needs attention:") &&
+          message.text.includes("Hari’s private school email has the original form."),
       ),
     ).toHaveLength(1);
     const founderBeforePartner = await harness.florence.workspaceForAdult(harness.founderAdultId);
@@ -475,7 +564,7 @@ release("Florence parent journeys", () => {
       expect.arrayContaining([
         expect.objectContaining({
           statement: INITIAL_PRIVATE_SCHOOL_FACT,
-          visibility: "private",
+          visibility: "household",
           source: expect.objectContaining({ kind: "gmail" }),
         }),
       ]),
@@ -491,11 +580,20 @@ release("Florence parent journeys", () => {
       ]),
     );
     await harness.assertDatabase(
-      "The founder review or its calm follow-through did not commit before partner activation",
-      `(select count(*)=1 from proactive_work where kind='initial_private_review' and status='completed')
-        and (select count(*)=1 from proactive_work where kind='personal_google_poll' and status='active')
-        and (select count(*)=1 from proactive_work where kind='finite_monitor' and status='active')
-        and not exists (select 1 from calendar_actions)`,
+      "The founder review did not complete before partner activation",
+      `(select count(*)=1 from proactive_work where kind='initial_private_review' and status='completed')`,
+    );
+    await harness.assertDatabase(
+      "The founder's personal Google poll did not start after the initial review",
+      `(select count(*)=1 from proactive_work where kind='personal_google_poll' and status='active')`,
+    );
+    await harness.assertDatabase(
+      "The founder review did not retain both expected follow-throughs",
+      `(select count(*)=2 from proactive_work where kind='finite_monitor' and status='active')`,
+    );
+    await harness.assertDatabase(
+      "The founder review staged a family Calendar action before family activation",
+      `not exists (select 1 from calendar_actions)`,
     );
     expect(harness.linq.createdChats).toHaveLength(0);
     expect(harness.state.calendarExecutions).toHaveLength(0);
@@ -683,7 +781,8 @@ release("Florence parent journeys", () => {
     await harness.drain();
     const expirationNotices = harness.linq.messages
       .filter((message) => message.providerConversationId === PRIVATE_FOUNDER)
-      .slice(founderMessagesBeforeExpiry);
+      .slice(founderMessagesBeforeExpiry)
+      .filter((message) => message.text === PARTNER_SETUP_EXPIRED_NOTICE);
     expect(expirationNotices).toHaveLength(1);
     expect(expirationNotices[0]?.text).toBe(PARTNER_SETUP_EXPIRED_NOTICE);
     expect((await harness.florence.workspaceForAdult(harness.founderAdultId)).workspace.setup).toMatchObject({
@@ -905,11 +1004,12 @@ release("Florence parent journeys", () => {
             "I made the De la Cruz–Anbarasu Family calendar too. I’m checking both calendars and recent family email now, and I’ll be back with what’s on the docket.",
       ),
     ).toHaveLength(1);
-    expect(harness.state.briefings).toHaveLength(1);
+    expect(harness.state.briefings).toHaveLength(0);
     expect(
       harness.linq.messages.filter(
         (message) =>
-          message.providerConversationId === FAMILY_GROUP && message.text.startsWith("Here’s what I found:"),
+          message.providerConversationId === FAMILY_GROUP &&
+          message.text.startsWith("Here’s what’s on the docket:"),
       ),
     ).toHaveLength(1);
     expect(
@@ -940,6 +1040,82 @@ release("Florence parent journeys", () => {
       initialBriefing: "sent",
     });
     expect(partner.workspace.setup).toEqual(founder.workspace.setup);
+
+    harness.state.now = Date.parse("2026-08-17T21:44:00.000Z");
+    await harness.drain();
+    const finiteReviewsBeforeReminder = harness.state.finiteReviews;
+    await harness.accept("private", "one-shot-pickup-reminder", ONE_SHOT_REMINDER_REQUEST);
+    await harness.drain();
+    expect(
+      harness.linq.messages.filter(
+        (message) =>
+          message.providerConversationId === PRIVATE_FOUNDER && message.text === ONE_SHOT_REMINDER_ACK,
+      ),
+    ).toHaveLength(1);
+    expect(harness.linq.messages.some((message) => message.text === ONE_SHOT_REMINDER_TEXT)).toBe(false);
+    expect(harness.state.finiteReviews).toBe(finiteReviewsBeforeReminder);
+    await harness.assertDatabase(
+      "A one-shot reminder became a monitor or did not preserve the parent's exact delivery time",
+      `(select count(*)=1 from messages
+          where direction='outbound' and text=${sqlLiteral(ONE_SHOT_REMINDER_TEXT)}
+            and status='pending' and not_before=${sqlLiteral(ONE_SHOT_REMINDER_AT)}::timestamptz)
+        and not exists (
+          select 1 from proactive_work_sources link
+          join proactive_work work on work.id=link.work_id
+          where link.source_id=${sqlLiteral(
+            inboundSourceId("event-one-shot-pickup-reminder"),
+          )}::uuid and work.kind='finite_monitor'
+        )`,
+    );
+
+    harness.state.now = Date.parse(ONE_SHOT_REMINDER_AT) - 1;
+    await harness.drain();
+    expect(harness.linq.sendMessageAttempts.some((message) => message.text === ONE_SHOT_REMINDER_TEXT)).toBe(
+      false,
+    );
+
+    harness.linq.oneShotReminderDeliveryFailuresRemaining = 1;
+    harness.state.now = Date.parse(ONE_SHOT_REMINDER_AT);
+    await harness.drain();
+    const failedReminderAttempts = harness.linq.sendMessageAttempts.filter(
+      (message) => message.text === ONE_SHOT_REMINDER_TEXT,
+    );
+    expect(failedReminderAttempts).toHaveLength(1);
+    expect(harness.linq.messages.some((message) => message.text === ONE_SHOT_REMINDER_TEXT)).toBe(false);
+    expect(harness.state.finiteReviews).toBe(finiteReviewsBeforeReminder);
+
+    harness.state.now += 5_000;
+    await harness.drain();
+    const completedReminderAttempts = harness.linq.sendMessageAttempts.filter(
+      (message) => message.text === ONE_SHOT_REMINDER_TEXT,
+    );
+    expect(completedReminderAttempts).toHaveLength(2);
+    expect(new Set(completedReminderAttempts.map((message) => message.idempotencyKey)).size).toBe(1);
+    expect(
+      harness.linq.messages.filter(
+        (message) =>
+          message.providerConversationId === PRIVATE_FOUNDER && message.text === ONE_SHOT_REMINDER_TEXT,
+      ),
+    ).toHaveLength(1);
+    expect(harness.state.finiteReviews).toBe(finiteReviewsBeforeReminder);
+    await harness.drain();
+    expect(
+      harness.linq.sendMessageAttempts.filter((message) => message.text === ONE_SHOT_REMINDER_TEXT),
+    ).toHaveLength(2);
+    await harness.assertDatabase(
+      "A retried one-shot reminder did not finish exactly once",
+      `(select count(*)=1 from messages
+          where direction='outbound' and text=${sqlLiteral(ONE_SHOT_REMINDER_TEXT)}
+            and status='sent' and not_before=${sqlLiteral(ONE_SHOT_REMINDER_AT)}::timestamptz
+            and sent_at>=not_before)
+        and not exists (
+          select 1 from proactive_work_sources link
+          join proactive_work work on work.id=link.work_id
+          where link.source_id=${sqlLiteral(
+            inboundSourceId("event-one-shot-pickup-reminder"),
+          )}::uuid and work.kind='finite_monitor'
+        )`,
+    );
 
     failNextGroupGreeting = true;
     expect(await harness.accept("group", "group-greeting-invalid-output", "Hi Florence")).toMatchObject({
@@ -1114,6 +1290,7 @@ release("Florence parent journeys", () => {
     let ordinaryUnusedSourceId: string | null = null;
     let conversationalGoogleSourceId: string | null = null;
     let retainedGoogleMemorySourceId: string | null = null;
+    let groupHouseholdFactWasVisible = false;
     const nativeObservation: {
       audience: string | null;
       text: string | null;
@@ -1187,6 +1364,12 @@ release("Florence parent journeys", () => {
       if (input.currentMessage.sourceId !== inboundSourceId("event-native-school-update")) {
         return decision();
       }
+      groupHouseholdFactWasVisible = input.visibleSources.some(
+        (source) =>
+          source.kind === "memory" &&
+          source.visibility === "shared" &&
+          source.text === UPDATED_PRIVATE_SCHOOL_FACT,
+      );
       nativeInputWasRead = true;
       nativeObservation.audience = input.audience;
       nativeObservation.text = input.currentMessage.text;
@@ -1215,6 +1398,10 @@ release("Florence parent journeys", () => {
       });
     });
     harness.state.initialGoogleFailuresRemaining = 2;
+    harness.state.initialClassifierFailuresRemaining = 1;
+    harness.state.completeScanPaginationExercise = true;
+    harness.state.founderProductRecenterReview = true;
+    harness.state.initialHouseholdCalendarFailuresRemaining = 1;
     await harness.readyHousehold();
 
     expect(
@@ -1233,37 +1420,272 @@ release("Florence parent journeys", () => {
     expect(harness.linq.messages).toHaveLength(messagesAfterFirstSilentReviewFailure);
     harness.state.now += 16_000;
     await harness.drain();
+    expect(harness.state.initialClassifierFailuresRemaining).toBe(0);
+    expect(harness.linq.messages).toHaveLength(messagesAfterFirstSilentReviewFailure);
+    harness.state.now += 16_000;
+    await harness.drain();
 
     expect(harness.state.privateReviews.map((review) => review.adult.firstName).sort()).toEqual([
       "Alex",
       "Hari",
     ]);
-    expect(harness.state.briefings).toHaveLength(1);
-    expect(JSON.stringify(harness.state.briefings[0])).not.toMatch(
-      /hari-private@example\.com|alex-private@example\.com|private calendar detail/i,
+    const founderModelReview = harness.state.privateReviews.find(
+      (review) => review.adult.adultId === harness.founderAdultId,
     );
-    const briefing = harness.linq.messages.find(
-      (message) =>
-        message.providerConversationId === FAMILY_GROUP && message.text.startsWith("Here’s what I found"),
+    if (!founderModelReview) throw new Error("The founder's model-safe Gmail batch is missing");
+    const founderModelReviewJson = JSON.stringify(founderModelReview);
+    expect(founderModelReviewJson).toContain("[code removed]");
+    expect(founderModelReviewJson).toContain("[link removed]");
+    expect(founderModelReviewJson).not.toContain("123456");
+    expect(founderModelReviewJson).not.toContain("example.test/reset");
+    const founderBaselineReads = harness.state.baselinePageReads.filter(
+      (read) => read.ownerAdultId === harness.founderAdultId && read.connectionId === FOUNDER_GOOGLE,
     );
-    expect(briefing?.text).toContain("Maya’s permission-slip deadline is Tuesday");
-    expect(briefing?.text).toContain("Did I get that right?");
-    expect(briefing?.text).not.toMatch(/@example\.com|private calendar detail/i);
-
-    const founderAfterInitialReview = await harness.florence.workspaceForAdult(harness.founderAdultId);
-    const initialPrivateFact = founderAfterInitialReview.vault?.facts.find(
-      (fact) => fact.statement === INITIAL_PRIVATE_SCHOOL_FACT,
-    );
-    expect(initialPrivateFact).toMatchObject({
-      visibility: "private",
-      source: { kind: "gmail" },
-    });
-    if (!initialPrivateFact) throw new Error("The initial private Gmail fact was not retained");
     expect(
-      (await harness.florence.workspaceForAdult(harness.partnerAdultId)).vault?.facts.some(
-        (fact) => fact.id === initialPrivateFact.id,
+      founderBaselineReads.filter((read) => read.kind === "gmail").map((read) => read.pageToken),
+    ).toEqual([null, "gmail-baseline-page-2", "gmail-baseline-page-2"]);
+    expect(
+      founderBaselineReads.filter((read) => read.kind === "calendar_targets").map((read) => read.pageToken),
+    ).toEqual([
+      null,
+      "calendar-targets-page-2",
+      null,
+      "calendar-targets-page-2",
+      null,
+      "calendar-targets-page-2",
+      null,
+      "calendar-targets-page-2",
+    ]);
+    expect(
+      founderBaselineReads
+        .filter((read) => read.kind === "calendar_events" && read.calendarId === "primary")
+        .map((read) => read.pageToken),
+    ).toEqual([null, "calendar-events-page-2", null, "calendar-events-page-2"]);
+    expect(
+      founderBaselineReads.filter(
+        (read) => read.kind === "calendar_events" && read.calendarId?.startsWith("secondary-calendar-"),
+      ),
+    ).toHaveLength(100);
+    expect(harness.state.briefings).toHaveLength(0);
+    expect(harness.state.initialHouseholdCalendarFailuresRemaining).toBe(0);
+    expect(
+      harness.linq.messages.some((message) =>
+        message.idempotencyKey.startsWith("initial-household-briefing:"),
       ),
     ).toBe(false);
+
+    harness.state.now += 16_000;
+    const incompleteWork = await harness.store.readNextInitialIntelligence(harness.iso());
+    if (incompleteWork?.kind !== "initial_household_briefing") {
+      throw new Error("The complete private reviews did not produce household briefing work");
+    }
+    expect(incompleteWork.candidates).toHaveLength(5);
+    expect(incompleteWork.candidates.length).toBeGreaterThan(3);
+    expect(
+      incompleteWork.candidates.filter(
+        (candidate) =>
+          candidate.category === "conflict" && candidate.summary === SHARED_DUPLICATE_CONFLICT_SUMMARY,
+      ),
+    ).toHaveLength(1);
+    const incompleteCandidate = incompleteWork.candidates[0];
+    if (!incompleteCandidate) throw new Error("The incomplete briefing regression needs one candidate");
+    await expect(
+      harness.store.completeHouseholdInitialBriefing({
+        workId: incompleteWork.workId,
+        selectedCandidateIds: [incompleteCandidate.candidateId],
+        familyCalendarCursor: "{}",
+        bubbles: [
+          {
+            text: `Here’s what’s on the docket:\n• ${incompleteCandidate.summary}\n\nDid I get that right? If I missed something, tell me here.`,
+            delayMs: 0,
+          },
+        ],
+        occurredAt: harness.iso(),
+      }),
+    ).rejects.toThrow(/omitted or added a distinct finding/i);
+    await expect(
+      harness.store.completeHouseholdInitialBriefing({
+        workId: incompleteWork.workId,
+        selectedCandidateIds: incompleteWork.candidates.map((candidate) => candidate.candidateId),
+        familyCalendarCursor: "{}",
+        bubbles: [{ text: HOUSEHOLD_INITIAL_ALL_CLEAR, delayMs: 0 }],
+        occurredAt: harness.iso(),
+      }),
+    ).rejects.toThrow(/omitted or added a distinct finding/i);
+    await harness.assertDatabase(
+      "An incomplete household docket advanced work, sent an all-clear, or started polling",
+      `not exists (
+        select 1 from messages where idempotency_key like 'initial-household-briefing:%'
+      ) and not exists (
+        select 1 from proactive_work where kind='family_calendar_poll'
+      ) and exists (
+        select 1 from proactive_work
+        where id=${sqlLiteral(incompleteWork.workId)}::uuid and status='active'
+      )`,
+    );
+    const conflictIndex = incompleteWork.candidates.findIndex(
+      (candidate) => candidate.category === "conflict",
+    );
+    const secondParentIndex = incompleteWork.candidates.findIndex(
+      (candidate, index) => index > conflictIndex && candidate.summary === DISTINCT_CANDIDATE_SHARED_SUMMARY,
+    );
+    if (conflictIndex < 1 || secondParentIndex <= conflictIndex) {
+      throw new Error("The briefing metadata regression needs three ordered summary occurrences");
+    }
+    const briefingCandidateSlices = [
+      incompleteWork.candidates.slice(0, conflictIndex),
+      incompleteWork.candidates.slice(conflictIndex, secondParentIndex),
+      incompleteWork.candidates.slice(secondParentIndex),
+    ];
+    await harness.store.completeHouseholdInitialBriefing({
+      workId: incompleteWork.workId,
+      selectedCandidateIds: incompleteWork.candidates.map((candidate) => candidate.candidateId),
+      familyCalendarCursor: "{}",
+      bubbles: briefingCandidateSlices.map((candidates, index) => ({
+        text: `${index === 0 ? "Here’s what’s on the docket:" : "And:"}\n${candidates
+          .map((candidate) => `• ${candidate.summary}`)
+          .join("\n")}${
+          index === briefingCandidateSlices.length - 1
+            ? "\n\nDid I get that right? If I missed something, tell me here."
+            : ""
+        }`,
+        delayMs: 0,
+      })),
+      occurredAt: harness.iso(),
+    });
+    await harness.drain();
+
+    const briefingMessages = harness.linq.messages.filter(
+      (message) =>
+        message.providerConversationId === FAMILY_GROUP &&
+        message.idempotencyKey.startsWith("initial-household-briefing:"),
+    );
+    expect(briefingMessages).toHaveLength(3);
+    const briefing = briefingMessages.map((message) => message.text).join("\n");
+    expect(briefing.split(DISTINCT_CANDIDATE_SHARED_SUMMARY)).toHaveLength(4);
+    for (const summary of [SCHOOL_HANDOFF_SUMMARY, FAMILY_MEETING_SUMMARY]) {
+      expect(briefing.split(summary)).toHaveLength(2);
+    }
+    expect(briefing).toContain("Did I get that right? If I missed something, tell me here.");
+    expect(briefing).not.toMatch(/@example\.com|private calendar detail/i);
+    expect(briefing).not.toContain(PRIVATE_INITIAL_ONLY_FINDING);
+    expect(briefing).not.toContain(INITIAL_PRIVATE_SCHOOL_FACT);
+    expect(briefing).not.toContain(PARTNER_PRIVATE_GOOGLE_FACT);
+    expect(briefing).not.toBe(HOUSEHOLD_INITIAL_ALL_CLEAR);
+    expect(
+      harness.linq.messages.some(
+        (message) =>
+          message.providerConversationId === PRIVATE_FOUNDER &&
+          message.text.includes(PRIVATE_INITIAL_ONLY_FINDING) &&
+          message.text.includes("What needs attention:"),
+      ),
+    ).toBe(false);
+    expect(
+      harness.linq.messages.some(
+        (message) =>
+          message.text.includes(INITIAL_PRIVATE_SCHOOL_FACT) ||
+          message.text.includes(PARTNER_PRIVATE_GOOGLE_FACT),
+      ),
+    ).toBe(false);
+    await harness.assertDatabase(
+      "Identical briefing text crossed candidate metadata boundaries",
+      `exists (
+        select 1
+        from messages first_message join sources first_source on first_source.id=first_message.source_id
+        join messages middle_message on middle_message.turn_id=first_message.turn_id
+          and middle_message.turn_part=1
+        join sources middle_source on middle_source.id=middle_message.source_id
+        join messages last_message on last_message.turn_id=first_message.turn_id
+          and last_message.turn_part=2
+        join sources last_source on last_source.id=last_message.source_id
+        where first_message.idempotency_key like 'initial-household-briefing:%'
+          and first_message.turn_part=0
+          and first_source.metadata->'privateConflictOwnerAdultIds' is null
+          and last_source.metadata->'privateConflictOwnerAdultIds' is null
+          and middle_source.metadata->'privateConflictOwnerAdultIds'
+            @> ${sqlLiteral(JSON.stringify([harness.founderAdultId, harness.partnerAdultId]))}::jsonb
+          and not exists (
+            select 1
+            from jsonb_array_elements_text(first_source.metadata->'googleSourceIds') first_id(value)
+            join jsonb_array_elements_text(last_source.metadata->'googleSourceIds') last_id(value)
+              on last_id.value=first_id.value
+          )
+          and not exists (
+            select 1
+            from jsonb_array_elements_text(first_source.metadata->'googleActionKeys') first_key(value)
+            join jsonb_array_elements_text(last_source.metadata->'googleActionKeys') last_key(value)
+              on last_key.value=first_key.value
+          )
+      )`,
+    );
+
+    const founderAfterInitialReview = await harness.florence.workspaceForAdult(harness.founderAdultId);
+    expect(founderAfterInitialReview.vault?.watches).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: "monitor",
+          currentConclusion: PRIVATE_INITIAL_ONLY_FINDING,
+          status: "active",
+          visibility: "private",
+        }),
+        expect.objectContaining({
+          kind: "monitor",
+          currentConclusion: PAGINATED_CALENDAR_FOLLOW_UP,
+          status: "active",
+          visibility: "private",
+        }),
+      ]),
+    );
+    const initialHouseholdFact = founderAfterInitialReview.vault?.facts.find(
+      (fact) => fact.statement === INITIAL_PRIVATE_SCHOOL_FACT,
+    );
+    expect(initialHouseholdFact).toMatchObject({
+      visibility: "household",
+      source: { kind: "gmail" },
+    });
+    if (!initialHouseholdFact) throw new Error("The initial household Gmail fact was not retained");
+    const partnerAfterInitialReview = await harness.florence.workspaceForAdult(harness.partnerAdultId);
+    expect(
+      partnerAfterInitialReview.vault?.facts.find((fact) => fact.id === initialHouseholdFact.id),
+    ).toEqual(
+      expect.objectContaining({
+        statement: INITIAL_PRIVATE_SCHOOL_FACT,
+        visibility: "household",
+        source: null,
+        recordedAt: null,
+      }),
+    );
+    expect(JSON.stringify(partnerAfterInitialReview.vault)).not.toMatch(
+      /hari-private@example\.com|Private school form/,
+    );
+    await harness.assertDatabase(
+      "A household Gmail fact duplicated its slot or lost either parent's private support",
+      `(select count(*)=1 from facts
+          where household_id=(select household_id from people
+            where id=${sqlLiteral(harness.founderAdultId)}::uuid)
+            and slot=${sqlLiteral(SHARED_SCHOOL_CONTACT_SLOT)}
+            and visibility='household' and owner_adult_id is null)
+        and (select count(distinct source.owner_adult_id)=2 from facts fact
+          join fact_sources link on link.fact_id=fact.id
+          join sources source on source.id=link.source_id
+          where fact.household_id=(select household_id from people
+            where id=${sqlLiteral(harness.founderAdultId)}::uuid)
+            and fact.slot=${sqlLiteral(SHARED_SCHOOL_CONTACT_SLOT)}
+            and source.kind='gmail' and source.visibility='private')`,
+    );
+    const googleCorrectableFact = founderAfterInitialReview.vault?.facts.find(
+      (fact) => fact.statement === GOOGLE_CORRECTION_FACT,
+    );
+    if (!googleCorrectableFact) throw new Error("The Google-backed correction fact is missing");
+    expect(
+      (
+        await harness.florence.correctFact(
+          harness.partnerAdultId,
+          googleCorrectableFact.id,
+          GOOGLE_CORRECTED_FACT,
+        )
+      ).vault?.facts.find((fact) => fact.id === googleCorrectableFact.id),
+    ).toEqual(expect.objectContaining({ statement: GOOGLE_CORRECTED_FACT, visibility: "household" }));
 
     await harness.assertDatabase(
       "Unused initial Gmail and Calendar evidence was retained",
@@ -1303,20 +1725,30 @@ release("Florence parent journeys", () => {
       false,
     );
     await harness.assertDatabase(
-      "An unrelated adult account email was retained, texted, or turned into a monitor",
+      "An unrelated adult account email source was retained",
       `not exists (
         select 1 from sources
         where kind='gmail' and metadata->>'messageId'='gmail-unrelated-retail-account-alert'
-      ) and not exists (
+      )`,
+    );
+    await harness.assertDatabase(
+      "An unrelated adult account email became a monitor",
+      `not exists (
         select 1 from proactive_work
         where kind='finite_monitor' and objective=${sqlLiteral(UNRELATED_ACCOUNT_MONITOR_OBJECTIVE)}
-      ) and not exists (
-        select 1 from facts where slot=${sqlLiteral(UNRELATED_ACCOUNT_FACT_SLOT)}
-      ) and exists (
+      )`,
+    );
+    await harness.assertDatabase(
+      "An unrelated adult account email became a fact",
+      `not exists (select 1 from facts where slot=${sqlLiteral(UNRELATED_ACCOUNT_FACT_SLOT)})`,
+    );
+    await harness.assertDatabase(
+      "An unrelated adult account email blocked the Gmail cursor",
+      `exists (
         select 1 from proactive_work
         where kind='personal_google_poll'
           and owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid
-          and gmail_cursor::jsonb->>'historyId'='102'
+          and (gmail_cursor::jsonb->'provider'->>'historyId')::bigint>=102
       )`,
     );
 
@@ -1327,30 +1759,50 @@ release("Florence parent journeys", () => {
     const updatedPrivateFact = founderAfterFactUpdate.vault?.facts.find(
       (fact) => fact.statement === UPDATED_PRIVATE_SCHOOL_FACT,
     );
+    if (!updatedPrivateFact) {
+      throw new Error("The incremental household Gmail fact was not updated");
+    }
     expect(updatedPrivateFact).toMatchObject({
-      id: initialPrivateFact.id,
-      visibility: "private",
+      id: initialHouseholdFact.id,
+      visibility: "household",
       source: { kind: "gmail" },
     });
-    expect(updatedPrivateFact?.source.id).not.toBe(initialPrivateFact.source.id);
+    expect(updatedPrivateFact?.source?.id).not.toBe(initialHouseholdFact.source?.id);
     expect(
-      (await harness.florence.workspaceForAdult(harness.partnerAdultId)).vault?.facts.some(
-        (fact) => fact.id === initialPrivateFact.id,
+      (await harness.florence.workspaceForAdult(harness.partnerAdultId)).vault?.facts.find(
+        (fact) => fact.id === initialHouseholdFact.id,
       ),
-    ).toBe(false);
+    ).toEqual(
+      expect.objectContaining({
+        statement: UPDATED_PRIVATE_SCHOOL_FACT,
+        visibility: "household",
+        source: null,
+      }),
+    );
     expect(
       harness.state.googleAssessments.find(
         (assessment) => assessment.adult.adultId === harness.founderAdultId,
-      )?.currentPrivateFacts,
+      )?.currentFacts,
     ).toEqual(
       expect.arrayContaining([{ slot: PRIVATE_SCHOOL_FACT_SLOT, statement: INITIAL_PRIVATE_SCHOOL_FACT }]),
     );
+    expect(founderAfterFactUpdate.vault?.facts.find((fact) => fact.id === googleCorrectableFact.id)).toEqual(
+      expect.objectContaining({
+        statement: GOOGLE_CORRECTED_FACT,
+        visibility: "household",
+        source: expect.objectContaining({ kind: "web" }),
+      }),
+    );
     await harness.assertDatabase(
-      "The cited incremental Gmail fact was not retained exactly once",
+      "The cited incremental Gmail fact did not update its household slot exactly once",
       `(
         select count(*)=1 from sources
         where kind='gmail' and metadata->>'messageId'='gmail-maya-school-enrollment-update'
-      )`,
+      ) and (select count(*)=1 from facts
+        where household_id=(select household_id from people
+          where id=${sqlLiteral(harness.founderAdultId)}::uuid)
+          and slot=${sqlLiteral(PRIVATE_SCHOOL_FACT_SLOT)}
+          and visibility='household')`,
     );
 
     harness.state.overlapGmailReadsRemaining = 2;
@@ -1371,7 +1823,7 @@ release("Florence parent journeys", () => {
         select 1 from proactive_work
         where kind='personal_google_poll'
           and owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid
-          and gmail_cursor::jsonb->>'historyId'='104'
+          and gmail_cursor::jsonb->'provider'->>'historyId'='104'
       )`,
     );
 
@@ -1446,6 +1898,7 @@ release("Florence parent journeys", () => {
     await harness.drain();
     expect(harness.linq.messages).toHaveLength(visibleAfterFirstDelivery);
     expect(nativeInputWasRead).toBe(true);
+    expect(groupHouseholdFactWasVisible).toBe(true);
     expect(nativeObservation).toMatchObject({
       audience: "group",
       imageCount: 1,
@@ -1651,9 +2104,10 @@ release("Florence parent journeys", () => {
       ) and exists (
         select 1 from facts fact join fact_sources link on link.fact_id=fact.id
           join sources source on source.id=link.source_id
-        where fact.owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid
+        where fact.visibility='household' and fact.owner_adult_id is null
           and fact.slot=${sqlLiteral(PRIVATE_SCHOOL_FACT_SLOT)}
-          and fact.corrected_at is not null and source.kind='gmail'
+          and source.kind='gmail'
+          and source.owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid
       ) and exists (
         select 1 from fact_sources link join facts fact on fact.id=link.fact_id
         where link.source_id=${sqlLiteral(harness.state.googleDeletionSourceId)}::uuid
@@ -1695,6 +2149,189 @@ release("Florence parent journeys", () => {
             @> ${sqlLiteral(JSON.stringify([FOUNDER_GOOGLE]))}::jsonb
       )`,
     );
+    const founderHouseholdId = (await harness.store.listHouseholdIdsForAdult(harness.founderAdultId))[0];
+    if (!founderHouseholdId) throw new Error("The wrong-account reconnect check needs a household");
+    const sessionToken = decodeURIComponent(harness.sessionCookie.split("=")[1] ?? "");
+    const browserSessionBinding = digest(`florence-google-session-v1\0${sessionToken}`);
+    const cancelledAccountState = "founder-cancelled-google-account-state";
+    await harness.store.createPending({
+      connectionId: CANCELLED_FOUNDER_GOOGLE,
+      householdId: founderHouseholdId,
+      ownerAdultId: harness.founderAdultId,
+      stateDigest: digest(cancelledAccountState),
+      sessionBindingDigest: browserSessionBinding,
+      stateExpiresAt: new Date(harness.state.now + 60_000).toISOString(),
+      now: harness.iso(),
+    });
+    const cancelledAccountApp = await harness.webApp();
+    const cancelledAccountResponse = await cancelledAccountApp.inject({
+      method: "GET",
+      url: "/oauth/google/callback?error=access_denied",
+      headers: { cookie: harness.sessionCookie },
+    });
+    await cancelledAccountApp.close();
+    expect(cancelledAccountResponse.statusCode).toBe(302);
+    expect(cancelledAccountResponse.headers.location).toBe("/?google=authorization_cancelled");
+    await harness.assertDatabase(
+      "Cancelling reauthorization changed the active account or its derived work",
+      `exists (
+          select 1 from google_connections where id=${sqlLiteral(FOUNDER_GOOGLE)}::uuid
+            and status='active'
+        ) and exists (
+          select 1 from google_connections where id=${sqlLiteral(CANCELLED_FOUNDER_GOOGLE)}::uuid
+            and status='pending' and state_consumed_at is null
+        ) and exists (
+          select 1 from facts fact join fact_sources link on link.fact_id=fact.id
+          where fact.slot=${sqlLiteral(GOOGLE_DELETION_FACT_SLOT)}
+            and link.source_id=${sqlLiteral(harness.state.googleDeletionSourceId)}::uuid
+        ) and exists (
+          select 1 from proactive_work_sources link join proactive_work work on work.id=link.work_id
+          where link.source_id=${sqlLiteral(harness.state.googleDeletionSourceId)}::uuid
+            and work.kind='finite_monitor' and work.status='active'
+        ) and exists (
+          select 1 from calendar_actions
+          where basis_source_id=${sqlLiteral(harness.state.googleDeletionSourceId)}::uuid
+            and status='offered'
+        ) and exists (
+          select 1 from messages where direction='outbound' and status='pending'
+            and text=${sqlLiteral(GOOGLE_MEMORY_REPLY)}
+        )`,
+    );
+    const wrongAccountState = "founder-wrong-google-account-state";
+    await harness.store.createPending({
+      connectionId: WRONG_FOUNDER_GOOGLE,
+      householdId: founderHouseholdId,
+      ownerAdultId: harness.founderAdultId,
+      stateDigest: digest(wrongAccountState),
+      sessionBindingDigest: browserSessionBinding,
+      stateExpiresAt: new Date(harness.state.now + 60_000).toISOString(),
+      now: harness.iso(),
+    });
+    harness.state.wrongGoogleSubjectNext = true;
+    const wrongAccountApp = await harness.webApp();
+    const wrongAccountResponse = await wrongAccountApp.inject({
+      method: "GET",
+      url: `/oauth/google/callback?state=${encodeURIComponent(wrongAccountState)}&code=wrong-account-code`,
+      headers: { cookie: harness.sessionCookie },
+    });
+    await wrongAccountApp.close();
+    expect(wrongAccountResponse.statusCode).toBe(302);
+    expect(wrongAccountResponse.headers.location).toBe("/?google=identity_conflict");
+    await harness.assertDatabase(
+      "A cancelled wrong-account reconnect replaced the active account or destroyed queued work",
+      `not exists (
+          select 1 from google_connections where id=${sqlLiteral(WRONG_FOUNDER_GOOGLE)}::uuid
+            and status='active'
+        ) and exists (
+          select 1 from google_connections where id=${sqlLiteral(FOUNDER_GOOGLE)}::uuid
+            and status='active'
+        ) and exists (
+          select 1 from messages where direction='outbound' and status='pending'
+            and text=${sqlLiteral(GOOGLE_MEMORY_REPLY)}
+        ) and exists (
+          select 1 from calendar_actions
+          where basis_source_id=${sqlLiteral(harness.state.googleDeletionSourceId)}::uuid
+            and status='offered'
+        ) and exists (
+          select 1 from facts fact join fact_sources link on link.fact_id=fact.id
+          where fact.slot=${sqlLiteral(GOOGLE_DELETION_FACT_SLOT)}
+            and link.source_id=${sqlLiteral(harness.state.googleDeletionSourceId)}::uuid
+        ) and exists (
+          select 1 from proactive_work_sources link join proactive_work work on work.id=link.work_id
+          where link.source_id=${sqlLiteral(harness.state.googleDeletionSourceId)}::uuid
+            and work.kind='finite_monitor' and work.status='active'
+        ) and exists (
+          select 1 from google_connections where id=${sqlLiteral(WRONG_FOUNDER_GOOGLE)}::uuid
+            and status='pending' and state_consumed_at is not null
+        )`,
+    );
+    await harness.activateGoogle(
+      harness.founderAdultId,
+      SAFE_REAUTHORIZED_FOUNDER_GOOGLE,
+      "founder-safe-reauthorization-state",
+    );
+    await harness.assertDatabase(
+      "A successful same-account reauthorization did not replace the credential atomically",
+      `exists (
+          select 1 from google_connections where id=${sqlLiteral(FOUNDER_GOOGLE)}::uuid
+            and status='disconnected' and refresh_token_envelope is null
+        ) and exists (
+          select 1 from google_connections where id=${sqlLiteral(SAFE_REAUTHORIZED_FOUNDER_GOOGLE)}::uuid
+            and status='active' and google_subject_digest is not null
+        ) and not exists (
+          select 1 from google_connections
+          where id in (
+            ${sqlLiteral(CANCELLED_FOUNDER_GOOGLE)}::uuid,
+            ${sqlLiteral(WRONG_FOUNDER_GOOGLE)}::uuid
+          ) and (status='pending' or session_binding_digest is not null)
+        )`,
+    );
+    await harness.assertDatabase(
+      "A successful same-account reauthorization lost Family Calendar or evidence lineage",
+      `exists (
+          select 1 from households
+          where id=${sqlLiteral(founderHouseholdId)}::uuid
+            and family_calendar_owner_connection_id=${sqlLiteral(SAFE_REAUTHORIZED_FOUNDER_GOOGLE)}::uuid
+        ) and exists (
+          select 1 from sources evidence
+          join google_connections historical
+            on historical.id::text=evidence.metadata->>'connectionId'
+          join google_connections active
+            on active.id=${sqlLiteral(SAFE_REAUTHORIZED_FOUNDER_GOOGLE)}::uuid
+            and active.household_id=historical.household_id
+            and active.owner_adult_id=historical.owner_adult_id
+            and active.google_subject_digest=historical.google_subject_digest
+            and active.google_subject_digest is not null and active.status='active'
+          where evidence.id=${sqlLiteral(harness.state.googleDeletionSourceId)}::uuid
+        )`,
+    );
+    await harness.assertDatabase(
+      "A successful same-account reauthorization did not reset its private review atomically",
+      `exists (
+          select 1 from proactive_work
+          where household_id=${sqlLiteral(founderHouseholdId)}::uuid
+            and owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid
+            and kind='initial_private_review' and status='active'
+            and next_check_at is not null
+        )`,
+    );
+    await harness.assertDatabase(
+      "A successful same-account reauthorization did not pause its old Google poll atomically",
+      `exists (
+          select 1 from proactive_work
+          where household_id=${sqlLiteral(founderHouseholdId)}::uuid
+            and owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid
+            and kind='personal_google_poll' and status='paused' and next_check_at is null
+        )`,
+    );
+    await harness.assertDatabase(
+      "A successful same-account reauthorization destroyed retained Google-derived work",
+      `exists (
+          select 1 from facts fact join fact_sources link on link.fact_id=fact.id
+          where fact.slot=${sqlLiteral(GOOGLE_DELETION_FACT_SLOT)}
+            and link.source_id=${sqlLiteral(harness.state.googleDeletionSourceId)}::uuid
+        ) and exists (
+          select 1 from proactive_work_sources link join proactive_work work on work.id=link.work_id
+          where link.source_id=${sqlLiteral(harness.state.googleDeletionSourceId)}::uuid
+            and work.kind='finite_monitor' and work.status='active'
+        ) and exists (
+          select 1 from calendar_actions
+          where basis_source_id=${sqlLiteral(harness.state.googleDeletionSourceId)}::uuid
+            and status='offered'
+        ) and exists (
+          select 1 from messages where direction='outbound' and status='pending'
+            and text=${sqlLiteral(GOOGLE_MEMORY_REPLY)}
+        )`,
+    );
+    await harness.store.createPending({
+      connectionId: ABANDONED_FOUNDER_GOOGLE,
+      householdId: founderHouseholdId,
+      ownerAdultId: harness.founderAdultId,
+      stateDigest: digest("founder-abandoned-google-state"),
+      sessionBindingDigest: browserSessionBinding,
+      stateExpiresAt: new Date(harness.state.now + 60_000).toISOString(),
+      now: harness.iso(),
+    });
     const founderGoogleReadsBeforeDisconnect = harness.state.googleChangeReads.filter(
       (read) => read.ownerAdultId === harness.founderAdultId,
     ).length;
@@ -1704,9 +2341,10 @@ release("Florence parent journeys", () => {
       method: "DELETE",
       url: "/api/v1/workspace/google-connections",
       headers: { cookie: harness.sessionCookie },
-      payload: { connectionId: FOUNDER_GOOGLE },
+      payload: { connectionId: SAFE_REAUTHORIZED_FOUNDER_GOOGLE },
     });
     await disconnectApp.close();
+    const linqMessagesAfterDisconnect = harness.linq.messages.length;
     expect(disconnectResponse.statusCode).toBe(200);
     expect(disconnectResponse.json()).toMatchObject({
       localAccess: "disconnected",
@@ -1715,7 +2353,7 @@ release("Florence parent journeys", () => {
         workspace: { googleConnections: [] },
         vault: {
           facts: expect.arrayContaining([
-            expect.objectContaining({ statement: GOOGLE_DELETION_FACT, visibility: "private" }),
+            expect.objectContaining({ statement: GOOGLE_DELETION_FACT, visibility: "household" }),
           ]),
           watches: expect.arrayContaining([
             expect.objectContaining({
@@ -1752,13 +2390,22 @@ release("Florence parent journeys", () => {
       )`,
     );
     await harness.assertDatabase(
+      "Ordinary disconnect left a stale reauthorization state consumable",
+      `not exists (
+        select 1 from google_connections
+        where household_id=${sqlLiteral(founderHouseholdId)}::uuid
+          and owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid
+          and (status='pending' or session_binding_digest is not null)
+      )`,
+    );
+    await harness.assertDatabase(
       "Ordinary disconnect left a Google-dependent outbound deliverable",
       `exists (
         select 1 from messages
         where direction='outbound' and status='failed'
           and text=${sqlLiteral(GOOGLE_MEMORY_REPLY)}
       ) and not exists (
-        select 1 from messages where direction='outbound' and status in ('pending','sending','sent')
+        select 1 from messages where direction='outbound' and status in ('pending','sending')
           and (
             text=${sqlLiteral(GOOGLE_DELETION_PRIVATE_ALERT)}
             or text=${sqlLiteral(GOOGLE_CITED_REPLY)}
@@ -1776,13 +2423,15 @@ release("Florence parent journeys", () => {
       harness.state.googleChangeReads.filter((read) => read.ownerAdultId === harness.founderAdultId),
     ).toHaveLength(founderGoogleReadsBeforeDisconnect);
     expect(
-      harness.linq.messages.some(
-        (message) =>
-          message.text === GOOGLE_DELETION_PRIVATE_ALERT ||
-          message.text === GOOGLE_CITED_REPLY ||
-          message.text === GOOGLE_MEMORY_REPLY ||
-          message.text.includes(GOOGLE_DELETION_FAMILY_DATE.title),
-      ),
+      harness.linq.messages
+        .slice(linqMessagesAfterDisconnect)
+        .some(
+          (message) =>
+            message.text === GOOGLE_DELETION_PRIVATE_ALERT ||
+            message.text === GOOGLE_CITED_REPLY ||
+            message.text === GOOGLE_MEMORY_REPLY ||
+            message.text.includes(GOOGLE_DELETION_FAMILY_DATE.title),
+        ),
     ).toBe(false);
     expect(
       harness.linq.messages.filter(
@@ -1799,10 +2448,109 @@ release("Florence parent journeys", () => {
       [...harness.state.calendarEvents.values()].some((event) => event.title === AUTOMATIC_FAMILY_DATE.title),
     ).toBe(true);
 
+    const stableSchoolSourceDigest = digest(
+      `gmail\0${harness.founderAdultId}\0${SCHOOL_ATTACHMENT.messageId}`,
+    );
+    const stableSchoolActionKey = digest(
+      JSON.stringify({
+        version: 2,
+        providers: [stableSchoolSourceDigest],
+        category: "loose_end",
+        dueAt: "2026-08-19T16:00:00.000Z",
+        actionAnchorDigest: digest("field-trip form"),
+      }),
+    );
+    await harness.assertDatabase(
+      "The delivered initial review is no longer recorded as sent",
+      `exists (
+        select 1 from messages
+        where status='sent' and idempotency_key like 'initial-private-review:%'
+      )`,
+    );
+    await harness.assertDatabase(
+      "The delivered initial review did not retain any provider-stable action keys",
+      `exists (
+        select 1 from messages message join sources source on source.id=message.source_id
+        where message.status='sent'
+          and jsonb_typeof(source.metadata->'googleActionKeys')='array'
+      )`,
+    );
+    await harness.assertDatabase(
+      "The delivered initial review did not retain its expected provider-stable action key",
+      `exists (
+        select 1 from messages message join sources source on source.id=message.source_id
+        where message.status='sent' and source.visibility='private'
+          and jsonb_typeof(source.metadata->'googleActionKeys')='array'
+          and jsonb_exists(source.metadata->'googleActionKeys',${sqlLiteral(stableSchoolActionKey)})
+      )`,
+    );
+
+    const messagesBeforeSameSubjectRescan = harness.linq.messages.length;
+    const preActivationExecutionsBeforeRescan = harness.state.calendarExecutions.filter(
+      (execution) =>
+        execution.mutation.operation === "create" &&
+        execution.mutation.event.title === PRE_ACTIVATION_FAMILY_DATE.title,
+    );
+    expect(preActivationExecutionsBeforeRescan).toHaveLength(1);
+    const preActivationActionId = preActivationExecutionsBeforeRescan[0]?.actionId;
+    if (!preActivationActionId) throw new Error("The provider-stable Calendar action is missing its ID");
     await harness.activateGoogle(
       harness.founderAdultId,
       RECONNECTED_FOUNDER_GOOGLE,
       "founder-google-reconnected-state",
+    );
+    await harness.drain();
+    expect(
+      harness.linq.messages
+        .slice(messagesBeforeSameSubjectRescan)
+        .filter((message) => !message.idempotencyKey.startsWith("calendar-confirmation:")),
+    ).toEqual([]);
+    expect(
+      harness.state.calendarExecutions
+        .filter(
+          (execution) =>
+            execution.mutation.operation === "create" &&
+            execution.mutation.event.title === PRE_ACTIVATION_FAMILY_DATE.title,
+        )
+        .map((execution) => execution.actionId),
+    ).toEqual([preActivationActionId]);
+    await harness.assertDatabase(
+      "A same-account reconnect duplicated a provider-stable watch",
+      `(select count(distinct work.id)<=2 from proactive_work work
+          join proactive_work_sources link on link.work_id=work.id
+          join sources source on source.id=link.source_id
+          where work.kind='finite_monitor' and work.status='active'
+            and work.owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid
+            and source.kind='gmail'
+            and source.metadata->>'messageId'=${sqlLiteral(SCHOOL_ATTACHMENT.messageId)})`,
+    );
+    await harness.assertDatabase(
+      "A same-account reconnect dropped a provider-stable watch",
+      `(select count(distinct work.id)>=2 from proactive_work work
+          join proactive_work_sources link on link.work_id=work.id
+          join sources source on source.id=link.source_id
+          where work.kind='finite_monitor' and work.status='active'
+            and work.owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid
+            and source.kind='gmail'
+            and source.metadata->>'messageId'=${sqlLiteral(SCHOOL_ATTACHMENT.messageId)})`,
+    );
+    await harness.assertDatabase(
+      "A same-account reconnect duplicated or dropped a handled Calendar action",
+      `(select count(*)=1 from calendar_actions
+        where payload->'event'->>'title'=${sqlLiteral(PRE_ACTIVATION_FAMILY_DATE.title)})
+        and not exists (
+          select 1 from calendar_actions action join sources basis on basis.id=action.basis_source_id
+          where action.payload->'event'->>'title'=${sqlLiteral(PRE_ACTIVATION_FAMILY_DATE.title)}
+            and basis.metadata->>'connectionId'=${sqlLiteral(RECONNECTED_FOUNDER_GOOGLE)}
+        )`,
+    );
+    await harness.assertDatabase(
+      "A same-account reconnect repeated a provider-stable delivered finding",
+      `not exists (
+          select 1 from messages message join sources source on source.id=message.source_id
+          where message.status='sent' and source.metadata->'googleActionKeys' is not null
+            and message.text like '%still waiting on Hari%'
+        )`,
     );
     harness.state.providerRevocations.push("confirmed");
     const deleteApp = await harness.webApp();
@@ -1821,13 +2569,41 @@ release("Florence parent journeys", () => {
     expect(deleted.deletion.googleSources).toBeGreaterThan(0);
     expect(deleted.deletion.facts).toBeGreaterThan(0);
     expect(deleted.deletion.watches).toBeGreaterThan(0);
-    expect(deleted.deletion.calendarActions).toBe(0);
+    expect(deleted.deletion.calendarActions).toBe(1);
     expect(deleted.deletion.unsentMessages).toBeGreaterThan(0);
+    expect(
+      harness.state.calendarExecutions
+        .filter(
+          (execution) =>
+            execution.mutation.operation === "create" &&
+            execution.mutation.event.title === PRE_ACTIVATION_FAMILY_DATE.title,
+        )
+        .map((execution) => execution.actionId),
+    ).toEqual([preActivationActionId]);
+    expect(
+      [...harness.state.calendarEvents.values()].some(
+        (event) => event.title === PRE_ACTIVATION_FAMILY_DATE.title,
+      ),
+    ).toBe(true);
     expect(
       deleted.workspace.vault.facts.some(
         (fact: { statement: string }) => fact.statement === GOOGLE_DELETION_FACT,
       ),
     ).toBe(false);
+    expect(deleted.workspace.vault.facts).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          statement: SHARED_SCHOOL_CONTACT_FACT,
+          visibility: "household",
+          source: null,
+        }),
+        expect.objectContaining({
+          statement: GOOGLE_CORRECTED_FACT,
+          visibility: "household",
+          source: expect.objectContaining({ kind: "web" }),
+        }),
+      ]),
+    );
     expect(
       deleted.workspace.vault.watches.some(
         (watch: { objective: string }) =>
@@ -1842,8 +2618,7 @@ release("Florence parent journeys", () => {
           and kind in ('gmail','calendar')
       ) and not exists (
         select 1 from facts
-        where owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid
-          and slot in (${sqlLiteral(PRIVATE_SCHOOL_FACT_SLOT)},${sqlLiteral(GOOGLE_DELETION_FACT_SLOT)})
+        where slot in (${sqlLiteral(PRIVATE_SCHOOL_FACT_SLOT)},${sqlLiteral(GOOGLE_DELETION_FACT_SLOT)})
       ) and not exists (
         select 1 from proactive_work
         where owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid
@@ -1853,28 +2628,46 @@ release("Florence parent journeys", () => {
         where payload->'event'->>'title'=${sqlLiteral(GOOGLE_DELETION_FAMILY_DATE.title)}
       ) and not exists (
         select 1 from messages
-        where text=${sqlLiteral(GOOGLE_DELETION_PRIVATE_ALERT)}
-          or text=${sqlLiteral(GOOGLE_CITED_REPLY)}
-          or text=${sqlLiteral(GOOGLE_MEMORY_REPLY)}
-          or (
-            idempotency_key like 'calendar-review-prompt:%'
-            and text like ${sqlLiteral(`%${GOOGLE_DELETION_FAMILY_DATE.title}%`)}
-          )
+        where direction='outbound' and status<>'sent' and (
+          text=${sqlLiteral(GOOGLE_DELETION_PRIVATE_ALERT)}
+            or text=${sqlLiteral(GOOGLE_CITED_REPLY)}
+            or text=${sqlLiteral(GOOGLE_MEMORY_REPLY)}
+            or (
+              idempotency_key like 'calendar-review-prompt:%'
+              and text like ${sqlLiteral(`%${GOOGLE_DELETION_FAMILY_DATE.title}%`)}
+            )
+        )
+      ) and exists (
+        select 1 from messages
+        where direction='outbound' and status='sent'
+          and text=${sqlLiteral(GOOGLE_DELETION_PRIVATE_ALERT)}
       ) and exists (
         select 1 from sources
         where owner_adult_id=${sqlLiteral(harness.partnerAdultId)}::uuid and kind='gmail'
       ) and exists (
         select 1 from facts
-        where owner_adult_id=${sqlLiteral(harness.partnerAdultId)}::uuid
+        where visibility='household' and owner_adult_id is null
           and slot=${sqlLiteral(PARTNER_PRIVATE_GOOGLE_FACT_SLOT)}
       ) and exists (
-        select 1 from messages
-        where direction='outbound' and status='sent'
-          and text like 'Here’s what I found:%'
+        select 1 from facts fact join fact_sources link on link.fact_id=fact.id
+          join sources source on source.id=link.source_id
+        where fact.visibility='household' and fact.owner_adult_id is null
+          and fact.slot=${sqlLiteral(SHARED_SCHOOL_CONTACT_SLOT)}
+          and source.owner_adult_id=${sqlLiteral(harness.partnerAdultId)}::uuid
+          and source.kind='gmail'
+      ) and not exists (
+        select 1 from facts fact join fact_sources link on link.fact_id=fact.id
+          join sources source on source.id=link.source_id
+        where fact.slot=${sqlLiteral(SHARED_SCHOOL_CONTACT_SLOT)}
+          and source.owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid
       ) and exists (
         select 1 from messages
         where direction='outbound' and status='sent'
-          and text='Hari, I checked your side and found one family item worth tracking.'
+          and text like 'Here’s what’s on the docket:%'
+      ) and exists (
+        select 1 from messages
+        where direction='outbound' and status='sent'
+          and text like '%Hari’s private school email has the original form.%'
       ) and exists (
         select 1 from messages
         where direction='outbound' and status='sent'
@@ -1903,7 +2696,7 @@ release("Florence parent journeys", () => {
     );
     expect((await harness.florence.workspaceForAdult(harness.partnerAdultId)).vault?.facts).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ statement: PARTNER_PRIVATE_GOOGLE_FACT, visibility: "private" }),
+        expect.objectContaining({ statement: PARTNER_PRIVATE_GOOGLE_FACT, visibility: "household" }),
       ]),
     );
     expect(
@@ -1942,7 +2735,10 @@ release("Florence parent journeys", () => {
       status: "ready",
       month: "2026-08",
       calendarName: "Anbarasu Family",
-      events: [expect.objectContaining({ title: AUTOMATIC_FAMILY_DATE.title })],
+      events: expect.arrayContaining([
+        expect.objectContaining({ title: AUTOMATIC_FAMILY_DATE.title }),
+        expect.objectContaining({ title: PRE_ACTIVATION_FAMILY_DATE.title }),
+      ]),
     });
 
     harness.state.invalidGrantAdultId = harness.partnerAdultId;
@@ -2056,6 +2852,17 @@ release("Florence parent journeys", () => {
     expect(calendarOnlyBubble).toContain("9:00");
     expect(calendarOnlyBubble).toContain("PDT");
     expect(calendarOnlyBubble).not.toMatch(/today|confirmed private calendar commitment/i);
+    const founderCalendarFact = (
+      await calendarOnlyHarness.florence.workspaceForAdult(calendarOnlyHarness.founderAdultId)
+    ).vault?.facts.find((fact) => fact.statement === PRIVATE_CALENDAR_FACT);
+    expect(founderCalendarFact).toEqual(
+      expect.objectContaining({ visibility: "private", source: expect.objectContaining({}) }),
+    );
+    expect(
+      (
+        await calendarOnlyHarness.florence.workspaceForAdult(calendarOnlyHarness.partnerAdultId)
+      ).vault?.facts.some((fact) => fact.statement === PRIVATE_CALENDAR_FACT),
+    ).toBe(false);
 
     const initialBoundaryHarness = await createHarness();
     initialBoundaryHarness.state.initialUnrelatedAccountReview = true;
@@ -2070,9 +2877,7 @@ release("Florence parent journeys", () => {
     expect(
       initialBoundaryHarness.linq.messages.some(
         (message) =>
-          message.providerConversationId === PRIVATE_FOUNDER &&
-          message.text ===
-            "I checked your Gmail and the next three weeks of Calendar. Nothing needs your attention right now.",
+          message.providerConversationId === PRIVATE_FOUNDER && message.text === PRIVATE_INITIAL_ALL_CLEAR,
       ),
     ).toBe(true);
     const initialBoundaryWorkspace = await initialBoundaryHarness.florence.workspaceForAdult(
@@ -2112,9 +2917,7 @@ release("Florence parent journeys", () => {
     expect(
       initialFactOnlyBoundaryHarness.linq.messages.some(
         (message) =>
-          message.providerConversationId === PRIVATE_FOUNDER &&
-          message.text ===
-            "I checked your Gmail and the next three weeks of Calendar. Nothing needs your attention right now.",
+          message.providerConversationId === PRIVATE_FOUNDER && message.text === PRIVATE_INITIAL_ALL_CLEAR,
       ),
     ).toBe(true);
     await initialFactOnlyBoundaryHarness.assertDatabase(
@@ -2126,7 +2929,7 @@ release("Florence parent journeys", () => {
         select 1 from facts where slot=${sqlLiteral(UNRELATED_ACCOUNT_FACT_SLOT)}
       )`,
     );
-  }, 30_000);
+  }, 90_000);
 
   test("keeps private context isolated while both parents can manage shared memory, Calendar, and group repair", async () => {
     const harness = await createHarness(async (input, reads) => {
@@ -2205,6 +3008,304 @@ release("Florence parent journeys", () => {
       return decision();
     });
     await harness.readyHousehold();
+
+    const messagesBeforePrivateCalendarAnniversary = harness.linq.messages.length;
+    harness.state.privateCalendarAnniversaryPending = true;
+    harness.state.now += 2 * 60_000;
+    await harness.drain();
+    expect(harness.state.privateCalendarAnniversaryDelivered).toBe(true);
+    const privateCalendarAnniversaryMessages = harness.linq.messages.slice(
+      messagesBeforePrivateCalendarAnniversary,
+    );
+    expect(
+      privateCalendarAnniversaryMessages.some(
+        (message) =>
+          message.providerConversationId === PRIVATE_FOUNDER &&
+          message.text.includes(PRIVATE_CALENDAR_ANNIVERSARY_TITLE),
+      ),
+    ).toBe(true);
+    expect(
+      privateCalendarAnniversaryMessages
+        .filter((message) => message.providerConversationId === FAMILY_GROUP)
+        .map((message) => message.text)
+        .join("\n"),
+    ).not.toContain(PRIVATE_CALENDAR_ANNIVERSARY_TITLE);
+    expect(
+      privateCalendarAnniversaryMessages
+        .filter((message) => message.providerConversationId === PRIVATE_FOUNDER)
+        .map((message) => message.text)
+        .join("\n"),
+    ).not.toContain(PRIVATE_CALENDAR_ANNIVERSARY_EVENT.location);
+    expect(
+      harness.state.calendarExecutions.filter(
+        (execution) =>
+          execution.mutation.operation === "create" &&
+          execution.mutation.event.title === PRIVATE_CALENDAR_ANNIVERSARY_TITLE,
+      ),
+    ).toHaveLength(0);
+    expect(
+      [...harness.state.calendarEvents.values()].filter(
+        (event) => event.title === PRIVATE_CALENDAR_ANNIVERSARY_TITLE,
+      ),
+    ).toHaveLength(0);
+    await harness.assertDatabase(
+      "A personal Calendar date crossed the owner-private approval boundary",
+      `(select count(*)=1 from calendar_actions action
+        join sources basis on basis.id=action.basis_source_id
+        join messages prompt on prompt.source_id=action.approval_prompt_source_id
+        join linq_channels channel on channel.id=prompt.channel_id
+        where action.status='offered' and action.approval_source_id is null
+          and action.payload->'event'->>'title'=${sqlLiteral(PRIVATE_CALENDAR_ANNIVERSARY_TITLE)}
+          and basis.kind='calendar' and basis.visibility='private'
+          and basis.owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid
+          and prompt.direction='outbound' and prompt.status='sent'
+          and channel.audience='private' and channel.adult_one_id=${sqlLiteral(
+            harness.founderAdultId,
+          )}::uuid and channel.adult_two_id is null)`,
+    );
+
+    await harness.accept(
+      "private",
+      "partner-cannot-approve-founders-private-calendar",
+      PRIVATE_CALENDAR_OWNER_APPROVAL,
+      "partner",
+    );
+    await harness.drain();
+    await harness.accept(
+      "group",
+      "group-cannot-approve-private-calendar",
+      PRIVATE_CALENDAR_OWNER_APPROVAL,
+      "partner",
+    );
+    await harness.drain();
+    expect(
+      harness.state.calendarExecutions.filter(
+        (execution) =>
+          execution.mutation.operation === "create" &&
+          execution.mutation.event.title === PRIVATE_CALENDAR_ANNIVERSARY_TITLE,
+      ),
+    ).toHaveLength(0);
+    await harness.assertDatabase(
+      "Another adult or the group authorized an owner-private Calendar offer",
+      `(select count(*)=1 from calendar_actions
+        where status='offered' and approval_source_id is null
+          and payload->'event'->>'title'=${sqlLiteral(PRIVATE_CALENDAR_ANNIVERSARY_TITLE)})`,
+    );
+
+    const messagesBeforeOwnerCalendarApproval = harness.linq.messages.length;
+    await harness.accept(
+      "private",
+      "founder-approves-private-calendar-date",
+      PRIVATE_CALENDAR_OWNER_APPROVAL,
+    );
+    await harness.drain();
+    const ownerApprovedMessages = harness.linq.messages.slice(messagesBeforeOwnerCalendarApproval);
+    const groupCalendarConfirmation = ownerApprovedMessages.find(
+      (message) =>
+        message.providerConversationId === FAMILY_GROUP &&
+        message.text.includes(PRIVATE_CALENDAR_ANNIVERSARY_TITLE),
+    );
+    expect(groupCalendarConfirmation?.text).toContain("Aug 24, 2026");
+    expect(groupCalendarConfirmation?.text).not.toContain(PRIVATE_CALENDAR_ANNIVERSARY_EVENT.location);
+    expect(
+      harness.state.calendarExecutions.filter(
+        (execution) =>
+          execution.mutation.operation === "create" &&
+          execution.mutation.event.title === PRIVATE_CALENDAR_ANNIVERSARY_TITLE,
+      ),
+    ).toHaveLength(1);
+    expect(
+      [...harness.state.calendarEvents.values()].filter(
+        (event) => event.title === PRIVATE_CALENDAR_ANNIVERSARY_TITLE,
+      ),
+    ).toEqual([expect.objectContaining({ location: null })]);
+    expect(
+      harness.state.timeline.filter(
+        (entry) => entry === `provider:create:${PRIVATE_CALENDAR_ANNIVERSARY_TITLE}`,
+      ),
+    ).toHaveLength(1);
+    await harness.assertDatabase(
+      "An owner-approved personal Calendar date was not added and announced exactly once",
+      `(select count(*)=1 from calendar_actions action
+        join sources basis on basis.id=action.basis_source_id
+        join messages approval on approval.source_id=action.approval_source_id
+        join linq_channels approval_channel on approval_channel.id=approval.channel_id
+        where action.status='committed'
+          and action.payload->'event'->>'title'=${sqlLiteral(PRIVATE_CALENDAR_ANNIVERSARY_TITLE)}
+          and basis.kind='calendar' and basis.visibility='private'
+          and basis.owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid
+          and approval.direction='inbound'
+          and approval.sender_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid
+          and approval_channel.audience='private'
+          and approval_channel.adult_one_id=${sqlLiteral(harness.founderAdultId)}::uuid
+          and approval_channel.adult_two_id is null)
+        and (select count(*)=1 from messages confirmation
+          join linq_channels confirmation_channel on confirmation_channel.id=confirmation.channel_id
+          where confirmation.direction='outbound' and confirmation.status='sent'
+            and confirmation_channel.audience='group'
+            and confirmation.text like ${sqlLiteral(`%${PRIVATE_CALENDAR_ANNIVERSARY_TITLE}%`)}
+            and confirmation.text like '%Aug 24, 2026%')`,
+    );
+
+    const messagesBeforeFamilyCalendarEcho = harness.linq.messages.length;
+    const createdAnniversary = [...harness.state.calendarEvents.values()].find(
+      (event) => event.title === PRIVATE_CALENDAR_ANNIVERSARY_TITLE,
+    );
+    if (!createdAnniversary) throw new Error("The approved anniversary event was not created");
+    harness.state.calendarEvents.set(createdAnniversary.providerEventId, {
+      ...createdAnniversary,
+      providerRevision: `${createdAnniversary.providerRevision}-benign-google-revision`,
+      providerUpdatedAt: new Date(harness.state.now + 60_000).toISOString(),
+    });
+    harness.state.familyCalendarEchoPending = true;
+    harness.state.now += 2 * 60_000;
+    await harness.drain();
+    expect(harness.state.familyCalendarEchoDelivered).toBe(true);
+    expect(harness.linq.messages).toHaveLength(messagesBeforeFamilyCalendarEcho);
+    await harness.assertDatabase(
+      "A harmless Calendar revision retained an echo watch for Florence's own event",
+      `not exists (
+        select 1 from proactive_work_sources link join sources source on source.id=link.source_id
+        where source.kind='calendar'
+          and source.metadata->>'providerEventId'=${sqlLiteral(createdAnniversary.providerEventId)}
+      )`,
+    );
+    const onceRevisedAnniversary = harness.state.calendarEvents.get(createdAnniversary.providerEventId);
+    if (!onceRevisedAnniversary) throw new Error("The approved anniversary event disappeared");
+    harness.state.calendarEvents.set(createdAnniversary.providerEventId, {
+      ...onceRevisedAnniversary,
+      providerRevision: `${onceRevisedAnniversary.providerRevision}-second-benign-revision`,
+      providerUpdatedAt: new Date(harness.state.now + 60_000).toISOString(),
+    });
+    harness.state.familyCalendarEchoDelivered = false;
+    harness.state.familyCalendarEchoPending = true;
+    harness.state.now += 2 * 60_000;
+    await harness.drain();
+    expect(harness.state.familyCalendarEchoDelivered).toBe(true);
+    expect(harness.linq.messages).toHaveLength(messagesBeforeFamilyCalendarEcho);
+
+    const messagesBeforeMixedFamilyCalendarChange = harness.linq.messages.length;
+    harness.state.familyCalendarMixedChangePending = true;
+    harness.state.now += 2 * 60_000;
+    await harness.drain();
+    expect(harness.state.familyCalendarMixedChangeDelivered).toBe(true);
+    expect(
+      harness.linq.messages
+        .slice(messagesBeforeMixedFamilyCalendarChange)
+        .filter((message) => message.providerConversationId === FAMILY_GROUP)
+        .map((message) => message.text),
+    ).toEqual([FAMILY_CALENDAR_MIXED_CHANGE_SUMMARY]);
+    await harness.assertDatabase(
+      "A real Family Calendar change or its co-cited echo evidence was lost",
+      `(select count(*)=2 from proactive_work_sources link
+        join sources source on source.id=link.source_id
+        where source.kind='calendar'
+          and source.metadata->>'providerEventId' in (
+            ${sqlLiteral(createdAnniversary.providerEventId)},
+            ${sqlLiteral(FAMILY_CALENDAR_MIXED_CHANGE_EVENT.providerEventId)}
+      ))`,
+    );
+
+    harness.state.familyCalendarRealOnlyOverlapPending = true;
+    harness.state.now += 2 * 60_000;
+    await harness.drain();
+    expect(harness.state.familyCalendarRealOnlyOverlapDelivered).toBe(true);
+    expect(
+      harness.linq.messages.filter(
+        (message) =>
+          message.providerConversationId === FAMILY_GROUP &&
+          message.text === FAMILY_CALENDAR_MIXED_CHANGE_SUMMARY,
+      ),
+    ).toHaveLength(1);
+    await harness.assertDatabase(
+      "A real-only Calendar overlap re-announced a mixed echo finding or lost its exact evidence",
+      `(select count(*)=1 from messages message
+        join sources outbound on outbound.id=message.source_id
+        where message.direction='outbound' and message.status='sent'
+          and message.text=${sqlLiteral(FAMILY_CALENDAR_MIXED_CHANGE_SUMMARY)}
+          and jsonb_typeof(outbound.metadata->'googleSourceIds')='array'
+          and (select count(*)=2
+            from jsonb_array_elements_text(outbound.metadata->'googleSourceIds') linked(id)
+            join sources evidence on evidence.id=linked.id::uuid
+            where evidence.kind='calendar'
+              and evidence.metadata->>'providerEventId' in (
+                ${sqlLiteral(createdAnniversary.providerEventId)},
+                ${sqlLiteral(FAMILY_CALENDAR_MIXED_CHANGE_EVENT.providerEventId)}
+              )))`,
+    );
+
+    const messagesBeforePrivateCalendarAdultEvent = harness.linq.messages.length;
+    harness.state.privateCalendarAdultEventPending = true;
+    harness.state.unrelatedAccountEmailPending = true;
+    harness.state.now += 2 * 60_000;
+    await harness.drain();
+    expect(harness.state.privateCalendarAdultEventDelivered).toBe(true);
+    expect(harness.state.unrelatedAccountEmailDelivered).toBe(true);
+    expect(
+      harness.state.googleAssessments.some(
+        (assessment) =>
+          assessment.evidence.calendar.events.some((event) => event.title === PRIVATE_CALENDAR_ADULT_TITLE) &&
+          assessment.evidence.gmail.sources.some(
+            (source) => source.subject === UNRELATED_ACCOUNT_EMAIL_SUBJECT,
+          ),
+      ),
+    ).toBe(true);
+    const privateCalendarAdultMessages = harness.linq.messages.slice(messagesBeforePrivateCalendarAdultEvent);
+    expect(
+      privateCalendarAdultMessages.some(
+        (message) =>
+          message.providerConversationId === PRIVATE_FOUNDER &&
+          message.text.includes(PRIVATE_CALENDAR_ADULT_TITLE),
+      ),
+    ).toBe(true);
+    expect(
+      privateCalendarAdultMessages
+        .filter((message) => message.providerConversationId === FAMILY_GROUP)
+        .map((message) => message.text)
+        .join("\n"),
+    ).not.toMatch(
+      new RegExp(`${PRIVATE_CALENDAR_ADULT_TITLE}|${PRIVATE_CALENDAR_ADULT_EVENT.location}`, "i"),
+    );
+    expect(
+      harness.state.calendarExecutions.some(
+        (execution) =>
+          execution.mutation.operation === "create" &&
+          execution.mutation.event.title === PRIVATE_CALENDAR_ADULT_TITLE,
+      ),
+    ).toBe(false);
+    expect(
+      [...harness.state.calendarEvents.values()].some(
+        (event) => event.title === PRIVATE_CALENDAR_ADULT_TITLE,
+      ),
+    ).toBe(false);
+    await harness.assertDatabase(
+      "An adult-private Calendar event crossed into the group or Family Calendar",
+      `not exists (
+        select 1 from calendar_actions
+        where payload::text like ${sqlLiteral(`%${PRIVATE_CALENDAR_ADULT_TITLE}%`)}
+      )`,
+    );
+
+    const messagesBeforePrivateCalendarConflict = harness.linq.messages.length;
+    harness.state.calendarOnlyChangePending = true;
+    harness.state.now += 2 * 60_000;
+    await harness.drain();
+    const privateCalendarConflictMessages = harness.linq.messages.slice(
+      messagesBeforePrivateCalendarConflict,
+    );
+    expect(
+      privateCalendarConflictMessages.filter(
+        (message) =>
+          message.providerConversationId === FAMILY_GROUP &&
+          message.text === "Hari has a calendar conflict then.",
+      ),
+    ).toHaveLength(1);
+    expect(
+      privateCalendarConflictMessages
+        .filter((message) => message.providerConversationId === FAMILY_GROUP)
+        .map((message) => message.text)
+        .join("\n"),
+    ).not.toMatch(new RegExp(`${PRIVATE_CALENDAR_ONLY_TITLE}|${PRIVATE_CALENDAR_CONFLICT_TITLE}`, "i"));
 
     let shared = await harness.florence.workspaceForAdult(harness.partnerAdultId);
     expect(shared.vault?.postalCode).toBe("94110");
@@ -2783,7 +3884,7 @@ class Harness {
 
   async drain(): Promise<void> {
     let idle = 0;
-    for (let index = 0; index < 50 && idle < 2; index += 1) {
+    for (let index = 0; index < 500 && idle < 2; index += 1) {
       const worked = await this.florence.runOnce();
       idle = worked ? 0 : idle + 1;
       if (!worked) await new Promise((resolve) => setTimeout(resolve, 0));
@@ -2861,6 +3962,7 @@ class FakeLinq {
   familyCalendarReadyFailuresRemaining = 0;
   familyCalendarReadyAcceptedReplaysRemaining = 0;
   googleDeletionDeliveryFailuresRemaining = 0;
+  oneShotReminderDeliveryFailuresRemaining = 0;
   staleReceiptForNextMessage = false;
 
   constructor(
@@ -3062,6 +4164,10 @@ class FakeLinq {
       this.googleDeletionDeliveryFailuresRemaining -= 1;
       throw new LinqError("provider_retryable", "The staged Google alert is still pending", true);
     }
+    if (this.oneShotReminderDeliveryFailuresRemaining > 0 && input.text === ONE_SHOT_REMINDER_TEXT) {
+      this.oneShotReminderDeliveryFailuresRemaining -= 1;
+      throw new LinqError("provider_retryable", "The one-shot reminder delivery is still pending", true);
+    }
     this.messages.push(input);
     this.state.timeline.push(`message:${input.text}`);
     this.ledger.nextMessageReceipt += 1;
@@ -3145,12 +4251,11 @@ function expectFreshLinqIncarnation(
 ): void {
   const expectedCounts = {
     founderHandoff: 2,
-    initialPrivateReview: 2,
     familyGroupCreate: 1,
     familyCalendarReady: 1,
     initialHouseholdBriefing: 1,
   } as const;
-  for (const category of Object.keys(expectedCounts) as (keyof LinqIncarnationSnapshot)[]) {
+  for (const category of Object.keys(expectedCounts) as (keyof typeof expectedCounts)[]) {
     const earlierDeliveries = earlier[category];
     const currentDeliveries = current[category];
     expect(earlierDeliveries).toHaveLength(expectedCounts[category]);
@@ -3163,6 +4268,17 @@ function expectFreshLinqIncarnation(
     expect(currentDeliveries.every((delivery) => !earlierKeys.has(delivery.key))).toBe(true);
     expect(currentDeliveries.every((delivery) => !earlierReceipts.has(delivery.receipt))).toBe(true);
   }
+  expect(earlier.initialPrivateReview).toHaveLength(2);
+  expect(current.initialPrivateReview).toHaveLength(2);
+  const earlierPrivateKeys = new Set(earlier.initialPrivateReview.map((delivery) => delivery.key));
+  const earlierPrivateReceipts = new Set(earlier.initialPrivateReview.map((delivery) => delivery.receipt));
+  for (const delivery of [...earlier.initialPrivateReview, ...current.initialPrivateReview]) {
+    expect(delivery.key).toMatch(/:h:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+  }
+  expect(current.initialPrivateReview.every((delivery) => !earlierPrivateKeys.has(delivery.key))).toBe(true);
+  expect(
+    current.initialPrivateReview.every((delivery) => !earlierPrivateReceipts.has(delivery.receipt)),
+  ).toBe(true);
 }
 
 async function createHarness(
@@ -3195,7 +4311,12 @@ async function createHarness(
     interestResearches: 0,
     voiceTranscriptions: 0,
     initialGoogleFailuresRemaining: 0,
+    initialClassifierFailuresRemaining: 0,
     initialGoogleFailureAdultId: null,
+    completeScanPaginationExercise: false,
+    wrongGoogleSubjectNext: false,
+    baselinePageReads: [],
+    initialHouseholdCalendarFailuresRemaining: 0,
     privateFactUpdatePending: false,
     privateFactUpdateDelivered: false,
     overlapGmailReadsRemaining: 0,
@@ -3224,6 +4345,16 @@ async function createHarness(
     initialUnrelatedAccountFactOnlyReview: false,
     calendarOnlyChangePending: false,
     calendarOnlyChangeDelivered: false,
+    privateCalendarAnniversaryPending: false,
+    privateCalendarAnniversaryDelivered: false,
+    familyCalendarEchoPending: false,
+    familyCalendarEchoDelivered: false,
+    familyCalendarMixedChangePending: false,
+    familyCalendarMixedChangeDelivered: false,
+    familyCalendarRealOnlyOverlapPending: false,
+    familyCalendarRealOnlyOverlapDelivered: false,
+    privateCalendarAdultEventPending: false,
+    privateCalendarAdultEventDelivered: false,
     unrelatedAccountEmailPending: false,
     unrelatedAccountEmailDelivered: false,
   };
@@ -3302,181 +4433,283 @@ function createReasoner(reason: Reason, state: HarnessState): FlorenceReasoner {
             ],
       };
     },
-    interpretCalendarApproval: async () => ({ approve: false }),
+    interpretCalendarApproval: async (
+      input: Parameters<FlorenceReasoner["interpretCalendarApproval"]>[0],
+    ) => ({ approve: input.currentMessage.text === PRIVATE_CALENDAR_OWNER_APPROVAL }),
     interpretPartnerInvitationApproval: async (
       input: Parameters<FlorenceReasoner["interpretPartnerInvitationApproval"]>[0],
     ) => ({
       sendInvitation:
         input.currentMessage.text === INVITE_APPROVAL || input.currentMessage.text === REINVITE_APPROVAL,
     }),
-    reviewPrivateGoogle: async (
-      input: Parameters<FlorenceReasoner["reviewPrivateGoogle"]>[0],
-      reads: Parameters<FlorenceReasoner["reviewPrivateGoogle"]>[1],
+    classifyPrivateGoogleBatch: async (
+      input: Parameters<FlorenceReasoner["classifyPrivateGoogleBatch"]>[0],
+      reads: Parameters<FlorenceReasoner["classifyPrivateGoogleBatch"]>[1],
     ) => {
-      state.privateReviews.push(input);
-      const current = Date.parse(input.currentTime);
-      const recent = await reads.searchGmail({
-        connectionId: input.googleConnection.connectionId,
-        query: "(school OR activity OR form) -category:promotions -category:social",
-        after: new Date(current - 14 * 24 * 60 * 60_000).toISOString(),
-        before: input.currentTime,
-        limit: 10,
-      });
-      await reads.searchGmail({
-        connectionId: input.googleConnection.connectionId,
-        query: "(school OR activity OR family) -category:promotions -category:social",
-        after: new Date(current - 90 * 24 * 60 * 60_000).toISOString(),
-        before: new Date(current - 14 * 24 * 60 * 60_000).toISOString(),
-        limit: 10,
-      });
-      const calendar = await reads.readPersonalCalendarWindow({
-        connectionId: input.googleConnection.connectionId,
-        timeMin: input.currentTime,
-        timeMax: new Date(current + 21 * 24 * 60 * 60_000).toISOString(),
-        limit: 50,
-      });
-      const source = recent[0];
-      if (!source) throw new Error("Initial review did not receive Gmail evidence");
-      const attachment = source.attachments[0];
-      if (attachment) {
-        const opened = await reads.readGmailAttachment({
-          connectionId: input.googleConnection.connectionId,
-          sourceId: source.sourceId,
-          attachment,
-        });
-        expect(opened.bytes).toEqual(PDF_BYTES);
+      if (!state.privateReviews.some((review) => review.adult.adultId === input.adult.adultId)) {
+        state.privateReviews.push(input);
       }
-      const founder = input.adult.firstName === "Hari";
+      const gmail = input.sources.filter(
+        (source): source is Extract<(typeof input.sources)[number], { kind: "gmail" }> =>
+          source.kind === "gmail",
+      );
+      const calendar = input.sources.filter(
+        (source): source is Extract<(typeof input.sources)[number], { kind: "calendar" }> =>
+          source.kind === "calendar",
+      );
+      if (
+        state.initialClassifierFailuresRemaining > 0 &&
+        input.googleConnection.connectionId === FOUNDER_GOOGLE &&
+        gmail.some((source) => source.subject === "Private school form")
+      ) {
+        state.initialClassifierFailuresRemaining -= 1;
+        throw new Error("Fake classifier failed before the provider page commit");
+      }
+      for (const source of gmail) {
+        const attachment = source.attachments[0];
+        if (attachment) {
+          const opened = await reads.readGmailAttachment({
+            connectionId: input.googleConnection.connectionId,
+            sourceId: source.sourceId,
+            attachment,
+          });
+          expect(opened.bytes).toEqual(PDF_BYTES);
+        }
+      }
       if (state.initialNoAttentionReview) {
         return {
-          bubbles: [{ text: PRIVATE_INITIAL_ALL_CLEAR, delayMs: 0 }],
           findings: [],
           facts: [],
+          dismissedSourceIds: input.sources.map((source) => source.sourceId),
         };
       }
-      if (founder && source.subject === UNRELATED_ACCOUNT_EMAIL_SUBJECT) {
-        if (state.initialUnrelatedAccountFactOnlyReview) {
-          return {
-            bubbles: [{ text: UNRELATED_ACCOUNT_EMAIL_ALERT, delayMs: 0 }],
-            findings: [],
-            facts: [
-              {
-                slot: UNRELATED_ACCOUNT_FACT_SLOT,
-                statement: UNRELATED_ACCOUNT_FACT,
-                familyRelevance: "adult_only" as const,
-                sourceIds: [source.sourceId],
-              },
-            ],
-          };
-        }
+      const founder = input.adult.firstName === "Hari";
+      const unrelated = gmail.filter((source) => source.subject === UNRELATED_ACCOUNT_EMAIL_SUBJECT);
+      const eligibleGmail = gmail.filter((source) => source.subject !== UNRELATED_ACCOUNT_EMAIL_SUBJECT);
+      const paginatedCalendarSource = calendar.find((source) => source.title === PAGINATED_CALENDAR_TITLE);
+      if (paginatedCalendarSource) {
         return {
-          bubbles: [{ text: UNRELATED_ACCOUNT_EMAIL_ALERT, delayMs: 0 }],
           findings: [
             {
-              privateSummary: UNRELATED_ACCOUNT_EMAIL_ALERT,
-              familyRelevance: "adult_only" as const,
-              sourceIds: [source.sourceId],
-              candidate: {
-                category: "loose_end" as const,
-                summary: "Hari’s retail account password changed.",
-                urgency: "now" as const,
-                dueAt: null,
-                needsAnswer: true,
-              },
+              privateSummary: PAGINATED_CALENDAR_FOLLOW_UP,
+              actionAnchor: PAGINATED_CALENDAR_TITLE,
+              familyRelevance: "child_care_school_or_activity" as const,
+              sourceIds: [paginatedCalendarSource.sourceId],
+              urgency: "watch" as const,
+              dueAt: "2026-09-03T17:00:00.000Z",
+              surfaceNow: false,
+              candidate: null,
               monitor: {
-                objective: UNRELATED_ACCOUNT_MONITOR_OBJECTIVE,
-                currentConclusion: "The account change needs the adult’s verification.",
-                endCondition: "The adult confirms the change or secures the account.",
-                nextCheck: new Date(Date.parse(input.currentTime) + 24 * 60 * 60_000).toISOString(),
-                why: "The account alert asks for verification.",
+                objective: "Resolve Maya’s school open-house plan.",
+                currentConclusion: PAGINATED_CALENDAR_FOLLOW_UP,
+                endCondition: "The family decides who will attend the school open house.",
+                nextCheck: "2026-08-24T18:00:00.000Z",
+                why: "This later-page Calendar item remains unresolved.",
               },
               familyCalendar: null,
             },
           ],
-          facts: [
-            {
-              slot: UNRELATED_ACCOUNT_FACT_SLOT,
-              statement: UNRELATED_ACCOUNT_FACT,
-              familyRelevance: "adult_only" as const,
-              sourceIds: [source.sourceId],
-            },
-          ],
+          facts: [],
+          dismissedSourceIds: input.sources
+            .map((source) => source.sourceId)
+            .filter((sourceId) => sourceId !== paginatedCalendarSource.sourceId),
         };
       }
-      if (founder && state.initialCalendarOnlyReview) {
-        const calendarSources = calendar.events.filter(
-          (event) =>
-            event.title === PRIVATE_INITIAL_CALENDAR_ONLY_EVENT.title ||
-            event.title === PRIVATE_INITIAL_CALENDAR_CONFLICT_EVENT.title,
-        );
-        if (calendarSources.length !== 2) {
-          throw new Error("Initial review did not receive both titled Calendar events");
-        }
+      if (founder && state.initialCalendarOnlyReview && gmail.length > 0) {
         return {
-          bubbles: [{ text: PRIVATE_CALENDAR_GENERIC_TODAY_REPLY, delayMs: 0 }],
+          findings: [],
+          facts: [],
+          dismissedSourceIds: gmail.map((source) => source.sourceId),
+        };
+      }
+      if (founder && state.initialCalendarOnlyReview && calendar.length > 0) {
+        return {
           findings: [
             {
               privateSummary: PRIVATE_CALENDAR_GENERIC_TODAY_REPLY,
+              actionAnchor: PRIVATE_INITIAL_CALENDAR_ONLY_EVENT.title,
               familyRelevance: "child_care_school_or_activity" as const,
-              sourceIds: [calendarSources[0]?.sourceId, source.sourceId, calendarSources[1]?.sourceId].filter(
-                (sourceId): sourceId is string => Boolean(sourceId),
-              ),
+              sourceIds: calendar.map((source) => source.sourceId),
+              urgency: "soon" as const,
+              dueAt: null,
+              surfaceNow: true,
               candidate: null,
               monitor: null,
               familyCalendar: null,
             },
           ],
           facts: [],
+          dismissedSourceIds: [],
         };
       }
-      return {
-        bubbles: [
-          {
-            text: `${input.adult.firstName}, I checked your side and found one family item worth tracking.`,
-            delayMs: 0,
-          },
-        ],
-        findings: [
-          {
-            privateSummary: founder
-              ? "Hari’s private school email has the original form."
-              : "Alex’s private calendar detail stays private.",
-            familyRelevance: "child_care_school_or_activity" as const,
-            sourceIds: [source.sourceId],
-            candidate: {
-              category: founder ? ("loose_end" as const) : ("deadline" as const),
-              summary: founder
-                ? "Maya’s field-trip form still needs a signature."
-                : "Maya’s permission-slip deadline is Tuesday.",
+      const source = eligibleGmail[0];
+      if (!source) {
+        return {
+          findings: [],
+          facts: [],
+          dismissedSourceIds: [...unrelated, ...calendar].map((candidate) => candidate.sourceId),
+        };
+      }
+      const sameSubjectRescan = input.googleConnection.connectionId === RECONNECTED_FOUNDER_GOOGLE;
+      const primaryFinding = {
+        privateSummary: founder
+          ? sameSubjectRescan
+            ? "The school form is still waiting on Hari’s side."
+            : "Hari’s private school email has the original form."
+          : "Alex’s private school email has the permission-slip deadline.",
+        actionAnchor: founder ? "field-trip form" : "permission-slip deadline",
+        familyRelevance: "child_care_school_or_activity" as const,
+        sourceIds: [source.sourceId],
+        urgency: "soon" as const,
+        dueAt: "2026-08-19T16:00:00.000Z",
+        surfaceNow: true,
+        candidate: {
+          category: founder ? ("loose_end" as const) : ("deadline" as const),
+          summary: founder
+            ? sameSubjectRescan
+              ? "The school form still needs a parent response."
+              : FOUNDER_FORM_SUMMARY
+            : PARTNER_PERMISSION_SUMMARY,
+          urgency: "soon" as const,
+          dueAt: "2026-08-19T16:00:00.000Z",
+          needsAnswer: true,
+        },
+        monitor: null,
+        familyCalendar: founder
+          ? state.founderProductRecenterReview
+            ? {
+                disposition: "automatic" as const,
+                sourceIds: [source.sourceId],
+                event: PRE_ACTIVATION_FAMILY_DATE,
+              }
+            : null
+          : {
+              disposition: "automatic" as const,
+              sourceIds: [source.sourceId],
+              event: AUTOMATIC_FAMILY_DATE,
+            },
+      };
+      const monitorFinding =
+        founder && state.founderProductRecenterReview
+          ? {
+              privateSummary: sameSubjectRescan
+                ? "The school form still needs confirmation on Hari’s side."
+                : "Florence is watching for confirmation that Maya’s field-trip form is signed.",
+              actionAnchor: "Muir Elementary",
+              familyRelevance: "child_care_school_or_activity" as const,
+              sourceIds: [source.sourceId],
               urgency: "soon" as const,
               dueAt: "2026-08-19T16:00:00.000Z",
-              needsAnswer: true,
+              surfaceNow: false,
+              candidate: null,
+              monitor: {
+                objective: sameSubjectRescan
+                  ? "Confirm that Maya’s field-trip form gets signed."
+                  : "Watch for confirmation that Maya’s field-trip form is signed.",
+                currentConclusion: "The form still needs a parent signature.",
+                endCondition: "A parent or the school confirms the form is signed.",
+                nextCheck: "2026-08-23T18:00:00.000Z",
+                why: "The school form has a live deadline.",
+              },
+              familyCalendar: null,
+            }
+          : null;
+      const findings = founder
+        ? [
+            primaryFinding,
+            ...(monitorFinding ? [monitorFinding] : []),
+            {
+              privateSummary: "The fall activity registration window opens Wednesday.",
+              actionAnchor: "activity registration window",
+              familyRelevance: "child_care_school_or_activity" as const,
+              sourceIds: [source.sourceId],
+              urgency: "soon" as const,
+              dueAt: "2026-08-20T16:00:00.000Z",
+              surfaceNow: true,
+              candidate: {
+                category: "conflict" as const,
+                summary: SHARED_DUPLICATE_CONFLICT_SUMMARY,
+                urgency: "soon" as const,
+                dueAt: "2026-08-20T16:00:00.000Z",
+                needsAnswer: true,
+              },
+              monitor: null,
+              familyCalendar: null,
             },
-            monitor:
-              founder && state.founderProductRecenterReview
-                ? {
-                    objective: "Watch for confirmation that Maya’s field-trip form is signed.",
-                    currentConclusion: "The form still needs a parent signature.",
-                    endCondition: "A parent or the school confirms the form is signed.",
-                    nextCheck: "2026-08-23T18:00:00.000Z",
-                    why: "The school form has a live deadline.",
-                  }
-                : null,
-            familyCalendar: founder
-              ? state.founderProductRecenterReview
-                ? {
-                    disposition: "automatic" as const,
-                    sourceIds: [source.sourceId],
-                    event: PRE_ACTIVATION_FAMILY_DATE,
-                  }
-                : null
-              : {
-                  disposition: "automatic" as const,
-                  sourceIds: [source.sourceId],
-                  event: AUTOMATIC_FAMILY_DATE,
-                },
-          },
-        ],
+            {
+              privateSummary: "Friday’s pickup handoff has not been assigned.",
+              actionAnchor: "pickup handoff",
+              familyRelevance: "household_logistics" as const,
+              sourceIds: [source.sourceId],
+              urgency: "soon" as const,
+              dueAt: "2026-08-21T21:45:00.000Z",
+              surfaceNow: true,
+              candidate: {
+                category: "handoff" as const,
+                summary: SCHOOL_HANDOFF_SUMMARY,
+                urgency: "soon" as const,
+                dueAt: "2026-08-21T21:45:00.000Z",
+                needsAnswer: true,
+              },
+              monitor: null,
+              familyCalendar: null,
+            },
+            {
+              privateSummary: sameSubjectRescan
+                ? "One more private school detail remains unresolved."
+                : PRIVATE_INITIAL_ONLY_FINDING,
+              actionAnchor: "private school detail",
+              familyRelevance: "child_care_school_or_activity" as const,
+              sourceIds: [source.sourceId],
+              urgency: "watch" as const,
+              dueAt: null,
+              surfaceNow: true,
+              candidate: null,
+              monitor: null,
+              familyCalendar: null,
+            },
+          ]
+        : [
+            primaryFinding,
+            {
+              privateSummary: "The fall activity registration window is also on Alex’s side.",
+              actionAnchor: "activity registration window",
+              familyRelevance: "child_care_school_or_activity" as const,
+              sourceIds: [source.sourceId],
+              urgency: "soon" as const,
+              dueAt: "2026-08-20T16:00:00.000Z",
+              surfaceNow: true,
+              candidate: {
+                category: "conflict" as const,
+                summary: SHARED_DUPLICATE_CONFLICT_SUMMARY,
+                urgency: "soon" as const,
+                dueAt: "2026-08-20T16:00:00.000Z",
+                needsAnswer: true,
+              },
+              monitor: null,
+              familyCalendar: null,
+            },
+            {
+              privateSummary: "The family meeting is on Alex’s calendar for Tuesday evening.",
+              actionAnchor: "family meeting",
+              familyRelevance: "household_logistics" as const,
+              sourceIds: [source.sourceId],
+              urgency: "watch" as const,
+              dueAt: "2026-09-01T15:00:00.000Z",
+              surfaceNow: true,
+              candidate: {
+                category: "family_date" as const,
+                summary: FAMILY_MEETING_SUMMARY,
+                urgency: "watch" as const,
+                dueAt: "2026-09-01T15:00:00.000Z",
+                needsAnswer: false,
+              },
+              monitor: null,
+              familyCalendar: null,
+            },
+          ];
+      return {
+        findings,
         facts: [
           {
             slot: founder ? PRIVATE_SCHOOL_FACT_SLOT : PARTNER_PRIVATE_GOOGLE_FACT_SLOT,
@@ -3484,7 +4717,26 @@ function createReasoner(reason: Reason, state: HarnessState): FlorenceReasoner {
             familyRelevance: "child_care_school_or_activity" as const,
             sourceIds: [source.sourceId],
           },
+          {
+            slot: SHARED_SCHOOL_CONTACT_SLOT,
+            statement: SHARED_SCHOOL_CONTACT_FACT,
+            familyRelevance: "child_care_school_or_activity" as const,
+            sourceIds: [source.sourceId],
+          },
+          ...(founder
+            ? [
+                {
+                  slot: GOOGLE_CORRECTION_SLOT,
+                  statement: GOOGLE_CORRECTION_FACT,
+                  familyRelevance: "child_care_school_or_activity" as const,
+                  sourceIds: [source.sourceId],
+                },
+              ]
+            : []),
         ],
+        dismissedSourceIds: [...unrelated, ...calendar, ...eligibleGmail.slice(1)].map(
+          (candidate) => candidate.sourceId,
+        ),
       };
     },
     synthesizeHouseholdBriefing: async (
@@ -3492,12 +4744,12 @@ function createReasoner(reason: Reason, state: HarnessState): FlorenceReasoner {
     ) => {
       state.briefings.push(input);
       return {
-        selectedCandidateIds: input.candidates.map((candidate) => candidate.candidateId).slice(0, 3),
+        selectedCandidateIds: input.candidates.map((candidate) => candidate.candidateId),
         bubbles: [
           {
             text: `Here’s what I found:\n${input.candidates
               .map((candidate) => `– ${candidate.summary}`)
-              .join("\n")}\n\nDid I get that right?`,
+              .join("\n")}\n\nDid I get that right? If I missed something, tell me here.`,
             delayMs: 0,
           },
         ],
@@ -3520,6 +4772,15 @@ function createReasoner(reason: Reason, state: HarnessState): FlorenceReasoner {
           candidate.title === PRIVATE_CALENDAR_CONFLICT_TITLE,
       );
       const calendarOnlySource = calendarOnlySources[0];
+      const privateCalendarAnniversarySource = input.evidence.calendar.events.find(
+        (candidate) => candidate.title === PRIVATE_CALENDAR_ANNIVERSARY_TITLE,
+      );
+      const familyCalendarMixedChangeSource = input.evidence.calendar.events.find(
+        (candidate) => candidate.title === FAMILY_CALENDAR_MIXED_CHANGE_TITLE,
+      );
+      const privateCalendarAdultSource = input.evidence.calendar.events.find(
+        (candidate) => candidate.title === PRIVATE_CALENDAR_ADULT_TITLE,
+      );
       const unrelatedAccountSource = input.evidence.gmail.sources.find(
         (candidate) => candidate.subject === UNRELATED_ACCOUNT_EMAIL_SUBJECT,
       );
@@ -3528,67 +4789,182 @@ function createReasoner(reason: Reason, state: HarnessState): FlorenceReasoner {
         state.overlapGmailAssessments += 1;
         state.overlapGmailSourceId = overlap.sourceId;
       }
-      return {
-        findings: unrelatedAccountSource
+      const decision = {
+        findings: familyCalendarMixedChangeSource
           ? [
               {
-                privateDetail: UNRELATED_ACCOUNT_EMAIL_ALERT,
-                familyRelevance: "adult_only" as const,
-                householdConclusion: null,
-                sourceIds: [unrelatedAccountSource.sourceId],
-                urgency: "now" as const,
-                materialChange: true,
-                monitor: {
-                  operation: "create" as const,
-                  monitorId: null,
-                  objective: UNRELATED_ACCOUNT_MONITOR_OBJECTIVE,
-                  currentConclusion: "The account change needs the adult’s verification.",
-                  endCondition: "The adult confirms the change or secures the account.",
-                  nextCheck: new Date(Date.parse(input.currentTime) + 24 * 60 * 60_000).toISOString(),
-                  why: "The account alert asks for verification.",
+                privateDetail: null,
+                actionAnchor: FAMILY_CALENDAR_MIXED_CHANGE_TITLE,
+                familyRelevance: "child_care_school_or_activity" as const,
+                householdConclusion: {
+                  category: "family_date" as const,
+                  summary: FAMILY_CALENDAR_MIXED_CHANGE_SUMMARY,
+                  urgency: "soon" as const,
+                  dueAt: FAMILY_CALENDAR_MIXED_CHANGE_EVENT.startsAt,
+                  needsAnswer: false,
                 },
+                sourceIds: [
+                  ...(privateCalendarAnniversarySource ? [privateCalendarAnniversarySource.sourceId] : []),
+                  familyCalendarMixedChangeSource.sourceId,
+                ],
+                urgency: "soon" as const,
+                dueAt: FAMILY_CALENDAR_MIXED_CHANGE_EVENT.startsAt,
+                materialChange: true,
+                monitor: null,
                 familyCalendar: null,
               },
             ]
-          : calendarOnlySource
+          : privateCalendarAdultSource
             ? [
                 {
-                  privateDetail: PRIVATE_CALENDAR_GENERIC_TODAY_REPLY,
-                  familyRelevance: "child_care_school_or_activity" as const,
-                  householdConclusion: null,
-                  sourceIds: calendarOnlySources.map((source) => source.sourceId),
-                  urgency: "now" as const,
+                  privateDetail: `${PRIVATE_CALENDAR_ADULT_TITLE} is on Tuesday.`,
+                  actionAnchor: PRIVATE_CALENDAR_ADULT_TITLE,
+                  familyRelevance: "household_logistics" as const,
+                  householdConclusion: {
+                    category: "loose_end" as const,
+                    summary: `${PRIVATE_CALENDAR_ADULT_TITLE} is on Tuesday at ${PRIVATE_CALENDAR_ADULT_EVENT.location}.`,
+                    urgency: "watch" as const,
+                    dueAt: PRIVATE_CALENDAR_ADULT_EVENT.startsAt,
+                    needsAnswer: false,
+                  },
+                  sourceIds: [
+                    privateCalendarAdultSource.sourceId,
+                    ...(unrelatedAccountSource ? [unrelatedAccountSource.sourceId] : []),
+                  ],
+                  urgency: "watch" as const,
+                  dueAt: PRIVATE_CALENDAR_ADULT_EVENT.startsAt,
                   materialChange: true,
                   monitor: null,
-                  familyCalendar: null,
+                  familyCalendar: {
+                    disposition: "automatic" as const,
+                    sourceIds: [unrelatedAccountSource?.sourceId ?? privateCalendarAdultSource.sourceId],
+                    event: {
+                      intervalKind: "timed" as const,
+                      title: PRIVATE_CALENDAR_ADULT_TITLE,
+                      startsAt: PRIVATE_CALENDAR_ADULT_EVENT.startsAt,
+                      endsAt: PRIVATE_CALENDAR_ADULT_EVENT.endsAt,
+                      timeZone: "America/Los_Angeles",
+                      location: PRIVATE_CALENDAR_ADULT_EVENT.location,
+                    },
+                  },
                 },
               ]
-            : deletionSource
+            : privateCalendarAnniversarySource
               ? [
                   {
-                    privateDetail: GOOGLE_DELETION_PRIVATE_ALERT,
-                    familyRelevance: "child_care_school_or_activity" as const,
-                    householdConclusion: null,
-                    sourceIds: [deletionSource.sourceId],
-                    urgency: "soon" as const,
-                    materialChange: true,
-                    monitor: {
-                      operation: "create" as const,
-                      monitorId: null,
-                      objective: "Watch for confirmation that Maya’s emergency card is signed.",
-                      currentConclusion: "The emergency card still needs a signature.",
-                      endCondition: "A parent or the school confirms the emergency card is signed.",
-                      nextCheck: new Date(Date.parse(input.currentTime) + 60 * 60_000).toISOString(),
-                      why: "The school reminder has a live deadline.",
+                    privateDetail: `${PRIVATE_CALENDAR_ANNIVERSARY_TITLE} is on Monday.`,
+                    actionAnchor: PRIVATE_CALENDAR_ANNIVERSARY_TITLE,
+                    familyRelevance: "household_logistics" as const,
+                    householdConclusion: {
+                      category: "family_date" as const,
+                      summary: `${PRIVATE_CALENDAR_ANNIVERSARY_TITLE} is on Monday at ${PRIVATE_CALENDAR_ANNIVERSARY_EVENT.location}.`,
+                      urgency: "watch" as const,
+                      dueAt: PRIVATE_CALENDAR_ANNIVERSARY_EVENT.startsAt,
+                      needsAnswer: false,
                     },
+                    sourceIds: [privateCalendarAnniversarySource.sourceId],
+                    urgency: "watch" as const,
+                    dueAt: PRIVATE_CALENDAR_ANNIVERSARY_EVENT.startsAt,
+                    materialChange: true,
+                    monitor: null,
                     familyCalendar: {
-                      disposition: "suggest" as const,
-                      sourceIds: [deletionSource.sourceId],
-                      event: GOOGLE_DELETION_FAMILY_DATE,
+                      disposition: "automatic" as const,
+                      sourceIds: [privateCalendarAnniversarySource.sourceId],
+                      event: {
+                        intervalKind: "timed" as const,
+                        title: PRIVATE_CALENDAR_ANNIVERSARY_TITLE,
+                        startsAt: PRIVATE_CALENDAR_ANNIVERSARY_EVENT.startsAt,
+                        endsAt: PRIVATE_CALENDAR_ANNIVERSARY_EVENT.endsAt,
+                        timeZone: "America/Los_Angeles",
+                        location: PRIVATE_CALENDAR_ANNIVERSARY_EVENT.location,
+                      },
                     },
                   },
                 ]
-              : [],
+              : unrelatedAccountSource
+                ? [
+                    {
+                      privateDetail: UNRELATED_ACCOUNT_EMAIL_ALERT,
+                      actionAnchor: "password changed",
+                      familyRelevance: "adult_only" as const,
+                      householdConclusion: null,
+                      sourceIds: [unrelatedAccountSource.sourceId],
+                      urgency: "now" as const,
+                      dueAt: null,
+                      materialChange: true,
+                      monitor: {
+                        operation: "create" as const,
+                        monitorId: null,
+                        objective: UNRELATED_ACCOUNT_MONITOR_OBJECTIVE,
+                        currentConclusion: "The account change needs the adult’s verification.",
+                        endCondition: "The adult confirms the change or secures the account.",
+                        nextCheck: new Date(Date.parse(input.currentTime) + 24 * 60 * 60_000).toISOString(),
+                        why: "The account alert asks for verification.",
+                      },
+                      familyCalendar: null,
+                    },
+                  ]
+                : calendarOnlySource
+                  ? [
+                      {
+                        privateDetail: PRIVATE_CALENDAR_GENERIC_TODAY_REPLY,
+                        actionAnchor: PRIVATE_CALENDAR_ONLY_TITLE,
+                        familyRelevance: "child_care_school_or_activity" as const,
+                        householdConclusion: {
+                          category: "conflict" as const,
+                          summary: `${PRIVATE_CALENDAR_ONLY_TITLE} overlaps ${PRIVATE_CALENDAR_CONFLICT_TITLE}.`,
+                          urgency: "now" as const,
+                          dueAt: PRIVATE_CALENDAR_ONLY_EVENT.startsAt,
+                          needsAnswer: true,
+                        },
+                        sourceIds: calendarOnlySources.map((source) => source.sourceId),
+                        urgency: "now" as const,
+                        dueAt: PRIVATE_CALENDAR_ONLY_EVENT.startsAt,
+                        materialChange: true,
+                        monitor: null,
+                        familyCalendar: null,
+                      },
+                    ]
+                  : deletionSource
+                    ? [
+                        {
+                          privateDetail: GOOGLE_DELETION_PRIVATE_ALERT,
+                          actionAnchor: "emergency card",
+                          familyRelevance: "child_care_school_or_activity" as const,
+                          householdConclusion: null,
+                          sourceIds: [deletionSource.sourceId],
+                          urgency: "soon" as const,
+                          dueAt: null,
+                          materialChange: true,
+                          monitor: {
+                            operation: "create" as const,
+                            monitorId: null,
+                            objective: "Watch for confirmation that Maya’s emergency card is signed.",
+                            currentConclusion: "The emergency card still needs a signature.",
+                            endCondition: "A parent or the school confirms the emergency card is signed.",
+                            nextCheck: new Date(Date.parse(input.currentTime) + 60 * 60_000).toISOString(),
+                            why: "The school reminder has a live deadline.",
+                          },
+                          familyCalendar: null,
+                        },
+                        {
+                          privateDetail: null,
+                          actionAnchor: GOOGLE_DELETION_FAMILY_DATE.title,
+                          familyRelevance: "child_care_school_or_activity" as const,
+                          householdConclusion: null,
+                          sourceIds: [deletionSource.sourceId],
+                          urgency: "soon" as const,
+                          dueAt: null,
+                          materialChange: true,
+                          monitor: null,
+                          familyCalendar: {
+                            disposition: "suggest" as const,
+                            sourceIds: [deletionSource.sourceId],
+                            event: GOOGLE_DELETION_FAMILY_DATE,
+                          },
+                        },
+                      ]
+                    : [],
         facts: unrelatedAccountSource
           ? [
               {
@@ -3599,7 +4975,14 @@ function createReasoner(reason: Reason, state: HarnessState): FlorenceReasoner {
               },
             ]
           : calendarOnlySource
-            ? []
+            ? [
+                {
+                  slot: PRIVATE_CALENDAR_FACT_SLOT,
+                  statement: PRIVATE_CALENDAR_FACT,
+                  familyRelevance: "child_care_school_or_activity" as const,
+                  sourceIds: [calendarOnlySource.sourceId],
+                },
+              ]
             : deletionSource
               ? [
                   {
@@ -3617,6 +5000,12 @@ function createReasoner(reason: Reason, state: HarnessState): FlorenceReasoner {
                       familyRelevance: "child_care_school_or_activity" as const,
                       sourceIds: [source.sourceId],
                     },
+                    {
+                      slot: GOOGLE_CORRECTION_SLOT,
+                      statement: GOOGLE_CORRECTION_FACT,
+                      familyRelevance: "child_care_school_or_activity" as const,
+                      sourceIds: [source.sourceId],
+                    },
                   ]
                 : overlap && state.overlapGmailAssessments === 2
                   ? [
@@ -3628,6 +5017,16 @@ function createReasoner(reason: Reason, state: HarnessState): FlorenceReasoner {
                       },
                     ]
                   : [],
+      };
+      const usedSourceIds = new Set([
+        ...decision.findings.flatMap((finding) => finding.sourceIds),
+        ...decision.facts.flatMap((fact) => fact.sourceIds),
+      ]);
+      return {
+        ...decision,
+        dismissedSourceIds: [...input.evidence.gmail.sources, ...input.evidence.calendar.events]
+          .map((candidate) => candidate.sourceId)
+          .filter((sourceId) => !usedSourceIds.has(sourceId)),
       };
     },
     reviewFiniteMonitor: async (input: Parameters<FlorenceReasoner["reviewFiniteMonitor"]>[0]) => {
@@ -3727,47 +5126,48 @@ function createGoogle(store: PostgresFlorenceStore, state: HarnessState): Google
     currentTime: string;
   }) => {
     const familyEvents = [...state.calendarEvents.values()];
-    const events = input.calendarId
-      ? state.monitorCancellationActive
-        ? familyEvents.slice(0, 1).map((event) => ({
-            providerEventId: event.providerEventId,
-            providerRevision: `${event.providerRevision}-cancelled`,
-            providerUpdatedAt: new Date(state.now).toISOString(),
-            status: "cancelled" as const,
-            busy: false,
-            title: null,
-            startsAt: null,
-            endsAt: null,
-            allDay: null,
-            timeZone: null,
-            startDate: null,
-            endDate: null,
-          }))
-        : state.monitorEvidenceExercise && state.finiteReviews === 0
-          ? familyEvents.map((event) => ({
-              ...event,
-              providerRevision: `${event.providerRevision}-silent-observation`,
+    const events =
+      input.calendarId && input.calendarId !== "primary"
+        ? state.monitorCancellationActive
+          ? familyEvents.slice(0, 1).map((event) => ({
+              providerEventId: event.providerEventId,
+              providerRevision: `${event.providerRevision}-cancelled`,
               providerUpdatedAt: new Date(state.now).toISOString(),
+              status: "cancelled" as const,
+              busy: false,
+              title: null,
+              startsAt: null,
+              endsAt: null,
+              allDay: null,
+              timeZone: null,
+              startDate: null,
+              endDate: null,
             }))
-          : familyEvents
-      : state.initialCalendarOnlyReview && input.ownerAdultId === founderSetup().adultId
-        ? [PRIVATE_INITIAL_CALENDAR_ONLY_EVENT, PRIVATE_INITIAL_CALENDAR_CONFLICT_EVENT]
-        : [
-            {
-              providerEventId: `private-event-${input.ownerAdultId}`,
-              providerRevision: `private-revision-${input.ownerAdultId}`,
-              providerUpdatedAt: new Date(state.now).toISOString(),
-              status: "confirmed" as const,
-              busy: true,
-              title: "Private calendar detail",
-              intervalKind: "timed" as const,
-              startsAt: "2026-08-18T17:00:00.000Z",
-              endsAt: "2026-08-18T18:00:00.000Z",
-              allDay: false,
-              timeZone: "America/Los_Angeles",
-              location: null,
-            },
-          ];
+          : state.monitorEvidenceExercise && state.finiteReviews === 0
+            ? familyEvents.map((event) => ({
+                ...event,
+                providerRevision: `${event.providerRevision}-silent-observation`,
+                providerUpdatedAt: new Date(state.now).toISOString(),
+              }))
+            : familyEvents
+        : state.initialCalendarOnlyReview && input.ownerAdultId === founderSetup().adultId
+          ? [PRIVATE_INITIAL_CALENDAR_ONLY_EVENT, PRIVATE_INITIAL_CALENDAR_CONFLICT_EVENT]
+          : [
+              {
+                providerEventId: `private-event-${input.ownerAdultId}`,
+                providerRevision: `private-revision-${input.ownerAdultId}`,
+                providerUpdatedAt: new Date(state.now).toISOString(),
+                status: "confirmed" as const,
+                busy: true,
+                title: "Private calendar detail",
+                intervalKind: "timed" as const,
+                startsAt: "2026-08-18T17:00:00.000Z",
+                endsAt: "2026-08-18T18:00:00.000Z",
+                allDay: false,
+                timeZone: "America/Los_Angeles",
+                location: null,
+              },
+            ];
     return {
       status: "complete" as const,
       events,
@@ -3805,15 +5205,35 @@ function createGoogle(store: PostgresFlorenceStore, state: HarnessState): Google
       });
       if (!pending) throw new Error("Fake Google state was not pending");
       const founder = pending.ownerAdultId === founderSetup().adultId;
-      return store.activate({
-        connectionId: pending.connectionId,
-        stateDigest,
-        googleSubjectDigest: digest(founder ? "google-founder" : "google-partner"),
-        emailLabel: founder ? "hari@example.com" : "alex@example.com",
-        grantedScopes: GOOGLE_SCOPES,
-        refreshTokenEnvelope: founder ? "encrypted-founder-token" : "encrypted-partner-token",
-        now: input.now,
-      });
+      try {
+        return await store.activate({
+          connectionId: pending.connectionId,
+          stateDigest,
+          googleSubjectDigest: digest(
+            state.wrongGoogleSubjectNext
+              ? "a-different-google-account"
+              : founder
+                ? "google-founder"
+                : "google-partner",
+          ),
+          emailLabel: founder ? "hari@example.com" : "alex@example.com",
+          grantedScopes: GOOGLE_SCOPES,
+          refreshTokenEnvelope: founder ? "encrypted-founder-token" : "encrypted-partner-token",
+          now: input.now,
+        });
+      } catch (error) {
+        if (
+          error &&
+          typeof error === "object" &&
+          "code" in error &&
+          error.code === "google_identity_conflict"
+        ) {
+          throw new GoogleConnectionError("Reconnect the same Google account", "identity_conflict");
+        }
+        throw error;
+      } finally {
+        state.wrongGoogleSubjectNext = false;
+      }
     },
     provisionFamilyCalendar: async (
       input: FamilyCalendarProvisioningInput,
@@ -3872,6 +5292,208 @@ function createGoogle(store: PostgresFlorenceStore, state: HarnessState): Google
         kind: "gmail_history_v1" as const,
         historyId: input.ownerAdultId === founderSetup().adultId ? "101" : "201",
         capturedAt: new Date(state.now).toISOString(),
+      };
+    },
+    readGmailBaselinePage: async (input: {
+      householdId: string;
+      ownerAdultId: string;
+      connectionId: string;
+      after: string;
+      before: string;
+      pageToken?: string;
+    }) => {
+      await activeCredential(input);
+      state.baselinePageReads.push({
+        kind: "gmail",
+        ownerAdultId: input.ownerAdultId,
+        connectionId: input.connectionId,
+        pageToken: input.pageToken ?? null,
+        calendarId: null,
+      });
+      const founder = input.ownerAdultId === founderSetup().adultId;
+      const initialUnrelatedAccount =
+        founder && (state.initialUnrelatedAccountReview || state.initialUnrelatedAccountFactOnlyReview);
+      const messageId = initialUnrelatedAccount
+        ? "gmail-initial-unrelated-retail-account-alert"
+        : founder
+          ? SCHOOL_ATTACHMENT.messageId
+          : `gmail-${input.ownerAdultId}-true`;
+      const relevant = {
+        messageId,
+        threadId: `thread-${messageId}`,
+        historyId: founder ? "101" : "201",
+        from: initialUnrelatedAccount
+          ? "account@example.test"
+          : founder
+            ? "hari-private@example.com"
+            : "alex-private@example.com",
+        subject: initialUnrelatedAccount
+          ? UNRELATED_ACCOUNT_EMAIL_SUBJECT
+          : founder
+            ? "Private school form"
+            : "Private family schedule",
+        sentAt: new Date(Date.parse(input.before) - 1_000).toISOString(),
+        text: initialUnrelatedAccount
+          ? "Your retail account password was changed."
+          : founder
+            ? "Hari private email: Maya attends Muir Elementary and her form needs a signature."
+            : "Alex private email: a personal appointment moved.",
+        textStatus: "complete" as const,
+        attachmentsStatus: "complete" as const,
+        attachments: !initialUnrelatedAccount && founder ? [SCHOOL_ATTACHMENT] : [],
+      };
+      if (state.completeScanPaginationExercise && founder && input.connectionId === FOUNDER_GOOGLE) {
+        if (input.pageToken === undefined) {
+          return {
+            status: "truncated" as const,
+            nextPageToken: "gmail-baseline-page-2",
+            messages: Array.from({ length: 50 }, (_, index) => ({
+              ...relevant,
+              messageId: `gmail-archived-irrelevant-${index}`,
+              threadId: `thread-gmail-archived-irrelevant-${index}`,
+              historyId: String(1_000 + index),
+              subject: UNRELATED_ACCOUNT_EMAIL_SUBJECT,
+              text:
+                index === 0
+                  ? "Archived adult-only account notice. Code 123456. https://example.test/reset?token=fake-only-token-value-1234567890"
+                  : "Archived adult-only account notice.",
+              attachments: [],
+            })),
+          };
+        }
+        expect(input.pageToken).toBe("gmail-baseline-page-2");
+      } else {
+        expect(input.pageToken).toBeUndefined();
+      }
+      return { status: "complete" as const, nextPageToken: null, messages: [relevant] };
+    },
+    readCalendarBaselineTargetsPage: async (input: {
+      householdId: string;
+      ownerAdultId: string;
+      connectionId: string;
+      excludedFamilyCalendarId: string | null;
+      pageToken?: string;
+    }) => {
+      await activeCredential(input);
+      state.baselinePageReads.push({
+        kind: "calendar_targets",
+        ownerAdultId: input.ownerAdultId,
+        connectionId: input.connectionId,
+        pageToken: input.pageToken ?? null,
+        calendarId: null,
+      });
+      const founder = input.ownerAdultId === founderSetup().adultId;
+      if (state.completeScanPaginationExercise && founder && input.connectionId === FOUNDER_GOOGLE) {
+        if (input.pageToken === undefined) {
+          return {
+            status: "truncated" as const,
+            nextPageToken: "calendar-targets-page-2",
+            targets: Array.from({ length: 50 }, (_, index) => ({
+              calendarId: `secondary-calendar-${index}`,
+              timeZone: "America/Los_Angeles",
+              accessRole: "reader" as const,
+              primary: false,
+            })),
+          };
+        }
+        expect(input.pageToken).toBe("calendar-targets-page-2");
+      } else {
+        expect(input.pageToken).toBeUndefined();
+      }
+      return {
+        status: "complete" as const,
+        nextPageToken: null,
+        targets:
+          input.excludedFamilyCalendarId === "primary"
+            ? []
+            : [
+                {
+                  calendarId: "primary",
+                  timeZone: "America/Los_Angeles",
+                  accessRole: "owner" as const,
+                  primary: true,
+                },
+              ],
+      };
+    },
+    readCalendarBaselineEventsPage: async (input: {
+      householdId: string;
+      ownerAdultId: string;
+      connectionId: string;
+      target: {
+        calendarId: string;
+        timeZone: string;
+        accessRole: "reader" | "writerWithoutPrivateAccess" | "writer" | "owner";
+        primary: boolean;
+      };
+      timeMin: string;
+      timeMax: string;
+      pageToken?: string;
+    }) => {
+      await activeCredential(input);
+      state.baselinePageReads.push({
+        kind: "calendar_events",
+        ownerAdultId: input.ownerAdultId,
+        connectionId: input.connectionId,
+        pageToken: input.pageToken ?? null,
+        calendarId: input.target.calendarId,
+      });
+      const founder = input.ownerAdultId === founderSetup().adultId;
+      if (
+        state.completeScanPaginationExercise &&
+        founder &&
+        input.connectionId === FOUNDER_GOOGLE &&
+        input.target.calendarId === "primary"
+      ) {
+        if (input.pageToken === undefined) {
+          return {
+            status: "truncated" as const,
+            nextPageToken: "calendar-events-page-2",
+            events: Array.from({ length: 50 }, (_, index) => ({
+              providerEventId: `archived-calendar-event-${index}`,
+              providerRevision: `archived-calendar-revision-${index}`,
+              providerUpdatedAt: new Date(Date.parse(input.timeMin) + index * 1_000).toISOString(),
+              status: "confirmed" as const,
+              busy: false,
+              title: `Archived adult calendar item ${index}`,
+              intervalKind: "timed" as const,
+              startsAt: "2026-08-20T17:00:00.000Z",
+              endsAt: "2026-08-20T18:00:00.000Z",
+              allDay: false,
+              timeZone: "America/Los_Angeles",
+              location: null,
+            })),
+          };
+        }
+        expect(input.pageToken).toBe("calendar-events-page-2");
+        return {
+          status: "complete" as const,
+          nextPageToken: null,
+          events: [
+            ...baseline({ ...input, calendarId: input.target.calendarId, currentTime: input.timeMin }).events,
+            {
+              providerEventId: "paginated-calendar-final-event",
+              providerRevision: "paginated-calendar-final-revision",
+              providerUpdatedAt: new Date(Date.parse(input.timeMax) - 1_000).toISOString(),
+              status: "confirmed" as const,
+              busy: true,
+              title: PAGINATED_CALENDAR_TITLE,
+              intervalKind: "timed" as const,
+              startsAt: "2026-09-03T17:00:00.000Z",
+              endsAt: "2026-09-03T18:00:00.000Z",
+              allDay: false,
+              timeZone: "America/Los_Angeles",
+              location: null,
+            },
+          ],
+        };
+      }
+      expect(input.pageToken).toBeUndefined();
+      return {
+        status: "complete" as const,
+        nextPageToken: null,
+        events: baseline({ ...input, calendarId: input.target.calendarId, currentTime: input.timeMin })
+          .events,
       };
     },
     searchGmail: async (input: {
@@ -3968,6 +5590,10 @@ function createGoogle(store: PostgresFlorenceStore, state: HarnessState): Google
       limit: number;
     }) => {
       await activeCredential(input);
+      if (input.calendarId && state.initialHouseholdCalendarFailuresRemaining > 0) {
+        state.initialHouseholdCalendarFailuresRemaining -= 1;
+        return { status: "unavailable" as const, events: [], cursor: null };
+      }
       return baseline(input);
     },
     readGmailChanges: async (input: {
@@ -4005,6 +5631,7 @@ function createGoogle(store: PostgresFlorenceStore, state: HarnessState): Google
       return {
         status: "complete" as const,
         resyncRequired: false as const,
+        removedMessageIds: [],
         messages: hasUnrelatedAccountEmail
           ? [
               {
@@ -4104,15 +5731,59 @@ function createGoogle(store: PostgresFlorenceStore, state: HarnessState): Google
         state.calendarOnlyChangePending &&
         !state.calendarOnlyChangeDelivered;
       if (hasCalendarOnlyChange) state.calendarOnlyChangeDelivered = true;
+      const hasPrivateCalendarAnniversary =
+        input.ownerAdultId === founderSetup().adultId &&
+        input.calendarId === "primary" &&
+        state.privateCalendarAnniversaryPending &&
+        !state.privateCalendarAnniversaryDelivered;
+      if (hasPrivateCalendarAnniversary) state.privateCalendarAnniversaryDelivered = true;
+      const hasFamilyCalendarEcho =
+        input.calendarId !== "primary" &&
+        state.familyCalendarEchoPending &&
+        !state.familyCalendarEchoDelivered;
+      if (hasFamilyCalendarEcho) state.familyCalendarEchoDelivered = true;
+      const hasFamilyCalendarMixedChange =
+        input.calendarId !== "primary" &&
+        state.familyCalendarMixedChangePending &&
+        !state.familyCalendarMixedChangeDelivered;
+      if (hasFamilyCalendarMixedChange) state.familyCalendarMixedChangeDelivered = true;
+      const hasFamilyCalendarRealOnlyOverlap =
+        input.calendarId !== "primary" &&
+        state.familyCalendarRealOnlyOverlapPending &&
+        !state.familyCalendarRealOnlyOverlapDelivered;
+      if (hasFamilyCalendarRealOnlyOverlap) state.familyCalendarRealOnlyOverlapDelivered = true;
+      const hasPrivateCalendarAdultEvent =
+        input.ownerAdultId === founderSetup().adultId &&
+        input.calendarId === "primary" &&
+        state.privateCalendarAdultEventPending &&
+        !state.privateCalendarAdultEventDelivered;
+      if (hasPrivateCalendarAdultEvent) state.privateCalendarAdultEventDelivered = true;
       return {
         status: "complete" as const,
         resyncRequired: false as const,
-        events: hasCalendarOnlyChange
-          ? [
-              { ...PRIVATE_CALENDAR_ONLY_EVENT, providerUpdatedAt: input.currentTime },
-              { ...PRIVATE_CALENDAR_CONFLICT_EVENT, providerUpdatedAt: input.currentTime },
-            ]
-          : [],
+        events: hasFamilyCalendarRealOnlyOverlap
+          ? [{ ...FAMILY_CALENDAR_MIXED_CHANGE_EVENT, providerUpdatedAt: input.currentTime }]
+          : hasFamilyCalendarMixedChange
+            ? [
+                ...[...state.calendarEvents.values()].filter(
+                  (event) => event.title === PRIVATE_CALENDAR_ANNIVERSARY_TITLE,
+                ),
+                { ...FAMILY_CALENDAR_MIXED_CHANGE_EVENT, providerUpdatedAt: input.currentTime },
+              ]
+            : hasFamilyCalendarEcho
+              ? [...state.calendarEvents.values()].filter(
+                  (event) => event.title === PRIVATE_CALENDAR_ANNIVERSARY_TITLE,
+                )
+              : hasPrivateCalendarAdultEvent
+                ? [{ ...PRIVATE_CALENDAR_ADULT_EVENT, providerUpdatedAt: input.currentTime }]
+                : hasPrivateCalendarAnniversary
+                  ? [{ ...PRIVATE_CALENDAR_ANNIVERSARY_EVENT, providerUpdatedAt: input.currentTime }]
+                  : hasCalendarOnlyChange
+                    ? [
+                        { ...PRIVATE_CALENDAR_ONLY_EVENT, providerUpdatedAt: input.currentTime },
+                        { ...PRIVATE_CALENDAR_CONFLICT_EVENT, providerUpdatedAt: input.currentTime },
+                      ]
+                    : [],
         cursor: {
           ...input.cursor,
           updatedMin: input.currentTime,
@@ -4305,184 +5976,6 @@ function familyProfileInput(): Parameters<Florence["completeFamilyOnboarding"]>[
       },
     ],
   };
-}
-
-async function assertFunctionCallContinuationIsWireSafe(): Promise<void> {
-  const functionCall = {
-    type: "function_call" as const,
-    id: "fc_1",
-    call_id: "call_1",
-    name: "search_private_gmail",
-    arguments: '{"query":"school","range":"recent_14_days","limit":10}',
-    status: "completed" as const,
-    parsed_arguments: { query: "school", range: "recent_14_days", limit: 10 },
-  };
-  let parseCalls = 0;
-  let continuedInput: unknown = null;
-  const fakeClient = {
-    responses: {
-      parse: async (params: { input?: unknown }) => {
-        parseCalls += 1;
-        if (parseCalls === 1) return { output: [functionCall], output_parsed: null };
-        continuedInput = params.input;
-        throw new Error("Stop after capturing the continued OpenAI input");
-      },
-    },
-  };
-  const reasoner = new FlorenceReasoner(
-    { apiKey: "fake-openai-key", model: "fake-openai-model" },
-    fakeClient as unknown as OpenAI,
-  );
-  await expect(
-    reasoner.reviewPrivateGoogle(
-      {
-        familyProfile: {
-          familyLabel: "Anbarasu Family",
-          timeZone: "America/Los_Angeles",
-          adultFirstNames: ["Hari"],
-          children: [],
-          postalCode: "94110",
-        },
-        adult: { adultId: "adult-1", firstName: "Hari" },
-        googleConnection: { connectionId: "google-1", status: "active", kind: "personal" },
-        currentTime: new Date(NOW).toISOString(),
-        currentPrivateFacts: [],
-      },
-      {
-        searchGmail: async () => [],
-        readPersonalCalendarWindow: async () => ({ status: "complete", events: [] }),
-        readGmailAttachment: async () => {
-          throw new Error("The continuation regression does not request an attachment");
-        },
-      },
-    ),
-  ).rejects.toMatchObject({ code: "rejected" });
-  expect(parseCalls).toBe(2);
-  if (!Array.isArray(continuedInput)) throw new Error("OpenAI continuation input was not captured");
-  const replayed = (continuedInput as unknown[]).find(
-    (item): item is Record<string, unknown> =>
-      typeof item === "object" && item !== null && "id" in item && item.id === functionCall.id,
-  );
-  expect(replayed).toEqual({
-    type: functionCall.type,
-    id: functionCall.id,
-    call_id: functionCall.call_id,
-    name: functionCall.name,
-    arguments: functionCall.arguments,
-    status: functionCall.status,
-  });
-  expect(Object.hasOwn(replayed ?? {}, "parsed_arguments")).toBe(false);
-}
-
-async function assertNormalParentTurnsCannotDisappear(): Promise<void> {
-  const silentDecision = decision();
-  const visibleDecision = decision({
-    bubbles: [{ text: "Nothing needs your attention right now.", delayMs: 0 }],
-  });
-  const applicationOwnedDecision = decision({
-    householdUpdate: {
-      text: "Pickup moved to 4:00 p.m.",
-      sourceIds: ["source-current-parent-message"],
-    },
-  });
-  const reactionDecision = decision();
-  reactionDecision.conversation.reaction = "love";
-  reactionDecision.conversation.replyToCurrentMessage = true;
-  const normalizedReactionDecision = {
-    ...reactionDecision,
-    conversation: { ...reactionDecision.conversation, replyToCurrentMessage: false },
-  };
-  const outputs = [
-    silentDecision,
-    silentDecision,
-    visibleDecision,
-    applicationOwnedDecision,
-    reactionDecision,
-  ];
-  let parseCalls = 0;
-  const fakeClient = {
-    responses: {
-      parse: async (params: { text?: { format?: unknown } }) => {
-        expect(JSON.stringify(params.text?.format)).not.toContain("\\\\p{L}");
-        expect(JSON.stringify(params.text?.format)).not.toContain("\\\\p{N}");
-        expect(JSON.stringify(params.text?.format)).not.toContain('"format":"uri"');
-        const outputParsed = outputs[parseCalls];
-        parseCalls += 1;
-        if (!outputParsed) throw new Error("The silence regression exhausted its fake OpenAI output");
-        return { output: [], output_parsed: outputParsed };
-      },
-    },
-  };
-  const reasoner = new FlorenceReasoner(
-    { apiKey: "fake-openai-key", model: "fake-openai-model" },
-    fakeClient as unknown as OpenAI,
-  );
-  const normalMessage: Parameters<FlorenceReasoner["decide"]>[0] = {
-    household: {
-      householdId: "household-1",
-      name: "Anbarasu Family",
-      timeZone: "America/Los_Angeles",
-      adultNames: ["Hari", "Alex"],
-      familyProfile: "{}",
-    },
-    audience: "private",
-    currentAdultId: "adult-1",
-    currentMessage: {
-      sourceId: "source-current-parent-message",
-      senderName: "Hari",
-      moveKind: "message",
-      text: "Anything we should know about?",
-      authoredText: "Anything we should know about?",
-      voiceTranscriptPresent: false,
-      occurredAt: new Date(NOW).toISOString(),
-      images: [],
-      pdfs: [],
-      replyTo: null,
-    },
-    recentMessages: [],
-    visibleSources: [],
-    pendingFollowUps: [],
-    visibleInterests: [],
-    pendingCalendarOffers: [],
-    googleConnections: [],
-  };
-  const reads: Parameters<FlorenceReasoner["decide"]>[1] = {
-    searchGmail: async () => [],
-    searchFamilyMemory: async () => [],
-    readCalendarWindow: async () => ({ status: "complete", events: [] }),
-    readSource: async () => null,
-    readCurrentImage: async () => {
-      throw new Error("The silence regression has no image");
-    },
-    readCurrentPdf: async () => {
-      throw new Error("The silence regression has no PDF");
-    },
-  };
-  await expect(reasoner.decide(normalMessage, reads)).rejects.toMatchObject({ code: "invalid_output" });
-  await expect(
-    reasoner.decide(
-      {
-        ...normalMessage,
-        currentMessage: {
-          ...normalMessage.currentMessage,
-          moveKind: "reply",
-          text: "Yes, that one.",
-          authoredText: "Yes, that one.",
-          replyTo: {
-            sourceId: "source-prior-florence-message",
-            senderName: "Florence",
-            text: "Did you mean Tuesday?",
-            occurredAt: new Date(NOW - 1_000).toISOString(),
-          },
-        },
-      },
-      reads,
-    ),
-  ).rejects.toMatchObject({ code: "invalid_output" });
-  await expect(reasoner.decide(normalMessage, reads)).resolves.toEqual(visibleDecision);
-  await expect(reasoner.decide(normalMessage, reads)).resolves.toEqual(applicationOwnedDecision);
-  await expect(reasoner.decide(normalMessage, reads)).resolves.toEqual(normalizedReactionDecision);
-  expect(parseCalls).toBe(5);
 }
 
 function withSchema(connectionString: string, schema: string): string {

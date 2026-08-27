@@ -581,7 +581,7 @@ export class Florence {
           {
             text: invitation.linkIssued
               ? "That Florence setup link has expired. Ask your partner to send a fresh invitation."
-              : "That Florence invitation expired before you replied. Ask your partner to send a fresh one.",
+              : "I couldn’t confirm delivery of your Florence setup link before it expired. Ask your partner to send a fresh invitation.",
             delayMs: 0,
           },
         ];
@@ -639,7 +639,7 @@ export class Florence {
             identitySubjectDigest: invitation.identitySubjectDigest,
             householdId: invitation.householdId,
             adultId: invitation.adultId,
-            occurredAt: invitation.handshakeAt,
+            occurredAt: invitation.setupIssuedAt ?? input.occurredAt,
           });
           const setupUrl = `${this.#setupOrigin}/#s=${encodeURIComponent(setup.token)}`;
           bubbles = [

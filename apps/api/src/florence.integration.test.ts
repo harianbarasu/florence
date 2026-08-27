@@ -126,7 +126,7 @@ const ONE_SHOT_REMINDER_REQUEST = "Remind me to pick up the kids at 2:45 today."
 const ONE_SHOT_REMINDER_ACK = "Absolutely—I’ll remind you to pick up the kids at 2:45 PM.";
 const ONE_SHOT_REMINDER_ACTION = "pick up the kids";
 const ONE_SHOT_REMINDER_TEXT = "Reminder: pick up the kids.";
-const ONE_SHOT_REMINDER_AT = "2026-08-17T21:45:00.000Z";
+const ONE_SHOT_REMINDER_AT = "2026-08-19T21:45:00.000Z";
 const PRIVATE_CALENDAR_ONLY_TITLE = "Maya’s soccer clinic";
 const PRIVATE_CALENDAR_CONFLICT_TITLE = "School volunteer shift";
 const PRIVATE_CALENDAR_ANNIVERSARY_TITLE = "Private anniversary dinner";
@@ -751,8 +751,38 @@ release("Florence parent journeys", () => {
           and invitation_approval_source_id is not null and invitation_approved_at is not null
       )`,
     );
+    harness.state.now += 2 * 24 * 60 * 60_000 + 1_000;
+    await harness.drain();
+    await harness.assertDatabase(
+      "The background expiry sweep stopped a partner who had not replied yet",
+      `exists (
+        select 1 from people where adult_slot=2 and status='planned'
+          and invitation_digest is null and invitation_consumed_at is null
+          and invitation_conversation_id=${sqlLiteral(PRIVATE_PARTNER)}
+          and invitation_approval_source_id is not null
+      ) and not exists (
+        select 1 from messages where direction='outbound'
+          and idempotency_key like 'partner-invitation-expired:%'
+      )`,
+    );
+    harness.linq.partnerSetupLinkState = "accepted";
+    const linkSendAttemptsBeforeRetry = harness.linq.sendMessageAttempts.filter((message) =>
+      message.text.includes("#s="),
+    ).length;
+    await expect(
+      harness.receiveParts(
+        "partner-handshake-delayed-first-reply",
+        [{ type: "text", value: PARTNER_SETUP_HANDSHAKE_REPLY }],
+        PRIVATE_PARTNER,
+        "partner",
+      ),
+    ).rejects.toMatchObject({ code: "provider_retryable", retryable: true });
+    const stagedPartnerSetupToken = harness.setupTokenFor(PRIVATE_PARTNER);
+    expect(stagedPartnerSetupToken).toMatch(/^ps1\./);
+    harness.state.now += 60_000;
+    harness.linq.partnerSetupLinkState = "sent";
     await harness.receiveParts(
-      "partner-handshake-reply-after-rejection",
+      "partner-handshake-delivery-retry",
       [{ type: "text", value: PARTNER_SETUP_HANDSHAKE_REPLY }],
       PRIVATE_PARTNER,
       "partner",
@@ -766,17 +796,42 @@ release("Florence parent journeys", () => {
       (message) => message.providerConversationId === PRIVATE_PARTNER && message.text.includes("#s="),
     );
     expect(firstPartnerSetupLinks).toHaveLength(1);
+    const retriedLinkAttempts = harness.linq.sendMessageAttempts
+      .filter((message) => message.text.includes("#s="))
+      .slice(linkSendAttemptsBeforeRetry);
+    expect(retriedLinkAttempts).toHaveLength(2);
+    expect(retriedLinkAttempts[1]).toMatchObject({
+      idempotencyKey: retriedLinkAttempts[0]?.idempotencyKey,
+      text: retriedLinkAttempts[0]?.text,
+    });
+    expect(
+      harness.linq.messages.some(
+        (message) =>
+          message.providerConversationId === PRIVATE_PARTNER &&
+          message.text.includes("invitation expired before you replied"),
+      ),
+    ).toBe(false);
     expect(firstPartnerSetupLinks[0]?.text).toContain("#s=ps1.");
     expect(firstPartnerSetupLinks[0]?.text).not.toContain("#s=fs2.");
     const expiringPartnerSetupToken = harness.setupTokenFor(PRIVATE_PARTNER);
+    expect(expiringPartnerSetupToken).toBe(stagedPartnerSetupToken);
     expect(expiringPartnerSetupToken).toMatch(/^ps1\./);
+    await harness.assertDatabase(
+      "The retried partner setup link was not confirmed against its original token",
+      `exists (
+        select 1 from people where adult_slot=2 and status='planned'
+          and invitation_digest is not null and invitation_expires_at is not null
+          and invitation_consumed_at is null and invitation_retry_at is null
+          and invitation_conversation_id=${sqlLiteral(PRIVATE_PARTNER)}
+      )`,
+    );
     const linkAttemptsBeforeExpiry = harness.linq.partnerSetupLinkAttempts;
-    expect(linkAttemptsBeforeExpiry).toBe(1);
+    expect(linkAttemptsBeforeExpiry).toBe(2);
     const partnerMessagesBeforeReplyReplay = harness.linq.messages.filter(
       (message) => message.providerConversationId === PRIVATE_PARTNER,
     ).length;
     await harness.receiveParts(
-      "partner-handshake-reply-after-rejection",
+      "partner-handshake-delayed-first-reply",
       [{ type: "text", value: PARTNER_SETUP_HANDSHAKE_REPLY }],
       PRIVATE_PARTNER,
       "partner",
@@ -1065,7 +1120,7 @@ release("Florence parent journeys", () => {
     });
     expect(partner.workspace.setup).toEqual(founder.workspace.setup);
 
-    harness.state.now = Date.parse("2026-08-17T21:44:00.000Z");
+    harness.state.now = Date.parse("2026-08-19T21:44:00.000Z");
     await harness.drain();
     const finiteReviewsBeforeReminder = harness.state.finiteReviews;
     await harness.accept("private", "one-shot-pickup-reminder", ONE_SHOT_REMINDER_REQUEST);

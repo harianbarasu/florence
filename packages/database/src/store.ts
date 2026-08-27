@@ -14,7 +14,9 @@ const MAX_PDF_ENVELOPE_BYTES = 20 * 1024 * 1024 + 16 * 1024;
 const GOOGLE_POLL_INTERVAL_MS = 2 * 60_000;
 const INTEREST_CHECK_INTERVAL_MS = 7 * 24 * 60 * 60_000;
 const LINQ_RECEIPT_CLOCK_SKEW_MS = 5 * 60_000;
-const PARTNER_HANDSHAKE_LIFETIME_MS = 24 * 60 * 60_000;
+// Kept as an on-disk compatibility marker for replicas from before the reply gate stopped expiring.
+// New code only treats this timestamp as a deadline after a signed-link digest has been stored.
+const LEGACY_PARTNER_HANDSHAKE_WINDOW_MS = 24 * 60 * 60_000;
 const PROACTIVE_CONSENT_PAUSE_REASON = "Paused because proactive Google use is disabled";
 const HOUSEHOLD_SAFE_MONITOR_WHY = "Florence is watching this family coordination item.";
 const COMPLETE_CALENDAR_HISTORY_SCOPE = "https://www.googleapis.com/auth/calendar.events.readonly" as const;
@@ -807,6 +809,7 @@ export type UnboundPartnerInvitation =
       identitySubjectDigest: string;
       initialProviderMessageId: string;
       handshakeAt: string;
+      setupIssuedAt: string | null;
     };
 
 export type InboundTurn = {
@@ -3895,6 +3898,7 @@ export class PostgresFlorenceStore {
         invitation_identity_digest: string;
         invitation_message_id: string;
         invitation_issued_at: Date;
+        setup_issued_at: Date | null;
         link_issued: boolean;
         state: "awaiting_reply" | "issued" | "expired" | "declined";
       }[]
@@ -3903,10 +3907,13 @@ export class PostgresFlorenceStore {
         approval.sender_adult_id as founder_adult_id,partner.messages_address,
         partner.invitation_conversation_id,partner.invitation_identity_digest,
         partner.invitation_message_id,partner.invitation_issued_at,
+        case when partner.invitation_digest is not null
+          then partner.invitation_retry_at else null end as setup_issued_at,
         (partner.invitation_digest is not null and partner.invitation_retry_at is null) as link_issued,
         case
           when partner.invitation_consumed_at is not null then 'declined'
-          when partner.invitation_expires_at<=${checkedAt} then 'expired'
+          when partner.invitation_digest is not null
+            and partner.invitation_expires_at<=${checkedAt} then 'expired'
           when partner.invitation_retry_at is not null then 'awaiting_reply'
           when partner.invitation_digest is null then 'awaiting_reply'
           else 'issued'
@@ -3923,10 +3930,10 @@ export class PostgresFlorenceStore {
         and partner.invitation_message_id is not null and partner.invitation_issued_at is not null
         and (
           (
-            partner.invitation_expires_at is not null and partner.invitation_consumed_at is null
-            and partner.messages_address is not null
+            partner.invitation_consumed_at is null and partner.messages_address is not null
             and partner.invitation_approval_source_id is not null
             and partner.invitation_approved_at is not null
+            and (partner.invitation_digest is null or partner.invitation_expires_at is not null)
             and founder.kind='adult' and founder.role='steward' and founder.adult_slot=1
             and founder.status='verified' and founder.identity_subject_digest is not null
             and channel.household_id=partner.household_id and channel.audience='private'
@@ -3982,6 +3989,7 @@ export class PostgresFlorenceStore {
       identitySubjectDigest: row.invitation_identity_digest,
       initialProviderMessageId: row.invitation_message_id,
       handshakeAt: row.invitation_issued_at.toISOString(),
+      setupIssuedAt: row.setup_issued_at?.toISOString() ?? null,
     };
   }
 
@@ -4026,10 +4034,11 @@ export class PostgresFlorenceStore {
           )
           or
           (
-            partner.invitation_expires_at is not null and partner.messages_address=${messagesAddress}
+            partner.messages_address=${messagesAddress}
             and partner.invitation_conversation_id is not null
             and partner.invitation_identity_digest is not null
             and partner.invitation_message_id is not null and partner.invitation_issued_at is not null
+            and (partner.invitation_digest is null or partner.invitation_expires_at is not null)
           )
         )
       limit 1
@@ -4158,9 +4167,9 @@ export class PostgresFlorenceStore {
           and partner.identity_subject_digest is null
           and partner.invitation_conversation_id=${providerConversationId}
           and partner.invitation_identity_digest=${input.identitySubjectDigest}
-          and partner.invitation_expires_at is not null
           and partner.invitation_consumed_at is null and partner.messages_address is not null
           and partner.invitation_message_id is not null and partner.invitation_issued_at is not null
+          and (partner.invitation_digest is null or partner.invitation_expires_at is not null)
           and partner.invitation_approval_source_id is not null
           and partner.invitation_approved_at is not null
           and founder.kind='adult' and founder.role='steward' and founder.adult_slot=1
@@ -4195,7 +4204,7 @@ export class PostgresFlorenceStore {
           and founder.household_id=partner.household_id
         where partner.kind='adult' and partner.role='steward' and partner.adult_slot=2
           and partner.status='planned' and partner.identity_subject_digest is null
-          and partner.invitation_expires_at is not null
+          and partner.invitation_digest is not null and partner.invitation_expires_at is not null
           and partner.invitation_expires_at<=${expiredAt}
           and partner.invitation_consumed_at is null and partner.messages_address is not null
           and partner.invitation_conversation_id is not null
@@ -4297,11 +4306,13 @@ export class PostgresFlorenceStore {
               and partner.invitation_identity_digest is null
               and partner.invitation_message_id is null and partner.invitation_issued_at is null)
             or
-            (partner.invitation_expires_at is not null and partner.messages_address is not null
+            (partner.messages_address is not null
               and partner.invitation_conversation_id is not null
               and partner.invitation_identity_digest is not null
               and partner.invitation_message_id is not null and partner.invitation_issued_at is not null
-              and (partner.invitation_digest is null or partner.invitation_retry_at is not null))
+              and (partner.invitation_digest is null
+                or (partner.invitation_expires_at is not null
+                  and partner.invitation_retry_at is not null)))
           )
           and partner.invitation_approval_source_id is not null
           and partner.invitation_approved_at is not null
@@ -4399,7 +4410,7 @@ export class PostgresFlorenceStore {
     if ((retryAt === null) !== (retryError === null) || (retryAt !== null && retryAt < occurredAt)) {
       throw new FlorenceStoreConflict("A pending partner handshake needs a valid retry state");
     }
-    const expiresAt = new Date(occurredAt.getTime() + PARTNER_HANDSHAKE_LIFETIME_MS);
+    const expiresAt = new Date(occurredAt.getTime() + LEGACY_PARTNER_HANDSHAKE_WINDOW_MS);
     const partner = await this.#sql.begin(async (sql) => {
       const [row] = await sql<PersonRow[]>`
         select * from people where household_id=${input.householdId} and id=${input.adultId}
@@ -4474,19 +4485,18 @@ export class PostgresFlorenceStore {
         }
         if (
           row.invitation_digest !== null ||
-          row.invitation_expires_at === null ||
           row.invitation_consumed_at !== null ||
           row.messages_address !== messagesAddress ||
           row.invitation_conversation_id !== providerConversationId ||
           row.invitation_identity_digest !== input.identitySubjectDigest ||
           row.invitation_message_id !== providerMessageId ||
-          occurredAt.getTime() < row.invitation_issued_at.getTime() - LINQ_RECEIPT_CLOCK_SKEW_MS ||
-          occurredAt >= row.invitation_expires_at
+          occurredAt.getTime() < row.invitation_issued_at.getTime() - LINQ_RECEIPT_CLOCK_SKEW_MS
         ) {
           throw new FlorenceStoreConflict("The partner handshake was already bound differently");
         }
         const [reconciled] = await sql<PersonRow[]>`
-          update people set invitation_retry_at=${retryAt},invitation_last_error=${retryError},
+          update people set invitation_expires_at=coalesce(invitation_expires_at,${expiresAt}),
+            invitation_retry_at=${retryAt},invitation_last_error=${retryError},
             updated_at=greatest(updated_at,${retryAt ?? occurredAt})
           where id=${row.id} and invitation_digest is null
             and invitation_conversation_id=${providerConversationId}
@@ -4529,6 +4539,8 @@ export class PostgresFlorenceStore {
         throw new FlorenceStoreConflict("The partner handshake is already bound elsewhere");
       }
       const [updated] = await sql<PersonRow[]>`
+        -- Preserve the legacy timestamp shape so older rolling-deploy replicas can still
+        -- recognize the bound chat. New readers ignore it until a signed link is stored.
         update people set invitation_digest=null,invitation_expires_at=${expiresAt},
           invitation_consumed_at=null,messages_address=${messagesAddress},
           invitation_conversation_id=${providerConversationId},
@@ -4626,15 +4638,13 @@ export class PostgresFlorenceStore {
       }
       if (
         row.invitation_digest !== null ||
-        row.invitation_expires_at === null ||
         row.invitation_consumed_at !== null ||
         row.messages_address !== messagesAddress ||
         row.invitation_conversation_id !== providerConversationId ||
         row.invitation_identity_digest !== input.identitySubjectDigest ||
         row.invitation_message_id !== providerMessageId ||
         row.invitation_issued_at === null ||
-        issuedAt < row.invitation_issued_at ||
-        issuedAt > row.invitation_expires_at
+        issuedAt < row.invitation_issued_at
       ) {
         throw new FlorenceStoreConflict("The planned partner is not awaiting a reply in this chat");
       }
@@ -7068,7 +7078,7 @@ export class PostgresFlorenceStore {
           )
           or
           (
-            partner.invitation_expires_at is not null and partner.messages_address=partner.profile->>'phoneNumber'
+            partner.messages_address=partner.profile->>'phoneNumber'
             and partner.invitation_conversation_id is not null
             and partner.invitation_identity_digest is not null
             and partner.invitation_message_id is not null and partner.invitation_issued_at is not null
@@ -8522,9 +8532,10 @@ async function terminalizeIssuedPartnerInvitation(
       invitation_consumed_at=${occurredAt},messages_address=null,
       invitation_approval_source_id=null,invitation_approved_at=null,
       invitation_retry_at=null,invitation_last_error=null,updated_at=${occurredAt}
-    where id=${invitation.adult_id} and invitation_expires_at is not null
-      and invitation_consumed_at is null and messages_address is not null
+    where id=${invitation.adult_id} and invitation_consumed_at is null
+      and messages_address is not null
       and invitation_message_id=${invitation.invitation_message_id}
+      and (invitation_digest is null or invitation_expires_at is not null)
     returning id
   `;
   if (invalidated.length !== 1) return false;
@@ -8560,7 +8571,7 @@ async function stagePartnerInvitationTerminalNotice(
   const text =
     input.reason === "expired"
       ? input.linkIssued === false
-        ? `${input.invitation.first_name} didn’t reply before the Florence invitation expired, so I stopped it. I won’t message them again unless you ask me to try again.`
+        ? `I couldn’t confirm delivery of ${input.invitation.first_name}’s Florence setup link before it expired, so I stopped the invitation. I won’t message them again unless you ask me to try again.`
         : `${input.invitation.first_name}’s Florence setup link expired, so I stopped the invitation. I won’t message them again unless you ask me to send a fresh one.`
       : input.reason === "delivery_failed"
         ? `I couldn’t deliver ${input.invitation.first_name}’s Florence setup link, so I stopped the invitation. I won’t message them again unless you ask me to try again.`

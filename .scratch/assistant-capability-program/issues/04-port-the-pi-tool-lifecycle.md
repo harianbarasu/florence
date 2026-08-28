@@ -22,4 +22,4 @@ The earlier overbuilt pieces were removed after the user corrected the program t
 
 ### Verification
 
-Three focused kernel tests cover malformed/truncated no-execution, timeout/cancellation, parallel source ordering, and the lightweight start callback. Product tests cover actual Gmail attachments, Calendar reads, and work cues.
+Product and provider tests cover the kernel through actual Gmail attachments, Calendar reads, durable work, and visible work cues. The framework-only fake-kernel test file was removed after the product-scope correction.

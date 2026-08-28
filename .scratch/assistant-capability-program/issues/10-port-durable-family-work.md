@@ -28,7 +28,7 @@ No new worker runtime, scheduler, queue, table, registry, policy layer, or gener
 ### Verification
 
 - `pnpm check` passes: lint, all package/app typechecks, 31 default tests with database-gated journeys skipped, and all builds.
-- `pnpm --filter @florence/api exec vitest run src/capability-lifecycle.test.ts src/reasoner-tool-loops.test.ts` passes 15 focused tests.
+- The focused reasoner tool-loop cases pass for durable planning, checkpoint execution, steering, retry, and one terminal result.
 - A clean PostgreSQL 17 run of `src/florence.integration.test.ts -t "recovers one persisted task and completes only after its terminal receipt"` passes and covers reminder-before-task scheduler order, persisted `tool_pending` restart, expired-lease takeover, stale settlement rejection, transactional progress/final outboxes, `delivering` before receipt, `completed` after receipt, and no duplicate outbound.
 - A second direct clean-database probe ends with `completed:terminal:2` and exactly two sent family-work messages (`sent,sent`).
 

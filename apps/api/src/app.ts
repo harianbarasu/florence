@@ -25,6 +25,7 @@ import { GoogleConnection, GoogleConnectionError } from "@florence/google";
 import { LinqClient } from "@florence/linq";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import { z } from "zod";
+import { BrowserbaseBrowserClient } from "./browser.js";
 import { EnrollmentCodes } from "./enrollment.js";
 import { KiwiFlightSearchClient } from "./flights.js";
 import { Florence } from "./florence.js";
@@ -55,6 +56,9 @@ export type AppOptions = {
 };
 
 const defaultFrontendRoot = fileURLToPath(new URL("../../web/dist", import.meta.url));
+const defaultAgentBrowserExecutable = fileURLToPath(
+  new URL("../node_modules/agent-browser/bin/agent-browser.js", import.meta.url),
+);
 const sessionCookieName = "florence_session";
 const sessionLifetimeSeconds = 7 * 24 * 60 * 60;
 const memberParamsSchema = z.object({ memberId: idSchema }).strict();
@@ -74,6 +78,15 @@ export function createDefaultDependencies(env: NodeJS.ProcessEnv = process.env):
   });
   const google = createDefaultGoogleConnection(env, store);
   const setupOrigin = new URL(requiredEnv(env, "GOOGLE_OAUTH_REDIRECT_URI")).origin;
+  const browserbaseApiKey = env.BROWSERBASE_API_KEY?.trim();
+  const browserbaseProjectId = env.BROWSERBASE_PROJECT_ID?.trim();
+  const browser = browserbaseApiKey
+    ? new BrowserbaseBrowserClient({
+        apiKey: browserbaseApiKey,
+        executable: defaultAgentBrowserExecutable,
+        ...(browserbaseProjectId ? { projectId: browserbaseProjectId } : {}),
+      })
+    : null;
   const florence = new Florence({
     store,
     linq,
@@ -82,6 +95,7 @@ export function createDefaultDependencies(env: NodeJS.ProcessEnv = process.env):
     publicPages: new PublicPageReader(),
     weather: new NwsWeatherClient(),
     flights: new KiwiFlightSearchClient(),
+    browser,
     reasoner: createFlorenceReasonerFromEnv(env),
     enrollmentCodes,
     imageVault,

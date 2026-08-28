@@ -6,7 +6,7 @@ Label: wayfinder:map
 
 Florence should feel like Instinct for a household: a parent asks naturally, Florence uses the relevant tools, and the work ends in a useful result, one genuinely blocking question, or an honest failure. Search, Gmail, and Calendar are only the first slice.
 
-Use the first-party product benchmark in `docs/research/instinct-product-benchmark.md`, the current Instinct/Poke capability audit in `research/instinct-capability-audit.md`, and the Pi/Hermes source inventory in `docs/research/pi-hermes-assistant-tool-gap-2026-08-27.md`.
+Use the first-party product benchmark in `docs/research/instinct-product-benchmark.md`, the current Instinct/Poke capability audit in `docs/research/instinct-capability-audit.md`, and the Pi/Hermes source inventory in `docs/research/pi-hermes-assistant-tool-gap-2026-08-27.md`.
 
 Direct upstream reuse remains required where it produces a real Florence capability:
 
@@ -51,6 +51,7 @@ Each ticket must name the family behavior it unlocks. Existing household boundar
 - [Read linked public pages and PDFs](issues/06-port-safe-public-page-reading.md) — one Hermes-adapted concrete reader now follows parent or research links, extracts HTML and PDFs locally, and works in foreground or durable tasks without a browser runtime, provider framework, or generic safety subsystem.
 - [Answer “what's on the docket?” with prioritized next actions](issues/12-adapt-the-family-docket-and-document-workflows.md) — the complete 90-day review now feeds one reconciled parental-unit docket, setup surfaces only the ranked three, ordinary chat can retrieve the rest, and unchanged findings no longer become delayed reminder noise.
 - [Add the useful Google Workspace surface](issues/13-add-google-workspace-reads.md) — one Hermes-adapted Google adapter now gives private conversation and durable work concrete Gmail, Drive, Contacts, Docs, Sheets, Slides, Tasks, and Calendar operations, with stable retries and reconnect-in-place instead of a second connector/runtime.
+- [Give Florence authenticated browser and computer use](issues/14-add-authenticated-browser-and-computer-use.md) — one Hermes-derived Browserbase/agent-browser tool now operates interactive and authenticated sites inside existing durable private work, supports live adult sign-in handoff and resume, and preserves ambiguous-action state without a second runtime or browser framework.
 
 ## Fog
 

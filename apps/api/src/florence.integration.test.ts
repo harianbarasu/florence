@@ -466,12 +466,25 @@ release("Durable family work store", () => {
       generation: 0,
       phase: "ready",
       claim: null,
+      browserSession: null,
       continuationItems: [],
       pendingCall: null,
       steering: [],
       publicMapResearchContext: [],
       progressRevision: 0,
       terminal: null,
+    } as const;
+    const cancelledBrowserSession = {
+      sessionId: "browserbase-cancelled-session",
+      expiresAt: at(3_600_000),
+    } as const;
+    const cancelledBrowserState = {
+      ...initialState,
+      generation: 1,
+      phase: "terminal",
+      browserSession: cancelledBrowserSession,
+      progressRevision: 1,
+      terminal: { outcome: "cancelled", text: "Cancelled." },
     } as const;
     await writeFile(
       setupFile,
@@ -515,9 +528,19 @@ release("Durable family work store", () => {
       ) values (
         '10000000-0000-4000-8000-000000000003',
         '10000000-0000-4000-8000-000000000001','family_task','private',
-        '10000000-0000-4000-8000-000000000002','Compare flights','Starting now.',
+        '10000000-0000-4000-8000-000000000002','Prepare the camp registration','Starting now.',
         ${sqlLiteral(JSON.stringify(initialState))}::jsonb,'active',
         ${sqlLiteral(at(-1_000))},${sqlLiteral(at(-9_000))}
+      );
+      insert into proactive_work (
+        id,household_id,kind,visibility,owner_adult_id,objective,current_conclusion,
+        task_state,status,next_check_at,created_at
+      ) values (
+        '10000000-0000-4000-8000-000000000006',
+        '10000000-0000-4000-8000-000000000001','family_task','private',
+        '10000000-0000-4000-8000-000000000002','Cancelled camp registration','Cancelled.',
+        ${sqlLiteral(JSON.stringify(cancelledBrowserState))}::jsonb,'cancelled',null,
+        ${sqlLiteral(at(-8_000))}
       );`,
     );
     const databaseUrl = withSchema(TEST_DATABASE_URL, schema);
@@ -538,6 +561,13 @@ release("Durable family work store", () => {
       await migrateDatabase(TEST_DATABASE_URL, setupFile);
       await rm(directory, { recursive: true, force: true });
     });
+
+    expect(await store.takeCancelledFamilyWorkBrowserSession("10000000-0000-4000-8000-000000000006")).toEqual(
+      cancelledBrowserSession,
+    );
+    expect(
+      await store.takeCancelledFamilyWorkBrowserSession("10000000-0000-4000-8000-000000000006"),
+    ).toBeNull();
 
     const reminder = await store.readNextDueProactiveWork(at(0));
     expect(reminder).toEqual({ kind: "reminder", workId: "10000000-0000-4000-8000-000000000005" });
@@ -562,13 +592,21 @@ release("Durable family work store", () => {
       continuationItems: [
         {
           type: "function_call",
-          call_id: "flight-options",
-          name: "flights_search",
-          arguments: "{}",
+          call_id: "camp-portal",
+          name: "browser_work",
+          arguments: JSON.stringify({ operation: "navigate", url: "https://camp.example/register" }),
           status: "completed",
         },
       ],
-      pendingCall: { callId: "flight-options", name: "flights_search", argumentsJson: "{}" },
+      pendingCall: {
+        callId: "camp-portal",
+        name: "browser_work",
+        argumentsJson: JSON.stringify({
+          operation: "navigate",
+          url: "https://camp.example/register",
+        }),
+        attempt: 0,
+      },
     };
     expect(
       await store.settleFamilyWorkClaim({
@@ -587,9 +625,11 @@ release("Durable family work store", () => {
       throw new Error("Persisted tool-pending work did not survive restart");
     }
     expect(interrupted.state.phase).toBe("tool_pending");
+    expect(interrupted.state.pendingCall?.attempt).toBe(1);
     const takeover = await store.readNextDueProactiveWork(at(120_101));
     if (takeover?.kind !== "family_task") throw new Error("Expired claim was not recovered");
     expect(takeover.claimId).not.toBe(interrupted.claimId);
+    expect(takeover.state.pendingCall?.attempt).toBe(2);
     expect(
       await store.settleFamilyWorkClaim({
         workId: interrupted.workId,
@@ -608,9 +648,17 @@ release("Durable family work store", () => {
       ...takeover.state,
       phase: "ready" as const,
       claim: null,
+      browserSession: {
+        sessionId: "browserbase-active-session",
+        expiresAt: at(3_600_000),
+      },
       continuationItems: [
         ...takeover.state.continuationItems,
-        { type: "function_call_output", call_id: "flight-options", output: '{"returnedCount":2}' },
+        {
+          type: "function_call_output",
+          call_id: "camp-portal",
+          output: '{"title":"Camp registration","snapshot":"Review registration"}',
+        },
       ],
       pendingCall: null,
       progressRevision: 1,
@@ -625,7 +673,7 @@ release("Durable family work store", () => {
           type: "continue",
           state: completedCallState,
           nextCheckAt: at(120_201),
-          progressText: "I found two nonstop alternatives and I’m comparing them now.",
+          progressText: "I opened the camp portal and I’m preparing the registration now.",
         },
       }),
     ).toBe("settled");
@@ -643,11 +691,13 @@ release("Durable family work store", () => {
 
     const finalClaim = await store.readNextDueProactiveWork(at(120_201));
     if (finalClaim?.kind !== "family_task") throw new Error("Final work was not claimed");
-    const terminalText = "1. Delta nonstop at 7:00 PM. 2. JetBlue nonstop at 8:15 PM.";
+    expect(finalClaim.state.browserSession).toEqual(completedCallState.browserSession);
+    const terminalText = "The camp registration is filled and ready on the final review page.";
     const terminalState = {
       ...finalClaim.state,
       phase: "terminal" as const,
       claim: null,
+      browserSession: null,
       continuationItems: [],
       pendingCall: null,
       publicMapResearchContext: [],

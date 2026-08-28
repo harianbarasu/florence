@@ -1,6 +1,7 @@
 import { type FamilyWorkStateV1, steerFamilyWorkState } from "@florence/database";
 import { GoogleCalendarTransientError, GoogleWorkspaceError } from "@florence/google";
 import { describe, expect, test } from "vitest";
+import type { FlorenceBrowserObservation, FlorenceBrowserOperation } from "./browser.js";
 import {
   type FlorenceDecision,
   type FlorenceGoogleChangesAssessmentInput,
@@ -173,6 +174,7 @@ describe("Florence reasoner capability cutover", () => {
       generation: 0,
       phase: "ready",
       claim: null,
+      browserSession: null,
       continuationItems: [],
       pendingCall: null,
       steering: [],
@@ -215,6 +217,211 @@ describe("Florence reasoner capability cutover", () => {
       outcome: "succeeded",
       text: expect.stringContaining("parent signature"),
     });
+  });
+
+  test("durable work operates a family portal, pauses for sign-in, and resumes at review", async () => {
+    const portalUrl = "https://camp.example/register";
+    const liveViewUrl = "https://www.browserbase.com/sessions/session-1";
+    const modelRequests: Record<string, unknown>[] = [];
+    const modelResponses = [
+      {
+        status: "completed",
+        output_parsed: null,
+        output: [
+          functionCall("open-camp-portal", "browser_work", browserArguments("navigate", { url: portalUrl })),
+        ],
+      },
+      {
+        status: "completed",
+        output_parsed: null,
+        output: [functionCall("sign-in-handoff", "browser_work", browserArguments("owner_handoff"))],
+      },
+      {
+        status: "completed",
+        output_parsed: {
+          outcome: "waiting",
+          text: `Please sign in here, then tell me when you’re done: ${liveViewUrl}`,
+        },
+        output: [],
+      },
+      {
+        status: "completed",
+        output_parsed: null,
+        output: [
+          functionCall(
+            "fill-child-name",
+            "browser_work",
+            browserArguments("type", { ref: "e5", text: "Violet Williams" }),
+          ),
+        ],
+      },
+      {
+        status: "completed",
+        output_parsed: null,
+        output: [functionCall("inspect-registration", "browser_work", browserArguments("screenshot"))],
+      },
+      {
+        status: "completed",
+        output_parsed: null,
+        output: [
+          functionCall("open-registration-review", "browser_work", browserArguments("click", { ref: "e9" })),
+        ],
+      },
+      {
+        status: "completed",
+        output_parsed: {
+          outcome: "succeeded",
+          text: "I filled Violet’s camp registration and reached the final review page. The Submit registration button is ready for your final check.",
+        },
+        output: [],
+      },
+    ];
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        parse(request: Record<string, unknown>) {
+          modelRequests.push(request);
+          const response = modelResponses.shift();
+          if (!response) throw new Error("Unexpected family portal model turn");
+          return response;
+        },
+      },
+    } as never);
+    const initialState: FamilyWorkStateV1 = {
+      kind: "family_work_v1",
+      version: 1,
+      generation: 0,
+      phase: "ready",
+      claim: null,
+      browserSession: null,
+      continuationItems: [],
+      pendingCall: null,
+      steering: [],
+      publicMapResearchContext: [],
+      progressRevision: 0,
+      terminal: null,
+    };
+    const input = {
+      workId: "family-work-camp-registration",
+      objective: "Fill out Violet’s camp registration and get it ready for my final review.",
+      visibility: "private" as const,
+      ownerAdultId: "adult-1",
+      household: {
+        householdId: "household-1",
+        familyLabel: "Test family",
+        timeZone: "America/Los_Angeles",
+        postalCode: "90045",
+        adults: [{ adultId: "adult-1", firstName: "Hari", displayName: "Hari Anbarasu" }],
+        children: [],
+      },
+      state: initialState,
+      currentTime: NOW,
+    };
+    const browserOperations: FlorenceBrowserOperation[] = [];
+    const reads = {
+      async runBrowser(operation: FlorenceBrowserOperation) {
+        browserOperations.push(operation);
+        switch (operation.kind) {
+          case "navigate":
+            return browserObservation({
+              title: "Family Camp Portal",
+              url: portalUrl,
+              snapshot: "- button Sign in [ref=e1]",
+            });
+          case "owner_handoff":
+            return browserObservation({
+              kind: "owner_handoff",
+              title: "Family Camp Portal",
+              url: portalUrl,
+              snapshot: "- button Sign in [ref=e1]",
+              liveViewUrl,
+              reason: "The parent can sign in through the live browser.",
+            });
+          case "type":
+            return browserObservation({
+              title: "Camp registration",
+              url: portalUrl,
+              snapshot: '- textbox "Child name" [ref=e5] value="Violet Williams"\n- button Preview [ref=e9]',
+            });
+          case "screenshot":
+            return browserObservation({
+              title: "Camp registration",
+              url: portalUrl,
+              snapshot: '- textbox "Child name" [ref=e5] value="Violet Williams"\n- button Preview [ref=e9]',
+              screenshot: {
+                mimeType: "image/jpeg" as const,
+                bytes: Uint8Array.from([0xff, 0xd8, 0xff, 0xd9]),
+              },
+            });
+          case "click":
+            return browserObservation({
+              title: "Review registration",
+              url: `${portalUrl}/review`,
+              snapshot: '- heading "Review registration"\n- button Submit registration [ref=e12]',
+            });
+          default:
+            throw new Error(`Unexpected browser operation ${String(operation.kind)}`);
+        }
+      },
+    };
+
+    const navigationPlanned = await reasoner.continueFamilyWork(input, reads);
+    if (navigationPlanned.kind !== "continue") throw new Error("Portal navigation was not planned");
+    const navigated = await reasoner.continueFamilyWork({ ...input, state: navigationPlanned.state }, reads);
+    if (navigated.kind !== "continue") throw new Error("Portal navigation did not settle");
+    expect(navigated.progressText).toContain("Family Camp Portal");
+
+    const handoffPlanned = await reasoner.continueFamilyWork({ ...input, state: navigated.state }, reads);
+    if (handoffPlanned.kind !== "continue") throw new Error("Portal handoff was not planned");
+    const handedOff = await reasoner.continueFamilyWork({ ...input, state: handoffPlanned.state }, reads);
+    if (handedOff.kind !== "continue") throw new Error("Portal handoff did not settle");
+    const waiting = await reasoner.continueFamilyWork({ ...input, state: handedOff.state }, reads);
+    expect(waiting).toMatchObject({
+      kind: "waiting",
+      question: expect.stringContaining("sign in"),
+    });
+    if (waiting.kind !== "waiting") throw new Error("Portal work did not wait for sign-in");
+    expect(waiting.question).toContain(liveViewUrl);
+    expect(JSON.stringify(modelRequests[2]?.input)).toContain(liveViewUrl);
+
+    const signedInState = steerFamilyWorkState(waiting.state, {
+      sourceId: "00000000-0000-4000-8000-000000000002",
+      text: "I’m signed in—keep going.",
+      occurredAt: "2026-08-27T20:02:00.000Z",
+    });
+    const fillPlanned = await reasoner.continueFamilyWork({ ...input, state: signedInState }, reads);
+    if (fillPlanned.kind !== "continue") throw new Error("Camp form fill was not planned");
+    const filled = await reasoner.continueFamilyWork({ ...input, state: fillPlanned.state }, reads);
+    if (filled.kind !== "continue") throw new Error("Camp form fill did not settle");
+
+    const screenshotPlanned = await reasoner.continueFamilyWork({ ...input, state: filled.state }, reads);
+    if (screenshotPlanned.kind !== "continue") throw new Error("Camp form inspection was not planned");
+    const inspected = await reasoner.continueFamilyWork({ ...input, state: screenshotPlanned.state }, reads);
+    if (inspected.kind !== "continue") throw new Error("Camp form inspection did not settle");
+    expect(JSON.stringify(inspected.state.continuationItems)).toContain("input_image");
+
+    const reviewPlanned = await reasoner.continueFamilyWork({ ...input, state: inspected.state }, reads);
+    if (reviewPlanned.kind !== "continue") throw new Error("Camp review was not planned");
+    expect(JSON.stringify(modelRequests[5]?.input)).toContain("input_image");
+    expect(JSON.stringify(reviewPlanned.state.continuationItems)).not.toContain("input_image");
+    const reviewed = await reasoner.continueFamilyWork({ ...input, state: reviewPlanned.state }, reads);
+    if (reviewed.kind !== "continue") throw new Error("Camp review did not settle");
+    const terminal = await reasoner.continueFamilyWork({ ...input, state: reviewed.state }, reads);
+
+    expect(browserOperations.map((operation) => operation.kind)).toEqual([
+      "navigate",
+      "owner_handoff",
+      "type",
+      "screenshot",
+      "click",
+    ]);
+    expect(JSON.stringify(modelRequests[3]?.input)).toContain("I’m signed in—keep going.");
+    expect(terminal).toMatchObject({
+      kind: "terminal",
+      outcome: "succeeded",
+      text: expect.stringContaining("final review page"),
+    });
+    if (terminal.kind !== "terminal") throw new Error("Camp registration did not finish");
+    expect(terminal.text).toContain("Submit registration");
   });
 
   test("ordinary route questions use the dedicated maps tools and start visible work once", async () => {
@@ -610,6 +817,7 @@ describe("Florence reasoner capability cutover", () => {
       generation: 0,
       phase: "ready",
       claim: null,
+      browserSession: null,
       continuationItems: [],
       pendingCall: null,
       steering: [],
@@ -809,6 +1017,7 @@ describe("Florence reasoner capability cutover", () => {
       generation: 3,
       phase: "ready",
       claim: null,
+      browserSession: null,
       continuationItems: [
         {
           type: "message",
@@ -1000,6 +1209,7 @@ describe("Florence reasoner capability cutover", () => {
       generation: 0,
       phase: "ready",
       claim: null,
+      browserSession: null,
       continuationItems: [],
       pendingCall: null,
       steering: [],
@@ -1158,6 +1368,7 @@ describe("Florence reasoner capability cutover", () => {
       generation: 0,
       phase: "ready",
       claim: null,
+      browserSession: null,
       continuationItems: [],
       pendingCall: null,
       steering: [],
@@ -1739,6 +1950,34 @@ function ordinaryDecision(input: { bubbleText?: string; researchUrls?: string[] 
     householdUpdate: null,
     webAccessPath: null,
     researchUrls: input.researchUrls ?? null,
+  };
+}
+
+function browserArguments(operation: string, overrides: Record<string, unknown> = {}) {
+  return {
+    operation,
+    url: null,
+    ref: null,
+    text: null,
+    values: [],
+    checked: null,
+    key: null,
+    direction: null,
+    milliseconds: null,
+    compact: true,
+    ...overrides,
+  };
+}
+
+function browserObservation(
+  input: Partial<FlorenceBrowserObservation> & Pick<FlorenceBrowserObservation, "url" | "title" | "snapshot">,
+): FlorenceBrowserObservation {
+  return {
+    kind: "page",
+    reason: null,
+    refCount: (input.snapshot.match(/\[ref=/gu) ?? []).length,
+    truncated: false,
+    ...input,
   };
 }
 

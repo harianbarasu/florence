@@ -58,6 +58,13 @@ Required:
 | `GOOGLE_OAUTH_REDIRECT_URI` | Exact `<origin>/oauth/google/callback`; its origin is also used for setup links |
 | `GOOGLE_CREDENTIAL_KEY` | Canonical base64 encoding of exactly 32 random bytes |
 
+Optional browser provider:
+
+| Variable | Contract |
+| --- | --- |
+| `BROWSERBASE_API_KEY` | Enables Florence's authenticated browser work when non-empty; omit to start without browser tooling |
+| `BROWSERBASE_PROJECT_ID` | Optional Browserbase project ID used when creating and releasing sessions |
+
 Optional bounded settings:
 
 - `FLORENCE_MODEL_TIMEOUT_MS=30000`

@@ -586,11 +586,16 @@ export type FamilyWorkStateV1 = {
   readonly generation: number;
   readonly phase: "ready" | "tool_pending" | "waiting" | "terminal";
   readonly claim: { readonly claimId: string; readonly leaseUntil: string } | null;
+  readonly browserSession: {
+    readonly sessionId: string;
+    readonly expiresAt: string;
+  } | null;
   readonly continuationItems: readonly JsonValue[];
   readonly pendingCall: {
     readonly callId: string;
     readonly name: string;
     readonly argumentsJson: string;
+    readonly attempt: number;
   } | null;
   readonly steering: readonly {
     readonly sourceId: string;
@@ -2833,9 +2838,20 @@ export class PostgresFlorenceStore {
           }
           const claimId = randomUUID();
           const leaseUntil = new Date(now.getTime() + FAMILY_WORK_CLAIM_LEASE_MS);
+          let pendingCall = state.pendingCall;
+          if (state.phase === "tool_pending") {
+            if (!pendingCall) {
+              throw new FlorenceStoreConflict("Due family work lost its pending capability call");
+            }
+            pendingCall = {
+              ...pendingCall,
+              attempt: incrementFamilyWorkCounter(pendingCall.attempt, "Family work capability attempt"),
+            };
+          }
           const claimedState = familyWorkState({
             ...state,
             claim: { claimId, leaseUntil: leaseUntil.toISOString() },
+            pendingCall,
           });
           await sql`
             update proactive_work set task_state=${sql.json(claimedState)},next_check_at=${leaseUntil},
@@ -3154,6 +3170,27 @@ export class PostgresFlorenceStore {
           and task_state->'claim'->>'claimId'=${input.claimId} returning id
       `;
       return updated.length === 1 ? "settled" : "stale";
+    });
+  }
+
+  async takeCancelledFamilyWorkBrowserSession(workId: string): Promise<FamilyWorkStateV1["browserSession"]> {
+    assertUuid(workId, "Family work ID");
+    return this.#sql.begin(async (sql) => {
+      const [work] = await sql<ProactiveWorkRow[]>`
+        select * from proactive_work
+        where id=${workId} and kind='family_task' and status='cancelled'
+        for update
+      `;
+      if (!work) return null;
+      const state = familyWorkState(work.task_state);
+      const browserSession = state.browserSession;
+      if (!browserSession) return null;
+      const nextState = familyWorkState({ ...state, browserSession: null });
+      await sql`
+        update proactive_work set task_state=${sql.json(nextState)}
+        where id=${work.id} and kind='family_task' and status='cancelled'
+      `;
+      return browserSession;
     });
   }
 
@@ -13562,6 +13599,7 @@ function reminderText(action: string): string {
 }
 
 const FAMILY_WORK_STATE_KEYS = [
+  "browserSession",
   "claim",
   "continuationItems",
   "generation",
@@ -13582,6 +13620,7 @@ function initialFamilyWorkState(): FamilyWorkStateV1 {
     generation: 0,
     phase: "ready",
     claim: null,
+    browserSession: null,
     continuationItems: [],
     pendingCall: null,
     steering: [],
@@ -13606,6 +13645,7 @@ function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWor
     throw new FlorenceStoreConflict("Stored family work state is invalid");
   }
   const state = canonical;
+  if (state.browserSession === undefined) state.browserSession = null;
   assertExactJsonKeys(state, FAMILY_WORK_STATE_KEYS, "Family work state");
   if (state.kind !== "family_work_v1" || state.version !== 1) {
     throw new FlorenceStoreConflict("Family work state has an unsupported version");
@@ -13632,6 +13672,28 @@ function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWor
     };
   }
 
+  let browserSession: FamilyWorkStateV1["browserSession"] = null;
+  if (state.browserSession !== null) {
+    const storedBrowserSession = strictJsonRecord(state.browserSession, "Family work browser session");
+    assertExactJsonKeys(storedBrowserSession, ["expiresAt", "sessionId"], "Family work browser session");
+    const expiresAt = requiredStringField(
+      storedBrowserSession,
+      "expiresAt",
+      "Family work browser session expiry",
+    );
+    if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/u.test(expiresAt)) {
+      throw new FlorenceStoreConflict("Family work browser session expiry is invalid");
+    }
+    browserSession = {
+      sessionId: limitedRequiredString(
+        requiredStringField(storedBrowserSession, "sessionId", "Family work browser session ID"),
+        500,
+        "Family work browser session ID",
+      ),
+      expiresAt: instant(expiresAt).toISOString(),
+    };
+  }
+
   const continuationItems = jsonArrayField(state, "continuationItems", "Family work continuation");
   let pendingCall: FamilyWorkStateV1["pendingCall"] = null;
   if (state.pendingCall === undefined) {
@@ -13639,7 +13701,12 @@ function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWor
   }
   if (state.pendingCall !== null) {
     const storedCall = strictJsonRecord(state.pendingCall, "Family work pending call");
-    assertExactJsonKeys(storedCall, ["argumentsJson", "callId", "name"], "Family work pending call");
+    if (storedCall.attempt === undefined) storedCall.attempt = 0;
+    assertExactJsonKeys(
+      storedCall,
+      ["argumentsJson", "attempt", "callId", "name"],
+      "Family work pending call",
+    );
     const callId = limitedRequiredString(
       requiredStringField(storedCall, "callId", "Family work call ID"),
       200,
@@ -13659,7 +13726,12 @@ function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWor
     } catch {
       throw new FlorenceStoreConflict("Family work call arguments are not JSON");
     }
-    pendingCall = { callId, name, argumentsJson };
+    pendingCall = {
+      callId,
+      name,
+      argumentsJson,
+      attempt: familyWorkCounter(storedCall.attempt, "Family work capability attempt"),
+    };
   }
 
   const steering = jsonArrayField(state, "steering", "Family work steering").map((item) => {
@@ -13734,6 +13806,7 @@ function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWor
     generation,
     phase,
     claim,
+    browserSession,
     continuationItems: [...continuationItems],
     pendingCall,
     steering,

@@ -1,106 +1,157 @@
-# Instinct/Poke capability audit for Florence
+# Instinct capability audit for Florence
 
 Research date: 2026-08-28
-Source access date: 2026-08-28 unless noted otherwise
+
+Source access date: 2026-08-28
 
 ## Bottom line
 
-The competitive bar is not “better search.” It is **accepting an ordinary household objective, gathering missing public context, and finishing the work across the services where that work lives**.
+Instinct's public product is not differentiated by a documented search engine. It is differentiated by an **outcome contract**: accept an ordinary objective over text or a call, recover context from the user's applications and devices, use a phone or computer, take actions across connected services, and follow up until something useful happens. Instinct's own examples end with a ride arranged or a handyman booked, not a list of links. ([Product page](https://instinct.co/), [Privacy Policy](https://instinct.co/privacy-policy), [Terms of Service](https://instinct.co/terms))
 
-Instinct's first-party product page describes the broadest version of that promise: an assistant connected to email, messaging, screen, audio, and location; trained to use a phone and computer; reachable by text or call; and able to follow up on dropped threads, arrange an airport ride, or book a handyman. Its founder additionally reports early users planning road trips, buying groceries and concert tickets, cancelling subscriptions, and planning a wedding. ([Instinct product page](https://instinct.co/), [founder launch post](https://x.com/noahrshinn/status/2092691344456351744))
+Florence already has the right household-specific foundation and considerably more implemented Google depth than a search-only assistant: two-parent Messages participation, reactions, 90-day source ingestion, household memory, maps, weather, flights, public HTML/PDF reading, reminders, durable work, and broad Google Workspace actions. Its largest lived-product gap was **operating the non-Google surface where family errands finish**.
 
-Poke documents the concrete execution surface behind a similar promise: actionable email and calendar connections, reminders, background automations, first-party and custom integrations, browser-backed reservations, and optional human completion for calls, orders, rides, and reservations. ([Poke product page](https://poke.com/), [Poke docs](https://poke.com/docs), [Poke integrations](https://poke.com/docs/managing-integrations), [Poke release notes](https://poke.com/docs/release-notes))
+The smallest implementation tranche that most closes that gap is:
 
-Florence already has the household thread, durable work, proactive scheduling, family memory, public research, maps, weather, flights, and substantial Google Workspace work. Its largest remaining gap is **execution beyond Google and public page reading**: authenticated browsing, forms, reservations, purchases, external communication, trip execution, and cross-service follow-through.
+> **The family can now ask Florence to open an authenticated site, keep the browser session alive across work turns, navigate and fill one real household flow, let an adult take over for sign-in when needed, and continue operating from the resulting page state.**
 
-## Evidence boundaries
+That means one browser/computer-use capability in Florence's existing durable work loop—not another search provider, connector framework, task runtime, or generic action/safety layer. The focused proof stops at a camp-portal review page so the browser journey has a deterministic assertion; the runtime action set itself does not impose a review-only boundary.
 
-The comparison below separates what the companies themselves publicly claim from product inference.
+## Evidence rules
 
-- **Instinct is still private access.** Its official site and founder's launch post are the available first-party capability evidence. They establish the product ambition and examples, but do not document supported connectors, booking providers, confirmation flows, memory behavior, reaction support, or response-time guarantees. Treat those examples as first-party claims, not a verified exhaustive tool list.
-- **Poke is documented in substantially more detail.** Its official docs, release notes, and recipes name integrations and end-user actions. Poke Team recipes are treated as first-party examples. Community recipes are useful evidence that the platform can be extended, but not evidence that every installation has that behavior by default.
-- **No first-party source reviewed publishes a response-time SLA or claims Tapback/reaction support.** “Real-time automations,” typing indicators, read receipts, and inline replies are documented; exact acknowledgement latency and reactions are not. Florence's immediate acknowledgement and situational-reaction goals are therefore product requirements, not copied competitor claims.
+This audit uses only first-party public sources for claims about Instinct:
 
-## Florence's current execution surface
+- Instinct's current [product page](https://instinct.co/);
+- Instinct's [Privacy Policy](https://instinct.co/privacy-policy), revised August 26, 2026;
+- Instinct's [Terms of Service](https://instinct.co/terms), revised August 26, 2026; and
+- founder Noah Shinn's [launch post](https://x.com/noahrshinn/status/2092691344456351744), with the access caveat below.
 
-This table describes implemented repository behavior, including the Google Workspace work in this branch. It is not a roadmap.
+The policy and terms are used here only where they materially define a shipped or contemplated product capability. This is not a privacy, legal, or safety review.
 
-| Area | Implemented now | Material limit |
-| --- | --- | --- |
-| Family messaging | Private-parent and family-group participation, inline reply context, inbound/outbound reactions, immediate work cues, typing, paced bubbles, delivery state, text, voice-note transcription, images, and PDFs. ([Linq adapter](../../packages/linq/src/index.ts), [turn orchestration](../../apps/api/src/florence.ts)) | No live phone call, outbound call, or general contact channel outside the connected parent threads. |
-| Household context | Source-linked family memory, two-adult household model, child profiles, retained facts/interests, 90-day Gmail and Calendar ingestion, and a reconciled household docket. ([store](../../packages/database/src/store.ts), [turn orchestration](../../apps/api/src/florence.ts)) | Source selection and proactive ranking still need product tuning; retaining evidence is useful only if Florence retrieves the right thing at the right time. |
-| Public information | Current web search plus exact public HTML/PDF reading. ([reasoner](../../apps/api/src/reasoner.ts), [page reader](../../apps/api/src/public-page.ts)) | Cannot operate an authenticated site, navigate a multi-page flow, fill/upload/submit a form, or return a transaction receipt. |
-| Places, routes, and weather | Place and nearby search, bounded-area search, reverse geocoding, real route distance/directions, time zones, and U.S. forecasts/alerts. ([maps](../../apps/api/src/maps.ts), [weather](../../apps/api/src/weather.ts)) | Cannot check provider-specific live availability, contact a business, reserve, or book transport. |
-| Travel discovery | Live flight alternatives with prices, segments, constraints, and booking links; public research can resolve identifiers. ([flights](../../apps/api/src/flights.ts), [reasoner](../../apps/api/src/reasoner.ts)) | No dedicated flight-number status/gate primitive, itinerary state, confirmation-email sync, disruption monitor, rebooking, hotel, or ground-transport completion. |
-| Calendar and reminders | Broad personal-calendar reads; shared family-calendar provision/create/update/delete; private-derived family-date offers; one-shot and recurring reminders; finite monitors; pause/resume/run/cancel. ([Google adapter](../../packages/google/src/index.ts), [reasoner](../../apps/api/src/reasoner.ts)) | No general personal-calendar invitation/RSVP workflow, meeting negotiation, or external scheduler. |
-| Gmail and Contacts | Gmail search/get/labels plus durable send/reply/label changes; Google Contacts search plus durable create/update. ([Workspace adapter](../../packages/google/src/workspace.ts), [reasoner tools](../../apps/api/src/reasoner.ts)) | No Gmail draft or forward operation, attachment send/reply, mail rules, or non-Google address book. |
-| Drive, Docs, Sheets, Slides, Tasks | Drive search/metadata plus durable folder/share/trash; Docs read/create/append; Sheets read/create/update/append; Slides read/create/add text slide; Google Tasks list/create/update/complete. ([Workspace adapter](../../packages/google/src/workspace.ts), [reasoner tools](../../apps/api/src/reasoner.ts)) | No arbitrary Drive file download/upload, PDF/image artifact pipeline, rich document editing, form submission, or non-Google document/task systems. |
-| Long-running work | Durable private or household work with steering, cancellation, checkpointed retries, bounded progress, and one terminal delivery. ([reasoner](../../apps/api/src/reasoner.ts), [store](../../packages/database/src/store.ts)) | The loop can only finish work for which Florence has a real tool. It cannot compensate for missing browser, commerce, booking, or communication actions. |
+Instinct remains in private access. Its public pages establish a product promise and supported data/action surfaces, but they do not expose a tool catalog, runtime design, provider matrix, or reliability data. Every statement below distinguishes a public claim from an implementation inference.
 
-## Competitor capability comparison
+## What Instinct publicly says it does
 
-| End-user job | Observed first-party Instinct claim | Observed first-party Poke capability | What it means for Florence |
+| Product surface | First-party evidence | What the evidence supports | What it does **not** establish |
 | --- | --- | --- | --- |
-| Hand off an objective and get an outcome | Uses a phone and computer “the same way that humans do”; examples include rides and handyman booking. ([Instinct](https://instinct.co/)) | API-triggered objectives can use email, calendar, reminders, and integrations; Poke Human completes calls, reservations, orders, and rides. ([Poke API](https://poke.com/docs/api), [Poke Human](https://poke.com/faq)) | A search result or “I'll look” is not completion. Every supported objective needs either an external result, a precise blocker, or an honest failure. |
-| Communicate on the user's behalf | Connects to email and messaging and can proactively call or text. ([Instinct](https://instinct.co/)) | Gmail searches, drafts, sends, labels, and organizes. Outlook supports compose/reply with attachments, search, folders, flags, rules, contacts, and calendars. ([Poke](https://poke.com/), [Outlook Mail](https://poke.com/recipes/outlook-mail), [release notes](https://poke.com/docs/release-notes)) | Finish Gmail drafts/forwarding/attachments, then add outbound provider communication and calls. |
-| Own calendar coordination | No detailed scheduling surface is publicly documented. | Google Calendar creates events, schedules meetings, checks availability across calendars, manages reminders, and coordinates scheduling; Outlook adds recurring events and RSVP tracking. ([Google Calendar](https://poke.com/r/google-calendar), [Outlook Calendar](https://poke.com/r/outlook-calendar)) | Extend family-calendar strength into meeting invitations, negotiation, RSVP handling, and external appointment workflows. |
-| Handle reminders and task systems | Following up on dropped threads is a core example. ([Instinct](https://instinct.co/)) | Native reminders plus Todoist/Asana task management and real-time background automations. ([Poke docs](https://poke.com/docs), [Todoist](https://poke.com/recipes/todoist), [Poke pricing](https://poke.com/pricing)) | Florence's native reminders and Google Tasks are a good base. The important gap is turning an open household objective into continued work, not adding another reminder representation. |
-| Browse, fill, and transact | Broad phone/computer use and reported purchases/cancellations imply general interface operation, but the mechanism and supported sites are not public. ([Instinct](https://instinct.co/), [founder launch post](https://x.com/noahrshinn/status/2092691344456351744)) | A first-party recipe finds restaurants and autonomously reserves through Browserbase; Poke Human handles the unsupported long tail. ([restaurant reservations](https://poke.com/r/restaurant-reservations), [release notes](https://poke.com/docs/release-notes)) | Authenticated browser completion is the highest-impact missing surface: school portals, forms, reservations, appointments, checkout, and cancellations. |
-| Complete travel work | First-party examples include airport rides and cross-country road-trip planning. ([Instinct](https://instinct.co/), [founder launch post](https://x.com/noahrshinn/status/2092691344456351744)) | First-party recipes detect flight confirmations, add timezone-correct calendar events, forward trips to TripIt/Flighty, and route receipts; the recipe directory also exposes flight-status and fare-monitor workflows. ([travel recipes](https://poke.com/recipes?tag=Travel), [release notes](https://poke.com/docs/release-notes)) | Treat a flight number as enough to begin. Add flight status and itinerary state, then disruption monitoring, rebooking options, hotels, and ground transport. |
-| Move information across services | Connects broadly to applications/devices, without a public integration inventory. ([Instinct](https://instinct.co/)) | Poke's API examples chain email, calendar, Notion, and reminders; Recipes bundle behavior with integrations; arbitrary MCP servers expose discoverable tools. ([Poke API](https://poke.com/docs/api), [Recipes docs](https://poke.com/docs/creating-recipes), [MCP docs](https://poke.com/docs/mcp-servers)) | Build a few high-value household connectors and complete cross-app workflows before investing in a general marketplace. |
-| Monitor and surface what matters | Understands what is important and follows up on dropped threads. ([Instinct](https://instinct.co/)) | Uses connected services and memory proactively; first-party recipes produce calendar/email morning briefings, flag unreplied sent mail, and prevent duplicate receipt forwarding. ([Poke](https://poke.com/), [morning briefing](https://poke.com/recipes/morning-briefing), [follow-up reminders](https://poke.com/recipes/follow-up-reminders), [receipt forwarding](https://poke.com/recipes/forward-receipts-to-mercury)) | Florence should read broad history but surface selectively. Monitoring needs evidence-change detection and deduplication so it does not repeat the same reminder. |
-| Remember useful context | Says it understands what the user is working on and what is important; no public memory model is documented. ([Instinct](https://instinct.co/)) | Markets integrated-service use plus memory to help at the right time. ([Poke](https://poke.com/)) | Keep the household/parental unit as Florence's differentiator: remember family facts once, retain provenance, and retrieve across both parents where the product has made the fact shared. |
-| Feel like a person in Messages | Text and calls are the stated interface. No official reaction behavior is documented. ([Instinct](https://instinct.co/)) | Lives in Apple Messages, WhatsApp, Telegram, and RCS; accepts voice messages; markets a friend-like personality; supports inline replies in Apple Messages and typing/read receipts/inline replies in WhatsApp. No official Tapback claim was found. ([Poke docs](https://poke.com/docs), [Poke](https://poke.com/), [release notes](https://poke.com/docs/release-notes)) | Use reactions situationally as immediate social acknowledgement, followed by actual work. Never use a reaction as the only answer to a substantive request, and never choose silence for a normal message. |
-| Make progress legible | No public progress protocol or response-time guarantee was found. | Markets “real-time” background automations and says API objectives take action and respond, but publishes no acknowledgement or completion SLA. ([Poke pricing](https://poke.com/pricing), [Poke API](https://poke.com/docs/api)) | Florence's UX should set its own stronger bar: acknowledge immediately, identify the work started, send only meaningful progress, and finish with the outcome or blocker. |
+| Natural interface | Users can text or call; the product says there are “no new interfaces.” ([Product page](https://instinct.co/)) | Ordinary conversational delegation rather than a task-builder UI | iMessage versus SMS behavior, WhatsApp support, group chats, reactions, typing indicators, or response latency |
+| Ambient context | Instinct names email, messaging, screen, audio, location, applications, and devices. ([Product page](https://instinct.co/)) | The assistant is expected to start from available personal context | Exact connectors, indexing horizon, retrieval quality, or family sharing |
+| Planning and autonomous work | The assistant “thinks, plans, and acts”; Instinct says it understands requests and plans and completes tasks, including by engaging third parties. ([Privacy Policy](https://instinct.co/privacy-policy)) | An objective may require several steps and external work | Durable jobs, retries, recovery after restart, steering, cancellation, or parallel work |
+| Phone and computer use | Instinct says it is trained to use a phone and computer the way people do. ([Product page](https://instinct.co/)) | General interface operation is central to the product claim | Browser vendor, accessibility/vision mechanism, site coverage, or whether every advertised outcome uses computer control |
+| Connected-service actions | The service may access, index, exchange data with, and take actions on connected third-party websites, applications, and services. ([Terms, “Connected services”](https://instinct.co/terms)) | The product contract extends beyond read-only retrieval and beyond Google | A complete provider list or per-provider operation list |
+| Google Workspace | Gmail, Calendar, Drive, Docs, Sheets, Slides, and Tasks are explicitly named, including taking actions and personalizing the service. ([Privacy Policy, “Google Workspace”](https://instinct.co/privacy-policy)) | Instinct's named Google surface is the full productivity suite | Editing depth, Contacts support, search quality, or demonstrated end-to-end workflows for each app |
+| Authenticated work | Instinct says an adult may provide credentials so the assistant can sign in to third-party accounts. ([Privacy Policy](https://instinct.co/privacy-policy)) | Authenticated portals and account chores are in scope | Credential storage design, assisted-login UX, MFA handling, session persistence, or adult takeover |
+| Purchases and commitments | The terms cover purchases, sharing a payment method with a connected service, and entering agreements, commitments, or transactions on the user's behalf. ([Terms, “Actions”](https://instinct.co/terms)) | Transactional completion—not just product research—is part of the product contract | Merchant coverage, checkout success rate, confirmation UX, or default review behavior |
+| External coordination | The assistant may engage third parties; current examples include arranging an airport ride, booking a handyman, and booking a medical appointment. ([Product page](https://instinct.co/), [Privacy Policy](https://instinct.co/privacy-policy)) | Instinct aims to coordinate with people and services outside the user's inbox | Whether it calls, texts, emails, uses a marketplace, or drives a website for each example |
+| Proactive follow-up | Instinct says it follows up on dropped threads and can proactively call or text the user. ([Product page](https://instinct.co/)) | It claims responsibility for unfinished work, not only reactive answers | Trigger logic, deduplication, progress cadence, or a response-time guarantee |
+| Status surfaces | The app contract names push, local, text, picture, alert, and email messages used for status updates. ([Terms, “Use of the app”](https://instinct.co/terms)) | Multiple outbound surfaces exist for keeping a user informed | Which channels the assistant itself uses, what it sends, or how quickly |
+| Memory-like context | Instinct describes personalization from current context and prior experience, indexing connected-service data, and a named Vault. ([Privacy Policy](https://instinct.co/privacy-policy), [Terms, “Materials”](https://instinct.co/terms)) | Persistent context is part of the product surface | Memory schema, source provenance, contradiction handling, active-thread representation, or shared-family knowledge |
+| Voice, screen, and location | The product names audio, calls, screen, and location; the policy names voice and optional precise geolocation. ([Product page](https://instinct.co/), [Privacy Policy](https://instinct.co/privacy-policy)) | Instinct targets more than a text-and-email assistant | Live conversational quality, screen-control architecture, or location-trigger behavior |
 
-## Prioritized capability gaps
+### Public outcome examples
 
-### P0: Work Florence should be able to finish next
+Instinct's live product page gives three concrete behaviors: recover a dropped thread and proactively contact the user, arrange a ride to the airport, and book a handyman. ([Product page](https://instinct.co/))
 
-1. **Authenticated browser completion** — open and navigate sites, maintain a task session, click, type, select, upload, download, submit, wait for page state, and return the confirmation. Initial family jobs: school/camp forms, appointment booking, restaurant reservations, account changes, and subscription cancellation.
-2. **External communication** — Gmail drafts, forwards, and attachments; contact lookup across connected accounts; outbound messages or calls to schools, camps, doctors, restaurants, and local providers; reply tracking until the household has an answer.
-3. **Travel state and disruption work** — resolve route/status from carrier + flight number + date without asking for data the public web provides; extract itineraries from email; track delays/gates; compare replacement flights, hotels, and ground transport; carry the selected option into booking.
-4. **Artifacts and forms** — download Drive or portal files, extract/OCR useful content, edit or generate the needed PDF/image/document, upload it, and retain the submitted confirmation. This is the bridge between “Florence found the form” and “the form is done.”
+The founder's launch post reports early users planning cross-country road trips, buying weekly groceries and concert tickets, cancelling subscriptions, and planning a wedding. ([Founder launch post](https://x.com/noahrshinn/status/2092691344456351744)) These are founder-reported examples, not public demonstrations or a guarantee of general support. The direct X page returned HTTP 403 to the research crawler on 2026-08-28, so the post URL is retained as the primary citation but its contents could not be freshly re-opened in this pass.
 
-### P1: Turn isolated tools into household outcomes
+The important commonality is not any one merchant or provider. Each example requires context gathering plus action across one or more ordinary services.
 
-5. **Reservations, appointments, and local services** — inspect live availability, reserve or book, contact providers for missing information, track replies/quotes, reschedule/cancel, and put the confirmed result on the family calendar.
-6. **Purchases and account chores** — compare the constrained options, check live price/availability, add to cart/order where supported, cancel subscriptions, and capture receipts or cancellation confirmations. Browser completion can cover the long tail; dedicated provider tools are worthwhile only for repeated family jobs.
-7. **Cross-app workflows** — email-to-calendar, email-to-task, form-to-Drive, receipt-to-record, trip-to-calendar, and provider-reply-to-docket flows that continue until the objective is done. The durable work record already exists; the missing piece is the external action chain.
-8. **Proactive monitoring that earns attention** — monitor changed evidence, unreplied messages, deadlines, trip disruptions, price/availability, and missing confirmations. Deduplicate by the underlying item and suppress unchanged results; broad 90-day ingestion should improve retrieval, not produce a flood of summaries.
+## What Instinct does not document publicly
 
-### P2: Expand reach after the core workflows work
+No first-party public source reviewed establishes:
 
-9. **A small set of household connectors** — likely Todoist/Notion, TripIt/Flighty, school/camp systems, and high-frequency booking or health-administration services. Choose them from actual family usage rather than cloning Poke's developer-oriented catalog.
-10. **Live calls** — parent-to-Florence voice plus outbound calls for providers whose workflows still require the phone. The result belongs back in the family thread and docket.
-11. **Human completion fallback** — only after the automated path has enough coverage to identify the jobs it genuinely cannot finish. Poke demonstrates that a person can close the phone/order/reservation long tail; it does not imply Florence needs that operating layer before browser and communication tools work.
+- a dedicated Google Search tool or any complete web/search provider inventory;
+- dedicated maps, weather, flight-status, hotel, restaurant, grocery, ticketing, healthcare, or home-service integrations;
+- whether long-tail work uses a browser, native app control, APIs, people, or a mixture;
+- a public browser action set such as navigation, snapshots, click, type, upload, download, or screenshots;
+- a human-operator fallback or assisted-login/takeover flow;
+- task persistence, retries, timeouts, steering, cancellation, or restart recovery;
+- progress-message cadence or an acknowledgement/completion SLA;
+- reactions, Tapbacks, inline replies, typing indicators, or read receipts;
+- group or household accounts, shared family memory, or multi-adult coordination; or
+- measured reliability for the advertised and founder-reported outcomes.
 
-## Messaging and latency acceptance bar
+These are meaningful evidence boundaries. For Florence, reactions and immediate feedback remain good product requirements because of the two-phone testing experience—not because Instinct publicly demonstrates them. Likewise, browser/computer use is the strongest implementation hypothesis for closing Florence's action gap, but Instinct does not publish its mechanism.
 
-These are Florence product requirements derived from the observed testing failures, not competitor claims:
+## Florence versus the public Instinct bar
 
-- A normal message always receives a useful response. Silence is reserved for non-substantive reactions or system noise, never an ordinary question or request.
-- A task that will continue after the turn gets an immediate, natural acknowledgement. A situational Tapback can make the interaction feel human, but it accompanies—not replaces—the acknowledgement.
-- Florence starts with available context. Identifiers such as a flight number, event link, business name, or email thread should trigger lookup before a clarifying question.
-- Progress messages report a meaningful new step or blocker. They do not repeat the request, narrate internal machinery, or resend the same reminder in different words.
-- The terminal message states what happened and includes the useful external evidence: reservation time, sent-email recipient, event link, order/confirmation number, submitted-form receipt, or the exact unresolved blocker.
-- Cross-app work remains one user objective. Parents should not have to manually relay outputs between Florence's own tools.
+This is implemented repository behavior as of the research date, not planned work.
 
-## Source register
+| Lived capability | Florence today | Instinct public bar | Material Florence gap |
+| --- | --- | --- | --- |
+| Parent interaction | Private-parent and family-group Messages, text, voice-note transcription, images/PDFs, inline context, reactions, typing, delivery state, and immediate work cues. ([Linq adapter](../../packages/linq/src/index.ts), [turn orchestration](../../apps/api/src/florence.ts)) | Text or call, plus proactive call/text | No live inbound/outbound call and no general messaging channel outside the connected family threads |
+| Household context | Two-adult household model, child profiles, source-linked memory, retained facts/interests, 90-day Gmail/Calendar ingestion, and a reconciled docket. ([store](../../packages/database/src/store.ts), [turn orchestration](../../apps/api/src/florence.ts)) | Personal context from apps/devices and prior experience | Retrieval/ranking still needs to turn broad history into the right next action without repetition; Instinct does not publicly offer Florence's shared-family model |
+| Public research and browser work | Current web search, exact public HTML/PDF reading, maps/places/routes/time zones, U.S. weather/alerts, live flight alternatives, and a durable authenticated browser with live owner takeover. ([reasoner](../../apps/api/src/reasoner.ts), [browser](../../apps/api/src/browser.ts), [page reader](../../apps/api/src/public-page.ts), [maps](../../apps/api/src/maps.ts), [weather](../../apps/api/src/weather.ts), [flights](../../apps/api/src/flights.ts)) | Broad context plus phone/computer operation | The browser closes the general interactive-site reach gap; provider-specific execution and confirmation remain to be proven one real workflow at a time |
+| Google work | Gmail read/search/send/reply/labels; Contacts search/create/update; Calendar read/shared-calendar actions; Drive, Docs, Sheets, Slides, and Tasks read/write operations. ([Google adapter](../../packages/google/src/index.ts), [Workspace adapter](../../packages/google/src/workspace.ts), [reasoner tools](../../apps/api/src/reasoner.ts)) | Gmail, Calendar, Drive, Docs, Sheets, Slides, and Tasks actions | Useful depth gaps remain, but another Google action closes less of the lived-product gap than non-Google execution |
+| Reminders and proactive work | Natural reminder create/list/change/cancel/pause/resume/run/recurrence, finite monitors, scheduled due work, and deduplicated delivery paths. ([reasoner](../../apps/api/src/reasoner.ts), [turn orchestration](../../apps/api/src/florence.ts)) | Dropped-thread follow-up and proactive call/text | Evidence ranking and active-thread follow-through need product tuning; new reminder infrastructure is not the missing capability |
+| Long-running objectives | Durable private or household work with checkpoints, retries, steering, cancellation, progress, a terminal result, and a browser session that survives those checkpoints. ([reasoner](../../apps/api/src/reasoner.ts), [browser](../../apps/api/src/browser.ts), [store](../../packages/database/src/store.ts)) | Think, plan, act, and complete tasks | The work loop now has a general external action tool; broad outcome reliability depends on proving and reconciling concrete workflows |
+| External outcomes | Google actions and family-calendar/reminder outcomes can complete; durable work can now operate interactive or authenticated sites rather than returning only links. | Rides, bookings, purchases, connected-service actions, and commitments | Provider-confirmed bookings, purchases, cancellations, third-party contact, and receipt capture still need end-to-end product journeys |
 
-All sources below are first-party and were accessed 2026-08-28.
+Florence was therefore not missing “agent infrastructure.” It was missing the **last-mile tool** that lets its existing durable worker turn research into a real-world state change. The browser tranche below supplies that reach; the remaining work is provider-confirmed execution across concrete household journeys.
 
-| Source | What it supports |
-| --- | --- |
-| [Instinct product page](https://instinct.co/) | Inputs/devices, phone/computer use, text/call interface, proactive follow-up, ride and handyman examples, private-access status. |
-| [Instinct founder launch post](https://x.com/noahrshinn/status/2092691344456351744) | Founder-reported early-user examples: road trips, groceries, concert tickets, subscription cancellation, wedding planning. |
-| [Poke product page](https://poke.com/) and [Poke docs](https://poke.com/docs) | Messaging channels, email/calendar/reminders/web, memory/proactivity marketing, voice input, integrations, background automation positioning. |
-| [Poke release notes](https://poke.com/docs/release-notes) and [FAQ](https://poke.com/faq) | Apple Messages availability, inline replies, WhatsApp presence behaviors, Outlook actions, attachments, Poke Human jobs. |
-| [Poke integrations](https://poke.com/docs/managing-integrations), [Recipes docs](https://poke.com/docs/creating-recipes), and [MCP docs](https://poke.com/docs/mcp-servers) | First/third-party integration model, recipe behavior bundles, custom discoverable tools. |
-| [Poke API](https://poke.com/docs/api) | Programmatic objectives and documented cross-app action examples. |
-| [Restaurant Reservations](https://poke.com/r/restaurant-reservations) | Poke Team's Browserbase-backed autonomous reservation example. |
-| [Google Calendar](https://poke.com/r/google-calendar) and [Outlook Calendar](https://poke.com/r/outlook-calendar) | Calendar creation, availability, meeting coordination, recurrence, reminders, and RSVPs. |
-| [Outlook Mail](https://poke.com/recipes/outlook-mail) | Search, drafts/sends, folders, flags, rules, and email workflows. |
-| [Morning Briefing](https://poke.com/recipes/morning-briefing), [Follow-up Reminders](https://poke.com/recipes/follow-up-reminders), and [receipt forwarding](https://poke.com/recipes/forward-receipts-to-mercury) | Proactive cross-source selection, unanswered-message follow-up, and duplicate-aware automation. |
-| [Travel recipes](https://poke.com/recipes?tag=Travel) | Flight status/fares, itinerary forwarding, receipt routing, and flight-to-calendar workflows. |
-| [Poke pricing](https://poke.com/pricing) | “Real-time” background automation positioning; no published latency SLA. |
+## Smallest next tranche: authenticated browser work
+
+### User-visible capability
+
+Start with one named family errand:
+
+> A parent asks Florence to handle a school/camp or appointment portal. Florence opens the site, keeps the session across work turns, lets the parent take over for sign-in if required, navigates by the site's current controls, fills the known household details, and returns the exact review state before the final submit/book/pay step.
+
+This is deliberately narrower than “general computer use” but exercises the part of Instinct's public bar Florence cannot currently reach.
+
+### Concrete operation surface
+
+The implemented first tranche includes the operations required by that journey:
+
+- open/navigate and go back;
+- extract a bounded accessibility snapshot with fresh element references;
+- click, type/fill, select, check/uncheck, press a key, scroll, and wait for page state;
+- capture a bounded screenshot when the accessibility view is insufficient;
+- keep one task-bound authenticated session alive across durable work passes;
+- provide an adult-facing takeover link when sign-in or MFA needs the parent; and
+- close the session on terminal completion or cancellation.
+
+The model should receive page state and action results through the existing typed durable-tool seam. Provider session IDs, credentials, cleanup, and reconnection remain application-owned rather than model-selected.
+
+### Why this tranche comes first
+
+1. **It closes the widest gap with one tool.** The same operation set reaches school portals, camp registration, appointments, restaurant availability, account changes, subscriptions, travel sites, and the long tail of local services.
+2. **It complements rather than duplicates Google Workspace.** Gmail/Calendar/Drive can supply the context; the browser carries that context into the external workflow.
+3. **It uses Florence's existing work loop.** Checkpointing, retry, steering, cancellation, progress, and terminal delivery already exist. No second task runtime or generalized action framework is justified.
+4. **It matches Instinct's defining public claim.** Phone/computer operation and authenticated connected-service actions are the clearest capability differences in Instinct's own materials.
+5. **It yields an honest, testable household result.** The pilot family can see the portal state and review what Florence filled, rather than evaluating an internal tool count.
+
+### Explicitly outside this tranche
+
+- a general connector/plugin marketplace;
+- a new credential store, scheduler, queue, memory system, or work runtime;
+- coding, terminal, shell, repository, or arbitrary-filesystem tools;
+- a generic approval, policy, evidence, safety, or privacy layer;
+- human call-center operations;
+- every browser action or every site;
+- provider-specific payment handling or a guarantee that every binding submission can be reconciled; and
+- random provider matrices or framework tests.
+
+Provider-confirmed submit/book/pay/cancel outcomes and external email/SMS/call completion are the next action tranche. The browser can already press the site's controls; what remains is proving concrete journeys and reporting the provider-confirmed outcome without a search-result handoff.
+
+## Next capabilities after browser reach
+
+Once the named browser journey works end to end, the next gaps should be closed in lived-product order:
+
+1. **Commit and verify external actions** — submit/book/cancel when requested, then report the provider-confirmed result or exact failure.
+2. **External communication** — Gmail draft/forward/attachments first, then provider email/SMS/calls and reply tracking.
+3. **Artifacts and forms** — download, understand, generate/edit, upload, and retain the submitted receipt.
+4. **Travel state and execution** — itinerary extraction, flight status/gates, disruption monitoring, hotels/ground transport, and carrying a selected option into booking.
+5. **Live voice/location work** — conversational calls and location-aware errands after the browser and communication paths can actually complete the underlying jobs.
+
+## Source register and uncertainty
+
+All live pages below are first-party Instinct sources accessed 2026-08-28.
+
+| Source | Exact evidence used | Uncertainty |
+| --- | --- | --- |
+| [Instinct product page](https://instinct.co/) | Email/messaging/screen/audio/location, phone/computer use, text/call interface, dropped-thread follow-up, proactive call/text, airport ride, handyman, private-access status | Marketing claims; no provider list, mechanism, demonstration, or reliability data |
+| [Instinct Privacy Policy](https://instinct.co/privacy-policy) | Autonomous assistant that thinks/plans/acts, third-party engagement, credentials/sign-in, rides, medical appointments, voice/location, Gmail/Calendar/Drive/Docs/Sheets/Slides/Tasks | Establishes intended/service surfaces, not operation depth or successful execution rates |
+| [Instinct Terms of Service](https://instinct.co/terms) | Connected-service indexing and actions, purchases, commitments/transactions, Vault, Mac/mobile apps, push/text/picture/alert/email status surfaces | Contract breadth does not prove every action is enabled for every user or provider |
+| [Founder launch post](https://x.com/noahrshinn/status/2092691344456351744) | Founder-reported road trips, groceries, concert tickets, subscription cancellation, and wedding planning | Direct X fetch returned 403 in this research pass; examples are reports, not public demos |
+
+No secondary reports, competitor teardowns, or inferred closed-product internals are used as evidence for Instinct capabilities in this audit.

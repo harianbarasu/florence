@@ -28,6 +28,11 @@ import type {
 } from "openai/resources/responses/responses";
 import { z } from "zod";
 import {
+  FlorenceBrowserError,
+  type FlorenceBrowserObservation,
+  type FlorenceBrowserOperation,
+} from "./browser.js";
+import {
   CapabilityAdapterError,
   type CapabilityCatalogSnapshot,
   CapabilityRegistry,
@@ -1349,7 +1354,7 @@ export type FlorenceFamilyWorkInput = Readonly<{
 
 export type FlorenceFamilyWorkReadTools = Pick<
   FlorenceReadTools,
-  "runMaps" | "runWeather" | "runFlights" | "runPublicPage" | "runGoogleWorkspace"
+  "runMaps" | "runWeather" | "runFlights" | "runPublicPage" | "runGoogleWorkspace" | "runBrowser"
 > &
   Partial<Pick<FlorenceReadTools, "listCalendars" | "readCalendarWindow">>;
 
@@ -1443,6 +1448,7 @@ type PrivateGoogleSource = FlorencePrivateGmailSource | FlorencePrivateCalendarE
 
 export interface FlorenceReadTools {
   settleSources(sources: readonly FlorenceSource[]): void;
+  runBrowser?(operation: FlorenceBrowserOperation, signal?: AbortSignal): Promise<FlorenceBrowserObservation>;
   runPublicPage?(request: FlorencePublicPageRequest, signal?: AbortSignal): Promise<FlorencePublicPageResult>;
   runMaps?(request: FlorenceMapsRequest, signal?: AbortSignal): Promise<FlorenceMapsResult>;
   runWeather?(request: FlorenceWeatherRequest, signal?: AbortSignal): Promise<FlorenceWeatherResult>;
@@ -1576,7 +1582,7 @@ Before returning a create, read a family-Calendar window that completely covers 
 
 Facts may be remembered or corrected only when policy.retain is true. Forgetting an existing fact is allowed when retain is false. A reminder, finite monitor, durable family task, durable interest discovery, Calendar offer, or direct Calendar decision may be created only when policy.schedule is true. Never claim that an external message, purchase, booking, or unsupported consequential action happened.
 
-The familyWork field is for a real multi-step task that should keep going after this reply: for example resolving a delayed flight, comparing live alternatives, researching and sending a plain email, finding a Google Doc or Sheet and updating its native content, or another task that cannot be usefully completed in the ordinary foreground turn. It is not a generic promise, a reminder, a finite evidence monitor, or a substitute for answering a normal question now. Create it when the parent explicitly asks Florence to keep working or when completing the request genuinely needs multiple tool checkpoints. Return one immediate natural acknowledgement bubble that names the work Florence is actually starting; a brief reaction is welcome when it feels natural, but never use it instead of the acknowledgement. Never say the work is complete at acceptance. The current background catalog includes public research, maps, weather, flights, and—when this parent has reconnected Google—Gmail, Drive metadata, Contacts, Docs, Sheets, Slides, and Tasks. Use what is actually available and report a real result, one blocking question, or an honest failure.
+The familyWork field is for a real multi-step task that should keep going after this reply: for example resolving a delayed flight, comparing live alternatives, researching and sending a plain email, working through an interactive website, finding a Google Doc or Sheet and updating its native content, or another task that cannot be usefully completed in the ordinary foreground turn. It is not a generic promise, a reminder, a finite evidence monitor, or a substitute for answering a normal question now. Create it when the parent explicitly asks Florence to keep working or when completing the request genuinely needs multiple tool checkpoints. Return one immediate natural acknowledgement bubble that names the work Florence is actually starting; a brief reaction is welcome when it feels natural, but never use it instead of the acknowledgement. Never say the work is complete at acceptance. The current background catalog includes public research, full-page reading, maps, weather, flights, authenticated browser work with parent takeover, and—when this parent has reconnected Google—Gmail, Drive metadata, Contacts, Docs, Sheets, Slides, and Tasks. Use what is actually available and report a real result, one blocking question, or an honest failure.
 
 householdDocket is the ranked household-safe backlog retained from the complete Google review. Treat it as current structured context, not a reason to volunteer every item. When a parent asks what is on the docket, what needs attention, or what the family is waiting on, reconcile it with visible reminders, active or waiting family work, pending follow-ups, pending Calendar offers, and a near-term family-Calendar read when timing could change the answer. Rank by consequence and time, not source or message count. Lead with at most three unfinished items. For each, say naturally what it is, why it matters now, and the next decision or action without inventing facts beyond the supplied summary, category, dueAt, and needsAnswer. If householdDocket.totalItems exceeds what you show, say how many lower-priority items remain instead of dumping them. Do not treat silence from another person as completion, and do not repeat an unchanged docket item unsolicited merely because it is still present. When the parent clearly says a supplied docket item is handled, finished, cancelled, or no longer relevant, put exactly that candidateId in docketCompletions and acknowledge it naturally. A reply or unambiguous recent referent may identify the item; if more than one supplied item plausibly matches, ask one focused question and return docketCompletions null. Return docketCompletions null when nothing was completed. Never infer completion from thanks, agreement, silence, or a reaction.
 
@@ -1688,7 +1694,7 @@ const FAMILY_WORK_INSTRUCTIONS = `You are Florence continuing one durable family
 
 This is real background work, not a chat acknowledgement. Advance the supplied objective by one useful checkpoint. You have the parent's original objective, every later steering instruction in order, prior tool calls and results, the current time, and a narrow family profile. Treat the latest steering as authoritative when it changes an earlier constraint. Do not expose task IDs, state, claims, generations, tool names, or internal process language.
 
-Use the available tools naturally. Public web research resolves current facts and identifiers from a task-specific query; read_public_page reads the full clean text of an exact public HTML page or PDF relevant to the task; dedicated maps, route, time-zone, weather, flight, Gmail, Drive, Contacts, Docs, Sheets, Slides, and Tasks tools do the structured work they cover. Drive search and get return metadata only: they cannot download a file's contents, including a PDF or other binary, and no Workspace tool uploads files. Durable Gmail work can read or send plain/HTML message bodies but cannot read or send attachments. Google Docs, Sheets, and Slides tools can operate on their native content by provider ID. Never claim an attachment, upload, download, or arbitrary Drive-file read happened. Use the Google Workspace tools to complete the parent's objective rather than merely explaining how they could do it. Ask only when one genuine missing choice blocks execution, and report what the returned result says actually happened. A flight number is an ordinary public identifier: resolve its current operating date, route, and status before searching alternatives. Prefer a second genuinely useful source or specialized tool for a comparison, but never call tools performatively or claim an action without a returned result.
+Use the available tools naturally. Public web research resolves current facts and identifiers from a task-specific query; read_public_page reads the full clean text of an exact public HTML page or PDF relevant to the task; dedicated maps, route, time-zone, weather, flight, Gmail, Drive, Contacts, Docs, Sheets, Slides, and Tasks tools do the structured work they cover. Use browser_work when the useful next step lives in an interactive or authenticated website rather than a public page or structured provider tool. Start by navigating, use only refs from the latest returned snapshot, and expect every action to return a fresh snapshot with new refs. If a browser result has kind uncertain_effect, do not repeat the earlier action unless the current page proves it did not happen; when its snapshot is empty, call snapshot next. If the site needs the parent's login, MFA, or direct takeover, use owner_handoff and give them the returned live-view link; after they say they are done, continue the same browser session. A screenshot is for visually ambiguous pages, not a substitute for the accessibility snapshot. Drive search and get return metadata only: they cannot download a file's contents, including a PDF or other binary, and no Workspace tool uploads files. Durable Gmail work can read or send plain/HTML message bodies but cannot read or send attachments. Google Docs, Sheets, and Slides tools can operate on their native content by provider ID. Never claim an attachment, upload, download, arbitrary Drive-file read, or website action happened unless the relevant tool result says it did. Use the tools to complete the parent's objective rather than merely explaining how they could do it. Ask only when one genuine missing choice blocks execution, and report what the returned result says actually happened. A flight number is an ordinary public identifier: resolve its current operating date, route, and status before searching alternatives. Prefer a second genuinely useful source or specialized tool for a comparison, but never call tools performatively.
 
 If another tool operation is needed, call exactly one tool and stop this checkpoint. If the accumulated evidence is enough, return a concise terminal result that leads with the useful answer and includes concrete options, times, tradeoffs, completed actions, and direct URLs already present in tool results when helpful. Use outcome succeeded when the requested work is complete, partial when useful results exist but one named source or constraint could not be resolved, failed only when no useful result can be produced, and waiting only when one consequential parent choice remains genuinely blocking after the available tools. A waiting result must ask exactly one focused question. Never say you will keep working unless you actually call another tool in this checkpoint. Output only the strict terminal schema when you do not call a tool.`;
 
@@ -2589,6 +2595,122 @@ const TASKS_WORK_PARAMETERS = {
   ],
 } as const;
 
+const browserWorkArguments = z
+  .object({
+    operation: z.enum([
+      "navigate",
+      "snapshot",
+      "click",
+      "type",
+      "select",
+      "check",
+      "press",
+      "scroll",
+      "wait",
+      "back",
+      "screenshot",
+      "owner_handoff",
+    ]),
+    url: z.string().trim().url().max(4_096).nullable(),
+    ref: z.string().trim().min(1).max(100).nullable(),
+    text: z.string().max(20_000).nullable(),
+    values: z.array(z.string().max(20_000)).max(20),
+    checked: z.boolean().nullable(),
+    key: z.string().trim().min(1).max(100).nullable(),
+    direction: z.enum(["up", "down"]).nullable(),
+    milliseconds: z.number().int().min(0).max(10_000).nullable(),
+    compact: z.boolean(),
+  })
+  .strict()
+  .superRefine((args, context) => {
+    const requireValue = (value: unknown, path: string): void => {
+      if (value === null || value === undefined || value === "") {
+        context.addIssue({
+          code: "custom",
+          path: [path],
+          message: `${path} is required for browser ${args.operation}`,
+        });
+      }
+    };
+    if (args.operation === "navigate") requireValue(args.url, "url");
+    if (["click", "type", "select", "check"].includes(args.operation)) {
+      requireValue(args.ref, "ref");
+    }
+    if (args.operation === "type" && args.text === null) requireValue(args.text, "text");
+    if (args.operation === "select" && args.values.length === 0) {
+      context.addIssue({
+        code: "custom",
+        path: ["values"],
+        message: "values are required for browser select",
+      });
+    }
+    if (args.operation === "check") requireValue(args.checked, "checked");
+    if (args.operation === "press") requireValue(args.key, "key");
+    if (args.operation === "scroll") requireValue(args.direction, "direction");
+    if (args.operation === "wait") requireValue(args.milliseconds, "milliseconds");
+  });
+
+const BROWSER_WORK_PARAMETERS = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    operation: {
+      type: "string",
+      enum: [
+        "navigate",
+        "snapshot",
+        "click",
+        "type",
+        "select",
+        "check",
+        "press",
+        "scroll",
+        "wait",
+        "back",
+        "screenshot",
+        "owner_handoff",
+      ],
+    },
+    url: { anyOf: [{ type: "string", minLength: 1, maxLength: 4_096 }, { type: "null" }] },
+    ref: { anyOf: [{ type: "string", minLength: 1, maxLength: 100 }, { type: "null" }] },
+    text: { anyOf: [{ type: "string", maxLength: 20_000 }, { type: "null" }] },
+    values: { type: "array", maxItems: 20, items: { type: "string", maxLength: 20_000 } },
+    checked: { anyOf: [{ type: "boolean" }, { type: "null" }] },
+    key: { anyOf: [{ type: "string", minLength: 1, maxLength: 100 }, { type: "null" }] },
+    direction: { anyOf: [{ type: "string", enum: ["up", "down"] }, { type: "null" }] },
+    milliseconds: {
+      anyOf: [{ type: "integer", minimum: 0, maximum: 10_000 }, { type: "null" }],
+    },
+    compact: { type: "boolean" },
+  },
+  required: [
+    "operation",
+    "url",
+    "ref",
+    "text",
+    "values",
+    "checked",
+    "key",
+    "direction",
+    "milliseconds",
+    "compact",
+  ],
+} as const;
+
+const browserObservationOutputSchema = z
+  .object({
+    kind: z.enum(["page", "owner_handoff", "uncertain_effect"]),
+    reason: z.string().max(500).nullable(),
+    url: z.string().max(4_096),
+    title: z.string().max(2_000),
+    snapshot: z.string().max(15_000),
+    refCount: z.number().int().min(0),
+    truncated: z.boolean(),
+    liveViewUrl: z.string().url().max(4_096).nullable(),
+    screenshotAttached: z.boolean(),
+  })
+  .strict();
+
 type ForegroundCapabilityContext = {
   readonly mode: "conversation" | "family_work";
   readonly input: FlorenceReasonerInput;
@@ -2981,6 +3103,105 @@ async function executeGoogleWorkspaceOperation(
   }, signal);
 }
 
+function browserOperation(args: z.infer<typeof browserWorkArguments>): FlorenceBrowserOperation {
+  switch (args.operation) {
+    case "navigate":
+      return { kind: "navigate", url: requiredWorkspaceValue(args.url, "browser URL") };
+    case "snapshot":
+      return { kind: "snapshot", compact: args.compact };
+    case "click":
+      return { kind: "click", ref: requiredWorkspaceValue(args.ref, "browser ref") };
+    case "type":
+      return {
+        kind: "type",
+        ref: requiredWorkspaceValue(args.ref, "browser ref"),
+        text: requiredWorkspaceValue(args.text, "browser text"),
+      };
+    case "select":
+      return {
+        kind: "select",
+        ref: requiredWorkspaceValue(args.ref, "browser ref"),
+        values: args.values,
+      };
+    case "check":
+      return {
+        kind: "check",
+        ref: requiredWorkspaceValue(args.ref, "browser ref"),
+        checked: requiredWorkspaceValue(args.checked, "browser checked state"),
+      };
+    case "press":
+      return { kind: "press", key: requiredWorkspaceValue(args.key, "browser key") };
+    case "scroll":
+      return {
+        kind: "scroll",
+        direction: requiredWorkspaceValue(args.direction, "browser scroll direction"),
+      };
+    case "wait":
+      return {
+        kind: "wait",
+        milliseconds: requiredWorkspaceValue(args.milliseconds, "browser wait duration"),
+      };
+    case "back":
+      return { kind: "back" };
+    case "screenshot":
+      return { kind: "screenshot" };
+    case "owner_handoff":
+      return { kind: "owner_handoff" };
+  }
+}
+
+async function executeBrowserOperation(
+  context: ForegroundCapabilityContext,
+  callId: string,
+  operation: FlorenceBrowserOperation,
+  signal: AbortSignal,
+): Promise<{ readonly output: z.infer<typeof browserObservationOutputSchema> }> {
+  const runBrowser = context.reads.runBrowser;
+  if (!runBrowser) throw new CapabilityAdapterError("unavailable", "Browser work is unavailable.");
+  let observation: FlorenceBrowserObservation;
+  try {
+    observation = await runBrowser(operation, signal);
+  } catch (error) {
+    if (!(error instanceof FlorenceBrowserError)) throw error;
+    if (error.code === "cancelled" && signal.aborted) throw error;
+    throw new CapabilityAdapterError(
+      error.code === "transient"
+        ? "transient"
+        : error.code === "invalid_response"
+          ? "invalid_response"
+          : error.code === "unavailable"
+            ? "unavailable"
+            : "permanent",
+      error.safeMessage,
+    );
+  }
+  throwIfAborted(signal);
+  if (observation.screenshot) {
+    context.artifacts.set(callId, [
+      {
+        type: "input_image",
+        detail: "auto",
+        image_url: `data:${observation.screenshot.mimeType};base64,${Buffer.from(
+          observation.screenshot.bytes,
+        ).toString("base64")}`,
+      },
+    ]);
+  }
+  return {
+    output: browserObservationOutputSchema.parse({
+      kind: observation.kind,
+      reason: observation.reason,
+      url: observation.url,
+      title: observation.title,
+      snapshot: observation.snapshot,
+      refCount: observation.refCount,
+      truncated: observation.truncated,
+      liveViewUrl: observation.liveViewUrl ?? null,
+      screenshotAttached: observation.screenshot !== undefined,
+    }),
+  };
+}
+
 /**
  * Directly adapted from Pi's immutable per-turn tool list and ordered tool-result
  * reduction (pi 4e494929, packages/agent/src/agent-loop.ts:374-580), combined
@@ -3109,6 +3330,21 @@ function foregroundCapabilityRegistry(): CapabilityRegistry<ForegroundCapability
           });
           return { output: page };
         }, signal),
+    }),
+    defineCapability({
+      name: "browser_work",
+      description:
+        "Use a real browser for an interactive website during durable private work: navigate, read the current accessibility snapshot, click, type, choose options, check boxes, press keys, scroll, wait, go back, inspect a screenshot, or hand the live session to the parent for sign-in/MFA. Element refs come from the latest snapshot and must be refreshed after each action. Set fields unused by the chosen operation to null or empty arrays.",
+      modelSchema: BROWSER_WORK_PARAMETERS,
+      inputSchema: browserWorkArguments,
+      outputSchema: browserObservationOutputSchema,
+      executionMode: "sequential",
+      timeoutMs: 90_000,
+      maxOutputBytes: 60_000,
+      availability: (context) => context.mode === "family_work" && context.reads.runBrowser !== undefined,
+      admit: ({ context }) => context.mode === "family_work",
+      execute: ({ callId, arguments: args, context, signal }) =>
+        executeBrowserOperation(context, callId, browserOperation(args), signal),
     }),
     defineCapability({
       name: "maps_search",
@@ -3675,6 +3911,21 @@ function storedResponseItems(items: readonly unknown[]): ResponseInputItem[] {
   return structuredClone(items) as ResponseInputItem[];
 }
 
+function compactConsumedFamilyWorkArtifacts(items: readonly unknown[]): JsonValue[] {
+  const cloned = JSON.parse(JSON.stringify(items)) as JsonValue[];
+  return cloned.map((item) => {
+    if (!isJsonRecord(item) || item.type !== "function_call_output" || !Array.isArray(item.output)) {
+      return item;
+    }
+    return {
+      ...item,
+      output: item.output.filter(
+        (part) => !isJsonRecord(part) || (part.type !== "input_image" && part.type !== "input_file"),
+      ),
+    };
+  });
+}
+
 function familyWorkProgressText(
   capabilityName: string,
   terminal: CapabilityTerminalEnvelope,
@@ -3711,6 +3962,16 @@ function familyWorkProgressText(
   }
   if (capabilityName === "weather_forecast") {
     return "I checked the live forecast and alerts. I’m folding that into the options now.";
+  }
+  if (capabilityName === "browser_work") {
+    const kind = (output as { kind?: unknown }).kind;
+    if (kind === "uncertain_effect") {
+      return "I’m checking the current page before I do anything else.";
+    }
+    const title = (output as { title?: unknown }).title;
+    return typeof title === "string" && title.trim()
+      ? `I opened ${title.trim()} and I’m working through it now.`.slice(0, 500)
+      : "I opened the site and I’m working through it now.";
   }
   return null;
 }
@@ -4490,17 +4751,19 @@ export class FlorenceReasoner {
       const calls = response.output.filter((item) => item.type === "function_call");
       if (calls.length > 1) throw invalidOutput("Durable family work planned more than one read step");
       const appended = jsonResponseItems(continuationItems(response.output));
+      const consumedContinuationItems = compactConsumedFamilyWorkArtifacts(input.state.continuationItems);
       const call = calls[0];
       if (call) {
         const state: FamilyWorkStateV1 = {
           ...input.state,
           phase: "tool_pending",
           claim: null,
-          continuationItems: [...input.state.continuationItems, ...appended],
+          continuationItems: [...consumedContinuationItems, ...appended],
           pendingCall: {
             callId: call.call_id,
             name: call.name,
             argumentsJson: call.arguments,
+            attempt: 0,
           },
         };
         if (familyWorkCheckpointBytes(state) > FAMILY_WORK_CHECKPOINT_MAX_BYTES) {
@@ -4521,7 +4784,7 @@ export class FlorenceReasoner {
           ...input.state,
           phase: "waiting",
           claim: null,
-          continuationItems: [...input.state.continuationItems, ...appended],
+          continuationItems: [...consumedContinuationItems, ...appended],
           pendingCall: null,
           progressRevision: input.state.progressRevision + 1,
         };

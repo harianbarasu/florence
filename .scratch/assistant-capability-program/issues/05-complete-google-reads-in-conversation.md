@@ -32,4 +32,4 @@ The implementation originally accumulated generalized stale-delivery replay, uni
 
 ### Verification
 
-The Google and database packages build, the API typechecks, the four focused tool-kernel tests pass, and the six focused reasoner tool-loop tests pass. PostgreSQL integration cases remain conditional on `TEST_DATABASE_URL`.
+The Google and database packages build, the API typechecks, and the focused reasoner tool-loop tests pass. PostgreSQL integration cases remain conditional on `TEST_DATABASE_URL`.

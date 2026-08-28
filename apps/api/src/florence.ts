@@ -99,6 +99,7 @@ import {
   type LinqReaction,
   type LinqReactionProposal,
 } from "@florence/linq";
+import type { FlorenceBrowserClient, FlorenceBrowserOperation } from "./browser.js";
 import type { EnrollmentCodes, WebAccessPath } from "./enrollment.js";
 import type { FlorenceFlightsClient } from "./flights.js";
 import type { FlorenceMapsClient } from "./maps.js";
@@ -159,6 +160,7 @@ export class Florence {
   readonly #publicPages: FlorencePublicPageClient | null;
   readonly #weather: FlorenceWeatherClient | null;
   readonly #flights: FlorenceFlightsClient | null;
+  readonly #browser: FlorenceBrowserClient | null;
   readonly #reasoner: FlorenceReasoner | null;
   readonly #enrollmentCodes: EnrollmentCodes;
   readonly #imageVault: EncryptedImageVault | null;
@@ -182,6 +184,7 @@ export class Florence {
     publicPages?: FlorencePublicPageClient | null;
     weather?: FlorenceWeatherClient | null;
     flights?: FlorenceFlightsClient | null;
+    browser?: FlorenceBrowserClient | null;
     reasoner: FlorenceReasoner | null;
     enrollmentCodes: EnrollmentCodes;
     imageVault: EncryptedImageVault | null;
@@ -197,6 +200,7 @@ export class Florence {
     this.#publicPages = input.publicPages ?? null;
     this.#weather = input.weather ?? null;
     this.#flights = input.flights ?? null;
+    this.#browser = input.browser ?? null;
     this.#reasoner = input.reasoner;
     this.#enrollmentCodes = input.enrollmentCodes;
     this.#imageVault = input.imageVault;
@@ -1497,6 +1501,16 @@ export class Florence {
           this.#activeFamilyWork
             .get(committedDecision.familyWork.workId)
             ?.controller.abort(new Error("The family task was cancelled"));
+          const browserSession = await this.#store.takeCancelledFamilyWorkBrowserSession(
+            committedDecision.familyWork.workId,
+          );
+          if (browserSession && this.#browser) {
+            try {
+              await this.#browser.close(browserSession);
+            } catch {
+              // Browserbase still expires the bounded session if release is unavailable.
+            }
+          }
         }
       } catch (error) {
         if (controller.signal.aborted) return;
@@ -3418,13 +3432,30 @@ export class Florence {
       });
       return;
     }
+    const familyWorkOwnerAdultId = work.ownerAdultId;
+    const browser =
+      this.#browser && work.visibility === "private" && familyWorkOwnerAdultId ? this.#browser : null;
+    const claimedBrowserSession = work.state.browserSession;
+    let browserSession = claimedBrowserSession;
+    const closeBrowserSession = async (session: NonNullable<typeof browserSession>): Promise<void> => {
+      if (!browser) return;
+      try {
+        await browser.close(session);
+      } catch {
+        // Browserbase sessions have a bounded expiry when release is unavailable.
+      }
+    };
+    const closeUncheckpointedBrowserSession = async (): Promise<void> => {
+      if (browserSession && browserSession.sessionId !== claimedBrowserSession?.sessionId) {
+        await closeBrowserSession(browserSession);
+      }
+    };
     try {
       const maps = this.#maps;
       const publicPages = this.#publicPages;
       const weather = this.#weather;
       const flights = this.#flights;
       const google = this.#google;
-      const familyWorkOwnerAdultId = work.ownerAdultId;
       const familyWorkGoogleConnections =
         google && work.visibility === "private" && familyWorkOwnerAdultId
           ? await google.status({
@@ -3616,6 +3647,29 @@ export class Florence {
           ...(maps ? { runMaps: (request, taskSignal) => maps.run(request, taskSignal) } : {}),
           ...(weather ? { runWeather: (request, taskSignal) => weather.run(request, taskSignal) } : {}),
           ...(flights ? { runFlights: (request, taskSignal) => flights.search(request, taskSignal) } : {}),
+          ...(browser && familyWorkOwnerAdultId
+            ? {
+                runBrowser: async (operation: FlorenceBrowserOperation, taskSignal?: AbortSignal) => {
+                  const pendingCall = work.state.pendingCall;
+                  if (pendingCall?.name !== "browser_work") {
+                    throw new Error("Durable browser work lost its pending call metadata");
+                  }
+                  const result = await browser.run(
+                    {
+                      workId: work.workId,
+                      ownerAdultId: familyWorkOwnerAdultId,
+                      callId: pendingCall.callId,
+                      attempt: pendingCall.attempt,
+                      session: browserSession,
+                      operation,
+                    },
+                    taskSignal,
+                  );
+                  browserSession = result.session;
+                  return result.observation;
+                },
+              }
+            : {}),
           ...(familyWorkCalendarConnection && familyWorkOwnerAdultId
             ? {
                 listCalendars: listFamilyWorkCalendars,
@@ -3642,64 +3696,91 @@ export class Florence {
       signal.throwIfAborted();
       const settledAt = this.#now().toISOString();
       if (step.kind === "continue") {
-        await this.#store.settleFamilyWorkClaim({
+        const settlement = await this.#store.settleFamilyWorkClaim({
           workId: work.workId,
           generation: work.generation,
           claimId: work.claimId,
           settledAt,
           result: {
             type: "continue",
-            state: step.state,
+            state: { ...step.state, browserSession },
             nextCheckAt: settledAt,
             ...(step.progressText ? { progressText: step.progressText } : {}),
           },
         });
+        if (settlement === "stale") await closeUncheckpointedBrowserSession();
       } else if (step.kind === "waiting") {
-        await this.#store.settleFamilyWorkClaim({
+        const settlement = await this.#store.settleFamilyWorkClaim({
           workId: work.workId,
           generation: work.generation,
           claimId: work.claimId,
           settledAt,
-          result: { type: "waiting", state: step.state, question: step.question },
+          result: {
+            type: "waiting",
+            state: { ...step.state, browserSession },
+            question: step.question,
+          },
         });
+        if (settlement === "stale") await closeUncheckpointedBrowserSession();
       } else {
-        await this.#store.settleFamilyWorkClaim({
+        const terminalBrowserSession = browserSession;
+        const settlement = await this.#store.settleFamilyWorkClaim({
           workId: work.workId,
           generation: work.generation,
           claimId: work.claimId,
           settledAt,
-          result: { type: "terminal", state: step.state, terminalText: step.text },
+          result: {
+            type: "terminal",
+            state: { ...step.state, browserSession: null },
+            terminalText: step.text,
+          },
         });
+        if (settlement === "settled" && terminalBrowserSession) {
+          await closeBrowserSession(terminalBrowserSession);
+        } else if (settlement === "stale") {
+          await closeUncheckpointedBrowserSession();
+          if (familyWorkWasExplicitlyCancelled(signal) && terminalBrowserSession) {
+            await closeBrowserSession(terminalBrowserSession);
+          }
+        }
       }
     } catch (error) {
       if (signal.aborted) {
+        const cancelled = familyWorkWasExplicitlyCancelled(signal);
+        if (cancelled && browserSession) await closeBrowserSession(browserSession);
         const interruptedAt = this.#now();
-        await this.#store.settleFamilyWorkClaim({
+        const settlement = await this.#store.settleFamilyWorkClaim({
           workId: work.workId,
           generation: work.generation,
           claimId: work.claimId,
           settledAt: interruptedAt.toISOString(),
           result: {
             type: "retry",
-            state: { ...work.state, claim: null },
+            state: {
+              ...work.state,
+              claim: null,
+              browserSession: cancelled ? null : browserSession,
+            },
             retryAt: later(interruptedAt, 1),
             error: "The task step was interrupted before its checkpoint and will resume",
           },
         });
+        if (settlement === "stale") await closeUncheckpointedBrowserSession();
         return;
       }
-      await this.#store.settleFamilyWorkClaim({
+      const settlement = await this.#store.settleFamilyWorkClaim({
         workId: work.workId,
         generation: work.generation,
         claimId: work.claimId,
         settledAt: this.#now().toISOString(),
         result: {
           type: "retry",
-          state: { ...work.state, claim: null },
+          state: { ...work.state, claim: null, browserSession },
           retryAt: later(this.#now(), RETRY_MS),
           error: errorText(error),
         },
       });
+      if (settlement === "stale") await closeUncheckpointedBrowserSession();
     }
   }
 
@@ -6935,6 +7016,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : "Unknown Florence loop failure";
+}
+
+function familyWorkWasExplicitlyCancelled(signal: AbortSignal): boolean {
+  return (
+    signal.aborted &&
+    signal.reason instanceof Error &&
+    signal.reason.message === "The family task was cancelled"
+  );
 }
 
 function credentialInvalidGrant(error: unknown): boolean {

@@ -429,6 +429,7 @@ type HarnessState = {
   initialGoogleFailureAdultId: string | null;
   completeScanPaginationExercise: boolean;
   completeFactSupportExercise: boolean;
+  retainedFactBeyondReviewWindowExercise: boolean;
   wrongGoogleSubjectNext: boolean;
   baselinePageReads: {
     kind: "gmail" | "calendar_targets" | "calendar_events";
@@ -1025,6 +1026,60 @@ release("Florence parent journeys", () => {
           and fact.slot=${sqlLiteral(SHARED_SCHOOL_CONTACT_SLOT)}
           and source.owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid
           and source.kind='gmail' and source.visibility='private')`,
+    );
+  }, 20_000);
+
+  test("keeps durable Google memory after its source ages beyond a later review window", async () => {
+    const harness = await createHarness(async () => decision());
+    harness.state.retainedFactBeyondReviewWindowExercise = true;
+    await harness.readyHousehold();
+
+    const beforeRescan = await harness.florence.workspaceForAdult(harness.founderAdultId);
+    const retainedBeforeRescan = beforeRescan.vault?.facts.find(
+      (fact) => fact.statement === INITIAL_PRIVATE_SCHOOL_FACT,
+    );
+    if (!retainedBeforeRescan) throw new Error("The initial Google review did not retain its durable fact");
+
+    harness.state.now += 91 * 24 * 60 * 60_000;
+    await harness.activateGoogle(
+      harness.founderAdultId,
+      RECONNECTED_FOUNDER_GOOGLE,
+      "founder-aged-memory-rescan-state",
+    );
+    await harness.drain();
+
+    const afterRescan = await harness.florence.workspaceForAdult(harness.founderAdultId);
+    expect(
+      afterRescan.vault?.facts.find((fact) => fact.statement === INITIAL_PRIVATE_SCHOOL_FACT),
+    ).toMatchObject({
+      id: retainedBeforeRescan.id,
+      visibility: "household",
+      source: { kind: "gmail" },
+    });
+    await harness.assertDatabase(
+      "A later 90-day discovery window expired durable Google memory",
+      `exists (
+          select 1 from proactive_work
+          where kind='initial_private_review' and status='completed'
+            and owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid
+        ) and exists (
+          select 1 from facts fact
+          join fact_sources link on link.fact_id=fact.id
+          join sources source on source.id=link.source_id
+          where fact.id=${sqlLiteral(retainedBeforeRescan.id)}::uuid
+            and fact.slot=${sqlLiteral(PRIVATE_SCHOOL_FACT_SLOT)}
+            and source.owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid
+            and source.kind='gmail'
+            and source.metadata->>'connectionId'=${sqlLiteral(FOUNDER_GOOGLE)}
+            and (source.metadata->>'sentAt')::timestamptz
+              < ${sqlLiteral(new Date(harness.state.now - 90 * 24 * 60 * 60_000).toISOString())}::timestamptz
+        ) and not exists (
+          select 1 from sources
+          where kind='gmail'
+            and owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid
+            and metadata->>'connectionId'=${sqlLiteral(RECONNECTED_FOUNDER_GOOGLE)}
+            and metadata->>'messageId'=${sqlLiteral(SCHOOL_ATTACHMENT.messageId)}
+        )`,
     );
   }, 20_000);
 
@@ -6356,6 +6411,7 @@ async function createHarness(
     initialGoogleFailureAdultId: null,
     completeScanPaginationExercise: false,
     completeFactSupportExercise: false,
+    retainedFactBeyondReviewWindowExercise: false,
     wrongGoogleSubjectNext: false,
     baselinePageReads: [],
     initialHouseholdCalendarFailuresRemaining: 0,
@@ -6542,6 +6598,28 @@ function createReasoner(
       const schoolContactSupports = eligibleGmail.filter((source) =>
         source.subject?.startsWith("School office contact confirmation "),
       );
+      if (state.retainedFactBeyondReviewWindowExercise) {
+        const retainedFactSource = founder
+          ? eligibleGmail.find((source) => source.subject !== GOOGLE_RECIPE_SUBJECT)
+          : undefined;
+        return {
+          findings: [],
+          facts: retainedFactSource
+            ? [
+                {
+                  slot: PRIVATE_SCHOOL_FACT_SLOT,
+                  statement: INITIAL_PRIVATE_SCHOOL_FACT,
+                  memory: googleFactMemory(INITIAL_PRIVATE_SCHOOL_FACT),
+                  familyRelevance: "household" as const,
+                  sourceIds: [retainedFactSource.sourceId],
+                },
+              ]
+            : [],
+          dismissedSourceIds: input.sources
+            .filter((source) => source.sourceId !== retainedFactSource?.sourceId)
+            .map((source) => source.sourceId),
+        };
+      }
       const paginatedCalendarSource = calendar.find((source) => source.title === PAGINATED_CALENDAR_TITLE);
       if (paginatedCalendarSource) {
         return {
@@ -7547,7 +7625,10 @@ function createGoogle(store: PostgresFlorenceStore, state: HarnessState): Google
           : founder
             ? "Private school form"
             : "Private family schedule",
-        sentAt: new Date(Date.parse(input.before) - 1_000).toISOString(),
+        sentAt:
+          state.retainedFactBeyondReviewWindowExercise && founder
+            ? new Date(NOW - 1_000).toISOString()
+            : new Date(Date.parse(input.before) - 1_000).toISOString(),
         text: initialUnrelatedAccount
           ? "Your retail account password was changed."
           : founder
@@ -7573,6 +7654,12 @@ function createGoogle(store: PostgresFlorenceStore, state: HarnessState): Google
         state.googleRecipeArtifactExercise && founder && input.connectionId === FOUNDER_GOOGLE
           ? [recipe]
           : [];
+      const relevantMessages =
+        state.retainedFactBeyondReviewWindowExercise && founder
+          ? Date.parse(relevant.sentAt) >= Date.parse(input.after)
+            ? [relevant]
+            : []
+          : [relevant];
       const schoolContactSupportMessages =
         state.completeFactSupportExercise && founder && input.connectionId === FOUNDER_GOOGLE
           ? Array.from({ length: 11 }, (_, index) => ({
@@ -7621,7 +7708,7 @@ function createGoogle(store: PostgresFlorenceStore, state: HarnessState): Google
       return {
         status: "complete" as const,
         nextPageToken: null,
-        messages: [relevant, ...schoolContactSupportMessages.slice(9), ...recipeMessages],
+        messages: [...relevantMessages, ...schoolContactSupportMessages.slice(9), ...recipeMessages],
       };
     },
     readCalendarBaselineTargetsPage: async (input: {

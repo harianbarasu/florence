@@ -68,6 +68,8 @@ The first Google review is complete, not sampled:
 
 There is no 20-message cap, relevance query, or model-selected sample in that background accounting pass. Florence does not surface everything immediately. She retains useful family context and brings it up when it becomes relevant, when a parent asks, or when there is a concrete next action.
 
+The 90-day window bounds onboarding discovery, not memory lifetime: durable facts and artifacts do not expire with age and remain available until corrected or forgotten, subject to explicit Google-derived data deletion.
+
 No arbitrary item, token-cost, or convenience cutoff may decide what Florence can know or recall. Provider page sizes are transport details and must be exhausted. A model call may receive relevance-ranked context, but the complete reviewed corpus remains durably indexed and retrievable for later questions and proactive judgment; bounded presentation must never become silent data loss.
 
 Google review uses only the distinction the family experience needs: a conclusion is useful to the household or it remains private to one adult. Topic labels such as school, travel, logistics, or adult coordination must not classify, route, or limit what Florence notices and can act on.

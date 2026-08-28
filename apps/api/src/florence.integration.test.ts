@@ -164,6 +164,25 @@ const ONE_SHOT_REMINDER_ACK = "Absolutely—I’ll remind you to pick up the kid
 const ONE_SHOT_REMINDER_ACTION = "pick up the kids";
 const ONE_SHOT_REMINDER_TEXT = "Reminder: pick up the kids.";
 const ONE_SHOT_REMINDER_AT = "2026-08-19T21:45:00.000Z";
+const RECURRING_REMINDER_REQUEST = "Every ten minutes, remind us to stretch.";
+const RECURRING_REMINDER_ACK = "Done—I’ll remind this group every ten minutes to stretch.";
+const RECURRING_REMINDER_ACTION = "stretch";
+const RECURRING_REMINDER_TEXT = "Reminder: stretch.";
+const RECURRING_REMINDER_ANCHOR = "2026-08-19T21:46:00.000Z";
+const LIST_REMINDERS_REQUEST = "What reminders are set?";
+const LIST_REMINDERS_REPLY = "Stretch — every ten minutes, starting at 2:46 PM.";
+const UPDATE_REMINDER_REQUEST = "Make the stretch reminder every five minutes starting at 2:47.";
+const UPDATE_REMINDER_ACK = "Done—I moved the stretch reminder to every five minutes from 2:47 PM.";
+const UPDATED_RECURRING_REMINDER_ANCHOR = "2026-08-19T21:47:00.000Z";
+const PAUSE_REMINDER_REQUEST = "Pause the stretch reminder.";
+const PAUSE_REMINDER_ACK = "Paused the stretch reminder.";
+const LIST_PAUSED_REMINDERS_REQUEST = "Which reminders are paused?";
+const LIST_PAUSED_REMINDERS_REPLY = "Stretch — every five minutes — paused.";
+const RESUME_REMINDER_REQUEST = "Resume the stretch reminder.";
+const RESUME_REMINDER_ACK = "Resumed—it’ll next remind this group at 2:52 PM.";
+const RUN_REMINDER_REQUEST = "Run the stretch reminder now.";
+const CANCEL_REMINDER_REQUEST = "Cancel the stretch reminder.";
+const CANCEL_REMINDER_ACK = "Cancelled the stretch reminder.";
 const PRIVATE_CALENDAR_ONLY_TITLE = "Maya’s soccer clinic";
 const PRIVATE_CALENDAR_CONFLICT_TITLE = "School volunteer shift";
 const PRIVATE_CALENDAR_ANNIVERSARY_TITLE = "Private anniversary dinner";
@@ -439,6 +458,8 @@ release("Florence parent journeys", () => {
     let contradictNextSuccessfulPartnerInvitation = false;
     let failNextGroupGreeting = false;
     let transientRetryAttempts = 0;
+    let activeReminderListSeen = false;
+    let pausedReminderListSeen = false;
     const harness = await createHarness(async (input) => {
       if (input.currentMessage.text === TRANSIENT_RETRY_REQUEST) {
         transientRetryAttempts += 1;
@@ -485,12 +506,113 @@ release("Florence parent journeys", () => {
       if (input.currentMessage.text === ONE_SHOT_REMINDER_REQUEST) {
         return decision({
           bubbles: [{ text: ONE_SHOT_REMINDER_ACK, delayMs: 0 }],
-          followUp: {
-            operation: "remind",
-            followUpId: null,
-            reminderAt: ONE_SHOT_REMINDER_AT,
-            reminderAction: ONE_SHOT_REMINDER_ACTION,
-            sourceIds: [input.currentMessage.sourceId],
+          reminder: {
+            operation: "create",
+            reminderId: null,
+            action: ONE_SHOT_REMINDER_ACTION,
+            schedule: { kind: "once", at: ONE_SHOT_REMINDER_AT },
+          },
+        });
+      }
+      const stretchReminder = input.visibleReminders.find(
+        (reminder) => reminder.action === RECURRING_REMINDER_ACTION,
+      );
+      if (input.currentMessage.text === RECURRING_REMINDER_REQUEST) {
+        return decision({
+          bubbles: [{ text: RECURRING_REMINDER_ACK, delayMs: 0 }],
+          reminder: {
+            operation: "create",
+            reminderId: null,
+            action: RECURRING_REMINDER_ACTION,
+            schedule: {
+              kind: "interval",
+              everyMinutes: 10,
+              anchorAt: RECURRING_REMINDER_ANCHOR,
+            },
+          },
+        });
+      }
+      if (input.currentMessage.text === LIST_REMINDERS_REQUEST) {
+        activeReminderListSeen = stretchReminder?.status === "active";
+        return decision({
+          bubbles: [{ text: LIST_REMINDERS_REPLY, delayMs: 0 }],
+          reminder: {
+            operation: "list",
+            reminderId: null,
+            action: null,
+            schedule: null,
+          },
+        });
+      }
+      if (input.currentMessage.text === UPDATE_REMINDER_REQUEST && stretchReminder) {
+        return decision({
+          bubbles: [{ text: UPDATE_REMINDER_ACK, delayMs: 0 }],
+          reminder: {
+            operation: "update",
+            reminderId: stretchReminder.reminderId,
+            action: null,
+            schedule: {
+              kind: "interval",
+              everyMinutes: 5,
+              anchorAt: UPDATED_RECURRING_REMINDER_ANCHOR,
+            },
+          },
+        });
+      }
+      if (input.currentMessage.text === PAUSE_REMINDER_REQUEST && stretchReminder) {
+        return decision({
+          bubbles: [{ text: PAUSE_REMINDER_ACK, delayMs: 0 }],
+          reminder: {
+            operation: "pause",
+            reminderId: stretchReminder.reminderId,
+            action: null,
+            schedule: null,
+          },
+        });
+      }
+      if (input.currentMessage.text === LIST_PAUSED_REMINDERS_REQUEST) {
+        pausedReminderListSeen = stretchReminder?.status === "paused";
+        return decision({
+          bubbles: [{ text: LIST_PAUSED_REMINDERS_REPLY, delayMs: 0 }],
+          reminder: {
+            operation: "list",
+            reminderId: null,
+            action: null,
+            schedule: null,
+          },
+        });
+      }
+      if (input.currentMessage.text === RESUME_REMINDER_REQUEST && stretchReminder) {
+        return decision({
+          bubbles: [{ text: RESUME_REMINDER_ACK, delayMs: 0 }],
+          reminder: {
+            operation: "resume",
+            reminderId: stretchReminder.reminderId,
+            action: null,
+            schedule: null,
+          },
+        });
+      }
+      if (input.currentMessage.text === RUN_REMINDER_REQUEST && stretchReminder) {
+        return decision({
+          reaction: "like",
+          bubbles: [],
+          reminder: {
+            operation: "run",
+            reminderId: stretchReminder.reminderId,
+            action: null,
+            schedule: null,
+          },
+        });
+      }
+      if (input.currentMessage.text === CANCEL_REMINDER_REQUEST && stretchReminder) {
+        return decision({
+          bubbles: [{ text: CANCEL_REMINDER_ACK, delayMs: 0 }],
+          reminder: {
+            operation: "cancel",
+            reminderId: stretchReminder.reminderId,
+            action: null,
+            schedule: null,
           },
         });
       }
@@ -1202,16 +1324,19 @@ release("Florence parent journeys", () => {
     expect(harness.linq.messages.some((message) => message.text === ONE_SHOT_REMINDER_TEXT)).toBe(false);
     expect(harness.state.finiteReviews).toBe(finiteReviewsBeforeReminder);
     await harness.assertDatabase(
-      "A one-shot reminder became a monitor or did not preserve the parent's exact delivery time",
-      `(select count(*)=1 from messages
-          where direction='outbound' and text=${sqlLiteral(ONE_SHOT_REMINDER_TEXT)}
-            and status='pending' and not_before=${sqlLiteral(ONE_SHOT_REMINDER_AT)}::timestamptz)
-        and not exists (
-          select 1 from proactive_work_sources link
+      "A one-shot reminder did not become one durable, addressable reminder at the exact requested time",
+      `(select count(*)=1 from proactive_work_sources link
           join proactive_work work on work.id=link.work_id
-          where link.source_id=${sqlLiteral(
-            inboundSourceId("event-one-shot-pickup-reminder"),
-          )}::uuid and work.kind='finite_monitor'
+          where link.source_id=${sqlLiteral(inboundSourceId("event-one-shot-pickup-reminder"))}::uuid
+            and work.kind='reminder' and work.status='active'
+            and work.objective=${sqlLiteral(ONE_SHOT_REMINDER_ACTION)}
+            and work.next_check_at=${sqlLiteral(ONE_SHOT_REMINDER_AT)}::timestamptz
+            and work.reminder_schedule=${sqlLiteral(
+              JSON.stringify({ kind: "once", at: ONE_SHOT_REMINDER_AT }),
+            )}::jsonb)
+        and not exists (
+          select 1 from messages
+          where direction='outbound' and text=${sqlLiteral(ONE_SHOT_REMINDER_TEXT)}
         )`,
     );
 
@@ -1230,6 +1355,13 @@ release("Florence parent journeys", () => {
     expect(failedReminderAttempts).toHaveLength(1);
     expect(harness.linq.messages.some((message) => message.text === ONE_SHOT_REMINDER_TEXT)).toBe(false);
     expect(harness.state.finiteReviews).toBe(finiteReviewsBeforeReminder);
+    await harness.assertDatabase(
+      "A one-shot reminder was marked complete before its queued delivery succeeded",
+      `(select count(*)=1 from proactive_work
+        where kind='reminder' and visibility='private' and objective=${sqlLiteral(
+          ONE_SHOT_REMINDER_ACTION,
+        )} and status='delivering' and next_check_at is null)`,
+    );
 
     harness.state.now += 5_000;
     await harness.drain();
@@ -1255,13 +1387,113 @@ release("Florence parent journeys", () => {
           where direction='outbound' and text=${sqlLiteral(ONE_SHOT_REMINDER_TEXT)}
             and status='sent' and not_before=${sqlLiteral(ONE_SHOT_REMINDER_AT)}::timestamptz
             and sent_at>=not_before)
-        and not exists (
-          select 1 from proactive_work_sources link
+        and (select count(*)=1 from proactive_work_sources link
           join proactive_work work on work.id=link.work_id
-          where link.source_id=${sqlLiteral(
-            inboundSourceId("event-one-shot-pickup-reminder"),
-          )}::uuid and work.kind='finite_monitor'
-        )`,
+          where link.source_id=${sqlLiteral(inboundSourceId("event-one-shot-pickup-reminder"))}::uuid
+            and work.kind='reminder' and work.status='completed'
+            and work.next_check_at is null and work.last_run_at is not null)`,
+    );
+
+    await harness.accept("group", "recurring-stretch-reminder", RECURRING_REMINDER_REQUEST);
+    await harness.drain();
+    await harness.accept("group", "list-active-reminders", LIST_REMINDERS_REQUEST);
+    await harness.drain();
+    expect(activeReminderListSeen).toBe(true);
+    expect(
+      harness.linq.messages.filter(
+        (message) => message.providerConversationId === FAMILY_GROUP && message.text === LIST_REMINDERS_REPLY,
+      ),
+    ).toHaveLength(1);
+
+    await harness.accept("group", "update-stretch-reminder", UPDATE_REMINDER_REQUEST);
+    await harness.drain();
+    await harness.accept("group", "pause-stretch-reminder", PAUSE_REMINDER_REQUEST);
+    await harness.drain();
+    harness.state.now = Date.parse("2026-08-19T21:48:00.000Z");
+    await harness.drain();
+    expect(harness.linq.messages.some((message) => message.text === RECURRING_REMINDER_TEXT)).toBe(false);
+    await harness.accept("group", "list-paused-reminders", LIST_PAUSED_REMINDERS_REQUEST);
+    await harness.drain();
+    expect(pausedReminderListSeen).toBe(true);
+
+    await harness.accept("group", "resume-stretch-reminder", RESUME_REMINDER_REQUEST);
+    await harness.drain();
+    const reactionsBeforeRunNow = harness.linq.reactions.length;
+    await harness.accept("group", "run-stretch-reminder", RUN_REMINDER_REQUEST);
+    await harness.drain();
+    expect(
+      harness.linq.messages.filter(
+        (message) =>
+          message.providerConversationId === FAMILY_GROUP && message.text === RECURRING_REMINDER_TEXT,
+      ),
+    ).toHaveLength(1);
+    expect(harness.linq.reactions.slice(reactionsBeforeRunNow)).toEqual([
+      expect.objectContaining({
+        providerConversationId: FAMILY_GROUP,
+        targetProviderMessageId: "message-run-stretch-reminder",
+        reaction: "like",
+      }),
+    ]);
+    await harness.assertDatabase(
+      "Run-now changed the recurring cadence or resumed a different reminder",
+      `(select count(*)=1 from proactive_work
+        where kind='reminder' and visibility='household' and objective=${sqlLiteral(
+          RECURRING_REMINDER_ACTION,
+        )} and status='active'
+          and reminder_schedule=${sqlLiteral(
+            JSON.stringify({
+              kind: "interval",
+              everyMinutes: 5,
+              anchorAt: UPDATED_RECURRING_REMINDER_ANCHOR,
+            }),
+          )}::jsonb
+          and next_check_at='2026-08-19T21:52:00.000Z'::timestamptz)`,
+    );
+
+    harness.state.now = Date.parse("2026-08-19T21:58:00.000Z");
+    await harness.florence.runOnce();
+    await harness.assertDatabase(
+      "The due recurring occurrence was not queued before the run-now race",
+      `exists (
+        select 1 from messages message join sources source on source.id=message.source_id
+        where message.direction='outbound' and message.status='pending'
+          and message.text=${sqlLiteral(RECURRING_REMINDER_TEXT)}
+          and source.metadata->>'reminderId' is not null
+      )`,
+    );
+    await harness.accept("group", "run-due-stretch-reminder", RUN_REMINDER_REQUEST);
+    await harness.drain();
+    const recurringDeliveries = harness.linq.messages.filter(
+      (message) =>
+        message.providerConversationId === FAMILY_GROUP && message.text === RECURRING_REMINDER_TEXT,
+    );
+    expect(recurringDeliveries).toHaveLength(2);
+    expect(new Set(recurringDeliveries.map((message) => message.idempotencyKey)).size).toBe(2);
+    await harness.assertDatabase(
+      "A missed recurring window burst old reminders or failed to fast-forward",
+      `(select count(*)=1 from proactive_work
+        where kind='reminder' and visibility='household' and objective=${sqlLiteral(
+          RECURRING_REMINDER_ACTION,
+        )} and status='active'
+          and next_check_at='2026-08-19T22:02:00.000Z'::timestamptz)`,
+    );
+
+    await harness.accept("group", "partner-cancel-stretch-reminder", CANCEL_REMINDER_REQUEST, "partner");
+    await harness.drain();
+    harness.state.now = Date.parse("2026-08-19T22:03:00.000Z");
+    await harness.drain();
+    expect(
+      harness.linq.messages.filter(
+        (message) =>
+          message.providerConversationId === FAMILY_GROUP && message.text === RECURRING_REMINDER_TEXT,
+      ),
+    ).toHaveLength(2);
+    await harness.assertDatabase(
+      "Partner cancellation did not make the shared reminder terminal",
+      `(select count(*)=1 from proactive_work
+        where kind='reminder' and visibility='household' and objective=${sqlLiteral(
+          RECURRING_REMINDER_ACTION,
+        )} and status='cancelled' and next_check_at is null)`,
     );
 
     failNextGroupGreeting = true;
@@ -6623,9 +6855,11 @@ function fakeResponseStream(events: readonly unknown[], response: unknown) {
 
 function decision(
   input: {
+    reaction?: FlorenceDecision["conversation"]["reaction"];
     bubbles?: FlorenceDecision["conversation"]["bubbles"];
     facts?: FlorenceDecision["facts"];
     followUp?: FlorenceDecision["followUp"];
+    reminder?: FlorenceDecision["reminder"];
     interest?: FlorenceDecision["interest"];
     calendar?: FlorenceDecision["calendar"];
     householdUpdate?: FlorenceDecision["householdUpdate"];
@@ -6637,11 +6871,12 @@ function decision(
     policy: { retain: true, schedule: true, stopMessaging: false },
     conversation: {
       replyToCurrentMessage: false,
-      reaction: null,
+      reaction: input.reaction ?? null,
       bubbles: input.bubbles ?? [],
     },
     facts: input.facts ?? [],
     followUp: input.followUp ?? null,
+    reminder: input.reminder ?? null,
     interest: input.interest ?? null,
     calendar: input.calendar ?? null,
     householdUpdate: input.householdUpdate ?? null,

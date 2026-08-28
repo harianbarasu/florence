@@ -47,6 +47,7 @@ Each ticket must name the family behavior it unlocks. Existing household boundar
 - [Complete Google reads in conversation](issues/05-complete-google-reads-in-conversation.md) — private Gmail attachment reads, complete Calendar catalog/window reads, and uncapped background 90-day accounting now use Florence's existing Google path without generalized delivery or evidence machinery.
 - [Port maps, places, routes, and time zones](issues/07-select-maps-weather-and-travel-providers.md) — eight Hermes-derived tools now use a concrete Nominatim, Overpass, Valhalla, and TimeAPI client through Florence's existing reasoner lifecycle, with no provider framework or new infrastructure.
 - [Add live weather and flight disruption help](issues/08-port-maps-weather-and-travel.md) — NOAA/NWS forecasts, observations, and alerts plus Hermes-derived live Kiwi alternatives now turn ordinary weather and flight-number disruption messages into work without a new provider framework.
+- [Port complete reminder control](issues/09-port-complete-reminder-control.md) — durable private and household reminders now support ordinary-language create/list/change/pause/resume/run/cancel and local-time recurrence through the existing due-work/outbox path.
 
 ## Fog
 

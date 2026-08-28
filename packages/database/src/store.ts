@@ -522,7 +522,51 @@ export type ProactiveMonitorChange =
       why: string;
     };
 
+/**
+ * Directly adapts Hermes Agent's tagged cron schedule and action lifecycle
+ * (6dcebea7, cron/jobs.py and tools/cronjob_tools.py) to family-local time.
+ * Florence keeps the behavior here in PostgreSQL instead of importing
+ * Hermes's JSON scheduler, agent sessions, or coding-job runtime.
+ */
+export type ReminderSchedule =
+  | { kind: "once"; at: string }
+  | { kind: "interval"; everyMinutes: number; anchorAt: string }
+  | { kind: "daily"; everyDays: number; localTime: string; startsOn: string }
+  | {
+      kind: "weekly";
+      everyWeeks: number;
+      weekdays: readonly number[];
+      localTime: string;
+      startsOn: string;
+    }
+  | {
+      kind: "monthly";
+      everyMonths: number;
+      dayOfMonth: number;
+      localTime: string;
+      startsOn: string;
+    }
+  | {
+      kind: "yearly";
+      everyYears: number;
+      month: number;
+      dayOfMonth: number;
+      localTime: string;
+      startsOn: string;
+    };
+
+export type VisibleReminder = {
+  reminderId: string;
+  action: string;
+  schedule: ReminderSchedule;
+  status: "active" | "paused" | "completed" | "cancelled";
+  nextAt: string | null;
+  lastRunAt: string | null;
+  createdAt: string;
+};
+
 export type DueProactiveWork =
+  | { kind: "reminder"; workId: string }
   | {
       kind: "personal_google_poll";
       workId: string;
@@ -840,6 +884,7 @@ export type InboundTurn = {
   currentDocuments?: readonly CurrentMessageDocument[];
   recentMessages: readonly ConversationTurn[];
   pendingFollowUps: readonly PendingFollowUp[];
+  visibleReminders: readonly VisibleReminder[];
   visibleInterests: readonly VisibleHouseholdInterest[];
   pendingCalendarOffers: readonly CalendarOffer[];
   pendingPartnerInvitation: PendingPartnerInvitation | null;
@@ -953,6 +998,26 @@ export type CalendarOfferApproval = { offerId: string };
 
 export type PartnerInvitationApproval = { adultId: string };
 
+export type ReminderMutation =
+  | {
+      operation: "create";
+      reminderId: string;
+      action: string;
+      schedule: ReminderSchedule;
+      visibility: Visibility;
+      ownerAdultId: string | null;
+    }
+  | {
+      operation: "update";
+      reminderId: string;
+      action: string | null;
+      schedule: ReminderSchedule | null;
+    }
+  | {
+      operation: "pause" | "resume" | "cancel" | "run";
+      reminderId: string;
+    };
+
 export type ApprovedPartnerInvitation = {
   householdId: string;
   founderAdultId: string;
@@ -981,6 +1046,7 @@ export type CommitTurnInput = {
   finiteMonitorUpdates?: readonly FiniteMonitorUpdate[];
   cancelMonitorIds?: readonly string[];
   interestMutation?: DurableInterestMutation | null;
+  reminderMutation?: ReminderMutation | null;
   outbound?: readonly OutboundDraft[];
   calendarOffers?: readonly CalendarOfferDraft[];
   approveCalendarOffers?: readonly CalendarOfferApproval[];
@@ -1162,7 +1228,8 @@ type ProactiveWorkRow = {
     | "personal_google_poll"
     | "family_calendar_poll"
     | "finite_monitor"
-    | "interest_monitor";
+    | "interest_monitor"
+    | "reminder";
   visibility: Visibility;
   owner_adult_id: string | null;
   objective: string | null;
@@ -1173,8 +1240,10 @@ type ProactiveWorkRow = {
   gmail_cursor: string | null;
   calendar_cursor: string | null;
   briefing_candidates: JsonValue;
-  status: "active" | "paused" | "completed";
+  status: "active" | "paused" | "delivering" | "completed" | "cancelled";
   next_check_at: Date | null;
+  reminder_schedule: JsonValue | null;
+  last_run_at: Date | null;
   last_error: string | null;
   created_at: Date;
 };
@@ -2516,10 +2585,13 @@ export class PostgresFlorenceStore {
 
       const due = await sql<ProactiveWorkRow[]>`
         select * from proactive_work where status='active' and next_check_at<=${now}
-          and kind in ('personal_google_poll','family_calendar_poll','finite_monitor','interest_monitor')
+          and kind in (
+            'reminder','personal_google_poll','family_calendar_poll','finite_monitor','interest_monitor'
+          )
         order by next_check_at,id
       `;
       for (const work of due) {
+        if (work.kind === "reminder") return { kind: "reminder", workId: work.id };
         if (work.kind === "personal_google_poll") {
           const [context] = await sql<
             {
@@ -2696,6 +2768,54 @@ export class PostgresFlorenceStore {
         }
       }
       return null;
+    });
+  }
+
+  async fireDueReminder(input: { workId: string; occurredAt: string }): Promise<void> {
+    assertUuid(input.workId, "Reminder ID");
+    const occurredAt = instant(input.occurredAt);
+    await this.#sql.begin(async (sql) => {
+      const [work] = await sql<ProactiveWorkRow[]>`
+        select * from proactive_work
+        where id=${input.workId} and kind='reminder' and status='active'
+          and next_check_at<=${occurredAt}
+        for update
+      `;
+      if (!work?.objective || !work.next_check_at) return;
+      const schedule = reminderSchedule(work.reminder_schedule);
+      const [household] = await sql<{ time_zone: string }[]>`
+        select time_zone from households where id=${work.household_id} for share
+      `;
+      if (!household) throw new FlorenceStoreConflict("The reminder household no longer exists");
+      const channel = await activeReminderChannel(sql, work);
+      if (!channel) {
+        await sql`
+          update proactive_work set status='paused',next_check_at=null,
+            last_error='Paused because this reminder no longer has an active Messages conversation'
+          where id=${work.id}
+        `;
+        return;
+      }
+      const scheduledAt = work.next_check_at;
+      await insertProactiveOutbound(sql, {
+        workId: work.id,
+        suffix: `reminder:${scheduledAt.toISOString()}`,
+        householdId: work.household_id,
+        channel,
+        visibility: work.visibility,
+        ownerAdultId: work.owner_adult_id,
+        text: reminderText(work.objective),
+        metadata: { reminderId: work.id, scheduledAt: scheduledAt.toISOString() },
+        notBefore: occurredAt,
+        occurredAt,
+      });
+      const nextAt = nextReminderOccurrence(schedule, occurredAt, household.time_zone);
+      await sql`
+        update proactive_work set
+          status=${schedule.kind === "once" ? "delivering" : "active"},
+          next_check_at=${nextAt},last_run_at=${occurredAt},last_error=null
+        where id=${work.id}
+      `;
     });
   }
 
@@ -5978,6 +6098,31 @@ export class PostgresFlorenceStore {
       group by w.id,w.objective,w.current_conclusion,w.end_condition,w.next_check_at,w.why
       order by w.next_check_at,w.id
     `;
+    const reminderRows = await this.#sql<
+      {
+        id: string;
+        objective: string;
+        reminder_schedule: JsonValue;
+        status: "active" | "paused" | "delivering" | "completed" | "cancelled";
+        next_check_at: Date | null;
+        last_run_at: Date | null;
+        created_at: Date;
+      }[]
+    >`
+      select id,objective,reminder_schedule,status,next_check_at,last_run_at,created_at
+      from proactive_work
+      where household_id=${row.household_id} and kind='reminder'
+        and (
+          (${channel.audience === "private"} and visibility='private'
+            and owner_adult_id=${row.sender_adult_id})
+          or (${channel.audience === "group"} and visibility='household'
+            and owner_adult_id is null)
+        )
+      order by
+        case when status in ('active','paused') then 0 else 1 end,
+        next_check_at nulls last,created_at desc,id
+      limit 100
+    `;
     const interestRows = await this.#sql<
       {
         id: string;
@@ -6163,6 +6308,15 @@ export class PostgresFlorenceStore {
         sourceIds: followUp.source_ids,
         googleBacked: followUp.google_backed,
       })),
+      visibleReminders: reminderRows.map((reminder) => ({
+        reminderId: reminder.id,
+        action: reminder.objective,
+        schedule: reminderSchedule(reminder.reminder_schedule),
+        status: reminder.status === "delivering" ? "active" : reminder.status,
+        nextAt: reminder.next_check_at?.toISOString() ?? null,
+        lastRunAt: reminder.last_run_at?.toISOString() ?? null,
+        createdAt: reminder.created_at.toISOString(),
+      })),
       visibleInterests: interestRows.map((interest) => ({
         interestWorkId: interest.id,
         status: interest.status,
@@ -6245,6 +6399,7 @@ export class PostgresFlorenceStore {
           (input.finiteMonitors?.length ?? 0) > 0 ||
           (input.cancelMonitorIds?.length ?? 0) > 0 ||
           input.interestMutation != null ||
+          input.reminderMutation != null ||
           (input.outbound?.length ?? 0) > 0 ||
           (input.calendarOffers?.length ?? 0) > 0 ||
           (input.approveCalendarOffers?.length ?? 0) > 0 ||
@@ -6672,6 +6827,224 @@ export class PostgresFlorenceStore {
         });
       }
 
+      if (input.reminderMutation) {
+        const mutation = input.reminderMutation;
+        if (turn.move_kind === "reaction") {
+          throw new FlorenceStoreUnauthorized("Reminder control requires a current parent request");
+        }
+        assertUuid(mutation.reminderId, "Reminder ID");
+        if (mutation.operation === "create") {
+          const expectedVisibility = turn.audience === "group" ? "household" : "private";
+          const expectedOwnerAdultId = expectedVisibility === "private" ? turn.sender_adult_id : null;
+          if (mutation.visibility !== expectedVisibility || mutation.ownerAdultId !== expectedOwnerAdultId) {
+            throw new FlorenceStoreUnauthorized(
+              "A reminder must stay inside the conversation where it was requested",
+            );
+          }
+          const action = bounded(required(mutation.action, "Reminder action"), 1_000);
+          const schedule = validateReminderSchedule(mutation.schedule);
+          const [sameId] = await sql<ProactiveWorkRow[]>`
+            select * from proactive_work where id=${mutation.reminderId} for update
+          `;
+          let storedReminderId = mutation.reminderId;
+          if (sameId) {
+            if (
+              sameId.household_id !== turn.household_id ||
+              sameId.kind !== "reminder" ||
+              sameId.visibility !== mutation.visibility ||
+              sameId.owner_adult_id !== mutation.ownerAdultId ||
+              sameId.objective !== action ||
+              JSON.stringify(reminderSchedule(sameId.reminder_schedule)) !== JSON.stringify(schedule)
+            ) {
+              throw new FlorenceStoreConflict("A reminder ID was reused for a different reminder");
+            }
+          } else {
+            const [household] = await sql<{ time_zone: string }[]>`
+              select time_zone from households where id=${turn.household_id} for share
+            `;
+            if (!household) throw new FlorenceStoreConflict("The reminder household no longer exists");
+            const nextAt = nextReminderOccurrence(schedule, handledAt, household.time_zone);
+            if (!nextAt) throw new FlorenceStoreConflict("A one-time reminder must still be in the future");
+            const [duplicate] = await sql<{ id: string }[]>`
+              select id from proactive_work
+              where household_id=${turn.household_id} and kind='reminder'
+                and visibility=${mutation.visibility}
+                and owner_adult_id is not distinct from ${mutation.ownerAdultId}
+                and objective=${action} and reminder_schedule=${sql.json(schedule)}
+                and status in ('active','paused','delivering')
+              limit 1 for update
+            `;
+            if (duplicate) {
+              storedReminderId = duplicate.id;
+            } else {
+              await sql`
+                insert into proactive_work (
+                  id,household_id,kind,visibility,owner_adult_id,objective,reminder_schedule,
+                  status,next_check_at,created_at
+                ) values (${mutation.reminderId},${turn.household_id},'reminder',${mutation.visibility},
+                  ${mutation.ownerAdultId},${action},${sql.json(schedule)},'active',${nextAt},${handledAt})
+              `;
+            }
+          }
+          await sql`
+            insert into proactive_work_sources (work_id,source_id)
+            values (${storedReminderId},${turn.source_id}) on conflict do nothing
+          `;
+        } else {
+          const [reminder] = await sql<ProactiveWorkRow[]>`
+            select * from proactive_work
+            where id=${mutation.reminderId} and household_id=${turn.household_id} and kind='reminder'
+              and ((${turn.audience}='group' and visibility='household' and owner_adult_id is null)
+                or (${turn.audience}='private' and visibility='private'
+                  and owner_adult_id=${turn.sender_adult_id}))
+            for update
+          `;
+          if (!reminder) {
+            throw new FlorenceStoreUnauthorized("That reminder does not belong to this conversation");
+          }
+          await sql`
+            insert into proactive_work_sources (work_id,source_id)
+            values (${reminder.id},${turn.source_id}) on conflict do nothing
+          `;
+          if (mutation.operation === "update") {
+            if (reminder.status === "completed" || reminder.status === "cancelled") {
+              throw new FlorenceStoreConflict("A finished reminder is no longer editable");
+            }
+            if (mutation.action === null && mutation.schedule === null) {
+              throw new FlorenceStoreConflict("A reminder update must change its action or schedule");
+            }
+            const schedule =
+              mutation.schedule === null
+                ? reminderSchedule(reminder.reminder_schedule)
+                : validateReminderSchedule(mutation.schedule);
+            const action =
+              mutation.action === null
+                ? required(reminder.objective ?? "", "Reminder action")
+                : bounded(required(mutation.action, "Reminder action"), 1_000);
+            if (reminder.status === "delivering" && mutation.schedule === null) {
+              if (
+                mutation.action === null ||
+                !(await updateQueuedReminderOccurrenceText(sql, reminder.id, reminderText(action), handledAt))
+              ) {
+                throw new FlorenceStoreConflict("That due reminder is already being delivered");
+              }
+              await sql`
+                update proactive_work set objective=${action},last_error=null where id=${reminder.id}
+              `;
+            } else {
+              let nextAt = reminder.next_check_at;
+              if (
+                (reminder.status === "active" || reminder.status === "delivering") &&
+                mutation.schedule !== null
+              ) {
+                const [household] = await sql<{ time_zone: string }[]>`
+                  select time_zone from households where id=${turn.household_id} for share
+                `;
+                if (!household) {
+                  throw new FlorenceStoreConflict("The reminder household no longer exists");
+                }
+                nextAt = nextReminderOccurrence(schedule, handledAt, household.time_zone);
+                if (!nextAt) {
+                  throw new FlorenceStoreConflict("A one-time reminder must still be in the future");
+                }
+              }
+              await terminalizeUnsentReminderOccurrences(sql, reminder.id);
+              await sql`
+                update proactive_work set objective=${action},reminder_schedule=${sql.json(schedule)},
+                  status=${reminder.status === "delivering" ? "active" : reminder.status},
+                  next_check_at=${nextAt},last_error=null where id=${reminder.id}
+              `;
+            }
+          } else if (mutation.operation === "pause") {
+            if (reminder.status === "active" || reminder.status === "delivering") {
+              await terminalizeUnsentReminderOccurrences(sql, reminder.id);
+              await sql`
+                update proactive_work set status='paused',next_check_at=null,last_error=null
+                where id=${reminder.id}
+              `;
+            } else if (reminder.status !== "paused") {
+              throw new FlorenceStoreConflict("A finished reminder cannot be paused");
+            }
+          } else if (mutation.operation === "resume") {
+            if (reminder.status === "paused") {
+              const [household] = await sql<{ time_zone: string }[]>`
+                select time_zone from households where id=${turn.household_id} for share
+              `;
+              if (!household) throw new FlorenceStoreConflict("The reminder household no longer exists");
+              const nextAt = nextReminderOccurrence(
+                reminderSchedule(reminder.reminder_schedule),
+                handledAt,
+                household.time_zone,
+              );
+              if (!nextAt) throw new FlorenceStoreConflict("That one-time reminder has already expired");
+              await sql`
+                update proactive_work set status='active',next_check_at=${nextAt},last_error=null
+                where id=${reminder.id}
+              `;
+            } else if (reminder.status !== "active") {
+              throw new FlorenceStoreConflict("A finished reminder cannot be resumed");
+            }
+          } else if (mutation.operation === "cancel") {
+            if (
+              reminder.status === "active" ||
+              reminder.status === "paused" ||
+              reminder.status === "delivering"
+            ) {
+              await terminalizeUnsentReminderOccurrences(sql, reminder.id);
+              await sql`
+                update proactive_work set status='cancelled',next_check_at=null,last_error=null
+                where id=${reminder.id}
+              `;
+            } else if (reminder.status !== "cancelled") {
+              throw new FlorenceStoreConflict("A completed reminder cannot be cancelled");
+            }
+          } else {
+            if (reminder.status === "completed" || reminder.status === "cancelled") {
+              throw new FlorenceStoreConflict("A finished reminder cannot run again");
+            }
+            const schedule = reminderSchedule(reminder.reminder_schedule);
+            const reusedQueuedOccurrence = await rearmQueuedReminderOccurrence(sql, reminder.id, handledAt);
+            const consumesDue =
+              reminder.status === "active" &&
+              reminder.next_check_at !== null &&
+              reminder.next_check_at <= handledAt;
+            const scheduledAt = consumesDue ? (reminder.next_check_at as Date) : handledAt;
+            if (!reusedQueuedOccurrence) {
+              await insertProactiveOutbound(sql, {
+                workId: reminder.id,
+                suffix: consumesDue
+                  ? `reminder:${scheduledAt.toISOString()}`
+                  : `reminder-run:${turn.source_id}`,
+                householdId: reminder.household_id,
+                channel: groupChannel,
+                visibility: reminder.visibility,
+                ownerAdultId: reminder.owner_adult_id,
+                text: reminderText(required(reminder.objective ?? "", "Reminder action")),
+                metadata: { reminderId: reminder.id, scheduledAt: scheduledAt.toISOString() },
+                notBefore: handledAt,
+                occurredAt: handledAt,
+              });
+            }
+            let nextAt = reminder.next_check_at;
+            let nextStatus: ProactiveWorkRow["status"] = reminder.status;
+            if (!reusedQueuedOccurrence && schedule.kind === "once") {
+              nextAt = null;
+              nextStatus = "delivering";
+            } else if (!reusedQueuedOccurrence && consumesDue) {
+              const [household] = await sql<{ time_zone: string }[]>`
+                select time_zone from households where id=${turn.household_id} for share
+              `;
+              if (!household) throw new FlorenceStoreConflict("The reminder household no longer exists");
+              nextAt = nextReminderOccurrence(schedule, handledAt, household.time_zone);
+            }
+            await sql`
+              update proactive_work set status=${nextStatus},next_check_at=${nextAt},
+                last_run_at=${handledAt},last_error=null where id=${reminder.id}
+            `;
+          }
+        }
+      }
+
       for (const outbound of input.outbound ?? []) {
         if (outbound.replyToSourceId) {
           await assertSourcesVisible(sql, turn.household_id, turn.audience, turn.sender_adult_id, [
@@ -7054,6 +7427,7 @@ export class PostgresFlorenceStore {
         await sql`
           update messages set receipt_detail=${sql.json(receiptDetail)} where source_id=${input.sourceId}
         `;
+        await completeDeliveredOneShotReminder(sql, input.sourceId);
         return;
       }
       const reactionConfirmed =
@@ -7074,6 +7448,7 @@ export class PostgresFlorenceStore {
           receipt_detail=${sql.json(receiptDetail)},sending_at=null,retry_at=null,last_error=null
         where source_id=${input.sourceId}
       `;
+      await completeDeliveredOneShotReminder(sql, input.sourceId);
     });
   }
 
@@ -12016,6 +12391,373 @@ function normalizedInterestTerms(values: readonly string[]): string[] {
     throw new FlorenceStoreConflict("Household interest terms must be unique");
   }
   return terms.sort();
+}
+
+function validateReminderSchedule(value: ReminderSchedule): ReminderSchedule {
+  return reminderSchedule(value as unknown as JsonValue);
+}
+
+function reminderSchedule(value: JsonValue | null): ReminderSchedule {
+  if (!isRecord(value) || typeof value.kind !== "string") {
+    throw new FlorenceStoreConflict("A reminder schedule is invalid");
+  }
+  const exactKeys = (keys: readonly string[]): void => {
+    if (!sameStrings(Object.keys(value).sort(), [...keys].sort())) {
+      throw new FlorenceStoreConflict("A reminder schedule has unexpected fields");
+    }
+  };
+  const integer = (key: string, minimum: number, maximum: number): number => {
+    const field = value[key];
+    if (!Number.isInteger(field) || (field as number) < minimum || (field as number) > maximum) {
+      throw new FlorenceStoreConflict(`Reminder ${key} is invalid`);
+    }
+    return field as number;
+  };
+  const text = (key: string): string => {
+    const field = value[key];
+    if (typeof field !== "string") throw new FlorenceStoreConflict(`Reminder ${key} is invalid`);
+    return field;
+  };
+  const localTime = (): string => {
+    const field = text("localTime");
+    if (!/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(field)) {
+      throw new FlorenceStoreConflict("A reminder local time must use HH:mm");
+    }
+    return field;
+  };
+  const startsOn = (): string => {
+    const field = text("startsOn");
+    if (!isReminderDate(field)) throw new FlorenceStoreConflict("A reminder start date is invalid");
+    return field;
+  };
+  if (value.kind === "once") {
+    exactKeys(["kind", "at"]);
+    const at = text("at");
+    explicitInstant(at);
+    return { kind: "once", at };
+  }
+  if (value.kind === "interval") {
+    exactKeys(["kind", "everyMinutes", "anchorAt"]);
+    const anchorAt = text("anchorAt");
+    explicitInstant(anchorAt);
+    return { kind: "interval", everyMinutes: integer("everyMinutes", 1, 525_600), anchorAt };
+  }
+  if (value.kind === "daily") {
+    exactKeys(["kind", "everyDays", "localTime", "startsOn"]);
+    return {
+      kind: "daily",
+      everyDays: integer("everyDays", 1, 3_650),
+      localTime: localTime(),
+      startsOn: startsOn(),
+    };
+  }
+  if (value.kind === "weekly") {
+    exactKeys(["kind", "everyWeeks", "weekdays", "localTime", "startsOn"]);
+    if (!Array.isArray(value.weekdays) || value.weekdays.length === 0 || value.weekdays.length > 7) {
+      throw new FlorenceStoreConflict("A weekly reminder needs one to seven weekdays");
+    }
+    const weekdays = value.weekdays.map((weekday) => {
+      if (!Number.isInteger(weekday) || (weekday as number) < 1 || (weekday as number) > 7) {
+        throw new FlorenceStoreConflict("A weekly reminder weekday is invalid");
+      }
+      return weekday as number;
+    });
+    if (new Set(weekdays).size !== weekdays.length) {
+      throw new FlorenceStoreConflict("Weekly reminder weekdays must be unique");
+    }
+    return {
+      kind: "weekly",
+      everyWeeks: integer("everyWeeks", 1, 520),
+      weekdays: weekdays.sort((a, b) => a - b),
+      localTime: localTime(),
+      startsOn: startsOn(),
+    };
+  }
+  if (value.kind === "monthly") {
+    exactKeys(["kind", "everyMonths", "dayOfMonth", "localTime", "startsOn"]);
+    return {
+      kind: "monthly",
+      everyMonths: integer("everyMonths", 1, 1_200),
+      dayOfMonth: integer("dayOfMonth", 1, 31),
+      localTime: localTime(),
+      startsOn: startsOn(),
+    };
+  }
+  if (value.kind === "yearly") {
+    exactKeys(["kind", "everyYears", "month", "dayOfMonth", "localTime", "startsOn"]);
+    return {
+      kind: "yearly",
+      everyYears: integer("everyYears", 1, 100),
+      month: integer("month", 1, 12),
+      dayOfMonth: integer("dayOfMonth", 1, 31),
+      localTime: localTime(),
+      startsOn: startsOn(),
+    };
+  }
+  throw new FlorenceStoreConflict("A reminder schedule kind is invalid");
+}
+
+function nextReminderOccurrence(schedule: ReminderSchedule, after: Date, timeZone: string): Date | null {
+  assertReminderTimeZone(timeZone);
+  if (schedule.kind === "once") {
+    const candidate = explicitInstant(schedule.at);
+    return candidate > after ? candidate : null;
+  }
+  if (schedule.kind === "interval") {
+    const anchor = explicitInstant(schedule.anchorAt);
+    const period = schedule.everyMinutes * 60_000;
+    if (anchor > after) return anchor;
+    return new Date(
+      anchor.getTime() + (Math.floor((after.getTime() - anchor.getTime()) / period) + 1) * period,
+    );
+  }
+  const afterLocalDate = reminderLocalDate(after, timeZone);
+  const start = schedule.startsOn > afterLocalDate ? schedule.startsOn : afterLocalDate;
+  for (let offset = 0; offset < 366 * 101 + 2; offset += 1) {
+    const date = addReminderDays(start, offset);
+    if (!reminderMatchesDate(schedule, date)) continue;
+    const candidate = reminderLocalInstant(date, schedule.localTime, timeZone);
+    if (candidate > after) return candidate;
+  }
+  throw new FlorenceStoreConflict("A reminder recurrence is too far in the future");
+}
+
+function reminderMatchesDate(
+  schedule: Exclude<ReminderSchedule, { kind: "once" | "interval" }>,
+  date: string,
+): boolean {
+  if (date < schedule.startsOn) return false;
+  const days = reminderDaysBetween(schedule.startsOn, date);
+  if (schedule.kind === "daily") return days % schedule.everyDays === 0;
+  if (schedule.kind === "weekly") {
+    return (
+      Math.floor(days / 7) % schedule.everyWeeks === 0 && schedule.weekdays.includes(reminderIsoWeekday(date))
+    );
+  }
+  const [year, month, day] = reminderDateParts(date);
+  const [startYear, startMonth] = reminderDateParts(schedule.startsOn);
+  if (schedule.kind === "monthly") {
+    const months = (year - startYear) * 12 + month - startMonth;
+    return (
+      months >= 0 &&
+      months % schedule.everyMonths === 0 &&
+      day === Math.min(schedule.dayOfMonth, reminderDaysInMonth(year, month))
+    );
+  }
+  return (
+    year >= startYear &&
+    (year - startYear) % schedule.everyYears === 0 &&
+    month === schedule.month &&
+    day === Math.min(schedule.dayOfMonth, reminderDaysInMonth(year, schedule.month))
+  );
+}
+
+function isReminderDate(value: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const [year, month, day] = value.split("-").map(Number) as [number, number, number];
+  return month >= 1 && month <= 12 && day >= 1 && day <= reminderDaysInMonth(year, month);
+}
+
+function reminderDateParts(value: string): [number, number, number] {
+  if (!isReminderDate(value)) throw new FlorenceStoreConflict("A reminder date is invalid");
+  return value.split("-").map(Number) as [number, number, number];
+}
+
+function addReminderDays(value: string, days: number): string {
+  const [year, month, day] = reminderDateParts(value);
+  return new Date(Date.UTC(year, month - 1, day + days)).toISOString().slice(0, 10);
+}
+
+function reminderDaysBetween(left: string, right: string): number {
+  const [ly, lm, ld] = reminderDateParts(left);
+  const [ry, rm, rd] = reminderDateParts(right);
+  return Math.round((Date.UTC(ry, rm - 1, rd) - Date.UTC(ly, lm - 1, ld)) / 86_400_000);
+}
+
+function reminderIsoWeekday(value: string): number {
+  const [year, month, day] = reminderDateParts(value);
+  return new Date(Date.UTC(year, month - 1, day)).getUTCDay() || 7;
+}
+
+function reminderDaysInMonth(year: number, month: number): number {
+  return new Date(Date.UTC(year, month, 0)).getUTCDate();
+}
+
+function assertReminderTimeZone(timeZone: string): void {
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone }).format(new Date(0));
+  } catch {
+    throw new FlorenceStoreConflict("The household time zone is invalid");
+  }
+}
+
+function reminderZonedParts(value: Date, timeZone: string): { date: string; hour: number; minute: number } {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(value);
+  const read = (type: Intl.DateTimeFormatPartTypes): string =>
+    parts.find((part) => part.type === type)?.value ?? "";
+  return {
+    date: `${read("year")}-${read("month")}-${read("day")}`,
+    hour: Number(read("hour")),
+    minute: Number(read("minute")),
+  };
+}
+
+function reminderLocalDate(value: Date, timeZone: string): string {
+  return reminderZonedParts(value, timeZone).date;
+}
+
+function reminderLocalInstant(date: string, time: string, timeZone: string): Date {
+  const [year, month, day] = reminderDateParts(date);
+  const [hour, minute] = time.split(":").map(Number) as [number, number];
+  const rough = Date.UTC(year, month - 1, day, hour, minute);
+  const exact: Date[] = [];
+  let firstAfter: Date | null = null;
+  for (let delta = -18 * 60; delta <= 18 * 60; delta += 1) {
+    const candidate = new Date(rough + delta * 60_000);
+    const local = reminderZonedParts(candidate, timeZone);
+    if (local.date !== date) continue;
+    if (local.hour === hour && local.minute === minute) exact.push(candidate);
+    if (firstAfter === null && (local.hour > hour || (local.hour === hour && local.minute > minute)))
+      firstAfter = candidate;
+  }
+  if (exact.length > 0) return exact[0] as Date;
+  if (firstAfter) return firstAfter;
+  throw new FlorenceStoreConflict("A reminder local time cannot be resolved");
+}
+
+function reminderText(action: string): string {
+  const normalized = required(action, "Reminder action");
+  return `Reminder: ${normalized}${/[.!?]$/u.test(normalized) ? "" : "."}`;
+}
+
+async function activeReminderChannel(
+  sql: postgres.TransactionSql,
+  work: ProactiveWorkRow,
+): Promise<ChannelRow | null> {
+  if (work.visibility === "private") {
+    const [channel] = await sql<(ChannelRow & { current_identity_digest: string | null })[]>`
+      select channel.*,adult.identity_subject_digest as current_identity_digest
+      from linq_channels channel join people adult on adult.household_id=channel.household_id
+        and adult.id=${work.owner_adult_id} and adult.kind='adult' and adult.status='verified'
+      where channel.household_id=${work.household_id} and channel.audience='private'
+        and channel.adult_one_id=${work.owner_adult_id} and channel.adult_two_id is null
+        and channel.revoked_at is null and channel.stopped_at is null
+      order by channel.bound_at desc,channel.id desc limit 1 for share of channel,adult
+    `;
+    if (
+      !channel?.current_identity_digest ||
+      channel.identity_one_digest !== channel.current_identity_digest ||
+      channel.identity_two_digest !== null ||
+      channel.authority_digest !==
+        digestStrings([work.owner_adult_id as string, channel.current_identity_digest])
+    )
+      return null;
+    return channel;
+  }
+  const [channel] = await sql<(ChannelRow & FamilyGroupAuthorityRow)[]>`
+    select family_group.*,founder.id as founder_adult_id,founder.identity_subject_digest as founder_identity_digest,
+      founder.status as founder_status,partner.id as partner_adult_id,
+      partner.identity_subject_digest as partner_identity_digest,partner.status as partner_status
+    from linq_channels family_group
+    join people founder on founder.household_id=family_group.household_id and founder.kind='adult' and founder.role='steward' and founder.adult_slot=1
+    join people partner on partner.household_id=family_group.household_id and partner.kind='adult' and partner.role='steward' and partner.adult_slot=2
+    where family_group.household_id=${work.household_id} and family_group.audience='group'
+      and family_group.adult_two_id is not null and family_group.revoked_at is null and family_group.stopped_at is null
+    order by family_group.bound_at desc,family_group.id desc limit 1 for share of family_group,founder,partner
+  `;
+  if (!channel || !isExactFamilyGroupAuthority(channel, channel, channel.founder_adult_id ?? "")) return null;
+  return channel;
+}
+
+async function terminalizeUnsentReminderOccurrences(
+  sql: postgres.TransactionSql,
+  reminderId: string,
+): Promise<void> {
+  await sql`
+    update messages message set status='failed',sending_at=null,retry_at=null,
+      last_error='Superseded by a reminder change before delivery'
+    from sources source
+    where source.id=message.source_id and source.metadata->>'reminderId'=${reminderId}
+      and message.direction='outbound' and message.status in ('pending','failed')
+  `;
+}
+
+async function rearmQueuedReminderOccurrence(
+  sql: postgres.TransactionSql,
+  reminderId: string,
+  occurredAt: Date,
+): Promise<boolean> {
+  const [message] = await sql<{ source_id: string; status: "pending" | "sending" | "failed" }[]>`
+    select message.source_id,message.status
+    from messages message join sources source on source.id=message.source_id
+    where source.metadata->>'reminderId'=${reminderId}
+      and message.direction='outbound' and message.status in ('pending','sending','failed')
+      and not (
+        message.status='failed'
+        and message.last_error='Superseded by a reminder change before delivery'
+      )
+    order by case message.status when 'sending' then 0 else 1 end,
+      message.not_before,source.occurred_at,message.source_id
+    limit 1 for update of message
+  `;
+  if (!message) return false;
+  if (message.status !== "sending") {
+    await sql`
+      update messages set status='pending',not_before=${occurredAt},sending_at=null,retry_at=null,
+        last_error=null where source_id=${message.source_id}
+    `;
+  }
+  return true;
+}
+
+async function updateQueuedReminderOccurrenceText(
+  sql: postgres.TransactionSql,
+  reminderId: string,
+  text: string,
+  occurredAt: Date,
+): Promise<boolean> {
+  const [message] = await sql<{ source_id: string }[]>`
+    select message.source_id
+    from messages message join sources source on source.id=message.source_id
+    where source.metadata->>'reminderId'=${reminderId}
+      and message.direction='outbound' and message.status='pending'
+      and message.sending_at is null and message.last_error is null
+      and message.provider_message_id is null and message.receipt_detail is null
+    order by message.not_before,source.occurred_at,message.source_id
+    limit 1 for update of message
+  `;
+  if (!message) return false;
+  await sql`
+    update messages set text=${text},status='pending',not_before=${occurredAt},sending_at=null,
+      retry_at=null,last_error=null where source_id=${message.source_id}
+  `;
+  await sql`
+    update sources set label=${bounded(text, 500)},
+      metadata=metadata || ${sql.json({ authoredText: text })}
+    where id=${message.source_id}
+  `;
+  return true;
+}
+
+async function completeDeliveredOneShotReminder(
+  sql: postgres.TransactionSql,
+  sourceId: string,
+): Promise<void> {
+  await sql`
+    update proactive_work work set status='completed',next_check_at=null,last_error=null
+    from sources source
+    where source.id=${sourceId} and source.metadata->>'reminderId'=work.id::text
+      and work.kind='reminder' and work.status='delivering'
+      and work.reminder_schedule->>'kind'='once'
+  `;
 }
 
 async function insertProactiveOutbound(

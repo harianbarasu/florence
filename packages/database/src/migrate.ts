@@ -4,7 +4,8 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import postgres from "postgres";
 
 export const baselineFile = fileURLToPath(new URL("../sql/001_florence.sql", import.meta.url));
-export const migrationFiles = [baselineFile] as const;
+const remindersFile = fileURLToPath(new URL("../sql/002_reminders.sql", import.meta.url));
+export const migrationFiles = [baselineFile, remindersFile] as const;
 
 export async function migrateDatabase(connectionString: string, sqlFile?: string): Promise<void> {
   const client = postgres(connectionString, { max: 1 });
@@ -21,24 +22,26 @@ export async function migrateDatabase(connectionString: string, sqlFile?: string
         applied_at timestamptz not null default now()
       )
     `);
-    const migration = await readFile(baselineFile, "utf8");
-    const name = "001_florence";
-    const digest = createHash("sha256").update(migration).digest("hex");
-    const [existing] = await client<{ sha256: string }[]>`
-      select sha256 from florence_schema_migrations where name=${name}
-    `;
-    if (existing) {
-      if (existing.sha256 !== digest) {
-        throw new Error(`Applied Florence migration ${name} has changed`);
-      }
-      return;
-    }
-    await client.begin(async (transaction) => {
-      await transaction.unsafe(migration);
-      await transaction`
-        insert into florence_schema_migrations (name,sha256) values (${name},${digest})
+    for (const file of migrationFiles) {
+      const migration = await readFile(file, "utf8");
+      const name = file.slice(file.lastIndexOf("/") + 1, -4);
+      const digest = createHash("sha256").update(migration).digest("hex");
+      const [existing] = await client<{ sha256: string }[]>`
+        select sha256 from florence_schema_migrations where name=${name}
       `;
-    });
+      if (existing) {
+        if (existing.sha256 !== digest) {
+          throw new Error(`Applied Florence migration ${name} has changed`);
+        }
+        continue;
+      }
+      await client.begin(async (transaction) => {
+        await transaction.unsafe(migration);
+        await transaction`
+          insert into florence_schema_migrations (name,sha256) values (${name},${digest})
+        `;
+      });
+    }
   } finally {
     await client.end({ timeout: 5 });
   }

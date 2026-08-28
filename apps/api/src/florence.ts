@@ -1284,6 +1284,7 @@ export class Florence {
             },
             facts: [],
             followUp: null,
+            reminder: null,
             calendar: null,
             householdUpdate: null,
           },
@@ -1506,6 +1507,7 @@ export class Florence {
                   },
                   facts: [],
                   followUp: null,
+                  reminder: null,
                   calendar: null,
                   householdUpdate: null,
                 },
@@ -1536,6 +1538,7 @@ export class Florence {
                       },
                       facts: [],
                       followUp: null,
+                      reminder: null,
                       calendar: null,
                       householdUpdate: null,
                     },
@@ -1560,6 +1563,7 @@ export class Florence {
                         },
                         facts: [],
                         followUp: null,
+                        reminder: null,
                         calendar: null,
                         householdUpdate: null,
                       },
@@ -1740,6 +1744,18 @@ export class Florence {
         nextCheck: followUp.nextCheck,
         why: followUp.why,
         sourceIds: [...followUp.sourceIds],
+      })),
+      visibleReminders: turn.visibleReminders.map((reminder) => ({
+        reminderId: reminder.reminderId,
+        action: reminder.action,
+        schedule:
+          reminder.schedule.kind === "weekly"
+            ? { ...reminder.schedule, weekdays: [...reminder.schedule.weekdays] }
+            : reminder.schedule,
+        status: reminder.status,
+        nextAt: reminder.nextAt,
+        lastRunAt: reminder.lastRunAt,
+        createdAt: reminder.createdAt,
       })),
       visibleInterests: turn.visibleInterests.map((interest) => ({
         interestWorkId: interest.interestWorkId,
@@ -3300,6 +3316,13 @@ export class Florence {
   }
 
   async #executeProactiveWork(work: DueProactiveWork): Promise<void> {
+    if (work.kind === "reminder") {
+      await this.#store.fireDueReminder({
+        workId: work.workId,
+        occurredAt: this.#now().toISOString(),
+      });
+      return;
+    }
     if (!this.#google || !this.#reasoner) {
       await this.#store.retryProactiveWork({
         workId: work.workId,
@@ -4682,6 +4705,7 @@ function enforcePolicy(decision: FlorenceDecision, announceRestrictions: boolean
       conversation: { replyToCurrentMessage: false, reaction: null, bubbles: [] },
       facts: [],
       followUp: null,
+      reminder: null,
       interest: null,
       calendar: null,
       householdUpdate: null,
@@ -4690,6 +4714,7 @@ function enforcePolicy(decision: FlorenceDecision, announceRestrictions: boolean
   }
   const retain = decision.policy.retain;
   const schedule = decision.policy.schedule;
+  const reminder = decision.reminder;
   const calendar = schedule ? decision.calendar : null;
   const interest =
     decision.interest?.operation === "stop"
@@ -4717,6 +4742,7 @@ function enforcePolicy(decision: FlorenceDecision, announceRestrictions: boolean
     conversation: { ...decision.conversation, bubbles },
     facts: retain ? decision.facts : decision.facts.filter((fact) => fact.operation === "forget"),
     followUp: schedule ? decision.followUp : null,
+    reminder,
     interest,
     calendar,
     householdUpdate: decision.householdUpdate,
@@ -4740,11 +4766,6 @@ function appendResearchSourceBubble(
   const second = main[1] as { text: string; delayMs: number };
   const third = main[2] as { text: string; delayMs: number };
   return [first, { text: `${second.text}\n\n${third.text}`, delayMs: second.delayMs }, sourceBubble];
-}
-
-function oneShotReminderText(action: string): string {
-  const punctuation = action.endsWith(".") || action.endsWith("!") || action.endsWith("?") ? "" : ".";
-  return `Reminder: ${action}${punctuation}`;
 }
 
 function decisionCommit(
@@ -4771,6 +4792,7 @@ function decisionCommit(
     turn.message.moveKind === "reaction" &&
     (decision.facts.length > 0 ||
       decision.followUp !== null ||
+      decision.reminder !== null ||
       decision.interest != null ||
       decision.calendar !== null ||
       decision.householdUpdate !== null ||
@@ -4901,25 +4923,29 @@ function decisionCommit(
       notBefore: new Date(now.getTime() + delay).toISOString(),
     });
   });
-  if (decision.followUp?.operation === "remind") {
-    const reminderAction = decision.followUp.reminderAction.trim();
-    if (!reminderAction || !turn.message.authoredText?.includes(reminderAction)) {
-      throw new FlorenceReasonerError(
-        "invalid_output",
-        "A one-shot reminder action must be copied exactly from the current parent Message",
-      );
-    }
-    const reminderTurnId = deterministicUuid(`reminder-turn\0${turn.message.sourceId}`);
-    outbound.push({
-      sourceId: deterministicUuid(`outbound\0${reminderTurnId}\0${0}`),
-      idempotencyKey: `reminder:${turn.message.sourceId}`,
-      moveKind: "message",
-      text: oneShotReminderText(reminderAction),
-      turnId: reminderTurnId,
-      turnPart: 0,
-      notBefore: decision.followUp.reminderAt,
-    });
-  }
+  const reminderMutation: CommitTurnInput["reminderMutation"] =
+    decision.reminder?.operation === "create"
+      ? {
+          operation: "create",
+          reminderId: deterministicUuid(`reminder\0${turn.message.sourceId}`),
+          action: decision.reminder.action,
+          schedule: decision.reminder.schedule,
+          visibility: turn.authority.audience === "group" ? "household" : "private",
+          ownerAdultId: turn.authority.audience === "group" ? null : turn.authority.senderAdultId,
+        }
+      : decision.reminder?.operation === "update"
+        ? {
+            operation: "update",
+            reminderId: decision.reminder.reminderId,
+            action: decision.reminder.action,
+            schedule: decision.reminder.schedule,
+          }
+        : decision.reminder && ["pause", "resume", "cancel", "run"].includes(decision.reminder.operation)
+          ? {
+              operation: decision.reminder.operation as "pause" | "resume" | "cancel" | "run",
+              reminderId: decision.reminder.reminderId as string,
+            }
+          : null;
   const calendar = calendarCommit(turn, decision, options.resolveCalendarEventTarget);
   const approval = options.approveCalendarOffer ? [calendarApproval(options.approveCalendarOffer)] : [];
   const householdUpdate = decision.householdUpdate;
@@ -4946,6 +4972,7 @@ function decisionCommit(
     finiteMonitors,
     finiteMonitorUpdates,
     cancelMonitorIds: decision.followUp?.operation === "cancel" ? [decision.followUp.followUpId] : [],
+    reminderMutation,
     interestMutation: decision.interest ?? null,
     outbound,
     approveCalendarOffers: approval,

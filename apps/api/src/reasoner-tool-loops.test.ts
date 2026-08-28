@@ -976,6 +976,7 @@ function foregroundInput(): FlorenceReasonerInput {
     recentMessages: [],
     visibleSources: [],
     pendingFollowUps: [],
+    visibleReminders: [],
     visibleInterests: [],
     pendingCalendarOffers: [],
     googleConnections: [
@@ -994,6 +995,7 @@ function ordinaryDecision(input: { bubbleText?: string; researchUrls?: string[] 
     },
     facts: [],
     followUp: null,
+    reminder: null,
     interest: null,
     calendar: null,
     householdUpdate: null,

@@ -428,6 +428,7 @@ type HarnessState = {
   initialClassifierFailuresRemaining: number;
   initialGoogleFailureAdultId: string | null;
   completeScanPaginationExercise: boolean;
+  completeFactSupportExercise: boolean;
   wrongGoogleSubjectNext: boolean;
   baselinePageReads: {
     kind: "gmail" | "calendar_targets" | "calendar_events";
@@ -998,6 +999,35 @@ release("Durable family work store", () => {
 });
 
 release("Florence parent journeys", () => {
+  test("retains every cross-page source supporting one initial Google fact", async () => {
+    const harness = await createHarness(async () => decision());
+    harness.state.completeFactSupportExercise = true;
+
+    await harness.readyHousehold();
+
+    expect(
+      harness.state.baselinePageReads
+        .filter(
+          (read) =>
+            read.kind === "gmail" &&
+            read.ownerAdultId === harness.founderAdultId &&
+            read.connectionId === FOUNDER_GOOGLE,
+        )
+        .map((read) => read.pageToken),
+    ).toEqual([null, "gmail-baseline-page-2"]);
+    await harness.assertDatabase(
+      "The initial Google fact lost cross-page supporting sources",
+      `(select count(*)=12 from facts fact
+        join fact_sources link on link.fact_id=fact.id
+        join sources source on source.id=link.source_id
+        where fact.household_id=(select household_id from people
+          where id=${sqlLiteral(harness.founderAdultId)}::uuid)
+          and fact.slot=${sqlLiteral(SHARED_SCHOOL_CONTACT_SLOT)}
+          and source.owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid
+          and source.kind='gmail' and source.visibility='private')`,
+    );
+  }, 20_000);
+
   test("delivers model-selected native mention and poll moves through the persisted outbox", async () => {
     const request = "Can you ask Alex which dinner night works?";
     let mentionedName = "";
@@ -6325,6 +6355,7 @@ async function createHarness(
     initialClassifierFailuresRemaining: 0,
     initialGoogleFailureAdultId: null,
     completeScanPaginationExercise: false,
+    completeFactSupportExercise: false,
     wrongGoogleSubjectNext: false,
     baselinePageReads: [],
     initialHouseholdCalendarFailuresRemaining: 0,
@@ -6508,6 +6539,9 @@ function createReasoner(
       const unrelated = gmail.filter((source) => source.subject === UNRELATED_ACCOUNT_EMAIL_SUBJECT);
       const eligibleGmail = gmail.filter((source) => source.subject !== UNRELATED_ACCOUNT_EMAIL_SUBJECT);
       const recipeSource = eligibleGmail.find((source) => source.subject === GOOGLE_RECIPE_SUBJECT);
+      const schoolContactSupports = eligibleGmail.filter((source) =>
+        source.subject?.startsWith("School office contact confirmation "),
+      );
       const paginatedCalendarSource = calendar.find((source) => source.title === PAGINATED_CALENDAR_TITLE);
       if (paginatedCalendarSource) {
         return {
@@ -6564,8 +6598,44 @@ function createReasoner(
           dismissedSourceIds: [],
         };
       }
-      const source = eligibleGmail.find((candidate) => candidate.subject !== GOOGLE_RECIPE_SUBJECT);
+      const source = eligibleGmail.find(
+        (candidate) =>
+          candidate.subject !== GOOGLE_RECIPE_SUBJECT &&
+          !candidate.subject?.startsWith("School office contact confirmation "),
+      );
       if (!source) {
+        if (schoolContactSupports.length > 0) {
+          return {
+            findings: [],
+            facts: [
+              {
+                slot: SHARED_SCHOOL_CONTACT_SLOT,
+                statement: SHARED_SCHOOL_CONTACT_FACT,
+                memory: googleFactMemory(SHARED_SCHOOL_CONTACT_FACT),
+                familyRelevance: "household" as const,
+                sourceIds: schoolContactSupports.map((candidate) => candidate.sourceId),
+              },
+              ...(recipeSource
+                ? [
+                    {
+                      slot: GOOGLE_RECIPE_SLOT,
+                      statement: GOOGLE_RECIPE_STATEMENT,
+                      memory: {
+                        memoryKind: "artifact" as const,
+                        artifactKind: "recipe" as const,
+                        title: GOOGLE_RECIPE_TITLE,
+                        details: GOOGLE_RECIPE_DETAILS,
+                        tags: ["recipe", "noodles", "weeknight"],
+                      },
+                      familyRelevance: "household" as const,
+                      sourceIds: [recipeSource.sourceId],
+                    },
+                  ]
+                : []),
+            ],
+            dismissedSourceIds: [...unrelated, ...calendar].map((candidate) => candidate.sourceId),
+          };
+        }
         const ownerPrivateSource = unrelated[0];
         if (founder && state.initialUnrelatedAccountReview && ownerPrivateSource) {
           return {
@@ -6772,7 +6842,7 @@ function createReasoner(
             statement: SHARED_SCHOOL_CONTACT_FACT,
             memory: googleFactMemory(SHARED_SCHOOL_CONTACT_FACT),
             familyRelevance: "household" as const,
-            sourceIds: [source.sourceId],
+            sourceIds: [source.sourceId, ...schoolContactSupports.map((candidate) => candidate.sourceId)],
           },
           ...(founder
             ? [
@@ -6804,7 +6874,12 @@ function createReasoner(
             : []),
         ],
         dismissedSourceIds: [...unrelated, ...calendar, ...eligibleGmail]
-          .filter((candidate) => candidate.sourceId !== source.sourceId && candidate !== recipeSource)
+          .filter(
+            (candidate) =>
+              candidate.sourceId !== source.sourceId &&
+              candidate !== recipeSource &&
+              !schoolContactSupports.some((support) => support.sourceId === candidate.sourceId),
+          )
           .map((candidate) => candidate.sourceId),
       };
     },
@@ -7498,30 +7573,56 @@ function createGoogle(store: PostgresFlorenceStore, state: HarnessState): Google
         state.googleRecipeArtifactExercise && founder && input.connectionId === FOUNDER_GOOGLE
           ? [recipe]
           : [];
-      if (state.completeScanPaginationExercise && founder && input.connectionId === FOUNDER_GOOGLE) {
+      const schoolContactSupportMessages =
+        state.completeFactSupportExercise && founder && input.connectionId === FOUNDER_GOOGLE
+          ? Array.from({ length: 11 }, (_, index) => ({
+              ...relevant,
+              messageId: `gmail-school-office-contact-confirmation-${index}`,
+              threadId: `thread-gmail-school-office-contact-confirmation-${index}`,
+              historyId: String(2_000 + index),
+              subject: `School office contact confirmation ${index}`,
+              sentAt: new Date(Date.parse(input.before) - 900 + index).toISOString(),
+              text: SHARED_SCHOOL_CONTACT_FACT,
+              attachments: [],
+            }))
+          : [];
+      if (
+        (state.completeScanPaginationExercise || state.completeFactSupportExercise) &&
+        founder &&
+        input.connectionId === FOUNDER_GOOGLE
+      ) {
         if (input.pageToken === undefined) {
           return {
             status: "truncated" as const,
             nextPageToken: "gmail-baseline-page-2",
-            messages: Array.from({ length: 50 }, (_, index) => ({
-              ...relevant,
-              messageId: `gmail-archived-irrelevant-${index}`,
-              threadId: `thread-gmail-archived-irrelevant-${index}`,
-              historyId: String(1_000 + index),
-              subject: UNRELATED_ACCOUNT_EMAIL_SUBJECT,
-              text:
-                index === 0
-                  ? "Archived owner-private account notice. Code 123456. https://example.test/reset?token=fake-only-token-value-1234567890"
-                  : "Archived owner-private account notice.",
-              attachments: [],
-            })),
+            messages: [
+              ...(state.completeScanPaginationExercise
+                ? Array.from({ length: 50 }, (_, index) => ({
+                    ...relevant,
+                    messageId: `gmail-archived-irrelevant-${index}`,
+                    threadId: `thread-gmail-archived-irrelevant-${index}`,
+                    historyId: String(1_000 + index),
+                    subject: UNRELATED_ACCOUNT_EMAIL_SUBJECT,
+                    text:
+                      index === 0
+                        ? "Archived owner-private account notice. Code 123456. https://example.test/reset?token=fake-only-token-value-1234567890"
+                        : "Archived owner-private account notice.",
+                    attachments: [],
+                  }))
+                : []),
+              ...schoolContactSupportMessages.slice(0, 9),
+            ],
           };
         }
         expect(input.pageToken).toBe("gmail-baseline-page-2");
       } else {
         expect(input.pageToken).toBeUndefined();
       }
-      return { status: "complete" as const, nextPageToken: null, messages: [relevant, ...recipeMessages] };
+      return {
+        status: "complete" as const,
+        nextPageToken: null,
+        messages: [relevant, ...schoolContactSupportMessages.slice(9), ...recipeMessages],
+      };
     },
     readCalendarBaselineTargetsPage: async (input: {
       householdId: string;

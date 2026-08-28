@@ -7463,8 +7463,7 @@ function initialGoogleFactWithObservations(
       (left, right) =>
         Date.parse(right.observedAt) - Date.parse(left.observedAt) ||
         left.sourceId.localeCompare(right.sourceId),
-    )
-    .slice(0, 10);
+    );
   const observedAt = retained[0]?.observedAt;
   if (!observedAt) throw new Error("An initial Google fact lost every current support");
   return {

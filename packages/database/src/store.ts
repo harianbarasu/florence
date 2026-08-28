@@ -11207,8 +11207,8 @@ function googleStableFacts(input: readonly GoogleStableFactDraft[]): GoogleStabl
       throw new FlorenceStoreUnauthorized("Owner-private Google evidence cannot become stable memory");
     }
     const sourceIds = unique(fact.sourceIds);
-    if (sourceIds.length < 1 || sourceIds.length > 10) {
-      throw new FlorenceStoreConflict("A Google fact needs one to ten current sources");
+    if (sourceIds.length < 1) {
+      throw new FlorenceStoreConflict("A Google fact needs at least one current source");
     }
     for (const sourceId of sourceIds) assertUuid(sourceId, "Google fact source ID");
     const memory = memoryPresentationSchema.required().safeParse(fact.memory);
@@ -16605,7 +16605,7 @@ function initialGoogleScanFact(value: JsonValue): InitialGoogleScanFact {
     throw new FlorenceStoreConflict("Initial Google scan fact relevance is invalid");
   }
   const retainedFamilyRelevance = familyRelevance as Exclude<FamilyRelevance, "owner_private">;
-  const sourceIds = scanSourceIds(fact.sourceIds, "Initial Google scan fact");
+  const sourceIds = scanMergedFactSourceIds(fact.sourceIds);
   const observedAt = instant(
     requiredStringField(fact, "observedAt", "Initial Google scan fact observation"),
   ).toISOString();
@@ -16729,6 +16729,15 @@ function scanSourceIds(value: JsonValue | undefined, name: string): string[] {
     throw new FlorenceStoreConflict(`${name} needs one to ten sources`);
   }
   for (const sourceId of values) assertUuid(sourceId, `${name} source ID`);
+  return values;
+}
+
+function scanMergedFactSourceIds(value: JsonValue | undefined): string[] {
+  const values = scanStringArray(value, "Initial Google scan fact sources");
+  if (values.length < 1) {
+    throw new FlorenceStoreConflict("An initial Google scan fact needs at least one source");
+  }
+  for (const sourceId of values) assertUuid(sourceId, "Initial Google scan fact source ID");
   return values;
 }
 

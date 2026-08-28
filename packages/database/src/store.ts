@@ -2770,20 +2770,14 @@ export class PostgresFlorenceStore {
       if (!sameStringSet(input.selectedCandidateIds, representativeCandidateIds)) {
         throw new FlorenceStoreConflict("The household briefing did not select the ranked current docket");
       }
-      assertHouseholdInitialBriefingAccounting(
-        selectedCandidateGroups.map(({ candidate }) => candidate),
+      const bubbleCandidateGroups = householdInitialBriefingCandidateGroups(
+        candidateGroups,
+        selectedCandidateGroups,
         bubbles,
       );
-      let nextCandidateGroupIndex = 0;
-      const bubbleCandidateGroupRanges = bubbles.map((bubble) => {
-        const startIndex = nextCandidateGroupIndex;
-        nextCandidateGroupIndex += initialBriefingBulletItems([bubble]).length;
-        return {
-          startIndex,
-          endIndex: nextCandidateGroupIndex,
-          groups: selectedCandidateGroups.slice(startIndex, nextCandidateGroupIndex),
-        };
-      });
+      const selectedCandidateGroupIndexes = new Map(
+        selectedCandidateGroups.map(({ candidate }, index) => [candidate.candidateId, index] as const),
+      );
       const candidateSourceIds = unique(
         selectedCandidateGroups.flatMap(({ members }) =>
           members.flatMap((candidate) => [...candidate.sourceIds]),
@@ -2815,9 +2809,18 @@ export class PostgresFlorenceStore {
       if (selectedCandidateGroups.length > 0 && visibleGoogleActionKeys.length === 0) {
         throw new FlorenceStoreConflict("A household Google briefing needs provider-stable evidence");
       }
-      const briefingBubbleMetadata = bubbleCandidateGroupRanges.map(({ startIndex, endIndex, groups }) => {
-        const googleActions = visibleGoogleActions.filter(
-          ({ candidateGroupIndex }) => candidateGroupIndex >= startIndex && candidateGroupIndex < endIndex,
+      const briefingBubbleMetadata = bubbleCandidateGroups.map((groups) => {
+        const groupIndexes = new Set(
+          groups.map(({ candidate }) => {
+            const index = selectedCandidateGroupIndexes.get(candidate.candidateId);
+            if (index === undefined) {
+              throw new FlorenceStoreConflict("The household briefing grounded an unselected docket item");
+            }
+            return index;
+          }),
+        );
+        const googleActions = visibleGoogleActions.filter(({ candidateGroupIndex }) =>
+          groupIndexes.has(candidateGroupIndex),
         );
         return {
           conflictOwnerAdultIds: unique(
@@ -2911,27 +2914,21 @@ export class PostgresFlorenceStore {
         `;
       }
       if (nextJob) {
-        const kickoffRange = bubbleCandidateGroupRanges[nextJob.kickoffBubbleIndex];
-        if (!kickoffRange) {
+        const kickoffGroups = bubbleCandidateGroups[nextJob.kickoffBubbleIndex];
+        if (!kickoffGroups) {
           throw new FlorenceStoreConflict("A household next job lost its kickoff bubble");
         }
-        const selectedGroupIndexByCandidateId = new Map(
-          selectedCandidateGroups.map(({ candidate }, index) => [candidate.candidateId, index] as const),
-        );
+        const kickoffCandidateIds = new Set(kickoffGroups.map(({ candidate }) => candidate.candidateId));
         const referencedGroupIndexes = nextJob.candidateIds.map((candidateId) => {
-          const index = selectedGroupIndexByCandidateId.get(candidateId);
+          const index = selectedCandidateGroupIndexes.get(candidateId);
           if (index === undefined) {
             throw new FlorenceStoreConflict("A household next job cited an undelivered docket item");
           }
+          if (!kickoffCandidateIds.has(candidateId)) {
+            throw new FlorenceStoreConflict("A household next job must be grounded in its kickoff bubble");
+          }
           return index;
         });
-        if (
-          referencedGroupIndexes.some(
-            (index) => index < kickoffRange.startIndex || index >= kickoffRange.endIndex,
-          )
-        ) {
-          throw new FlorenceStoreConflict("A household next job must be grounded in its kickoff bubble");
-        }
         const referencedGroups = new Set(referencedGroupIndexes);
         await stageProactiveFamilyWork(sql, {
           basis: `initial-household-briefing\0${work.id}`,
@@ -3035,8 +3032,7 @@ export class PostgresFlorenceStore {
       const [cancelledFamilyTask] = await sql<ProactiveWorkRow[]>`
         select * from proactive_work
         where kind='family_task' and status='cancelled' and next_check_at<=${now}
-          and task_state->'activePhoneCall' is not null
-          and task_state->'activePhoneCall' <> 'null'::jsonb
+          and jsonb_typeof(task_state->'activePhoneCall')='object'
         order by next_check_at,id
         limit 1 for update skip locked
       `;
@@ -16879,27 +16875,68 @@ function assertPrivateInitialReviewAccounting(
   }
 }
 
-function assertHouseholdInitialBriefingAccounting(
-  candidates: readonly StoredBriefingCandidate[],
+function householdInitialBriefingCandidateGroups(
+  candidateGroups: readonly StoredBriefingCandidateGroup[],
+  selectedCandidateGroups: readonly StoredBriefingCandidateGroup[],
   bubbles: readonly InitialBriefingBubble[],
-): void {
-  if (candidates.length === 0) {
+): StoredBriefingCandidateGroup[][] {
+  if (selectedCandidateGroups.length === 0) {
     if (
       bubbles.length !== 1 ||
       bubbles[0]?.text !== "I don’t have a household item to flag right now. I’ll keep watching."
     ) {
       throw new FlorenceStoreConflict("A household all-clear must use the complete deterministic output");
     }
-    return;
+    return [[]];
   }
-  const expected = candidates.map((candidate) => candidate.summary);
-  const visible = initialBriefingBulletItems(bubbles);
-  if (visible.length !== expected.length || visible.some((item, index) => item !== expected[index])) {
-    throw new FlorenceStoreConflict("The household briefing output omitted or added a distinct finding");
+
+  const selectedBySummary = new Map<string, StoredBriefingCandidateGroup[]>();
+  for (const group of selectedCandidateGroups) {
+    const summary = group.candidate.summary;
+    selectedBySummary.set(summary, [...(selectedBySummary.get(summary) ?? []), group]);
+  }
+  const groupsByBubble = bubbles.map(() => [] as StoredBriefingCandidateGroup[]);
+  for (const [summary, groups] of selectedBySummary) {
+    const occurrencesByBubble = bubbles.map((bubble) => exactTextOccurrences(bubble.text, summary));
+    if (occurrencesByBubble.reduce((total, occurrences) => total + occurrences, 0) !== groups.length) {
+      throw new FlorenceStoreConflict(
+        "The household briefing output omitted or duplicated a distinct finding",
+      );
+    }
+    let groupIndex = 0;
+    for (const [bubbleIndex, occurrences] of occurrencesByBubble.entries()) {
+      for (let occurrence = 0; occurrence < occurrences; occurrence += 1) {
+        const group = groups[groupIndex];
+        if (!group) {
+          throw new FlorenceStoreConflict("The household briefing output duplicated a distinct finding");
+        }
+        groupsByBubble[bubbleIndex]?.push(group);
+        groupIndex += 1;
+      }
+    }
+  }
+  for (const { candidate } of candidateGroups) {
+    if (selectedBySummary.has(candidate.summary)) continue;
+    if (bubbles.some((bubble) => exactTextOccurrences(bubble.text, candidate.summary) > 0)) {
+      throw new FlorenceStoreConflict("The household briefing output added an unselected distinct finding");
+    }
   }
   if (!bubbles.at(-1)?.text.endsWith("Did I get that right? If I missed something, tell me here.")) {
     throw new FlorenceStoreConflict("The household briefing must end with its correction invitation");
   }
+  return groupsByBubble;
+}
+
+function exactTextOccurrences(text: string, exactText: string): number {
+  let occurrences = 0;
+  let fromIndex = 0;
+  while (fromIndex <= text.length - exactText.length) {
+    const index = text.indexOf(exactText, fromIndex);
+    if (index < 0) break;
+    occurrences += 1;
+    fromIndex = index + exactText.length;
+  }
+  return occurrences;
 }
 
 function initialBriefingBulletItems(bubbles: readonly InitialBriefingBubble[]): string[] {

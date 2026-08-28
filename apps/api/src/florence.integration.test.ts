@@ -710,6 +710,15 @@ release("Durable family work store", () => {
       await rm(directory, { recursive: true, force: true });
     });
 
+    await assertDatabase(
+      "The cancelled family-task cleanup lease is not protected by its named due-state check",
+      `exists (
+        select 1 from pg_constraint
+        where conrelid='proactive_work'::regclass
+          and conname='proactive_work_due_state_check'
+      )`,
+    );
+
     expect(await store.takeCancelledFamilyWorkResources("10000000-0000-4000-8000-000000000006")).toEqual({
       browserSession: cancelledBrowserSession,
       activePhoneCall: cancelledPhoneCall,
@@ -742,6 +751,12 @@ release("Durable family work store", () => {
       browserSession: null,
       activePhoneCall: resolvedCancelledTwilioCall,
     });
+    expect(
+      await store.clearCancelledFamilyWorkPhoneCall(
+        "10000000-0000-4000-8000-000000000006",
+        resolvedCancelledTwilioCall,
+      ),
+    ).toBe(true);
     expect(await store.takeCancelledFamilyWorkResources("10000000-0000-4000-8000-000000000006")).toBeNull();
     expect(
       await store.retainCancelledFamilyWorkPhoneCall(
@@ -781,6 +796,23 @@ release("Durable family work store", () => {
         cancelledPhoneCall,
       ),
     ).toBe(true);
+    await assertDatabase(
+      "Clearing a cancelled family-task phone call retained its cleanup lease",
+      `exists (
+        select 1 from proactive_work
+        where id='10000000-0000-4000-8000-000000000006'::uuid
+          and status='cancelled' and next_check_at is null
+          and task_state->'activePhoneCall'='null'::jsonb
+      )`,
+    );
+    await writeFile(
+      assertionFile,
+      `update proactive_work set next_check_at=${sqlLiteral(at(2))}
+        where id='10000000-0000-4000-8000-000000000006'::uuid;`,
+    );
+    await expect(migrateDatabase(databaseUrl, assertionFile)).rejects.toThrow(
+      /proactive_work_due_state_check/,
+    );
 
     const reminder = await store.readNextDueProactiveWork(at(0));
     expect(reminder).toEqual({ kind: "reminder", workId: "10000000-0000-4000-8000-000000000005" });
@@ -3464,6 +3496,29 @@ release("Florence parent journeys", () => {
       )`,
     );
     const rankedCandidates = incompleteWork.candidates.slice(0, 3);
+    const rankedSummaries = rankedCandidates.map((candidate) => candidate.summary);
+    const extraCandidate = incompleteWork.candidates[3];
+    const firstRankedSummary = rankedSummaries[0];
+    if (!extraCandidate || !firstRankedSummary) {
+      throw new Error("The household briefing grounding regression needs four candidates");
+    }
+    const naturalBriefing = (summaries: readonly string[]): string =>
+      `Here are the things I’d put at the top: ${summaries.join(" ")}\n\nDid I get that right? If I missed something, tell me here.`;
+    for (const invalidSummaries of [
+      rankedSummaries.slice(0, -1),
+      [...rankedSummaries, firstRankedSummary],
+      [...rankedSummaries, extraCandidate.summary],
+    ]) {
+      await expect(
+        harness.store.completeHouseholdInitialBriefing({
+          workId: incompleteWork.workId,
+          selectedCandidateIds: rankedCandidates.map((candidate) => candidate.candidateId),
+          familyCalendarCursor: "{}",
+          bubbles: [{ text: naturalBriefing(invalidSummaries), delayMs: 0 }],
+          occurredAt: harness.iso(),
+        }),
+      ).rejects.toThrow(/distinct finding/i);
+    }
     await harness.drain();
     const [householdBriefingInput] = harness.state.briefings;
     if (!householdBriefingInput) throw new Error("The household briefing reasoner did not run");

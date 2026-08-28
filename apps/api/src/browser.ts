@@ -43,7 +43,6 @@ const DEFAULT_KERNEL_SESSION_TIMEOUT_SECONDS = 259_200;
 const DEFAULT_KERNEL_PLAYWRIGHT_TIMEOUT_SECONDS = 60;
 const MAX_KERNEL_PLAYWRIGHT_TIMEOUT_SECONDS = 300;
 const MAX_PLAYWRIGHT_CODE_CHARS = 50_000;
-const MAX_COMPUTER_ACTIONS_PER_CALL = 50;
 const MAX_BROWSER_IMAGE_BYTES = MAX_UPLOAD_BYTES;
 
 export interface FlorenceBrowserSession {
@@ -93,26 +92,64 @@ export type FlorenceBrowserComputerAction =
       readonly type: "click_mouse";
       readonly x: number;
       readonly y: number;
-      readonly button?: "left" | "right" | "middle";
+      readonly button?: "left" | "right" | "middle" | "back" | "forward";
       readonly clickType?: "down" | "up" | "click";
       readonly numClicks?: number;
+      readonly holdKeys?: readonly string[];
     }
-  | { readonly type: "move_mouse"; readonly x: number; readonly y: number }
-  | { readonly type: "type_text"; readonly text: string }
-  | { readonly type: "press_key"; readonly keys: readonly string[] }
+  | {
+      readonly type: "move_mouse";
+      readonly x: number;
+      readonly y: number;
+      readonly holdKeys?: readonly string[];
+      readonly durationMs?: number;
+      readonly smooth?: boolean;
+    }
+  | { readonly type: "type_text"; readonly text: string; readonly delayMs?: number }
+  | {
+      readonly type: "press_key";
+      readonly keys: readonly string[];
+      readonly durationMs?: number;
+      readonly holdKeys?: readonly string[];
+    }
   | {
       readonly type: "scroll";
       readonly x: number;
       readonly y: number;
       readonly deltaX?: number;
       readonly deltaY?: number;
+      readonly holdKeys?: readonly string[];
     }
   | {
       readonly type: "drag_mouse";
       readonly path: readonly { readonly x: number; readonly y: number }[];
       readonly button?: "left" | "right" | "middle";
+      readonly delayMs?: number;
+      readonly durationMs?: number;
+      readonly smooth?: boolean;
+      readonly stepsPerSegment?: number;
+      readonly stepDelayMs?: number;
+      readonly holdKeys?: readonly string[];
     }
+  | { readonly type: "set_cursor"; readonly hidden: boolean }
+  | { readonly type: "write_clipboard"; readonly text: string }
+  | { readonly type: "read_clipboard" }
+  | { readonly type: "get_mouse_position" }
   | { readonly type: "sleep"; readonly milliseconds: number };
+
+export type FlorenceBrowserComputerReadResult =
+  | {
+      readonly actionIndex: number;
+      readonly type: "read_clipboard";
+      readonly text: string;
+      readonly truncated: boolean;
+    }
+  | {
+      readonly actionIndex: number;
+      readonly type: "get_mouse_position";
+      readonly x: number;
+      readonly y: number;
+    };
 
 export type FlorenceBrowserObservationKind = "page" | "owner_handoff" | "uncertain_effect";
 
@@ -140,6 +177,7 @@ export interface FlorenceBrowserObservation {
   readonly liveViewUrl?: string;
   readonly screenshot?: FlorenceBrowserScreenshot;
   readonly selectedImage?: FlorenceBrowserSelectedImage;
+  readonly computerReads?: readonly FlorenceBrowserComputerReadResult[];
 }
 
 export interface FlorenceBrowserRunInput {
@@ -288,6 +326,18 @@ const UNCERTAIN_RETRY_OPERATIONS = new Set<FlorenceBrowserOperation["kind"]>([
   "computer",
 ]);
 
+function operationMayHaveUncertainEffect(operation: FlorenceBrowserOperation): boolean {
+  if (operation.kind !== "computer") return UNCERTAIN_RETRY_OPERATIONS.has(operation.kind);
+  return operation.actions.some(
+    (action) =>
+      action.type === "click_mouse" ||
+      action.type === "type_text" ||
+      action.type === "press_key" ||
+      action.type === "scroll" ||
+      action.type === "drag_mouse",
+  );
+}
+
 export class KernelBrowserClient implements FlorenceBrowserClient {
   readonly #kernel: Kernel;
   readonly #executable: string;
@@ -365,8 +415,9 @@ export class KernelBrowserClient implements FlorenceBrowserClient {
     this.#rememberSession(sessionDetails);
 
     let actionMayHaveHappened = false;
+    let computerReads: readonly FlorenceBrowserComputerReadResult[] | undefined;
     try {
-      if (input.attempt > 1 && UNCERTAIN_RETRY_OPERATIONS.has(input.operation.kind)) {
+      if (input.attempt > 1 && operationMayHaveUncertainEffect(input.operation)) {
         try {
           await this.#recycleCommandGeneration(session.sessionId);
           const observation = await this.#observePage(
@@ -403,14 +454,14 @@ export class KernelBrowserClient implements FlorenceBrowserClient {
           operationResult = await this.#executePlaywright(sessionDetails, input.operation, localSignal);
           break;
         case "computer":
-          actionMayHaveHappened = true;
-          await this.#executeComputer(sessionDetails, input.operation.actions, localSignal);
+          actionMayHaveHappened = operationMayHaveUncertainEffect(input.operation);
+          computerReads = await this.#executeComputer(sessionDetails, input.operation.actions, localSignal);
           if (input.operation.screenshot) {
             screenshot = await this.#captureScreenshot(sessionDetails, localSignal);
           }
           break;
         default:
-          actionMayHaveHappened = UNCERTAIN_RETRY_OPERATIONS.has(input.operation.kind);
+          actionMayHaveHappened = operationMayHaveUncertainEffect(input.operation);
           await this.#performLegacyOperation(sessionDetails, input.operation, input.uploadFile, localSignal);
       }
 
@@ -426,6 +477,7 @@ export class KernelBrowserClient implements FlorenceBrowserClient {
           : null,
         screenshot,
         operationResult,
+        computerReads,
       );
       return { session, observation };
     } catch (error) {
@@ -433,6 +485,16 @@ export class KernelBrowserClient implements FlorenceBrowserClient {
       if (browserError.code === "invalid_input") {
         if (createdThisRun) await this.#bestEffortClose(session);
         throw browserError;
+      }
+      if (computerReads && computerReads.length > 0 && !localSignal.aborted) {
+        return {
+          session,
+          observation: unreadableComputerReadObservation(
+            input.operation.kind,
+            computerReads,
+            actionMayHaveHappened,
+          ),
+        };
       }
       if (actionMayHaveHappened && !localSignal.aborted) {
         try {
@@ -673,12 +735,73 @@ export class KernelBrowserClient implements FlorenceBrowserClient {
     session: KernelSessionDetails,
     actions: readonly FlorenceBrowserComputerAction[],
     signal: AbortSignal,
-  ): Promise<void> {
-    const batches = computerActionBatches(actions);
-    for (const batch of batches) {
-      throwIfAborted(signal);
-      await this.#kernel.browsers.computer.batch(session.session.sessionId, { actions: batch }, { signal });
+  ): Promise<readonly FlorenceBrowserComputerReadResult[]> {
+    if (!Array.isArray(actions) || actions.length < 1) {
+      throw new FlorenceBrowserError("invalid_input", "A computer action call needs at least one action.");
     }
+
+    const computer = this.#kernel.browsers.computer;
+    const reads: FlorenceBrowserComputerReadResult[] = [];
+    let pendingActions: ComputerBatchParams.Action[] = [];
+    const flushPendingActions = async (): Promise<void> => {
+      if (pendingActions.length === 0) return;
+      throwIfAborted(signal);
+      const batch = pendingActions;
+      pendingActions = [];
+      await computer.batch(session.session.sessionId, { actions: batch }, { signal });
+    };
+
+    for (const [actionIndex, action] of actions.entries()) {
+      const batchAction = computerBatchAction(action);
+      if (batchAction) {
+        pendingActions.push(batchAction);
+        continue;
+      }
+
+      await flushPendingActions();
+      throwIfAborted(signal);
+      switch (action.type) {
+        case "write_clipboard":
+          await computer.writeClipboard(
+            session.session.sessionId,
+            { text: boundedInput(action.text, "Clipboard text") },
+            { signal },
+          );
+          break;
+        case "read_clipboard": {
+          const result = await computer.readClipboard(session.session.sessionId, { signal });
+          const clipboard = boundedProviderText(result.text, "Kernel returned unreadable clipboard text.");
+          reads.push({
+            actionIndex,
+            type: action.type,
+            text: clipboard.value,
+            truncated: clipboard.truncated,
+          });
+          break;
+        }
+        case "get_mouse_position": {
+          const result = await computer.getMousePosition(session.session.sessionId, { signal });
+          reads.push({
+            actionIndex,
+            type: action.type,
+            x: finiteProviderCoordinate(result.x, "mouse x"),
+            y: finiteProviderCoordinate(result.y, "mouse y"),
+          });
+          break;
+        }
+        case "click_mouse":
+        case "drag_mouse":
+        case "move_mouse":
+        case "press_key":
+        case "scroll":
+        case "set_cursor":
+        case "sleep":
+        case "type_text":
+          throw invalidProviderResponse(`Kernel computer action ${action.type} was not batched.`);
+      }
+    }
+    await flushPendingActions();
+    return reads;
   }
 
   async #performLegacyOperation(
@@ -794,6 +917,7 @@ export class KernelBrowserClient implements FlorenceBrowserClient {
     reason: string | null,
     screenshot?: FlorenceBrowserScreenshot,
     operationResult?: string,
+    computerReads?: readonly FlorenceBrowserComputerReadResult[],
   ): Promise<FlorenceBrowserObservation> {
     const snapshotArgs = operation.kind === "snapshot" && operation.compact === false ? [] : ["-c"];
     const snapshotEnvelope = await this.#agentBrowser(
@@ -818,6 +942,7 @@ export class KernelBrowserClient implements FlorenceBrowserClient {
       truncated: merged.truncated,
       ...(kind === "owner_handoff" && session.liveViewUrl ? { liveViewUrl: session.liveViewUrl } : {}),
       ...(screenshot ? { screenshot } : {}),
+      ...(computerReads && computerReads.length > 0 ? { computerReads } : {}),
     };
   }
 
@@ -1187,7 +1312,7 @@ export class BrowserbaseBrowserClient implements FlorenceBrowserClient {
 
     let actionMayHaveHappened = false;
     try {
-      if (input.attempt > 1 && UNCERTAIN_RETRY_OPERATIONS.has(input.operation.kind)) {
+      if (input.attempt > 1 && operationMayHaveUncertainEffect(input.operation)) {
         try {
           await this.#recycleCommandGeneration(session.sessionId);
           const observation = await this.#observePage(
@@ -1229,7 +1354,7 @@ export class BrowserbaseBrowserClient implements FlorenceBrowserClient {
               { retryable: false },
             );
           }
-          actionMayHaveHappened = UNCERTAIN_RETRY_OPERATIONS.has(input.operation.kind);
+          actionMayHaveHappened = operationMayHaveUncertainEffect(input.operation);
           await this.#performOperation(sessionDetails, input.operation, input.uploadFile, localSignal);
         }
       }
@@ -1832,19 +1957,7 @@ function boundedPlaywrightOutput(result: unknown, stdout: string | undefined): s
   ).value;
 }
 
-function computerActionBatches(
-  actions: readonly FlorenceBrowserComputerAction[],
-): readonly ComputerBatchParams.Action[][] {
-  if (!Array.isArray(actions) || actions.length < 1 || actions.length > MAX_COMPUTER_ACTIONS_PER_CALL) {
-    throw new FlorenceBrowserError(
-      "invalid_input",
-      `A computer action call must contain between 1 and ${MAX_COMPUTER_ACTIONS_PER_CALL} actions. Florence can continue with another call afterward.`,
-    );
-  }
-  return [actions.map(computerBatchAction)];
-}
-
-function computerBatchAction(action: FlorenceBrowserComputerAction): ComputerBatchParams.Action {
+function computerBatchAction(action: FlorenceBrowserComputerAction): ComputerBatchParams.Action | null {
   switch (action.type) {
     case "click_mouse":
       return {
@@ -1855,6 +1968,9 @@ function computerBatchAction(action: FlorenceBrowserComputerAction): ComputerBat
           ...(action.button ? { button: action.button } : {}),
           ...(action.clickType ? { click_type: action.clickType } : {}),
           ...(action.numClicks === undefined ? {} : { num_clicks: boundedInteger(action.numClicks, 1, 10) }),
+          ...(action.holdKeys && action.holdKeys.length > 0
+            ? { hold_keys: computerKeys(action.holdKeys, "click modifier") }
+            : {}),
         },
       };
     case "move_mouse":
@@ -1863,12 +1979,22 @@ function computerBatchAction(action: FlorenceBrowserComputerAction): ComputerBat
         move_mouse: {
           x: finiteCoordinate(action.x, "move x"),
           y: finiteCoordinate(action.y, "move y"),
+          ...(action.holdKeys && action.holdKeys.length > 0
+            ? { hold_keys: computerKeys(action.holdKeys, "move modifier") }
+            : {}),
+          ...(action.durationMs === undefined
+            ? {}
+            : { duration_ms: boundedInteger(action.durationMs, 0, DEFAULT_MAX_WAIT_MS) }),
+          ...(action.smooth === undefined ? {} : { smooth: action.smooth }),
         },
       };
     case "type_text":
       return {
         type: action.type,
-        type_text: { text: boundedInput(action.text, "Computer text") },
+        type_text: {
+          text: boundedInput(action.text, "Computer text"),
+          ...(action.delayMs === undefined ? {} : { delay: boundedInteger(action.delayMs, 0, 250) }),
+        },
       };
     case "press_key":
       if (action.keys.length < 1 || action.keys.length > 20) {
@@ -1877,7 +2003,13 @@ function computerBatchAction(action: FlorenceBrowserComputerAction): ComputerBat
       return {
         type: action.type,
         press_key: {
-          keys: action.keys.map((key) => requireNonEmpty(key, "Computer key", 100)),
+          keys: computerKeys(action.keys, "Computer key"),
+          ...(action.durationMs === undefined
+            ? {}
+            : { duration: boundedInteger(action.durationMs, 0, DEFAULT_MAX_WAIT_MS) }),
+          ...(action.holdKeys && action.holdKeys.length > 0
+            ? { hold_keys: computerKeys(action.holdKeys, "key modifier") }
+            : {}),
         },
       };
     case "scroll":
@@ -1892,6 +2024,9 @@ function computerBatchAction(action: FlorenceBrowserComputerAction): ComputerBat
           ...(action.deltaY === undefined
             ? {}
             : { delta_y: finiteCoordinate(action.deltaY, "vertical scroll") }),
+          ...(action.holdKeys && action.holdKeys.length > 0
+            ? { hold_keys: computerKeys(action.holdKeys, "scroll modifier") }
+            : {}),
         },
       };
     case "drag_mouse":
@@ -1903,14 +2038,46 @@ function computerBatchAction(action: FlorenceBrowserComputerAction): ComputerBat
         drag_mouse: {
           path: action.path.map(({ x, y }) => [finiteCoordinate(x, "drag x"), finiteCoordinate(y, "drag y")]),
           ...(action.button ? { button: action.button } : {}),
+          ...(action.delayMs === undefined
+            ? {}
+            : { delay: boundedInteger(action.delayMs, 0, DEFAULT_MAX_WAIT_MS) }),
+          ...(action.durationMs === undefined
+            ? {}
+            : { duration_ms: boundedInteger(action.durationMs, 0, DEFAULT_MAX_WAIT_MS) }),
+          ...(action.smooth === undefined ? {} : { smooth: action.smooth }),
+          ...(action.stepsPerSegment === undefined
+            ? {}
+            : { steps_per_segment: boundedInteger(action.stepsPerSegment, 1, 1_000) }),
+          ...(action.stepDelayMs === undefined
+            ? {}
+            : { step_delay_ms: boundedInteger(action.stepDelayMs, 0, 250) }),
+          ...(action.holdKeys && action.holdKeys.length > 0
+            ? { hold_keys: computerKeys(action.holdKeys, "drag modifier") }
+            : {}),
         },
+      };
+    case "set_cursor":
+      return {
+        type: action.type,
+        set_cursor: { hidden: action.hidden },
       };
     case "sleep":
       return {
         type: action.type,
         sleep: { duration_ms: boundedInteger(action.milliseconds, 0, DEFAULT_MAX_WAIT_MS) },
       };
+    case "write_clipboard":
+    case "read_clipboard":
+    case "get_mouse_position":
+      return null;
   }
+}
+
+function computerKeys(keys: readonly string[], label: string): string[] {
+  if (keys.length < 1 || keys.length > 20) {
+    throw new FlorenceBrowserError("invalid_input", `${label} needs one to twenty keys.`);
+  }
+  return keys.map((key) => requireNonEmpty(key, label, 100));
 }
 
 function finiteCoordinate(value: number, label: string): number {
@@ -1918,6 +2085,26 @@ function finiteCoordinate(value: number, label: string): number {
     throw new FlorenceBrowserError("invalid_input", `${label} must be a finite number.`);
   }
   return value;
+}
+
+function finiteProviderCoordinate(value: unknown, label: string): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw invalidProviderResponse(`Kernel returned an invalid ${label} coordinate.`);
+  }
+  return value;
+}
+
+function boundedProviderText(
+  value: unknown,
+  safeMessage: string,
+): { readonly value: string; readonly truncated: boolean } {
+  if (typeof value !== "string") throw invalidProviderResponse(safeMessage);
+  if (value.length <= MAX_INPUT_CHARS) return { value, truncated: false };
+  const marker = "\n[Clipboard content truncated]";
+  return {
+    value: `${value.slice(0, MAX_INPUT_CHARS - marker.length)}${marker}`,
+    truncated: true,
+  };
 }
 
 function requireCaptureSelector(value: string | undefined): string {
@@ -2167,6 +2354,25 @@ function unreadableUncertainObservation(
     snapshot: "",
     refCount: 0,
     truncated: false,
+  };
+}
+
+function unreadableComputerReadObservation(
+  operation: FlorenceBrowserOperation["kind"],
+  computerReads: readonly FlorenceBrowserComputerReadResult[],
+  actionMayHaveHappened: boolean,
+): FlorenceBrowserObservation {
+  return {
+    kind: actionMayHaveHappened ? "uncertain_effect" : "page",
+    reason: actionMayHaveHappened
+      ? `The ${operation} returned its requested data, but Florence could not read the resulting page; other actions in the same call may already have happened.`
+      : `The ${operation} returned its requested data, but Florence could not read the current page afterward.`,
+    url: "",
+    title: "",
+    snapshot: "",
+    refCount: 0,
+    truncated: false,
+    computerReads,
   };
 }
 

@@ -3534,17 +3534,36 @@ const telephonyResultOutputSchema = z
 
 const browserComputerActionArguments = z
   .object({
-    type: z.enum(["click_mouse", "move_mouse", "type_text", "press_key", "scroll", "drag_mouse", "sleep"]),
+    type: z.enum([
+      "click_mouse",
+      "move_mouse",
+      "type_text",
+      "press_key",
+      "scroll",
+      "drag_mouse",
+      "set_cursor",
+      "sleep",
+      "write_clipboard",
+      "read_clipboard",
+      "get_mouse_position",
+    ]),
     x: z.number().finite().nullable(),
     y: z.number().finite().nullable(),
-    button: z.enum(["left", "right", "middle"]).nullable(),
+    button: z.enum(["left", "right", "middle", "back", "forward"]).nullable(),
     clickType: z.enum(["down", "up", "click"]).nullable(),
     numClicks: z.number().int().min(1).max(10).nullable(),
     text: z.string().max(20_000).nullable(),
     keys: z.array(z.string().trim().min(1).max(100)).max(20),
+    holdKeys: z.array(z.string().trim().min(1).max(100)).max(20).default([]),
+    delayMs: z.number().int().min(0).max(10_000).nullable().default(null),
+    durationMs: z.number().int().min(0).max(10_000).nullable().default(null),
+    smooth: z.boolean().nullable().default(null),
     deltaX: z.number().finite().nullable(),
     deltaY: z.number().finite().nullable(),
     path: z.array(z.object({ x: z.number().finite(), y: z.number().finite() }).strict()).max(100),
+    stepsPerSegment: z.number().int().min(1).max(1_000).nullable().default(null),
+    stepDelayMs: z.number().int().min(0).max(250).nullable().default(null),
+    hidden: z.boolean().nullable().default(null),
     milliseconds: z.number().int().min(0).max(10_000).nullable(),
   })
   .strict()
@@ -3562,7 +3581,14 @@ const browserComputerActionArguments = z
       requireValue(action.x, "x");
       requireValue(action.y, "y");
     }
-    if (action.type === "type_text") requireValue(action.text, "text");
+    if (action.type === "type_text" || action.type === "write_clipboard") requireValue(action.text, "text");
+    if (action.type === "type_text" && action.delayMs !== null && action.delayMs > 250) {
+      context.addIssue({
+        code: "custom",
+        path: ["delayMs"],
+        message: "type_text delayMs must be at most 250 milliseconds",
+      });
+    }
     if (action.type === "press_key" && action.keys.length === 0) {
       context.addIssue({ code: "custom", path: ["keys"], message: "keys are required for press_key" });
     }
@@ -3573,6 +3599,14 @@ const browserComputerActionArguments = z
         message: "at least two path points are required for drag_mouse",
       });
     }
+    if (action.type === "drag_mouse" && (action.button === "back" || action.button === "forward")) {
+      context.addIssue({
+        code: "custom",
+        path: ["button"],
+        message: "drag_mouse supports left, right, or middle button",
+      });
+    }
+    if (action.type === "set_cursor") requireValue(action.hidden, "hidden");
     if (action.type === "sleep") requireValue(action.milliseconds, "milliseconds");
   });
 
@@ -3617,7 +3651,7 @@ const browserWorkArguments = z
     compact: z.boolean(),
     code: z.string().min(1).max(50_000).nullable(),
     timeoutSeconds: z.number().int().min(1).max(300).nullable(),
-    actions: z.array(browserComputerActionArguments).max(50),
+    actions: z.array(browserComputerActionArguments),
     screenshot: z.boolean(),
     captureSource: z.enum(["viewport", "full_page", "element", "image_resource"]).nullable().default(null),
     captureLabel: z.string().trim().min(1).max(200).nullable().default(null),
@@ -3682,12 +3716,24 @@ const BROWSER_COMPUTER_ACTION_PARAMETERS = {
   properties: {
     type: {
       type: "string",
-      enum: ["click_mouse", "move_mouse", "type_text", "press_key", "scroll", "drag_mouse", "sleep"],
+      enum: [
+        "click_mouse",
+        "move_mouse",
+        "type_text",
+        "press_key",
+        "scroll",
+        "drag_mouse",
+        "set_cursor",
+        "sleep",
+        "write_clipboard",
+        "read_clipboard",
+        "get_mouse_position",
+      ],
     },
     x: { anyOf: [{ type: "number" }, { type: "null" }] },
     y: { anyOf: [{ type: "number" }, { type: "null" }] },
     button: {
-      anyOf: [{ type: "string", enum: ["left", "right", "middle"] }, { type: "null" }],
+      anyOf: [{ type: "string", enum: ["left", "right", "middle", "back", "forward"] }, { type: "null" }],
     },
     clickType: {
       anyOf: [{ type: "string", enum: ["down", "up", "click"] }, { type: "null" }],
@@ -3697,6 +3743,18 @@ const BROWSER_COMPUTER_ACTION_PARAMETERS = {
     },
     text: { anyOf: [{ type: "string", maxLength: 20_000 }, { type: "null" }] },
     keys: { type: "array", maxItems: 20, items: { type: "string", minLength: 1, maxLength: 100 } },
+    holdKeys: {
+      type: "array",
+      maxItems: 20,
+      items: { type: "string", minLength: 1, maxLength: 100 },
+    },
+    delayMs: {
+      anyOf: [{ type: "integer", minimum: 0, maximum: 10_000 }, { type: "null" }],
+    },
+    durationMs: {
+      anyOf: [{ type: "integer", minimum: 0, maximum: 10_000 }, { type: "null" }],
+    },
+    smooth: { anyOf: [{ type: "boolean" }, { type: "null" }] },
     deltaX: { anyOf: [{ type: "number" }, { type: "null" }] },
     deltaY: { anyOf: [{ type: "number" }, { type: "null" }] },
     path: {
@@ -3709,6 +3767,13 @@ const BROWSER_COMPUTER_ACTION_PARAMETERS = {
         required: ["x", "y"],
       },
     },
+    stepsPerSegment: {
+      anyOf: [{ type: "integer", minimum: 1, maximum: 1_000 }, { type: "null" }],
+    },
+    stepDelayMs: {
+      anyOf: [{ type: "integer", minimum: 0, maximum: 250 }, { type: "null" }],
+    },
+    hidden: { anyOf: [{ type: "boolean" }, { type: "null" }] },
     milliseconds: {
       anyOf: [{ type: "integer", minimum: 0, maximum: 10_000 }, { type: "null" }],
     },
@@ -3722,9 +3787,16 @@ const BROWSER_COMPUTER_ACTION_PARAMETERS = {
     "numClicks",
     "text",
     "keys",
+    "holdKeys",
+    "delayMs",
+    "durationMs",
+    "smooth",
     "deltaX",
     "deltaY",
     "path",
+    "stepsPerSegment",
+    "stepDelayMs",
+    "hidden",
     "milliseconds",
   ],
 } as const;
@@ -3772,7 +3844,7 @@ const BROWSER_WORK_PARAMETERS = {
     timeoutSeconds: {
       anyOf: [{ type: "integer", minimum: 1, maximum: 300 }, { type: "null" }],
     },
-    actions: { type: "array", maxItems: 50, items: BROWSER_COMPUTER_ACTION_PARAMETERS },
+    actions: { type: "array", items: BROWSER_COMPUTER_ACTION_PARAMETERS },
     screenshot: { type: "boolean" },
     captureSource: {
       anyOf: [
@@ -3832,6 +3904,25 @@ const familyWorkSelectedImageSchema = z
   })
   .strict();
 
+const browserComputerReadResultSchema = z.discriminatedUnion("type", [
+  z
+    .object({
+      actionIndex: z.number().int().min(0),
+      type: z.literal("read_clipboard"),
+      text: z.string().max(20_000),
+      truncated: z.boolean(),
+    })
+    .strict(),
+  z
+    .object({
+      actionIndex: z.number().int().min(0),
+      type: z.literal("get_mouse_position"),
+      x: z.number().finite(),
+      y: z.number().finite(),
+    })
+    .strict(),
+]);
+
 const browserObservationOutputSchema = z
   .object({
     kind: z.enum(["page", "owner_handoff", "uncertain_effect"]),
@@ -3844,6 +3935,7 @@ const browserObservationOutputSchema = z
     liveViewUrl: z.string().url().max(4_096).nullable(),
     screenshotAttached: z.boolean(),
     selectedImage: familyWorkSelectedImageSchema.nullable(),
+    computerReads: z.array(browserComputerReadResultSchema).default([]),
   })
   .strict();
 
@@ -4543,20 +4635,30 @@ function browserComputerAction(
         ...(action.button === null ? {} : { button: action.button }),
         ...(action.clickType === null ? {} : { clickType: action.clickType }),
         ...(action.numClicks === null ? {} : { numClicks: action.numClicks }),
+        ...(action.holdKeys.length === 0 ? {} : { holdKeys: action.holdKeys }),
       };
     case "move_mouse":
       return {
         type: action.type,
         x: requiredWorkspaceValue(action.x, "computer action x"),
         y: requiredWorkspaceValue(action.y, "computer action y"),
+        ...(action.holdKeys.length === 0 ? {} : { holdKeys: action.holdKeys }),
+        ...(action.durationMs === null ? {} : { durationMs: action.durationMs }),
+        ...(action.smooth === null ? {} : { smooth: action.smooth }),
       };
     case "type_text":
       return {
         type: action.type,
         text: requiredWorkspaceValue(action.text, "computer action text"),
+        ...(action.delayMs === null ? {} : { delayMs: action.delayMs }),
       };
     case "press_key":
-      return { type: action.type, keys: action.keys };
+      return {
+        type: action.type,
+        keys: action.keys,
+        ...(action.durationMs === null ? {} : { durationMs: action.durationMs }),
+        ...(action.holdKeys.length === 0 ? {} : { holdKeys: action.holdKeys }),
+      };
     case "scroll":
       return {
         type: action.type,
@@ -4564,19 +4666,48 @@ function browserComputerAction(
         y: requiredWorkspaceValue(action.y, "computer action y"),
         ...(action.deltaX === null ? {} : { deltaX: action.deltaX }),
         ...(action.deltaY === null ? {} : { deltaY: action.deltaY }),
+        ...(action.holdKeys.length === 0 ? {} : { holdKeys: action.holdKeys }),
       };
     case "drag_mouse":
       return {
         type: action.type,
         path: action.path,
-        ...(action.button === null ? {} : { button: action.button }),
+        ...(action.button === null ? {} : { button: browserDragButton(action.button) }),
+        ...(action.delayMs === null ? {} : { delayMs: action.delayMs }),
+        ...(action.durationMs === null ? {} : { durationMs: action.durationMs }),
+        ...(action.smooth === null ? {} : { smooth: action.smooth }),
+        ...(action.stepsPerSegment === null ? {} : { stepsPerSegment: action.stepsPerSegment }),
+        ...(action.stepDelayMs === null ? {} : { stepDelayMs: action.stepDelayMs }),
+        ...(action.holdKeys.length === 0 ? {} : { holdKeys: action.holdKeys }),
       };
+    case "set_cursor":
+      return {
+        type: action.type,
+        hidden: requiredWorkspaceValue(action.hidden, "computer cursor visibility"),
+      };
+    case "write_clipboard":
+      return {
+        type: action.type,
+        text: requiredWorkspaceValue(action.text, "computer clipboard text"),
+      };
+    case "read_clipboard":
+    case "get_mouse_position":
+      return { type: action.type };
     case "sleep":
       return {
         type: action.type,
         milliseconds: requiredWorkspaceValue(action.milliseconds, "computer action duration"),
       };
   }
+}
+
+function browserDragButton(
+  button: "left" | "right" | "middle" | "back" | "forward",
+): "left" | "right" | "middle" {
+  if (button === "back" || button === "forward") {
+    throw unsafeRead("A computer drag supports left, right, or middle button");
+  }
+  return button;
 }
 
 function browserOperation(args: z.infer<typeof browserWorkArguments>): FlorenceBrowserOperation {
@@ -4701,6 +4832,7 @@ async function executeBrowserOperation(
       liveViewUrl: observation.liveViewUrl ?? null,
       screenshotAttached: observation.screenshot !== undefined,
       selectedImage: observation.selectedImage ?? null,
+      computerReads: observation.computerReads ?? [],
     }),
   };
 }
@@ -4976,7 +5108,7 @@ function foregroundCapabilityRegistry(): CapabilityRegistry<ForegroundCapability
     defineCapability({
       name: "browser_work",
       description:
-        "Use Florence's persistent real browser for any interactive website during durable family work. Prefer one bounded Playwright program to inspect the current DOM, perform related actions, and verify the resulting state. Use native computer actions with a final screenshot when visual or coordinate-level control is more reliable. Routine screenshot is temporary visual context for you. Capture is different: it deliberately preserves one user-visible browser image for the final conversation, from the viewport or region, full page, rendered element, or original image resource; use it only when the parent asked for an image or the image materially improves the result. The compatibility operations can navigate, read an accessibility snapshot, click, type, upload one exact image or PDF from the initiating message, choose options, check boxes, press keys, scroll, wait, go back, or hand the live session to the parent for sign-in/MFA. This is a general browser, not a task-specific workflow. Set fields unused by the chosen operation to null, false, or empty arrays.",
+        "Use Florence's persistent real browser for any interactive website during durable family work. Prefer one bounded Playwright program to inspect the current DOM, perform related actions, and verify the resulting state. Use native computer actions when visual or coordinate-level control is more reliable: batches can click, move, type, press, scroll, drag, show or hide the cursor, and read or write the clipboard; clipboard and mouse-position reads are returned in action order. Set screenshot true on that same call when temporary visual inspection is useful. Routine screenshot is temporary visual context for you. Capture is different: it deliberately preserves one user-visible browser image for the final conversation, from the viewport or region, full page, rendered element, or original image resource; use it only when the parent asked for an image or the image materially improves the result. The compatibility operations can navigate, read an accessibility snapshot, click, type, upload one exact image or PDF from the initiating message, choose options, check boxes, press keys, scroll, wait, go back, or hand the live session to the parent for sign-in/MFA. This is a general browser, not a task-specific workflow. Set fields unused by the chosen operation to null, false, or empty arrays.",
       modelSchema: BROWSER_WORK_PARAMETERS,
       inputSchema: browserWorkArguments,
       outputSchema: browserObservationOutputSchema,

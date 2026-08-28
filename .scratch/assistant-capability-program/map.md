@@ -30,6 +30,8 @@ Standing product constraints:
 
 <!-- Resolved tickets are indexed here by linked name and one-line gist. -->
 
+- [Make broad assistant work the product contract](issues/01-make-broad-assistant-work-the-product-contract.md) — `PLAN.md` and `AGENTS.md` now require direct Pi/Hermes reuse and authorize the complete assistant breadth under owner-scoped privacy, one durable work seam, exact consequential-action settlement, and staged real-world proof.
+
 ## Fog
 
 - The exact payment, cancellation, refund, and dispute contract for purchases and bookings will become specifiable after the exact-action settlement ticket resolves.

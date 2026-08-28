@@ -1,12 +1,12 @@
 Label: wayfinder:task
 Type: task
 Status: open
-Blocked by: 04, 06, 07
+Blocked by: 04, 07
 
-# Port maps, weather, and travel into Florence
+# Add live weather and flight disruption help
 
 ## Question
 
-How can a family ask ordinary place, route, time-zone, weather, flight-status, and alternative-travel questions and receive sourced current answers before Florence asks for information a public identifier can resolve?
+How can Florence answer an ordinary weather question and turn “DL 747 is delayed tonight—find options” into a live route/status lookup plus useful alternative flights before asking for information the flight number already supplies?
 
-Port Hermes's maps operation set and normalized JSON behavior from `skills/productivity/maps/scripts/maps_client.py`; adapt the selected pinned Hermes MCP manifests or official provider clients for search-only travel; reuse the safe public-page/result bounds from the earlier ticket. Only the current authored public query and necessary coarse household location may leave Florence, and no tool may book or purchase.
+Use one concrete NOAA/NWS adapter for pilot weather. Adapt the minimal flight-search operation from Hermes's pinned `optional-mcps/kiwi/manifest.yaml` or its official provider client, and keep hotel search for a later real travel workflow. Do not build a generic MCP/provider framework.

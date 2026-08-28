@@ -3,7 +3,7 @@ Type: task
 Status: open
 Blocked by: 05, 06, 08, 09
 
-# Ship the safe assistant tranche
+# Ship the core assistant tools tranche
 
 ## Question
 

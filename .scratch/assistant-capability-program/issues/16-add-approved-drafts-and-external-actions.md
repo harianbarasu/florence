@@ -1,12 +1,12 @@
 Label: wayfinder:task
 Type: task
 Status: open
-Blocked by: 13, 14, 15
+Blocked by: 13, 14
 
-# Add approved drafts and external actions
+# Add Gmail communication, then concrete external actions
 
 ## Question
 
-How can Florence first create provider-backed Gmail drafts, then send/reply, contact an outside person, submit a form, or complete a reservation/booking/purchase only after the owning adult approves the exact staged action and Florence can return a provider-confirmed receipt or honest unknown state?
+How can Florence first create and manage Gmail drafts, then send or reply for its owner, and later complete one real reservation, booking, or service workflow at a time with a clear preview and provider-confirmed result?
 
-Port the Gmail operation contracts and read-back rules from Hermes's Google Workspace skill and `google_api.py`, and reuse only the isolated browser operations admitted by the settlement interface. Implement each consequence class as its own Florence-owned adapter; do not expose a generic browser submit, generic MCP call, or generic send-message tool to the model.
+Port the Gmail operation contracts and read-back rules from Hermes's Google Workspace skill and `google_api.py`. Add each outside action only when a concrete family scenario and provider are selected; do not build a generic action framework first.

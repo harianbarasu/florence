@@ -1,7 +1,7 @@
 Label: wayfinder:task
 Type: task
 Status: open
-Blocked by: 10, 11, 12, 13, 14, 19
+Blocked by: 10, 12, 13, 14, 19
 
 # Ship the reliable work and research tranche
 

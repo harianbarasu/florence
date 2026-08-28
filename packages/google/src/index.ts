@@ -288,17 +288,30 @@ export type GoogleCalendarBaselineTarget = {
   timeZone: string;
   accessRole: GoogleCalendarReadableAccessRole;
   primary: boolean;
+  /** Private account display metadata; baseline persistence does not depend on this value. */
+  label?: string;
+};
+
+/** A listed Calendar whose grant exposes only busy state, not readable event coverage. */
+export type GoogleCalendarNoEventCoverageTarget = {
+  calendarId: string;
+  timeZone: string;
+  accessRole: "freeBusyReader";
+  primary: boolean;
+  label?: string;
 };
 
 export type GoogleCalendarBaselineTargetsPage =
   | {
       status: "more";
       targets: readonly GoogleCalendarBaselineTarget[];
+      noEventCoverageTargets?: readonly GoogleCalendarNoEventCoverageTarget[];
       nextPageToken: string;
     }
   | {
       status: "complete";
       targets: readonly GoogleCalendarBaselineTarget[];
+      noEventCoverageTargets?: readonly GoogleCalendarNoEventCoverageTarget[];
       nextPageToken: null;
     };
 
@@ -318,6 +331,54 @@ export type GoogleCalendarBaselineEventsPage =
       events: readonly [];
       nextPageToken: null;
     };
+
+export type GooglePersonalCalendarWindowTarget = {
+  /** Provider identity is application-internal and must not be placed in model-visible output. */
+  calendarId: string;
+  /** Private display metadata that may only be shown to this connection's owning adult. */
+  label: string | null;
+  timeZone: string | null;
+  accessRole: GoogleCalendarReadableAccessRole | "freeBusyReader" | null;
+  primary: boolean;
+  status: "complete" | "unavailable" | "missing";
+  /** Complete provider event count for this target; zero for unavailable or missing targets. */
+  eventCount: number;
+};
+
+export type GooglePersonalCalendarWindowEvent = GoogleCalendarWindowEvent & {
+  /** Provider Calendar identity is application-internal; expose its private label to the model. */
+  calendarId: string;
+};
+
+/** One complete account-level private Calendar observation across all provider pages. */
+export type GooglePersonalCalendarWindowRead = {
+  status: "complete" | "truncated" | "partial" | "unavailable";
+  timeMin: string;
+  timeMax: string;
+  calendars: readonly GooglePersonalCalendarWindowTarget[];
+  totalCalendarCount: number;
+  events: readonly GooglePersonalCalendarWindowEvent[];
+  totalEventCount: number;
+};
+
+export type GooglePersonalCalendarCatalogTarget = {
+  /** Provider identity is application-internal and must not be placed in model-visible output. */
+  calendarId: string;
+  /** Private display metadata that may only be shown to this connection's owning adult. */
+  label: string | null;
+  timeZone: string;
+  accessRole: GoogleCalendarReadableAccessRole | "freeBusyReader";
+  primary: boolean;
+  /** Whether Florence can read event details or only learn that time is busy. */
+  eventCoverage: "readable" | "free_busy_only";
+};
+
+/** Exhaustive account Calendar catalog. */
+export type GooglePersonalCalendarCatalogRead = {
+  status: "complete" | "partial" | "unavailable";
+  calendars: readonly GooglePersonalCalendarCatalogTarget[];
+  totalCalendarCount: number;
+};
 
 /** Capture before the baseline Gmail reads, then persist only after that review commits. */
 export type GoogleGmailCursor = {
@@ -1428,7 +1489,7 @@ export class GoogleConnection {
     if (!credential) throw new GoogleConnectionError("Active Google connection was not found", "not_found");
     const accessToken = await this.#baselineCalendarAccessToken(credential);
     const query = new URLSearchParams({
-      fields: "nextPageToken,items(id,timeZone,accessRole,primary,deleted)",
+      fields: "nextPageToken,items(id,summary,summaryOverride,timeZone,accessRole,primary,deleted)",
       maxResults: String(CALENDAR_BASELINE_PAGE_SIZE),
       showDeleted: "false",
       showHidden: "true",
@@ -1445,8 +1506,19 @@ export class GoogleConnection {
       throw providerError("Google exceeded the Calendar-list baseline page size");
     }
     const targets: GoogleCalendarBaselineTarget[] = [];
+    const noEventCoverageTargets: GoogleCalendarNoEventCoverageTarget[] = [];
     const seenCalendarIds = new Set<string>();
     for (const entry of entries) {
+      const noEventCoverageTarget = calendarNoEventCoverageTargetFromList(entry);
+      if (noEventCoverageTarget) {
+        if (noEventCoverageTarget.calendarId === excludedFamilyCalendarId) continue;
+        if (seenCalendarIds.has(noEventCoverageTarget.calendarId)) {
+          throw providerError("Google repeated a Calendar baseline target");
+        }
+        seenCalendarIds.add(noEventCoverageTarget.calendarId);
+        noEventCoverageTargets.push(noEventCoverageTarget);
+        continue;
+      }
       const target = calendarBaselineTargetFromList(entry);
       if (!target || target.calendarId === excludedFamilyCalendarId) continue;
       if (seenCalendarIds.has(target.calendarId)) {
@@ -1456,10 +1528,11 @@ export class GoogleConnection {
       targets.push(target);
     }
     targets.sort((left, right) => left.calendarId.localeCompare(right.calendarId));
+    noEventCoverageTargets.sort((left, right) => left.calendarId.localeCompare(right.calendarId));
     const nextPageToken = nextGoogleBaselinePageToken(body, pageToken, "Calendar-list baseline page token");
     return nextPageToken
-      ? { status: "more", targets, nextPageToken }
-      : { status: "complete", targets, nextPageToken: null };
+      ? { status: "more", targets, noEventCoverageTargets, nextPageToken }
+      : { status: "complete", targets, noEventCoverageTargets, nextPageToken: null };
   }
 
   /** Reads one fixed-size page of every event in a single baseline Calendar target. */
@@ -1524,6 +1597,417 @@ export class GoogleConnection {
     return nextPageToken
       ? { status: "more", events, nextPageToken }
       : { status: "complete", events, nextPageToken: null };
+  }
+
+  /**
+   * Reads the complete private Calendar catalog for one account. The bound Florence Family
+   * Calendar is excluded exactly, and Calendar-list pagination is exhausted before returning.
+   */
+  async readPersonalCalendarCatalog(input: {
+    householdId: string;
+    ownerAdultId: string;
+    connectionId: string;
+    excludedFamilyCalendarId: string | null;
+  }): Promise<GooglePersonalCalendarCatalogRead> {
+    const excludedFamilyCalendarId =
+      input.excludedFamilyCalendarId === null
+        ? null
+        : secondaryCalendarTarget(input.excludedFamilyCalendarId);
+    const unavailable = (): GooglePersonalCalendarCatalogRead => ({
+      status: "unavailable",
+      calendars: [],
+      totalCalendarCount: 0,
+    });
+    const credential = await this.#store.readActiveGoogleCredential({
+      householdId: input.householdId,
+      ownerAdultId: input.ownerAdultId,
+      connectionId: input.connectionId,
+    });
+    if (!credential) return unavailable();
+
+    const calendars = new Map<string, GooglePersonalCalendarCatalogTarget>();
+    const seenPageTokens = new Set<string>();
+    let pageToken: string | undefined;
+    while (true) {
+      if (pageToken !== undefined) {
+        if (seenPageTokens.has(pageToken)) {
+          throw providerError("Google cycled the Calendar-list catalog page token");
+        }
+        seenPageTokens.add(pageToken);
+      }
+      const page = await this.readCalendarBaselineTargetsPage({
+        householdId: input.householdId,
+        ownerAdultId: input.ownerAdultId,
+        connectionId: input.connectionId,
+        excludedFamilyCalendarId,
+        ...(pageToken === undefined ? {} : { pageToken }),
+      });
+      for (const target of page.targets) {
+        if (calendars.has(target.calendarId)) {
+          throw providerError("Google repeated a Calendar catalog target across pages");
+        }
+        calendars.set(target.calendarId, personalCalendarCatalogTarget(target));
+      }
+      for (const target of page.noEventCoverageTargets ?? []) {
+        if (calendars.has(target.calendarId)) {
+          throw providerError("Google repeated a Calendar catalog target across pages");
+        }
+        calendars.set(target.calendarId, personalCalendarCatalogTarget(target));
+      }
+      if (page.status === "complete") break;
+      pageToken = page.nextPageToken;
+    }
+
+    const observed = [...calendars.values()].sort((left, right) =>
+      left.calendarId.localeCompare(right.calendarId),
+    );
+    return {
+      status: "complete",
+      calendars: observed,
+      totalCalendarCount: observed.length,
+    };
+  }
+
+  /**
+   * Reads a complete private Calendar window across every event-readable Calendar in one account.
+   * Calendar-list and event pagination are exhaustive; `limit` bounds only the model-facing event
+   * projection.
+   */
+  async readPersonalCalendarWindow(input: {
+    householdId: string;
+    ownerAdultId: string;
+    connectionId: string;
+    excludedFamilyCalendarId: string | null;
+    timeMin: string;
+    timeMax: string;
+    calendarIds?: readonly string[];
+    limit?: number;
+  }): Promise<GooglePersonalCalendarWindowRead> {
+    const excludedFamilyCalendarId =
+      input.excludedFamilyCalendarId === null
+        ? null
+        : secondaryCalendarTarget(input.excludedFamilyCalendarId);
+    const timeMin = explicitInstant(input.timeMin);
+    const timeMax = explicitInstant(input.timeMax);
+    if (timeMax <= timeMin) throw new Error("Personal Calendar read end must follow start");
+    if (timeMax.getTime() - timeMin.getTime() > 31 * 24 * 60 * 60_000) {
+      throw new Error("Personal Calendar read window cannot exceed 31 days");
+    }
+    const limit = input.limit ?? 50;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 50) {
+      throw new Error("Personal Calendar read limit must be between 1 and 50");
+    }
+    const selectedCalendarIds = personalCalendarSelection(input.calendarIds);
+    const normalizedTimeMin = timeMin.toISOString();
+    const normalizedTimeMax = timeMax.toISOString();
+    const unavailable = (): GooglePersonalCalendarWindowRead => {
+      const calendars: readonly GooglePersonalCalendarWindowTarget[] = [];
+      const events: readonly GooglePersonalCalendarWindowEvent[] = [];
+      return {
+        status: "unavailable",
+        timeMin: normalizedTimeMin,
+        timeMax: normalizedTimeMax,
+        calendars,
+        totalCalendarCount: 0,
+        events,
+        totalEventCount: 0,
+      };
+    };
+
+    const credential = await this.#store.readActiveGoogleCredential({
+      householdId: input.householdId,
+      ownerAdultId: input.ownerAdultId,
+      connectionId: input.connectionId,
+    });
+    if (!credential) return unavailable();
+
+    const discoveredTargets = new Map<string, GoogleCalendarBaselineTarget>();
+    const discoveredNoEventCoverageTargets = new Map<string, GoogleCalendarNoEventCoverageTarget>();
+    const seenTargetPageTokens = new Set<string>();
+    let targetPageToken: string | undefined;
+    while (true) {
+      if (targetPageToken !== undefined) {
+        if (seenTargetPageTokens.has(targetPageToken)) {
+          throw providerError("Google cycled the Calendar-list baseline page token");
+        }
+        seenTargetPageTokens.add(targetPageToken);
+      }
+      const page = await this.readCalendarBaselineTargetsPage({
+        householdId: input.householdId,
+        ownerAdultId: input.ownerAdultId,
+        connectionId: input.connectionId,
+        excludedFamilyCalendarId,
+        ...(targetPageToken === undefined ? {} : { pageToken: targetPageToken }),
+      });
+      for (const target of page.targets) {
+        if (
+          discoveredTargets.has(target.calendarId) ||
+          discoveredNoEventCoverageTargets.has(target.calendarId)
+        ) {
+          throw providerError("Google repeated a Calendar baseline target across pages");
+        }
+        discoveredTargets.set(target.calendarId, target);
+      }
+      for (const target of page.noEventCoverageTargets ?? []) {
+        if (
+          discoveredTargets.has(target.calendarId) ||
+          discoveredNoEventCoverageTargets.has(target.calendarId)
+        ) {
+          throw providerError("Google repeated a Calendar baseline target across pages");
+        }
+        discoveredNoEventCoverageTargets.set(target.calendarId, target);
+      }
+      if (page.status === "complete") break;
+      targetPageToken = page.nextPageToken;
+    }
+
+    return this.#readCompleteCalendarWindowFromTargets({
+      householdId: input.householdId,
+      ownerAdultId: input.ownerAdultId,
+      connectionId: input.connectionId,
+      excludedFamilyCalendarId,
+      selectedCalendarIds,
+      readableTargets: [...discoveredTargets.values()],
+      noEventCoverageTargets: [...discoveredNoEventCoverageTargets.values()],
+      timeMin: normalizedTimeMin,
+      timeMax: normalizedTimeMax,
+      limit,
+    });
+  }
+
+  /** Reads one exact Calendar catalog entry without enumerating any other account Calendar. */
+  async readExactCalendarCatalog(input: {
+    householdId: string;
+    ownerAdultId: string;
+    connectionId: string;
+    calendarId: string;
+  }): Promise<GooglePersonalCalendarCatalogRead> {
+    const calendarId = secondaryCalendarTarget(input.calendarId);
+    const unavailable = (): GooglePersonalCalendarCatalogRead => ({
+      status: "unavailable",
+      calendars: [],
+      totalCalendarCount: 0,
+    });
+    const credential = await this.#store.readActiveGoogleCredential({
+      householdId: input.householdId,
+      ownerAdultId: input.ownerAdultId,
+      connectionId: input.connectionId,
+    });
+    if (!credential) return unavailable();
+    const accessToken = await this.#baselineCalendarAccessToken(credential);
+    const query = new URLSearchParams({
+      fields: "id,timeZone,accessRole,deleted",
+    });
+    const body = await this.#calendarBaselineJson(
+      `users/me/calendarList/${encodeURIComponent(calendarId)}?${query}`,
+      accessToken,
+      "Google exact Calendar-list read",
+      true,
+    );
+    if (!body) return unavailable();
+    const noEventCoverageTarget = calendarNoEventCoverageTargetFromList(body);
+    const readableTarget = noEventCoverageTarget ? null : calendarBaselineTargetFromList(body);
+    const target = noEventCoverageTarget ?? readableTarget;
+    if (!target || target.calendarId !== calendarId) {
+      throw providerError("Google returned a different exact Calendar target");
+    }
+    const calendars = [personalCalendarCatalogTarget(target)];
+    return {
+      status: "complete",
+      calendars,
+      totalCalendarCount: calendars.length,
+    };
+  }
+
+  /** Reads only one exact bound Calendar without enumerating any other Calendar-list entry. */
+  async readExactCalendarWindow(input: {
+    householdId: string;
+    ownerAdultId: string;
+    connectionId: string;
+    calendarId: string;
+    timeMin: string;
+    timeMax: string;
+    limit?: number;
+  }): Promise<GooglePersonalCalendarWindowRead> {
+    const calendarId = secondaryCalendarTarget(input.calendarId);
+    const timeMin = explicitInstant(input.timeMin);
+    const timeMax = explicitInstant(input.timeMax);
+    if (timeMax <= timeMin) throw new Error("Exact Calendar read end must follow start");
+    if (timeMax.getTime() - timeMin.getTime() > 31 * 24 * 60 * 60_000) {
+      throw new Error("Exact Calendar read window cannot exceed 31 days");
+    }
+    const limit = input.limit ?? 50;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 50) {
+      throw new Error("Exact Calendar read limit must be between 1 and 50");
+    }
+    const normalizedTimeMin = timeMin.toISOString();
+    const normalizedTimeMax = timeMax.toISOString();
+    const catalog = await this.readExactCalendarCatalog({
+      householdId: input.householdId,
+      ownerAdultId: input.ownerAdultId,
+      connectionId: input.connectionId,
+      calendarId,
+    });
+    const catalogTarget = catalog.calendars[0];
+    const readableTargets: readonly GoogleCalendarBaselineTarget[] =
+      catalogTarget?.eventCoverage === "readable"
+        ? [
+            {
+              calendarId: catalogTarget.calendarId,
+              ...(catalogTarget.label === null ? {} : { label: catalogTarget.label }),
+              timeZone: catalogTarget.timeZone,
+              accessRole: catalogTarget.accessRole as GoogleCalendarReadableAccessRole,
+              primary: catalogTarget.primary,
+            },
+          ]
+        : [];
+    const noEventCoverageTargets: readonly GoogleCalendarNoEventCoverageTarget[] =
+      catalogTarget?.eventCoverage === "free_busy_only"
+        ? [
+            {
+              calendarId: catalogTarget.calendarId,
+              ...(catalogTarget.label === null ? {} : { label: catalogTarget.label }),
+              timeZone: catalogTarget.timeZone,
+              accessRole: "freeBusyReader",
+              primary: catalogTarget.primary,
+            },
+          ]
+        : [];
+    return this.#readCompleteCalendarWindowFromTargets({
+      householdId: input.householdId,
+      ownerAdultId: input.ownerAdultId,
+      connectionId: input.connectionId,
+      excludedFamilyCalendarId: null,
+      selectedCalendarIds: [calendarId],
+      readableTargets,
+      noEventCoverageTargets,
+      timeMin: normalizedTimeMin,
+      timeMax: normalizedTimeMax,
+      limit,
+    });
+  }
+
+  async #readCompleteCalendarWindowFromTargets(input: {
+    householdId: string;
+    ownerAdultId: string;
+    connectionId: string;
+    excludedFamilyCalendarId: string | null;
+    selectedCalendarIds: readonly string[] | null;
+    readableTargets: readonly GoogleCalendarBaselineTarget[];
+    noEventCoverageTargets: readonly GoogleCalendarNoEventCoverageTarget[];
+    timeMin: string;
+    timeMax: string;
+    limit: number;
+  }): Promise<GooglePersonalCalendarWindowRead> {
+    const selectedTargets = [...input.readableTargets]
+      .filter(
+        (target) =>
+          input.selectedCalendarIds === null || input.selectedCalendarIds.includes(target.calendarId),
+      )
+      .sort((left, right) => left.calendarId.localeCompare(right.calendarId));
+    const calendars: GooglePersonalCalendarWindowTarget[] = [];
+    const fullEvents: GooglePersonalCalendarWindowEvent[] = [];
+
+    for (const target of [...input.noEventCoverageTargets]
+      .filter(
+        (candidate) =>
+          input.selectedCalendarIds === null || input.selectedCalendarIds.includes(candidate.calendarId),
+      )
+      .sort((left, right) => left.calendarId.localeCompare(right.calendarId))) {
+      calendars.push({
+        calendarId: target.calendarId,
+        label: target.label ?? "Calendar",
+        timeZone: target.timeZone,
+        accessRole: target.accessRole,
+        primary: target.primary,
+        status: "unavailable",
+        eventCount: 0,
+      });
+    }
+
+    for (const target of selectedTargets) {
+      const targetEvents: GooglePersonalCalendarWindowEvent[] = [];
+      const seenEventPageTokens = new Set<string>();
+      const seenEventIds = new Set<string>();
+      let eventPageToken: string | undefined;
+      let targetUnavailable = false;
+      while (true) {
+        if (eventPageToken !== undefined) {
+          if (seenEventPageTokens.has(eventPageToken)) {
+            throw providerError("Google cycled a Calendar-event baseline page token");
+          }
+          seenEventPageTokens.add(eventPageToken);
+        }
+        const page = await this.readCalendarBaselineEventsPage({
+          householdId: input.householdId,
+          ownerAdultId: input.ownerAdultId,
+          connectionId: input.connectionId,
+          target,
+          timeMin: input.timeMin,
+          timeMax: input.timeMax,
+          ...(eventPageToken === undefined ? {} : { pageToken: eventPageToken }),
+        });
+        if (page.status === "unavailable") {
+          targetUnavailable = true;
+          break;
+        }
+        for (const event of page.events) {
+          if (seenEventIds.has(event.providerEventId)) {
+            throw providerError("Google repeated a Calendar event across baseline pages");
+          }
+          seenEventIds.add(event.providerEventId);
+          targetEvents.push({ calendarId: target.calendarId, ...event });
+        }
+        if (page.status === "complete") break;
+        eventPageToken = page.nextPageToken;
+      }
+
+      const descriptor = personalCalendarTarget(target);
+      if (targetUnavailable) {
+        calendars.push({ ...descriptor, status: "unavailable", eventCount: 0 });
+        continue;
+      }
+      targetEvents.sort(comparePersonalCalendarWindowEvents);
+      calendars.push({ ...descriptor, status: "complete", eventCount: targetEvents.length });
+      fullEvents.push(...targetEvents);
+    }
+
+    if (input.selectedCalendarIds !== null) {
+      const discoveredCalendarIds = new Set([
+        ...input.readableTargets.map((target) => target.calendarId),
+        ...input.noEventCoverageTargets.map((target) => target.calendarId),
+      ]);
+      for (const calendarId of input.selectedCalendarIds) {
+        if (discoveredCalendarIds.has(calendarId)) {
+          continue;
+        }
+        calendars.push({
+          calendarId,
+          label: null,
+          timeZone: null,
+          accessRole: null,
+          primary: false,
+          status: "missing",
+          eventCount: 0,
+        });
+      }
+    }
+    calendars.sort((left, right) => left.calendarId.localeCompare(right.calendarId));
+    fullEvents.sort(comparePersonalCalendarWindowEvents);
+    const totalEventCount = fullEvents.length;
+    const events = fullEvents.slice(0, input.limit);
+    const incompleteTargets = calendars.filter((calendar) => calendar.status !== "complete");
+    const status: GooglePersonalCalendarWindowRead["status"] =
+      incompleteTargets.length === 0 ? (totalEventCount > input.limit ? "truncated" : "complete") : "partial";
+    return {
+      status,
+      timeMin: input.timeMin,
+      timeMax: input.timeMax,
+      calendars,
+      totalCalendarCount: calendars.length,
+      events,
+      totalEventCount,
+    };
   }
 
   async readInitialCalendarReview(input: {
@@ -3556,11 +4040,40 @@ function calendarBaselineTargetFromList(entry: Record<string, unknown>): GoogleC
   if (entry.primary !== undefined && typeof entry.primary !== "boolean") {
     throw providerError("Google returned an invalid Calendar baseline primary flag");
   }
+  const summaryOverride = optionalStringField(entry, "summaryOverride");
+  const summary = optionalStringField(entry, "summary");
+  const label = nullableBounded(summaryOverride ?? summary ?? undefined, 500);
   return {
     calendarId: calendarTarget(stringField(entry, "id")),
     timeZone: calendarTimeZone(stringField(entry, "timeZone")),
     accessRole,
     primary: entry.primary === true,
+    ...(label === null ? {} : { label }),
+  };
+}
+
+function calendarNoEventCoverageTargetFromList(
+  entry: Record<string, unknown>,
+): GoogleCalendarNoEventCoverageTarget | null {
+  if (entry.deleted !== undefined && typeof entry.deleted !== "boolean") {
+    throw providerError("Google returned an invalid Calendar baseline target");
+  }
+  if (entry.deleted === true) {
+    throw providerError("Google returned a deleted Calendar in the readable baseline");
+  }
+  if (entry.accessRole !== "freeBusyReader") return null;
+  if (entry.primary !== undefined && typeof entry.primary !== "boolean") {
+    throw providerError("Google returned an invalid Calendar baseline primary flag");
+  }
+  const summaryOverride = optionalStringField(entry, "summaryOverride");
+  const summary = optionalStringField(entry, "summary");
+  const label = nullableBounded(summaryOverride ?? summary ?? undefined, 500);
+  return {
+    calendarId: calendarTarget(stringField(entry, "id")),
+    timeZone: calendarTimeZone(stringField(entry, "timeZone")),
+    accessRole: "freeBusyReader",
+    primary: entry.primary === true,
+    ...(label === null ? {} : { label }),
   };
 }
 
@@ -3584,6 +4097,33 @@ function calendarBaselineTarget(value: GoogleCalendarBaselineTarget): GoogleCale
     timeZone: calendarTimeZone(value.timeZone),
     accessRole: value.accessRole,
     primary: value.primary,
+    ...(value.label === undefined
+      ? {}
+      : { label: boundedRequired(value.label, "Calendar display label", 500) }),
+  };
+}
+
+function personalCalendarSelection(value: readonly string[] | undefined): readonly string[] | null {
+  if (value === undefined) return null;
+  if (!Array.isArray(value)) throw new Error("Personal Calendar selection must be an array");
+  const calendarIds = value.map((calendarId) => calendarTarget(calendarId));
+  const uniqueCalendarIds = new Set(calendarIds);
+  if (uniqueCalendarIds.size !== calendarIds.length) {
+    throw new Error("Personal Calendar selection contains a duplicate Calendar ID");
+  }
+  return [...uniqueCalendarIds].sort((left, right) => left.localeCompare(right));
+}
+
+function personalCalendarTarget(
+  target: GoogleCalendarBaselineTarget,
+): Omit<GooglePersonalCalendarWindowTarget, "status" | "eventCount"> {
+  const validated = calendarBaselineTarget(target);
+  return {
+    calendarId: validated.calendarId,
+    label: validated.label ?? (validated.primary ? "Primary calendar" : "Calendar"),
+    timeZone: validated.timeZone,
+    accessRole: validated.accessRole,
+    primary: validated.primary,
   };
 }
 
@@ -3598,6 +4138,33 @@ function compareCalendarWindowEvents(
     left.providerEventId.localeCompare(right.providerEventId) ||
     left.providerRevision.localeCompare(right.providerRevision)
   );
+}
+
+function comparePersonalCalendarWindowEvents(
+  left: GooglePersonalCalendarWindowEvent,
+  right: GooglePersonalCalendarWindowEvent,
+): number {
+  const leftStart = left.intervalKind === "timed" ? left.startsAt : left.startDate;
+  const rightStart = right.intervalKind === "timed" ? right.startsAt : right.startDate;
+  return (
+    leftStart.localeCompare(rightStart) ||
+    left.calendarId.localeCompare(right.calendarId) ||
+    left.providerEventId.localeCompare(right.providerEventId) ||
+    left.providerRevision.localeCompare(right.providerRevision)
+  );
+}
+
+function personalCalendarCatalogTarget(
+  target: GoogleCalendarBaselineTarget | GoogleCalendarNoEventCoverageTarget,
+): GooglePersonalCalendarCatalogTarget {
+  return {
+    calendarId: target.calendarId,
+    label: target.label ?? null,
+    timeZone: target.timeZone,
+    accessRole: target.accessRole,
+    primary: target.primary,
+    eventCoverage: target.accessRole === "freeBusyReader" ? "free_busy_only" : "readable",
+  };
 }
 
 function calendarBoundedCursor(
@@ -3899,11 +4466,13 @@ function collectGmailAttachmentReferences(
   message: { messageId: string; threadId: string; historyId: string },
 ): { attachments: readonly GmailAttachmentReference[]; status: "complete" | "truncated" } {
   const found: GmailAttachmentReference[] = [];
+  let omittedNamedAttachment = false;
   const visit = (part: Record<string, unknown>): void => {
     const rawMimeType = part.mimeType;
     const mimeType = typeof rawMimeType === "string" ? supportedGmailAttachmentMimeType(rawMimeType) : null;
     const rawFilename = part.filename;
     const filename = typeof rawFilename === "string" ? rawFilename.trim() : "";
+    if (filename && !mimeType) omittedNamedAttachment = true;
     if (mimeType && filename) {
       const body = recordField(part, "body");
       const sizeBytes = nonNegativeIntegerField(body, "size");
@@ -3926,6 +4495,8 @@ function collectGmailAttachmentReferences(
             sizeBytes,
           }),
         );
+      } else {
+        omittedNamedAttachment = true;
       }
     }
     for (const child of recordArray(part.parts)) visit(child);
@@ -3933,7 +4504,8 @@ function collectGmailAttachmentReferences(
   visit(payload);
   return {
     attachments: found.slice(0, MAX_GMAIL_ATTACHMENTS_PER_MESSAGE),
-    status: found.length > MAX_GMAIL_ATTACHMENTS_PER_MESSAGE ? "truncated" : "complete",
+    status:
+      omittedNamedAttachment || found.length > MAX_GMAIL_ATTACHMENTS_PER_MESSAGE ? "truncated" : "complete",
   };
 }
 

@@ -9,11 +9,13 @@ import {
   GOOGLE_SCOPES,
   type GoogleCalendarExecutionResult,
   GoogleCalendarTransientError,
+  type GoogleCalendarWindowEvent,
   type GoogleConnection,
   GoogleConnectionError,
   type GoogleFamilyCalendarProvisioningResult,
   type GoogleFamilyCalendarRenameResult,
   GoogleFamilyCalendarTransientError,
+  type GooglePersonalCalendarWindowEvent,
 } from "@florence/google";
 import {
   type LinqClient,
@@ -316,9 +318,13 @@ const SCHOOL_ATTACHMENT: GmailAttachmentReference = {
 
 type Reason = FlorenceReasoner["decide"];
 type CalendarExecutionInput = Parameters<GoogleConnection["executeCalendar"]>[0];
-type CalendarMutation = CalendarExecutionInput["mutation"];
+type CalendarMutation = NonNullable<FlorenceDecision["calendar"]>["mutation"];
 type FamilyCalendarProvisioningInput = Parameters<GoogleConnection["provisionFamilyCalendar"]>[0];
 type CalendarReadInput = Parameters<GoogleConnection["readCalendarWindow"]>[0];
+type PersonalCalendarCatalogInput = Parameters<GoogleConnection["readPersonalCalendarCatalog"]>[0];
+type PersonalCalendarReadInput = Parameters<GoogleConnection["readPersonalCalendarWindow"]>[0];
+type ExactCalendarCatalogInput = Parameters<GoogleConnection["readExactCalendarCatalog"]>[0];
+type ExactCalendarReadInput = Parameters<GoogleConnection["readExactCalendarWindow"]>[0];
 type TestPart =
   | { type: "text" | "link"; value: string }
   | {
@@ -361,6 +367,7 @@ type HarnessState = {
   providerCalendarSummary: string | null;
   calendarExecutions: CalendarExecutionInput[];
   calendarReads: CalendarReadInput[];
+  personalCalendarReads: PersonalCalendarReadInput[];
   calendarEvents: Map<string, FakeCalendarEvent>;
   uncertainCalendarCreateTitle: string | null;
   timeline: string[];
@@ -1673,10 +1680,12 @@ release("Florence parent journeys", () => {
       if (input.currentMessage.text === GOOGLE_CITED_REPLY_QUESTION) {
         const connection = input.googleConnections.find((candidate) => candidate.kind === "personal");
         if (!connection) throw new Error("The private Gmail connection is missing");
-        const [source] = await reads.searchGmail({
-          query: GOOGLE_CITED_REPLY_QUERY,
-          limit: 10,
-        });
+        const [source] = (
+          await reads.searchGmail({
+            query: GOOGLE_CITED_REPLY_QUERY,
+            limit: 10,
+          })
+        ).sources;
         if (!source?.text.includes("emergency card")) {
           throw new Error("The conversational Gmail read returned no usable evidence");
         }
@@ -1686,10 +1695,12 @@ release("Florence parent journeys", () => {
       if (input.currentMessage.text === ORDINARY_UNUSED_GMAIL_QUESTION) {
         const connection = input.googleConnections.find((candidate) => candidate.kind === "personal");
         if (!connection) throw new Error("The private Gmail connection is missing");
-        const [source] = await reads.searchGmail({
-          query: ORDINARY_UNUSED_GMAIL_QUERY,
-          limit: 10,
-        });
+        const [source] = (
+          await reads.searchGmail({
+            query: ORDINARY_UNUSED_GMAIL_QUERY,
+            limit: 10,
+          })
+        ).sources;
         if (!source) throw new Error("The ordinary Gmail search returned no evidence");
         ordinaryUnusedSourceId = source.sourceId;
         return decision({
@@ -3434,6 +3445,30 @@ release("Florence parent journeys", () => {
           ],
         });
       }
+      if (text === "What is on all of my calendars tomorrow?") {
+        const catalog = await reads.listCalendars?.();
+        if (catalog?.status !== "complete") {
+          throw new Error("The private Calendar catalog was unavailable");
+        }
+        if (catalog.calendars.some((calendar) => calendar.label.includes("Family"))) {
+          throw new Error("The Family Calendar leaked into the private Calendar catalog");
+        }
+        const calendarRead = await reads.readCalendarWindow({
+          timeMin: "2026-08-18T07:00:00.000Z",
+          timeMax: "2026-08-19T07:00:00.000Z",
+          limit: 50,
+          scope: "all",
+          calendarRefs: [],
+        });
+        if (calendarRead.calendars.some((calendar) => calendar.label?.includes("Family"))) {
+          throw new Error("The Family Calendar leaked into a private all-Calendar read");
+        }
+        return decision({
+          bubbles: [
+            { text: "I checked every personal calendar; your family calendar stayed separate.", delayMs: 0 },
+          ],
+        });
+      }
       if (text === "Add Maya pickup to the family calendar.") {
         return decision({
           calendar: calendarDecision(input.currentMessage.sourceId, {
@@ -3466,6 +3501,28 @@ release("Florence parent journeys", () => {
       return decision();
     });
     await harness.readyHousehold();
+
+    await harness.accept("private", "private-all-calendar-read", "What is on all of my calendars tomorrow?");
+    await harness.drain();
+    const privateAllCalendarReads = harness.state.personalCalendarReads.filter(
+      (read) => read.timeMin === "2026-08-18T07:00:00.000Z",
+    );
+    expect(privateAllCalendarReads).toHaveLength(1);
+    expect(privateAllCalendarReads).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          excludedFamilyCalendarId: FAMILY_CALENDAR,
+          calendarIds: undefined,
+        }),
+      ]),
+    );
+    expect(
+      harness.linq.messages.some(
+        (message) =>
+          message.providerConversationId === PRIVATE_FOUNDER &&
+          message.text === "I checked every personal calendar; your family calendar stayed separate.",
+      ),
+    ).toBe(true);
 
     const messagesBeforePrivateCalendarAnniversary = harness.linq.messages.length;
     harness.state.privateCalendarAnniversaryPending = true;
@@ -4763,6 +4820,7 @@ async function createHarness(
     providerCalendarSummary: null,
     calendarExecutions: [],
     calendarReads: [],
+    personalCalendarReads: [],
     calendarEvents: new Map(),
     uncertainCalendarCreateTitle: null,
     timeline: [],
@@ -6251,6 +6309,225 @@ function createGoogle(store: PostgresFlorenceStore, state: HarnessState): Google
         },
       };
     },
+    readPersonalCalendarCatalog: async (input: PersonalCalendarCatalogInput) => {
+      await activeCredential(input);
+      state.interactiveGoogleReads += 1;
+      const calendars = [
+        {
+          calendarId: "primary",
+          label: "Primary calendar",
+          timeZone: "America/Los_Angeles",
+          accessRole: "owner" as const,
+          primary: true,
+          eventCoverage: "readable" as const,
+        },
+        {
+          calendarId: FAMILY_CALENDAR,
+          label: state.providerCalendarSummary ?? "Family Calendar",
+          timeZone: "America/Los_Angeles",
+          accessRole: "owner" as const,
+          primary: false,
+          eventCoverage: "readable" as const,
+        },
+      ]
+        .filter((target) => target.calendarId !== input.excludedFamilyCalendarId)
+        .sort((left, right) => left.calendarId.localeCompare(right.calendarId));
+      return {
+        status: "complete" as const,
+        calendars,
+        totalCalendarCount: calendars.length,
+        coverageDigest: digest(JSON.stringify(calendars)),
+        logicalCoverageDigest: digest(
+          JSON.stringify(
+            calendars.map((calendar) => ({
+              calendarId: calendar.calendarId,
+              timeZone: calendar.timeZone,
+              eventCoverage: calendar.eventCoverage,
+            })),
+          ),
+        ),
+      };
+    },
+    readExactCalendarCatalog: async (input: ExactCalendarCatalogInput) => {
+      await activeCredential(input);
+      state.interactiveGoogleReads += 1;
+      const calendars =
+        input.calendarId === FAMILY_CALENDAR
+          ? [
+              {
+                calendarId: FAMILY_CALENDAR,
+                label: state.providerCalendarSummary ?? "Family Calendar",
+                timeZone: "America/Los_Angeles",
+                accessRole: "owner" as const,
+                primary: false,
+                eventCoverage: "readable" as const,
+              },
+            ]
+          : [];
+      const status = calendars.length === 1 ? ("complete" as const) : ("unavailable" as const);
+      return {
+        status,
+        calendars,
+        totalCalendarCount: calendars.length,
+        coverageDigest: digest(JSON.stringify({ calendarId: input.calendarId, calendars })),
+        logicalCoverageDigest: digest(
+          JSON.stringify({
+            calendarId: input.calendarId,
+            available: calendars.length === 1,
+            eventCoverage: calendars[0]?.eventCoverage ?? null,
+          }),
+        ),
+      };
+    },
+    readPersonalCalendarWindow: async (input: PersonalCalendarReadInput) => {
+      await activeCredential(input);
+      state.interactiveGoogleReads += 1;
+      state.personalCalendarReads.push(input);
+      const availableTargets = [
+        {
+          calendarId: "primary",
+          label: "Primary calendar",
+          timeZone: "America/Los_Angeles",
+          accessRole: "owner" as const,
+          primary: true,
+        },
+        {
+          calendarId: FAMILY_CALENDAR,
+          label: state.providerCalendarSummary ?? "Family Calendar",
+          timeZone: "America/Los_Angeles",
+          accessRole: "owner" as const,
+          primary: false,
+        },
+      ].filter((target) => target.calendarId !== input.excludedFamilyCalendarId);
+      const selectedIds = input.calendarIds ? new Set(input.calendarIds) : null;
+      const selectedTargets = availableTargets.filter(
+        (target) => selectedIds === null || selectedIds.has(target.calendarId),
+      );
+      const fullEvents: GooglePersonalCalendarWindowEvent[] = [];
+      for (const target of selectedTargets) {
+        const events: readonly GoogleCalendarWindowEvent[] =
+          target.calendarId === FAMILY_CALENDAR
+            ? [...state.calendarEvents.values()]
+            : (baseline({
+                ...input,
+                calendarId: target.calendarId,
+                currentTime: input.timeMin,
+              }).events as readonly GoogleCalendarWindowEvent[]);
+        for (const event of events) {
+          const startsAt =
+            event.intervalKind === "timed" ? event.startsAt : `${event.startDate}T00:00:00.000Z`;
+          const endsAt = event.intervalKind === "timed" ? event.endsAt : `${event.endDate}T00:00:00.000Z`;
+          if (endsAt > input.timeMin && startsAt < input.timeMax) {
+            fullEvents.push({ calendarId: target.calendarId, ...event });
+          }
+        }
+      }
+      const missingIds =
+        selectedIds === null
+          ? []
+          : [...selectedIds].filter(
+              (calendarId) => !selectedTargets.some((target) => target.calendarId === calendarId),
+            );
+      const calendars = [
+        ...selectedTargets.map((target) => ({
+          ...target,
+          status: "complete" as const,
+          eventCount: fullEvents.filter((event) => event.calendarId === target.calendarId).length,
+        })),
+        ...missingIds.map((calendarId) => ({
+          calendarId,
+          label: null,
+          timeZone: null,
+          accessRole: null,
+          primary: false,
+          status: "missing" as const,
+          eventCount: 0,
+        })),
+      ].sort((left, right) => left.calendarId.localeCompare(right.calendarId));
+      fullEvents.sort((left, right) => {
+        const leftStart = left.intervalKind === "timed" ? left.startsAt : left.startDate;
+        const rightStart = right.intervalKind === "timed" ? right.startsAt : right.startDate;
+        return leftStart.localeCompare(rightStart) || left.calendarId.localeCompare(right.calendarId);
+      });
+      const coverageDigest = digest(
+        JSON.stringify({
+          timeMin: input.timeMin,
+          timeMax: input.timeMax,
+          excludedFamilyCalendarId: input.excludedFamilyCalendarId,
+          calendarIds: input.calendarIds === undefined ? null : [...input.calendarIds].sort(),
+          calendars,
+          events: fullEvents,
+        }),
+      );
+      return {
+        status: missingIds.length > 0 ? ("partial" as const) : ("complete" as const),
+        timeMin: input.timeMin,
+        timeMax: input.timeMax,
+        calendars,
+        totalCalendarCount: calendars.length,
+        events: fullEvents.slice(0, input.limit ?? 50),
+        totalEventCount: fullEvents.length,
+        coverageDigest,
+        logicalCoverageDigest: digest(
+          JSON.stringify({
+            timeMin: input.timeMin,
+            timeMax: input.timeMax,
+            calendarIds: input.calendarIds === undefined ? null : [...input.calendarIds].sort(),
+            calendars: calendars.map((calendar) => ({
+              calendarId: calendar.calendarId,
+              status: calendar.status,
+              eventCount: calendar.eventCount,
+            })),
+            events: fullEvents,
+          }),
+        ),
+      };
+    },
+    readExactCalendarWindow: async (input: ExactCalendarReadInput) => {
+      await activeCredential(input);
+      state.interactiveGoogleReads += 1;
+      const exists = input.calendarId === FAMILY_CALENDAR;
+      const fullEvents = exists
+        ? [...state.calendarEvents.values()]
+            .filter((event) => overlaps(event, input))
+            .map((event) => ({ calendarId: input.calendarId, ...event }))
+        : [];
+      const calendars = [
+        {
+          calendarId: input.calendarId,
+          label: exists ? (state.providerCalendarSummary ?? "Family Calendar") : null,
+          timeZone: exists ? "America/Los_Angeles" : null,
+          accessRole: exists ? ("owner" as const) : null,
+          primary: false,
+          status: exists ? ("complete" as const) : ("missing" as const),
+          eventCount: fullEvents.length,
+        },
+      ];
+      const logicalCoverage = {
+        calendarId: input.calendarId,
+        timeMin: input.timeMin,
+        timeMax: input.timeMax,
+        status: calendars[0]?.status,
+        events: fullEvents,
+      };
+      return {
+        status: exists ? ("complete" as const) : ("partial" as const),
+        timeMin: input.timeMin,
+        timeMax: input.timeMax,
+        calendars,
+        totalCalendarCount: 1,
+        events: fullEvents.slice(0, input.limit ?? 50),
+        totalEventCount: fullEvents.length,
+        coverageDigest: digest(
+          JSON.stringify({
+            ...logicalCoverage,
+            label: calendars[0]?.label,
+            accessRole: calendars[0]?.accessRole,
+          }),
+        ),
+        logicalCoverageDigest: digest(JSON.stringify(logicalCoverage)),
+      };
+    },
     readCalendarWindow: async (input: CalendarReadInput) => {
       await activeCredential(input);
       state.interactiveGoogleReads += 1;
@@ -6400,12 +6677,15 @@ async function calendarTarget(
     timeMin: "2026-08-18T21:30:00.000Z",
     timeMax: "2026-08-18T22:30:00.000Z",
     limit: 50,
+    scope: "all",
+    calendarRefs: [],
   });
   const event = result.events.find((candidate) => candidate.title === expected.title);
   if (event?.intervalKind !== "timed") throw new Error("Maya pickup was not found");
+  expect(event).not.toHaveProperty("providerEventId");
+  expect(event).not.toHaveProperty("providerRevision");
   return {
-    providerEventId: event.providerEventId,
-    providerRevision: event.providerRevision,
+    eventRef: event.eventRef,
     observedEvent: {
       intervalKind: "timed" as const,
       title: event.title ?? expected.title,

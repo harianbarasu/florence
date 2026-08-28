@@ -1,12 +1,12 @@
 Label: wayfinder:task
 Type: task
 Status: open
-Blocked by: 01, 02, 04
+Blocked by: 04, 07, 08, 09
 
-# Port durable family work
+# Keep multi-step family work going and show real progress
 
 ## Question
 
-How can Florence durably accept genuinely long parent work, keep it alive across turns and process loss, support steering and cancellation, persist progress and results, deliver completion once, and report an honest `unknown` outcome when a consequential effect cannot yet be reconciled?
+How can Florence take one real multi-source comparison using the maps, travel, page, or reminder tools, keep it alive across turns and process loss, accept natural steering or cancellation, and acknowledge, report meaningful progress, and deliver the terminal result while the family keeps chatting?
 
-Adapt Pi's intent/effect/settlement specification in `packages/agent/docs/harness.md`, event and steering contracts in `packages/agent/src/agent-loop.ts`, and test vocabulary under `packages/agent/test/harness/`. Port Hermes's accepted/running/succeeded/failed/unknown/cancelled lifecycle, completion ledger, and recovery semantics from `tools/async_delegation.py`, `agent/replay_cleanup.py`, `tests/gateway/test_async_delegation_session_binding.py`, `tests/gateway/test_async_delivery_capability.py`, and `tests/cron/test_execution_ledger.py`. Florence's PostgreSQL store, live authority checks, idempotency, and provider reconciliation remain authoritative.
+Adapt only the useful work states, steering, cancellation, and recovery behavior from Pi's `packages/agent/src/agent-loop.ts` and `packages/agent/docs/harness.md`, plus Hermes's `tools/async_delegation.py` and `agent/replay_cleanup.py`. Reuse Florence's existing PostgreSQL due-work seam, reactions, typing, and Linq outbox; do not add another runtime, queue, or progress subsystem.

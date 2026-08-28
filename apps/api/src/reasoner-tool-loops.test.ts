@@ -1,5 +1,4 @@
 import { describe, expect, test } from "vitest";
-import type { CapabilityLifecycleEvent } from "./capability-lifecycle.js";
 import {
   type FlorenceDecision,
   type FlorenceGoogleChangesAssessmentInput,
@@ -12,17 +11,13 @@ import {
 const NOW = "2026-08-27T20:00:00.000Z";
 const PUBLIC_URL = "https://example.com/current-result";
 const admittedReadAccounting = {
-  async admitCapability() {
-    return true;
-  },
   settleSources() {},
-  settleCalendarRead() {},
 };
 
 describe("Florence reasoner capability cutover", () => {
   test("all foreground function calls use one source-bearing lifecycle and cue only after admission", async () => {
     const requests: Record<string, unknown>[] = [];
-    const events: CapabilityLifecycleEvent[] = [];
+    let workStarts = 0;
     const calls = [
       functionCall("memory-call", "search_family_memory", { query: "school", limit: 3 }),
       functionCall("source-call", "read_source", { sourceId: "turn-1" }),
@@ -32,6 +27,8 @@ describe("Florence reasoner capability cutover", () => {
         timeMin: "2026-08-28T16:00:00.000Z",
         timeMax: "2026-08-28T18:00:00.000Z",
         limit: 10,
+        scope: "all",
+        calendarRefs: [],
       }),
     ];
     let foregroundTurn = 0;
@@ -72,11 +69,11 @@ describe("Florence reasoner capability cutover", () => {
         },
         async searchGmail() {
           readCounts.gmail += 1;
-          return [source("gmail-1", "gmail", "adult_private")];
+          return { status: "complete" as const, sources: [conversationalGmailSource()] };
         },
         async readCalendarWindow() {
           readCounts.calendar += 1;
-          return { status: "complete", events: [] };
+          return completeCalendarRead();
         },
         async readCurrentImage() {
           throw new Error("No image was authorized");
@@ -84,8 +81,8 @@ describe("Florence reasoner capability cutover", () => {
       },
       undefined,
       {
-        onLifecycleEvent(event) {
-          events.push(event);
+        onWorkStarted() {
+          workStarts += 1;
         },
       },
     );
@@ -94,17 +91,16 @@ describe("Florence reasoner capability cutover", () => {
     expect(readCounts).toEqual({ memory: 1, source: 1, gmail: 1, calendar: 1 });
     const toolNames = ((requests[0]?.tools as { name: string }[]) ?? []).map((tool) => tool.name);
     expect(toolNames).toEqual([
+      "list_calendars",
       "read_calendar_window",
+      "read_gmail_attachment",
       "read_source",
       "research_public_web",
       "search_family_memory",
       "search_gmail",
     ]);
     expect(JSON.stringify(requests[0])).not.toContain("connectionId");
-    expect(events.filter((event) => event.phase === "requested")).toHaveLength(5);
-    expect(events.findIndex((event) => event.phase === "running")).toBeGreaterThan(
-      events.map((event) => event.phase).lastIndexOf("admitted"),
-    );
+    expect(workStarts).toBe(1);
     const secondInput = JSON.stringify(requests[1]?.input);
     for (const call of calls) {
       expect(secondInput).toContain(call.call_id);
@@ -113,14 +109,224 @@ describe("Florence reasoner capability cutover", () => {
     expect(envelopes).toHaveLength(5);
     for (const envelope of envelopes) {
       expect(envelope.outcome).toBe("succeeded");
-      expect(envelope.sources.length).toBeGreaterThan(0);
       expect(JSON.stringify(envelope).length).toBeLessThan(120_000);
     }
   });
 
+  test("a foreground Gmail search can open only its verified attachment as an ephemeral artifact", async () => {
+    const gmail = conversationalGmailSource();
+    const requests: Record<string, unknown>[] = [];
+    const responses = [
+      {
+        status: "completed",
+        output_parsed: null,
+        output: [
+          functionCall("gmail-search", "search_gmail", {
+            query: "school form",
+            limit: 3,
+          }),
+        ],
+      },
+      {
+        status: "completed",
+        output_parsed: null,
+        output: [
+          functionCall("gmail-attachment", "read_gmail_attachment", {
+            sourceId: gmail.sourceId,
+            attachmentRef: gmail.attachments[0]?.attachmentRef ?? "missing-attachment",
+          }),
+        ],
+      },
+      {
+        status: "completed",
+        output_parsed: ordinaryDecision(),
+        output: [],
+      },
+    ];
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        stream: (request: Record<string, unknown>) => {
+          requests.push(request);
+          const response = responses.shift();
+          if (!response) throw new Error("Unexpected model request");
+          return fakeStream(response);
+        },
+      },
+    } as never);
+    let attachmentInput: { sourceId: string; attachmentRef: string } | null = null;
+
+    await reasoner.decide(foregroundInput(), {
+      ...inertReads(),
+      async searchGmail() {
+        return { status: "complete", sources: [gmail] };
+      },
+      async readGmailAttachment(input) {
+        attachmentInput = {
+          sourceId: input.sourceId,
+          attachmentRef: input.attachment.attachmentRef,
+        };
+        return {
+          sourceId: input.sourceId,
+          attachmentRef: input.attachment.attachmentRef,
+          filename: input.attachment.filename,
+          mimeType: input.attachment.mimeType,
+          bytes: new Uint8Array(Buffer.from("%PDF-")),
+        };
+      },
+    });
+
+    expect(attachmentInput).toEqual({
+      sourceId: gmail.sourceId,
+      attachmentRef: gmail.attachments[0]?.attachmentRef,
+    });
+    const searchEnvelope = functionOutputEnvelopes(requests[1]).find(
+      (envelope) => envelope.callId === "gmail-search",
+    );
+    expect(searchEnvelope?.output).toMatchObject({
+      status: "complete",
+      sources: [
+        expect.objectContaining({
+          sourceId: gmail.sourceId,
+          textStatus: "complete",
+          attachmentsStatus: "complete",
+        }),
+      ],
+    });
+    const attachmentOutput = functionOutputs(requests[2]).find(
+      (item) => item.call_id === "gmail-attachment",
+    )?.output;
+    expect(Array.isArray(attachmentOutput)).toBe(true);
+    expect(JSON.stringify(attachmentOutput)).toContain("input_file");
+    expect(JSON.stringify(requests)).not.toContain("connectionId");
+  });
+
+  test("calendar catalog references admit a selected window without hiding partial coverage", async () => {
+    const requests: Record<string, unknown>[] = [];
+    const calendarRefs = ["calendar-school", "calendar-work"];
+    const selectedRead = {
+      status: "partial" as const,
+      calendars: [
+        {
+          calendarRef: calendarRefs[0] ?? "missing-school",
+          label: "School",
+          timeZone: "America/Los_Angeles",
+          primary: false,
+          accessRole: "reader" as const,
+          status: "complete" as const,
+          eventCount: 1,
+        },
+        {
+          calendarRef: calendarRefs[1] ?? "missing-work",
+          label: "Work",
+          timeZone: "America/Los_Angeles",
+          primary: false,
+          accessRole: "owner" as const,
+          status: "unavailable" as const,
+          eventCount: 0,
+        },
+      ],
+      events: [
+        {
+          eventRef: "event-1",
+          providerUpdatedAt: "2026-08-27T19:00:00.000Z",
+          calendarRef: calendarRefs[0] ?? "missing-school",
+          calendarLabel: "School",
+          title: "Back-to-school night",
+          location: "Wish Charter",
+          status: "tentative" as const,
+          busy: true,
+          intervalKind: "timed" as const,
+          startsAt: "2026-08-28T16:00:00.000Z",
+          endsAt: "2026-08-28T18:00:00.000Z",
+          timeZone: "America/Los_Angeles",
+        },
+      ],
+      totalCalendarCount: 2,
+      totalEventCount: 1,
+    };
+    const responses = [
+      {
+        status: "completed",
+        output_parsed: null,
+        output: [functionCall("calendar-catalog", "list_calendars", {})],
+      },
+      {
+        status: "completed",
+        output_parsed: null,
+        output: [
+          functionCall("calendar-window", "read_calendar_window", {
+            timeMin: "2026-08-28T00:00:00.000Z",
+            timeMax: "2026-08-29T00:00:00.000Z",
+            limit: 20,
+            scope: "selected",
+            calendarRefs,
+          }),
+        ],
+      },
+      { status: "completed", output_parsed: ordinaryDecision(), output: [] },
+    ];
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        stream: (request: Record<string, unknown>) => {
+          requests.push(request);
+          const response = responses.shift();
+          if (!response) throw new Error("Unexpected model request");
+          return fakeStream(response);
+        },
+      },
+    } as never);
+    let calendarInput: Record<string, unknown> | null = null;
+
+    await reasoner.decide(foregroundInput(), {
+      ...inertReads(),
+      async listCalendars() {
+        return {
+          status: "complete",
+          calendars: [
+            {
+              calendarRef: calendarRefs[0] ?? "missing-school",
+              label: "School",
+              timeZone: "America/Los_Angeles",
+              primary: false,
+              accessRole: "reader",
+              eventCoverage: "readable",
+            },
+            {
+              calendarRef: calendarRefs[1] ?? "missing-work",
+              label: "Work",
+              timeZone: "America/Los_Angeles",
+              primary: false,
+              accessRole: "owner",
+              eventCoverage: "readable",
+            },
+          ],
+          totalCalendarCount: 2,
+        };
+      },
+      async readCalendarWindow(input) {
+        calendarInput = input;
+        return selectedRead;
+      },
+    });
+
+    expect(calendarInput).toMatchObject({ scope: "selected", calendarRefs });
+    const windowEnvelope = functionOutputEnvelopes(requests[2]).find(
+      (envelope) => envelope.callId === "calendar-window",
+    );
+    expect(windowEnvelope?.output).toMatchObject({
+      status: "partial",
+      totalEventCount: 1,
+      calendars: [
+        expect.objectContaining({ label: "School", status: "complete", eventCount: 1 }),
+        expect.objectContaining({ label: "Work", status: "unavailable", eventCount: 0 }),
+      ],
+      events: [expect.objectContaining({ calendarLabel: "School", status: "tentative", busy: true })],
+    });
+  });
+
   test("truncated, malformed, and unknown calls never execute and remain model-visible for recovery", async () => {
     const requests: Record<string, unknown>[] = [];
-    const events: CapabilityLifecycleEvent[] = [];
+    let workStarts = 0;
     let modelTurn = 0;
     let memoryReads = 0;
     const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
@@ -169,10 +375,10 @@ describe("Florence reasoner capability cutover", () => {
           return null;
         },
         async searchGmail() {
-          return [];
+          return { status: "complete", sources: [] };
         },
         async readCalendarWindow() {
-          return { status: "complete", events: [] };
+          return completeCalendarRead();
         },
         async readCurrentImage() {
           throw new Error("No image was authorized");
@@ -180,27 +386,26 @@ describe("Florence reasoner capability cutover", () => {
       },
       undefined,
       {
-        onLifecycleEvent(event) {
-          events.push(event);
+        onWorkStarted() {
+          workStarts += 1;
         },
       },
     );
 
     expect(memoryReads).toBe(0);
-    expect(events.some((event) => event.phase === "admitted" || event.phase === "running")).toBe(false);
+    expect(workStarts).toBe(0);
     expect(functionOutputEnvelopes(requests[1])[0]?.error?.code).toBe("truncated_model_output");
     const rejected = functionOutputEnvelopes(requests[2]).slice(-2);
     expect(rejected.map((envelope) => envelope.error?.code)).toEqual([
       "unknown_or_unavailable_capability",
       "invalid_arguments",
     ]);
-    expect(rejected.every((envelope) => envelope.sources.length > 0)).toBe(true);
   });
 
   test("both private Gmail attachment loops use the registry without exposing connection IDs", async () => {
     const gmail = privateGmailSource();
     const requests: Record<string, unknown>[] = [];
-    const events: CapabilityLifecycleEvent[] = [];
+    let workStarts = 0;
     const responses = [
       { status: "completed", output_parsed: null, output: [attachmentCall("batch-attachment")] },
       {
@@ -231,7 +436,7 @@ describe("Florence reasoner capability cutover", () => {
         attachmentReads += 1;
         return {
           sourceId: gmail.sourceId,
-          attachmentId: gmail.attachments[0]?.attachmentId ?? "missing",
+          attachmentRef: gmail.attachments[0]?.attachmentRef ?? "missing",
           filename: gmail.attachments[0]?.filename ?? "missing.pdf",
           mimeType: "application/pdf" as const,
           bytes: new Uint8Array(Buffer.from("%PDF-")),
@@ -239,8 +444,8 @@ describe("Florence reasoner capability cutover", () => {
       },
     };
     const presentation = {
-      onLifecycleEvent(event: CapabilityLifecycleEvent) {
-        events.push(event);
+      onWorkStarted() {
+        workStarts += 1;
       },
     };
 
@@ -248,7 +453,7 @@ describe("Florence reasoner capability cutover", () => {
     await reasoner.assessGoogleChanges(privateAssessmentInput(gmail), reads, undefined, presentation);
 
     expect(attachmentReads).toBe(2);
-    expect(events.filter((event) => event.phase === "running")).toHaveLength(2);
+    expect(workStarts).toBe(2);
     for (const firstRequest of [requests[0], requests[2]]) {
       expect(JSON.stringify(firstRequest)).not.toContain("private-google-connection");
       expect(JSON.stringify(firstRequest)).not.toContain("connectionId");
@@ -371,7 +576,7 @@ function functionCall(callId: string, name: string, args: object) {
 function attachmentCall(callId: string) {
   return functionCall(callId, "read_private_gmail_attachment", {
     sourceId: "gmail-private-1",
-    attachmentId: "attachment-1",
+    attachmentRef: "attachment-1",
   });
 }
 
@@ -394,20 +599,20 @@ function fakeStream(response: unknown) {
 }
 
 function functionOutputs(request: Record<string, unknown> | undefined) {
-  return ((request?.input as { type?: string; output?: unknown }[]) ?? []).filter(
+  return ((request?.input as { type?: string; call_id?: string; output?: unknown }[]) ?? []).filter(
     (item) => item.type === "function_call_output",
   );
 }
 
 function functionOutputEnvelopes(request: Record<string, unknown> | undefined) {
-  return functionOutputs(request).map(
-    (item) =>
-      JSON.parse(typeof item.output === "string" ? item.output : "{}") as {
-        outcome: string;
-        error: { code: string } | null;
-        sources: unknown[];
-      },
-  );
+  return functionOutputs(request).map((item) => ({
+    callId: item.call_id,
+    ...(JSON.parse(typeof item.output === "string" ? item.output : "{}") as {
+      outcome: string;
+      output: unknown;
+      error: { code: string } | null;
+    }),
+  }));
 }
 
 function privateGmailSource() {
@@ -419,14 +624,30 @@ function privateGmailSource() {
     sender: "School",
     subject: "School form",
     text: "Please review School form",
+    textStatus: "complete" as const,
     attachments: [
       {
-        attachmentId: "attachment-1",
+        attachmentRef: "attachment-1",
         filename: "form.pdf",
         mimeType: "application/pdf" as const,
         sizeBytes: 5,
       },
     ],
+    attachmentsStatus: "complete" as const,
+  };
+}
+
+function conversationalGmailSource() {
+  return privateGmailSource();
+}
+
+function completeCalendarRead() {
+  return {
+    status: "complete" as const,
+    calendars: [],
+    totalCalendarCount: 0,
+    events: [],
+    totalEventCount: 0,
   };
 }
 
@@ -489,10 +710,10 @@ function inertReads() {
       return null;
     },
     async searchGmail() {
-      return [];
+      return { status: "complete" as const, sources: [] };
     },
     async readCalendarWindow() {
-      return { status: "complete" as const, events: [] };
+      return completeCalendarRead();
     },
     async readCurrentImage() {
       throw new Error("No image was authorized");

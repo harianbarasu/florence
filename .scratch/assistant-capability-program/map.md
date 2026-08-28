@@ -1,44 +1,53 @@
 Label: wayfinder:map
 
-# Make Florence a broadly capable family assistant
+# Make Florence a general household operator
 
-## Notes
+## Product target
 
-The family can now ask Florence to investigate, remember, coordinate, and follow through on ordinary life tasks, and Florence either does the work or clearly says what it needs.
+Florence should feel like Instinct for a household: a parent asks naturally, Florence uses the relevant tools, and the work ends in a useful result, one genuinely blocking question, or an honest failure. Search, Gmail, and Calendar are only the first slice.
 
-Every session working this map must read `AGENTS.md`, `PLAN.md`, `docs/research/pi-hermes-assistant-tool-gap-2026-08-27.md`, and the relevant closed-ticket decisions before changing code.
+Use the first-party product benchmark in `docs/research/instinct-product-benchmark.md` and the Pi/Hermes source inventory in `docs/research/pi-hermes-assistant-tool-gap-2026-08-27.md`.
 
-Direct upstream reuse is a binding implementation constraint:
+Direct upstream reuse remains required where it produces a real Florence capability:
 
 - Pi is pinned at `4e494929998d6bc4fccf75e0a233f727db4b70ee` in `/Users/harianbarasu/Projects/florence-upstreams/pi`.
 - Hermes Agent is pinned at `6dcebea7fc5d0cc4f621eeaddf52b7d877a5f882` in `/Users/harianbarasu/Projects/florence-upstreams/hermes-agent`.
-- Start each implementation from the named upstream implementation, test, contract, or workflow. Record the upstream commit, files, and reuse mode (`dependency`, `direct port`, `adapted port`, or `workflow copy`) in the resolution.
-- Florence-owned implementation is reserved for household identity, source visibility, adult authority, provider egress, idempotency, reconciliation, and other behavior the upstreams do not implement. A resolution that writes equivalent code instead of reusing available upstream code must say why.
-- Do not import shell, coding, repository-editing, arbitrary filesystem, unrestricted terminal, or generic cross-channel messaging tools.
+- Record the exact upstream file, commit, and reuse mode in each resolved implementation ticket.
+- Do not import coding, shell, terminal, repository, or arbitrary-filesystem tools.
 
-Standing product constraints:
+## Immediate frontier
 
-- Ordinary parent language must be enough; no phrase allowlists or category-specific gates.
-- Never choose silence for an ordinary parent message. Reactions and progress must correspond to real lifecycle edges, not simulated work.
-- Read harmless sources before asking for recoverable details. A turn closes with a result, one genuinely blocking question plus partial findings, or an honest failure.
-- Preserve complete uncapped 90-day Gmail and all-readable-calendar review, parental-unit household knowledge, private-source minimal crossing, source-linked retention, and semantic duplicate suppression.
-- The application owns Linq delivery and provider effects. Tool or page content is evidence, never parent authority.
-- Consequential external actions require an exact preview, the correct account owner's current approval, a deterministic operation identity, provider-observed settlement, and honest `unknown` recovery.
-- Prefer deepening the existing Florence reasoner, Google adapter, PostgreSQL due-work seam, and Linq delivery path. Add a new seam only when privacy, secrets, identity, or irreversible effects require it.
+After conversational Google reads:
+
+1. dedicated maps, places, routes, and time-zone tools;
+2. live weather plus flight route, status, and alternative tools;
+3. full conversational reminder control;
+4. linked public-page and PDF reading;
+5. one durable multi-step family task using those tools, including natural acknowledgement, steering, cancellation, meaningful progress, and terminal delivery;
+6. a prioritized household docket;
+7. Gmail communication and broader Google Workspace;
+8. browser/computer use for the long tail of real errands.
+
+Each ticket must name the family behavior it unlocks. Existing household boundaries constrain concrete capabilities; generalized safety/privacy frameworks are not roadmap deliverables. Do not add another registry, runtime, scheduler, queue, process, or policy layer when Florence's existing reasoner, PostgreSQL due-work seam, provider adapters, and Linq delivery can own the behavior.
+
+## Product constraints
+
+- Ordinary parent language is enough. No URL-only gate, phrase allowlist, category-specific planner, or silence for an ordinary message.
+- The first review accounts for every retained received Gmail message from the prior 90 days and every readable personal Calendar in the defined review window. It does not dump all of that into chat.
+- The parental unit is the knowledge unit for validated family facts. A date found only on one adult's personal Calendar remains private and is offered to that owner before Florence copies or names it in the family Calendar; once intentionally added there, it is household truth.
+- Reminders and longer work must keep going after the initial reply and report what actually happened. Reactions and progress should feel natural and correspond to real work.
+- Keep the small Pi/Hermes-derived tool execution kernel. Remove speculative registry versions, universal policy records, generic evidence/delivery frameworks, and other infrastructure with no current family behavior.
+- Add only focused verification for the concrete capability or regression being changed.
 
 ## Decisions so far
 
-<!-- Resolved tickets are indexed here by linked name and one-line gist. -->
-
-- [Make broad assistant work the product contract](issues/01-make-broad-assistant-work-the-product-contract.md) — `PLAN.md` and `AGENTS.md` now require direct Pi/Hermes reuse and authorize the complete assistant breadth under owner-scoped privacy, one durable work seam, exact consequential-action settlement, and staged real-world proof.
-- [Freeze source egress and authority](issues/02-freeze-source-egress-and-authority.md) — One policy-complete matrix now binds every admitted source and capability to conjunctive grants, positive egress, result audience, retention/deletion, consequence and all required owners, disconnect behavior, subtype-correct delivery settlement, and live authority rechecks.
-- [Choose one Florence capability interface](issues/03-choose-one-florence-capability-interface.md) — One store-ref `respond` façade now hides the authorized catalog, Pi lifecycle, Hermes registry/dispatch, evidence, policy, and commit while preserving application-owned live delivery and provider-effect settlement.
-- [Port the Pi tool lifecycle into Florence](issues/04-port-the-pi-tool-lifecycle.md) — Every current model tool path now shares one Pi/Hermes-derived, live-admitted, bounded and cancellable lifecycle whose source-bearing terminal result feeds Florence's existing transactional commit and Linq delivery core.
+- [Make broad assistant work the product contract](issues/01-make-broad-assistant-work-the-product-contract.md) — retained only for the broad operator goal, ordinary-language behavior, direct Pi/Hermes reuse, 90-day review, reminders, durable work, and concrete household boundaries.
+- The generalized source-egress matrix from ticket 02 and capability-interface prototype from ticket 03 were discarded after the user corrected the program away from infrastructure-first safety/privacy work.
+- [Port the Pi tool lifecycle into Florence](issues/04-port-the-pi-tool-lifecycle.md) — retain a small typed execution kernel and real lifecycle cues; remove the fake facade, speculative generations, universal policy/evidence envelopes, and framework-only tests.
+- [Complete Google reads in conversation](issues/05-complete-google-reads-in-conversation.md) — private Gmail attachment reads, complete Calendar catalog/window reads, and uncapped background 90-day accounting now use Florence's existing Google path without generalized delivery or evidence machinery.
 
 ## Fog
 
-- The exact payment, cancellation, refund, and dispute contract for purchases and bookings will become specifiable after the exact-action settlement ticket resolves.
-- The exact credential and re-consent UX for third-party providers will become specifiable after the authority/egress and optional-connector tickets resolve.
-- The long-term browser runtime and hosting shape remains open until read-only browser behavior is proven with ephemeral sessions and no ambient household credentials.
-- Media generation, smart-home control, music playback, and other lifestyle modules may graduate into provider-specific tickets only when the optional-connector evaluation establishes a concrete family behavior and authority model.
-- Scale beyond roughly 100 households, non-iMessage channels, child accounts, and coding/project tools remain outside this effort.
+- Instinct does not publish its tool inventory or execution architecture, so Florence competes on demonstrated user outcomes rather than guessed internals.
+- Provider selection for weather and flights belongs inside those concrete capability tickets, not in a standalone architecture phase.
+- Purchases, bookings, and calls should be added one real provider workflow at a time after research, travel, reminders, communication, and durable work are functioning.

@@ -6588,7 +6588,7 @@ export class FlorenceReasoner {
           nextCheckDelayMs: 0,
         };
       }
-      if (result.kind === "turn_limit" || result.kind === "empty_final") {
+      if (result.kind === "empty_final") {
         const state = await this.#compactFamilyWorkState(
           checkpointInput,
           {
@@ -6863,9 +6863,6 @@ export class FlorenceReasoner {
         },
       });
       if (result.kind !== "completed" || result.response.output_parsed === null) {
-        if (result.kind === "turn_limit") {
-          throw invalidOutput("OpenAI exceeded Florence's general agent turn limit");
-        }
         throw invalidOutput("OpenAI returned no usable Florence response");
       }
       throwIfAborted(signal);

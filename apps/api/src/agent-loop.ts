@@ -120,13 +120,6 @@ export interface AgentLoopInput<TContext, TParsed = unknown, TSuspension = never
   /** Re-resolved before every model turn so availability and execution share one current context. */
   readonly getCapabilityContext: () => Readonly<TContext> | Promise<Readonly<TContext>>;
   readonly signal?: AbortSignal;
-  /**
-   * Optional caller-owned stop policy. The general loop is deliberately
-   * unlimited by default, matching Pi's `while (true)` tool loop and Hermes's
-   * unlimited default. A product surface may opt into a finite budget when it
-   * also owns the continuation or partial-result behavior for that boundary.
-   */
-  readonly maxTurns?: number | null;
   readonly maxEmptyFinalRetries?: number;
   readonly parallelToolCalls?: boolean;
   readonly getSteeringInput?: () => ResponseInput | undefined | Promise<ResponseInput | undefined>;
@@ -146,7 +139,7 @@ export interface AgentLoopInput<TContext, TParsed = unknown, TSuspension = never
   readonly isUsableFinal?: (response: ParsedResponse<TParsed>) => boolean | Promise<boolean>;
 }
 
-export type AgentLoopResultKind = "completed" | "suspended" | "yielded" | "turn_limit" | "empty_final";
+export type AgentLoopResultKind = "completed" | "suspended" | "yielded" | "empty_final";
 
 interface AgentLoopResultBase {
   readonly transcript: readonly ResponseInputItem[];
@@ -171,11 +164,6 @@ export interface AgentLoopYielded extends AgentLoopResultBase {
   readonly results: readonly CapabilityTerminalEnvelope[];
 }
 
-export interface AgentLoopTurnLimit<TParsed> extends AgentLoopResultBase {
-  readonly kind: "turn_limit";
-  readonly response: ParsedResponse<TParsed> | null;
-}
-
 export interface AgentLoopEmptyFinal<TParsed> extends AgentLoopResultBase {
   readonly kind: "empty_final";
   readonly response: ParsedResponse<TParsed>;
@@ -185,7 +173,6 @@ export type AgentLoopResult<TParsed, TSuspension> =
   | AgentLoopCompleted<TParsed>
   | AgentLoopSuspended<TParsed, TSuspension>
   | AgentLoopYielded
-  | AgentLoopTurnLimit<TParsed>
   | AgentLoopEmptyFinal<TParsed>;
 
 /** Run or continue a model-directed capability loop over an existing Responses transcript. */
@@ -195,7 +182,6 @@ export async function runAgentLoop<TContext, const TRequest extends AgentLoopReq
   },
 ): Promise<AgentLoopResult<AgentLoopParsed<TRequest>, TSuspension>> {
   type TParsed = AgentLoopParsed<TRequest>;
-  const maxTurns = optionalPositiveCount(input.maxTurns, "maxTurns");
   const maxEmptyFinalRetries = boundedCount(
     input.maxEmptyFinalRetries,
     DEFAULT_EMPTY_FINAL_RETRIES,
@@ -209,7 +195,6 @@ export async function runAgentLoop<TContext, const TRequest extends AgentLoopReq
   };
   let turns = 0;
   let emptyFinalRetries = 0;
-  let lastResponse: ParsedResponse<TParsed> | null = null;
 
   throwIfAborted(input.signal);
   await emit({ type: "agent_start" });
@@ -248,7 +233,10 @@ export async function runAgentLoop<TContext, const TRequest extends AgentLoopReq
     return result;
   }
 
-  while (maxTurns === null || turns < maxTurns) {
+  // Direct Pi behavior: useful tool turns continue until the model reaches a
+  // final response, the caller cancels, or a durable effect checkpoints. An
+  // arbitrary iteration count must never decide that a household task failed.
+  while (true) {
     throwIfAborted(input.signal);
     turns += 1;
     await emit({ type: "turn_start", turn: turns });
@@ -278,7 +266,6 @@ export async function runAgentLoop<TContext, const TRequest extends AgentLoopReq
       }
       response = (await stream.finalResponse()) as ParsedResponse<TParsed>;
     }
-    lastResponse = response;
     throwIfAborted(input.signal);
     await emit({ type: "response_end", turn: turns, response });
 
@@ -386,15 +373,6 @@ export async function runAgentLoop<TContext, const TRequest extends AgentLoopReq
     await emit({ type: "agent_end", outcome: result.kind });
     return result;
   }
-
-  const result: AgentLoopTurnLimit<TParsed> = {
-    kind: "turn_limit",
-    transcript,
-    turns,
-    response: lastResponse,
-  };
-  await emit({ type: "agent_end", outcome: result.kind });
-  return result;
 }
 
 async function executeCapabilityCalls<TContext, TParsed>(input: {
@@ -528,14 +506,6 @@ function boundedCount(
     throw new Error(`${label} must be an integer from ${minimum} through ${maximum}`);
   }
   return candidate;
-}
-
-function optionalPositiveCount(value: number | null | undefined, label: string): number | null {
-  if (value === undefined || value === null) return null;
-  if (!Number.isSafeInteger(value) || value < 1) {
-    throw new Error(`${label} must be a positive safe integer when supplied`);
-  }
-  return value;
 }
 
 function throwIfAborted(signal?: AbortSignal): void {

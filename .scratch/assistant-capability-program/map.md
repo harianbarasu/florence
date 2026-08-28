@@ -45,6 +45,7 @@ Each ticket must name the family behavior it unlocks. Existing household boundar
 - The generalized source-egress matrix from ticket 02 and capability-interface prototype from ticket 03 were discarded after the user corrected the program away from infrastructure-first safety/privacy work.
 - [Port the Pi tool lifecycle into Florence](issues/04-port-the-pi-tool-lifecycle.md) — retain a small typed execution kernel and real lifecycle cues; remove the fake facade, speculative generations, universal policy/evidence envelopes, and framework-only tests.
 - [Complete Google reads in conversation](issues/05-complete-google-reads-in-conversation.md) — private Gmail attachment reads, complete Calendar catalog/window reads, and uncapped background 90-day accounting now use Florence's existing Google path without generalized delivery or evidence machinery.
+- [Port maps, places, routes, and time zones](issues/07-select-maps-weather-and-travel-providers.md) — eight Hermes-derived tools now use a concrete Nominatim, Overpass, Valhalla, and TimeAPI client through Florence's existing reasoner lifecycle, with no provider framework or new infrastructure.
 
 ## Fog
 

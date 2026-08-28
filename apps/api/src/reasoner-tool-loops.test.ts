@@ -113,6 +113,224 @@ describe("Florence reasoner capability cutover", () => {
     }
   });
 
+  test("ordinary route questions use the dedicated maps tools and start visible work once", async () => {
+    const requests: Record<string, unknown>[] = [];
+    const mapRequests: unknown[] = [];
+    let workStarts = 0;
+    let modelTurn = 0;
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        stream: (request: Record<string, unknown>) => {
+          requests.push(request);
+          modelTurn += 1;
+          return fakeStream(
+            modelTurn === 1
+              ? {
+                  status: "completed",
+                  output_parsed: null,
+                  output: [
+                    functionCall("route-call", "maps_distance", {
+                      origin: "LAX",
+                      destination: "Wish Charter School, Los Angeles",
+                      mode: "driving",
+                    }),
+                  ],
+                }
+              : { status: "completed", output_parsed: ordinaryDecision(), output: [] },
+          );
+        },
+      },
+    } as never);
+
+    await reasoner.decide(
+      foregroundInput(),
+      {
+        ...inertReads(),
+        async runMaps(request) {
+          mapRequests.push(request);
+          return {
+            operation: "distance" as const,
+            origin: {
+              query: "LAX",
+              displayName: "Los Angeles International Airport",
+              lat: 33.9416,
+              lon: -118.4085,
+            },
+            destination: {
+              query: "Wish Charter School, Los Angeles",
+              displayName: "Wish Charter School, Los Angeles",
+              lat: 33.958,
+              lon: -118.416,
+            },
+            mode: "driving" as const,
+            distanceM: 4_200,
+            durationSeconds: 720,
+            straightLineM: 2_000,
+            attribution: [
+              {
+                provider: "OpenStreetMap",
+                label: "© OpenStreetMap contributors",
+                url: "https://www.openstreetmap.org/copyright",
+              },
+              {
+                provider: "Valhalla",
+                label: "Routing by Valhalla's FOSSGIS public service",
+                url: "https://valhalla.openstreetmap.de/",
+              },
+            ],
+          };
+        },
+      },
+      undefined,
+      {
+        onWorkStarted() {
+          workStarts += 1;
+        },
+      },
+    );
+
+    expect(mapRequests).toEqual([
+      {
+        operation: "distance",
+        origin: "LAX",
+        destination: "Wish Charter School, Los Angeles",
+        mode: "driving",
+      },
+    ]);
+    expect(workStarts).toBe(1);
+    const toolNames = ((requests[0]?.tools as { name: string }[]) ?? []).map((tool) => tool.name);
+    expect(toolNames).toEqual(
+      expect.arrayContaining([
+        "maps_area",
+        "maps_bounds",
+        "maps_directions",
+        "maps_distance",
+        "maps_nearby",
+        "maps_reverse",
+        "maps_search",
+        "maps_time_zone",
+      ]),
+    );
+    const result = functionOutputEnvelopes(requests[1]).find((envelope) => envelope.callId === "route-call");
+    expect(result).toMatchObject({
+      outcome: "succeeded",
+      output: {
+        operation: "distance",
+        mode: "driving",
+        distanceM: 4_200,
+        durationSeconds: 720,
+      },
+    });
+  });
+
+  test("public place verification receives the map candidates selected earlier in the turn", async () => {
+    let modelTurn = 0;
+    const publicResearchRequests: Record<string, unknown>[] = [];
+    let workStarts = 0;
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        stream: () => {
+          modelTurn += 1;
+          return fakeStream(
+            modelTurn === 1
+              ? {
+                  status: "completed",
+                  output_parsed: null,
+                  output: [
+                    functionCall("nearby-call", "maps_nearby", {
+                      center: { lat: 40.758, lon: -73.9855 },
+                      categories: ["restaurant"],
+                      radiusM: 300,
+                      limit: 3,
+                    }),
+                  ],
+                }
+              : modelTurn === 2
+                ? {
+                    status: "completed",
+                    output_parsed: null,
+                    output: [functionCall("research-call", "research_public_web", {})],
+                  }
+                : {
+                    status: "completed",
+                    output_parsed: ordinaryDecision({ researchUrls: [PUBLIC_URL] }),
+                    output: [],
+                  },
+          );
+        },
+        parse: (request: Record<string, unknown>) => {
+          publicResearchRequests.push(request);
+          return {
+            status: "completed",
+            output_parsed: { outcome: "result", summary: "Open now", urls: [PUBLIC_URL] },
+            output: [completedWebSearch(PUBLIC_URL)],
+          };
+        },
+      },
+    } as never);
+    const input = foregroundInput();
+    input.currentMessage.text = "Which of these restaurants is open now?";
+    input.currentMessage.authoredText = input.currentMessage.text;
+
+    await reasoner.decide(
+      input,
+      {
+        ...inertReads(),
+        async runMaps() {
+          return {
+            operation: "nearby" as const,
+            center: {
+              query: null,
+              displayName: "40.758, -73.9855",
+              lat: 40.758,
+              lon: -73.9855,
+            },
+            categories: ["restaurant" as const],
+            radiusM: 300,
+            count: 1,
+            results: [
+              {
+                name: "Junior's",
+                address: "1515 Broadway, New York",
+                lat: 40.7582151,
+                lon: -73.9866267,
+                osmType: "node",
+                osmId: "763650163",
+                category: "restaurant" as const,
+                distanceM: 97.9,
+                mapsUrl: "https://www.google.com/maps/search/?api=1&query=40.7582151%2C-73.9866267",
+                directionsUrl:
+                  "https://www.google.com/maps/dir/?api=1&origin=40.758%2C-73.9855&destination=40.7582151%2C-73.9866267",
+                website: "https://www.juniorscheesecake.com/blog/restaurants/times-square/",
+                tags: {},
+              },
+            ],
+            attribution: [
+              {
+                provider: "OpenStreetMap",
+                label: "© OpenStreetMap contributors",
+                url: "https://www.openstreetmap.org/copyright",
+              },
+            ],
+          };
+        },
+      },
+      undefined,
+      {
+        onWorkStarted() {
+          workStarts += 1;
+        },
+      },
+    );
+
+    const isolatedInput = JSON.stringify(publicResearchRequests[0]?.input);
+    expect(isolatedInput).toContain("Junior's");
+    expect(isolatedInput).toContain("1515 Broadway, New York");
+    expect(isolatedInput).toContain("juniorscheesecake.com");
+    expect(isolatedInput).not.toContain("40.7582151");
+    expect(workStarts).toBe(1);
+  });
+
   test("a foreground Gmail search can open only its verified attachment as an ephemeral artifact", async () => {
     const gmail = conversationalGmailSource();
     const requests: Record<string, unknown>[] = [];

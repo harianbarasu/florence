@@ -100,6 +100,7 @@ import {
   type LinqReactionProposal,
 } from "@florence/linq";
 import type { EnrollmentCodes, WebAccessPath } from "./enrollment.js";
+import type { FlorenceMapsClient } from "./maps.js";
 import {
   type FlorenceBoundedPrivateGoogleEvidence,
   type FlorenceCalendarCatalogRead,
@@ -144,6 +145,7 @@ export class Florence {
   readonly #store: PostgresFlorenceStore;
   readonly #linq: LinqClient;
   readonly #google: GoogleConnection | null;
+  readonly #maps: FlorenceMapsClient | null;
   readonly #reasoner: FlorenceReasoner | null;
   readonly #enrollmentCodes: EnrollmentCodes;
   readonly #imageVault: EncryptedImageVault | null;
@@ -162,6 +164,7 @@ export class Florence {
     store: PostgresFlorenceStore;
     linq: LinqClient;
     google: GoogleConnection | null;
+    maps?: FlorenceMapsClient | null;
     reasoner: FlorenceReasoner | null;
     enrollmentCodes: EnrollmentCodes;
     imageVault: EncryptedImageVault | null;
@@ -173,6 +176,7 @@ export class Florence {
     this.#store = input.store;
     this.#linq = input.linq;
     this.#google = input.google;
+    this.#maps = input.maps ?? null;
     this.#reasoner = input.reasoner;
     this.#enrollmentCodes = input.enrollmentCodes;
     this.#imageVault = input.imageVault;
@@ -1917,8 +1921,14 @@ export class Florence {
     };
     const enumerateConversationCalendars = async () =>
       (await readConversationCalendarCatalog()).read.calendars;
+    const maps = this.#maps;
 
     const reads: FlorenceReadTools = {
+      ...(maps
+        ? {
+            runMaps: (request, signal) => maps.run(request, signal),
+          }
+        : {}),
       settleSources: (sources) => {
         for (const source of sources) {
           sourceIndex.set(source.sourceId, source);

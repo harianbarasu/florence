@@ -28,6 +28,7 @@ import { z } from "zod";
 import { EnrollmentCodes } from "./enrollment.js";
 import { Florence } from "./florence.js";
 import { createLinqIngress, type LinqIngress, LinqIngressError } from "./linq-ingress.js";
+import { OpenStreetMapsClient } from "./maps.js";
 import { createFlorenceReasonerFromEnv } from "./reasoner.js";
 
 export type AdultCaller = { adultId: string };
@@ -74,6 +75,7 @@ export function createDefaultDependencies(env: NodeJS.ProcessEnv = process.env):
     store,
     linq,
     google,
+    maps: new OpenStreetMapsClient(),
     reasoner: createFlorenceReasonerFromEnv(env),
     enrollmentCodes,
     imageVault,

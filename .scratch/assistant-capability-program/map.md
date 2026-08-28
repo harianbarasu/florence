@@ -50,6 +50,7 @@ Each ticket must name the family behavior it unlocks. Existing household boundar
 - [Keep multi-step family work going](issues/10-port-durable-family-work.md) — one Pi/Hermes-adapted PostgreSQL checkpoint loop now acknowledges, resumes, steers, cancels, reports progress, rejects stale workers, and delivers one receipt-confirmed result without a second runtime or progress framework.
 - [Read linked public pages and PDFs](issues/06-port-safe-public-page-reading.md) — one Hermes-adapted concrete reader now follows parent or research links, extracts HTML and PDFs locally, and works in foreground or durable tasks without a browser runtime, provider framework, or generic safety subsystem.
 - [Answer “what's on the docket?” with prioritized next actions](issues/12-adapt-the-family-docket-and-document-workflows.md) — the complete 90-day review now feeds one reconciled parental-unit docket, setup surfaces only the ranked three, ordinary chat can retrieve the rest, and unchanged findings no longer become delayed reminder noise.
+- [Add the useful Google Workspace surface](issues/13-add-google-workspace-reads.md) — one Hermes-adapted Google adapter now gives private conversation and durable work concrete Gmail, Drive, Contacts, Docs, Sheets, Slides, Tasks, and Calendar operations, with stable retries and reconnect-in-place instead of a second connector/runtime.
 
 ## Fog
 

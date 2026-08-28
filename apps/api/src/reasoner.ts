@@ -1,6 +1,13 @@
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { MAX_IMAGE_BYTES, MAX_PDF_BYTES } from "@florence/artifacts";
 import type { FamilyWorkStateV1, SharedFamilyProfile } from "@florence/database";
+import {
+  GoogleCalendarTransientError,
+  GoogleWorkspaceError,
+  type GoogleWorkspaceOperation,
+  type GoogleWorkspaceResult,
+} from "@florence/google";
 import ffmpegStaticPath from "ffmpeg-static";
 import {
   APIConnectionError,
@@ -1342,8 +1349,9 @@ export type FlorenceFamilyWorkInput = Readonly<{
 
 export type FlorenceFamilyWorkReadTools = Pick<
   FlorenceReadTools,
-  "runMaps" | "runWeather" | "runFlights" | "runPublicPage"
->;
+  "runMaps" | "runWeather" | "runFlights" | "runPublicPage" | "runGoogleWorkspace"
+> &
+  Partial<Pick<FlorenceReadTools, "listCalendars" | "readCalendarWindow">>;
 
 export type FlorenceFamilyWorkStep =
   | Readonly<{
@@ -1442,6 +1450,10 @@ export interface FlorenceReadTools {
     request: FlorenceFlightSearchRequest,
     signal?: AbortSignal,
   ): Promise<FlorenceFlightSearchResult>;
+  runGoogleWorkspace?(
+    operation: GoogleWorkspaceOperation,
+    signal?: AbortSignal,
+  ): Promise<GoogleWorkspaceResult>;
   searchGmail(input: {
     query: string;
     after?: string;
@@ -1564,7 +1576,7 @@ Before returning a create, read a family-Calendar window that completely covers 
 
 Facts may be remembered or corrected only when policy.retain is true. Forgetting an existing fact is allowed when retain is false. A reminder, finite monitor, durable family task, durable interest discovery, Calendar offer, or direct Calendar decision may be created only when policy.schedule is true. Never claim that an external message, purchase, booking, or unsupported consequential action happened.
 
-The familyWork field is for a real multi-step task that should keep going after this reply: for example resolving a delayed flight, comparing live alternatives, route time, and weather, or another task that cannot be usefully completed in the ordinary foreground turn. It is not a generic promise, a reminder, a finite evidence monitor, or a substitute for answering a normal question now. Create it when the parent explicitly asks Florence to keep working or when completing the request genuinely needs multiple tool checkpoints. Return one immediate natural acknowledgement bubble that names the work Florence is actually starting; a brief reaction is welcome when it feels natural, but never use it instead of the acknowledgement. Never say the work is complete at acceptance. The current background catalog includes public research, maps, weather, and flight tools and will grow with Florence's other real capabilities; use what is actually available and report a real result, one blocking question, or an honest failure.
+The familyWork field is for a real multi-step task that should keep going after this reply: for example resolving a delayed flight, comparing live alternatives, researching and sending a plain email, finding a Google Doc or Sheet and updating its native content, or another task that cannot be usefully completed in the ordinary foreground turn. It is not a generic promise, a reminder, a finite evidence monitor, or a substitute for answering a normal question now. Create it when the parent explicitly asks Florence to keep working or when completing the request genuinely needs multiple tool checkpoints. Return one immediate natural acknowledgement bubble that names the work Florence is actually starting; a brief reaction is welcome when it feels natural, but never use it instead of the acknowledgement. Never say the work is complete at acceptance. The current background catalog includes public research, maps, weather, flights, and—when this parent has reconnected Google—Gmail, Drive metadata, Contacts, Docs, Sheets, Slides, and Tasks. Use what is actually available and report a real result, one blocking question, or an honest failure.
 
 householdDocket is the ranked household-safe backlog retained from the complete Google review. Treat it as current structured context, not a reason to volunteer every item. When a parent asks what is on the docket, what needs attention, or what the family is waiting on, reconcile it with visible reminders, active or waiting family work, pending follow-ups, pending Calendar offers, and a near-term family-Calendar read when timing could change the answer. Rank by consequence and time, not source or message count. Lead with at most three unfinished items. For each, say naturally what it is, why it matters now, and the next decision or action without inventing facts beyond the supplied summary, category, dueAt, and needsAnswer. If householdDocket.totalItems exceeds what you show, say how many lower-priority items remain instead of dumping them. Do not treat silence from another person as completion, and do not repeat an unchanged docket item unsolicited merely because it is still present. When the parent clearly says a supplied docket item is handled, finished, cancelled, or no longer relevant, put exactly that candidateId in docketCompletions and acknowledge it naturally. A reply or unambiguous recent referent may identify the item; if more than one supplied item plausibly matches, ask one focused question and return docketCompletions null. Return docketCompletions null when nothing was completed. Never infer completion from thanks, agreement, silence, or a reaction.
 
@@ -1676,9 +1688,9 @@ const FAMILY_WORK_INSTRUCTIONS = `You are Florence continuing one durable family
 
 This is real background work, not a chat acknowledgement. Advance the supplied objective by one useful checkpoint. You have the parent's original objective, every later steering instruction in order, prior tool calls and results, the current time, and a narrow family profile. Treat the latest steering as authoritative when it changes an earlier constraint. Do not expose task IDs, state, claims, generations, tool names, or internal process language.
 
-Use the available tools naturally. Public web research resolves current facts and identifiers from a task-specific query; read_public_page reads the full clean text of an exact public HTML page or PDF relevant to the task; dedicated maps, route, time-zone, weather, and flight tools do the structured work they cover. A flight number is an ordinary public identifier: resolve its current operating date, route, and status before searching alternatives. Prefer a second genuinely useful source or specialized tool for a comparison, but never call tools performatively or claim an action without a returned result.
+Use the available tools naturally. Public web research resolves current facts and identifiers from a task-specific query; read_public_page reads the full clean text of an exact public HTML page or PDF relevant to the task; dedicated maps, route, time-zone, weather, flight, Gmail, Drive, Contacts, Docs, Sheets, Slides, and Tasks tools do the structured work they cover. Drive search and get return metadata only: they cannot download a file's contents, including a PDF or other binary, and no Workspace tool uploads files. Durable Gmail work can read or send plain/HTML message bodies but cannot read or send attachments. Google Docs, Sheets, and Slides tools can operate on their native content by provider ID. Never claim an attachment, upload, download, or arbitrary Drive-file read happened. Use the Google Workspace tools to complete the parent's objective rather than merely explaining how they could do it. Ask only when one genuine missing choice blocks execution, and report what the returned result says actually happened. A flight number is an ordinary public identifier: resolve its current operating date, route, and status before searching alternatives. Prefer a second genuinely useful source or specialized tool for a comparison, but never call tools performatively or claim an action without a returned result.
 
-If another read is needed, call exactly one tool and stop this checkpoint. If the accumulated evidence is enough, return a concise terminal result that leads with the useful answer and includes concrete options, times, tradeoffs, and direct URLs already present in tool results when helpful. Use outcome succeeded when the requested comparison is complete, partial when useful results exist but one named source or constraint could not be resolved, failed only when no useful result can be produced, and waiting only when one consequential parent choice remains genuinely blocking after the available reads. A waiting result must ask exactly one focused question. Never say you will keep working unless you actually call another tool in this checkpoint. Output only the strict terminal schema when you do not call a tool.`;
+If another tool operation is needed, call exactly one tool and stop this checkpoint. If the accumulated evidence is enough, return a concise terminal result that leads with the useful answer and includes concrete options, times, tradeoffs, completed actions, and direct URLs already present in tool results when helpful. Use outcome succeeded when the requested work is complete, partial when useful results exist but one named source or constraint could not be resolved, failed only when no useful result can be produced, and waiting only when one consequential parent choice remains genuinely blocking after the available tools. A waiting result must ask exactly one focused question. Never say you will keep working unless you actually call another tool in this checkpoint. Output only the strict terminal schema when you do not call a tool.`;
 
 const FAMILY_WORK_CHECKPOINT_MAX_BYTES = 240 * 1024;
 const FAMILY_WORK_CHECKPOINT_LIMIT_TEXT =
@@ -2066,6 +2078,517 @@ const attachmentCapabilityOutputSchema = z
   })
   .strict();
 
+const googleWorkspaceOperationNames = [
+  "gmail_search",
+  "gmail_get",
+  "gmail_send",
+  "gmail_reply",
+  "gmail_labels",
+  "gmail_modify",
+  "drive_search",
+  "drive_get",
+  "drive_create_folder",
+  "drive_share",
+  "drive_trash",
+  "contacts_search",
+  "contacts_create",
+  "contacts_update",
+  "docs_get",
+  "docs_create",
+  "docs_append",
+  "sheets_get",
+  "sheets_create",
+  "sheets_update",
+  "sheets_append",
+  "slides_get",
+  "slides_create",
+  "slides_add_text_slide",
+  "tasklists_list",
+  "tasks_list",
+  "tasks_create",
+  "tasks_update",
+] as const;
+
+const googleWorkspaceJsonValueSchema: z.ZodType<JsonValue> = z.lazy(() =>
+  z.union([
+    z.string(),
+    z.number(),
+    z.boolean(),
+    z.null(),
+    z.array(googleWorkspaceJsonValueSchema),
+    z.record(z.string(), googleWorkspaceJsonValueSchema),
+  ]),
+);
+
+const googleWorkspaceResultSchema = z
+  .object({
+    operation: z.enum(googleWorkspaceOperationNames),
+    result: z.record(z.string(), googleWorkspaceJsonValueSchema),
+  })
+  .strict();
+
+const workspaceNullableIdSchema = z.string().trim().min(1).max(2_000).nullable();
+const workspaceNullableTextSchema = z.string().max(50_000).nullable();
+const workspaceStringListSchema = z.array(z.string().trim().min(1).max(500)).max(100);
+const workspaceSheetScalarSchema = z.union([z.string(), z.number(), z.boolean(), z.null()]);
+
+function requireWorkspaceArgument(
+  value: unknown,
+  path: string,
+  operation: string,
+  context: z.RefinementCtx,
+): void {
+  if (value === null || value === undefined || value === "") {
+    context.addIssue({
+      code: "custom",
+      path: [path],
+      message: `${path} is required for ${operation}`,
+    });
+  }
+}
+
+const gmailWorkArguments = z
+  .object({
+    operation: z.enum([
+      "gmail_search",
+      "gmail_get",
+      "gmail_send",
+      "gmail_reply",
+      "gmail_labels",
+      "gmail_modify",
+    ]),
+    query: workspaceNullableTextSchema,
+    limit: z.number().int().min(1).max(100).nullable(),
+    messageId: workspaceNullableIdSchema,
+    to: workspaceStringListSchema,
+    cc: workspaceStringListSchema,
+    bcc: workspaceStringListSchema,
+    subject: workspaceNullableTextSchema,
+    body: workspaceNullableTextSchema,
+    bodyFormat: z.enum(["plain", "html"]).nullable(),
+    threadId: workspaceNullableIdSchema,
+    addLabelIds: workspaceStringListSchema,
+    removeLabelIds: workspaceStringListSchema,
+  })
+  .strict()
+  .superRefine((args, context) => {
+    if (args.operation === "gmail_search") {
+      requireWorkspaceArgument(args.query, "query", args.operation, context);
+      requireWorkspaceArgument(args.limit, "limit", args.operation, context);
+    }
+    if (["gmail_get", "gmail_reply", "gmail_modify"].includes(args.operation)) {
+      requireWorkspaceArgument(args.messageId, "messageId", args.operation, context);
+    }
+    if (args.operation === "gmail_send") {
+      if (args.to.length === 0) {
+        context.addIssue({ code: "custom", path: ["to"], message: "to is required for gmail_send" });
+      }
+      requireWorkspaceArgument(args.subject, "subject", args.operation, context);
+      requireWorkspaceArgument(args.body, "body", args.operation, context);
+      requireWorkspaceArgument(args.bodyFormat, "bodyFormat", args.operation, context);
+    }
+    if (args.operation === "gmail_reply") {
+      requireWorkspaceArgument(args.body, "body", args.operation, context);
+      requireWorkspaceArgument(args.bodyFormat, "bodyFormat", args.operation, context);
+    }
+  });
+
+const GMAIL_WORK_PARAMETERS = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    operation: {
+      type: "string",
+      enum: ["gmail_search", "gmail_get", "gmail_send", "gmail_reply", "gmail_labels", "gmail_modify"],
+    },
+    query: { anyOf: [{ type: "string", minLength: 1, maxLength: 50_000 }, { type: "null" }] },
+    limit: { anyOf: [{ type: "integer", minimum: 1, maximum: 100 }, { type: "null" }] },
+    messageId: { anyOf: [{ type: "string", minLength: 1, maxLength: 2_000 }, { type: "null" }] },
+    to: { type: "array", maxItems: 100, items: { type: "string", minLength: 1, maxLength: 500 } },
+    cc: { type: "array", maxItems: 100, items: { type: "string", minLength: 1, maxLength: 500 } },
+    bcc: { type: "array", maxItems: 100, items: { type: "string", minLength: 1, maxLength: 500 } },
+    subject: { anyOf: [{ type: "string", maxLength: 50_000 }, { type: "null" }] },
+    body: { anyOf: [{ type: "string", maxLength: 50_000 }, { type: "null" }] },
+    bodyFormat: { anyOf: [{ type: "string", enum: ["plain", "html"] }, { type: "null" }] },
+    threadId: { anyOf: [{ type: "string", minLength: 1, maxLength: 2_000 }, { type: "null" }] },
+    addLabelIds: {
+      type: "array",
+      maxItems: 100,
+      items: { type: "string", minLength: 1, maxLength: 500 },
+    },
+    removeLabelIds: {
+      type: "array",
+      maxItems: 100,
+      items: { type: "string", minLength: 1, maxLength: 500 },
+    },
+  },
+  required: [
+    "operation",
+    "query",
+    "limit",
+    "messageId",
+    "to",
+    "cc",
+    "bcc",
+    "subject",
+    "body",
+    "bodyFormat",
+    "threadId",
+    "addLabelIds",
+    "removeLabelIds",
+  ],
+} as const;
+
+const driveWorkArguments = z
+  .object({
+    operation: z.enum(["drive_search", "drive_get", "drive_create_folder", "drive_share", "drive_trash"]),
+    query: workspaceNullableTextSchema,
+    limit: z.number().int().min(1).max(100).nullable(),
+    fileId: workspaceNullableIdSchema,
+    name: workspaceNullableTextSchema,
+    parentId: workspaceNullableIdSchema,
+    role: z.enum(["reader", "commenter", "writer"]).nullable(),
+    type: z.enum(["user", "group", "domain", "anyone"]).nullable(),
+    email: z.string().trim().min(1).max(500).nullable(),
+    domain: z.string().trim().min(1).max(500).nullable(),
+    notify: z.boolean(),
+  })
+  .strict()
+  .superRefine((args, context) => {
+    if (args.operation === "drive_search") {
+      requireWorkspaceArgument(args.query, "query", args.operation, context);
+      requireWorkspaceArgument(args.limit, "limit", args.operation, context);
+    }
+    if (["drive_get", "drive_share", "drive_trash"].includes(args.operation)) {
+      requireWorkspaceArgument(args.fileId, "fileId", args.operation, context);
+    }
+    if (args.operation === "drive_create_folder") {
+      requireWorkspaceArgument(args.name, "name", args.operation, context);
+    }
+    if (args.operation === "drive_share") {
+      requireWorkspaceArgument(args.role, "role", args.operation, context);
+      requireWorkspaceArgument(args.type, "type", args.operation, context);
+      if ((args.type === "user" || args.type === "group") && !args.email) {
+        context.addIssue({
+          code: "custom",
+          path: ["email"],
+          message: "email is required for this share type",
+        });
+      }
+      if (args.type === "domain" && !args.domain) {
+        context.addIssue({
+          code: "custom",
+          path: ["domain"],
+          message: "domain is required for domain sharing",
+        });
+      }
+    }
+  });
+
+const DRIVE_WORK_PARAMETERS = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    operation: {
+      type: "string",
+      enum: ["drive_search", "drive_get", "drive_create_folder", "drive_share", "drive_trash"],
+    },
+    query: { anyOf: [{ type: "string", minLength: 1, maxLength: 50_000 }, { type: "null" }] },
+    limit: { anyOf: [{ type: "integer", minimum: 1, maximum: 100 }, { type: "null" }] },
+    fileId: { anyOf: [{ type: "string", minLength: 1, maxLength: 2_000 }, { type: "null" }] },
+    name: { anyOf: [{ type: "string", minLength: 1, maxLength: 50_000 }, { type: "null" }] },
+    parentId: { anyOf: [{ type: "string", minLength: 1, maxLength: 2_000 }, { type: "null" }] },
+    role: { anyOf: [{ type: "string", enum: ["reader", "commenter", "writer"] }, { type: "null" }] },
+    type: {
+      anyOf: [{ type: "string", enum: ["user", "group", "domain", "anyone"] }, { type: "null" }],
+    },
+    email: { anyOf: [{ type: "string", minLength: 1, maxLength: 500 }, { type: "null" }] },
+    domain: { anyOf: [{ type: "string", minLength: 1, maxLength: 500 }, { type: "null" }] },
+    notify: { type: "boolean" },
+  },
+  required: [
+    "operation",
+    "query",
+    "limit",
+    "fileId",
+    "name",
+    "parentId",
+    "role",
+    "type",
+    "email",
+    "domain",
+    "notify",
+  ],
+} as const;
+
+const contactsWorkArguments = z
+  .object({
+    operation: z.enum(["contacts_search", "contacts_create", "contacts_update"]),
+    query: workspaceNullableTextSchema,
+    limit: z.number().int().min(1).max(100).nullable(),
+    resourceName: workspaceNullableIdSchema,
+    contactSource: z
+      .object({
+        type: z.literal("CONTACT"),
+        id: z.string().trim().min(1).max(2_000),
+        etag: z.string().trim().min(1).max(2_000),
+      })
+      .strict()
+      .nullable(),
+    givenName: workspaceNullableTextSchema,
+    familyName: workspaceNullableTextSchema,
+    emails: workspaceStringListSchema.nullable(),
+    phones: workspaceStringListSchema.nullable(),
+  })
+  .strict()
+  .superRefine((args, context) => {
+    if (args.operation === "contacts_search") {
+      requireWorkspaceArgument(args.query, "query", args.operation, context);
+      requireWorkspaceArgument(args.limit, "limit", args.operation, context);
+    } else if (args.operation === "contacts_create") {
+      requireWorkspaceArgument(args.givenName, "givenName", args.operation, context);
+      requireWorkspaceArgument(args.emails, "emails", args.operation, context);
+      requireWorkspaceArgument(args.phones, "phones", args.operation, context);
+    } else {
+      requireWorkspaceArgument(args.resourceName, "resourceName", args.operation, context);
+      requireWorkspaceArgument(args.contactSource, "contactSource", args.operation, context);
+      if (
+        args.givenName === null &&
+        args.familyName === null &&
+        args.emails === null &&
+        args.phones === null
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["givenName"],
+          message: "contacts_update needs at least one changed field",
+        });
+      }
+    }
+  });
+
+const CONTACTS_WORK_PARAMETERS = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    operation: { type: "string", enum: ["contacts_search", "contacts_create", "contacts_update"] },
+    query: { anyOf: [{ type: "string", minLength: 1, maxLength: 50_000 }, { type: "null" }] },
+    limit: { anyOf: [{ type: "integer", minimum: 1, maximum: 100 }, { type: "null" }] },
+    resourceName: { anyOf: [{ type: "string", minLength: 1, maxLength: 2_000 }, { type: "null" }] },
+    contactSource: {
+      anyOf: [
+        {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            type: { type: "string", enum: ["CONTACT"] },
+            id: { type: "string", minLength: 1, maxLength: 2_000 },
+            etag: { type: "string", minLength: 1, maxLength: 2_000 },
+          },
+          required: ["type", "id", "etag"],
+        },
+        { type: "null" },
+      ],
+    },
+    givenName: { anyOf: [{ type: "string", minLength: 1, maxLength: 50_000 }, { type: "null" }] },
+    familyName: { anyOf: [{ type: "string", minLength: 1, maxLength: 50_000 }, { type: "null" }] },
+    emails: {
+      anyOf: [
+        { type: "array", maxItems: 100, items: { type: "string", minLength: 1, maxLength: 500 } },
+        { type: "null" },
+      ],
+    },
+    phones: {
+      anyOf: [
+        { type: "array", maxItems: 100, items: { type: "string", minLength: 1, maxLength: 500 } },
+        { type: "null" },
+      ],
+    },
+  },
+  required: [
+    "operation",
+    "query",
+    "limit",
+    "resourceName",
+    "contactSource",
+    "givenName",
+    "familyName",
+    "emails",
+    "phones",
+  ],
+} as const;
+
+const docsWorkArguments = z
+  .object({
+    operation: z.enum(["docs_get", "docs_create", "docs_append"]),
+    documentId: workspaceNullableIdSchema,
+    tabId: workspaceNullableIdSchema,
+    title: workspaceNullableTextSchema,
+    body: workspaceNullableTextSchema,
+    text: workspaceNullableTextSchema,
+  })
+  .strict()
+  .superRefine((args, context) => {
+    if (["docs_get", "docs_append"].includes(args.operation)) {
+      requireWorkspaceArgument(args.documentId, "documentId", args.operation, context);
+    }
+    if (args.operation === "docs_create")
+      requireWorkspaceArgument(args.title, "title", args.operation, context);
+    if (args.operation === "docs_append")
+      requireWorkspaceArgument(args.text, "text", args.operation, context);
+  });
+
+const DOCS_WORK_PARAMETERS = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    operation: { type: "string", enum: ["docs_get", "docs_create", "docs_append"] },
+    documentId: { anyOf: [{ type: "string", minLength: 1, maxLength: 2_000 }, { type: "null" }] },
+    tabId: { anyOf: [{ type: "string", minLength: 1, maxLength: 2_000 }, { type: "null" }] },
+    title: { anyOf: [{ type: "string", minLength: 1, maxLength: 50_000 }, { type: "null" }] },
+    body: { anyOf: [{ type: "string", maxLength: 50_000 }, { type: "null" }] },
+    text: { anyOf: [{ type: "string", minLength: 1, maxLength: 50_000 }, { type: "null" }] },
+  },
+  required: ["operation", "documentId", "tabId", "title", "body", "text"],
+} as const;
+
+const sheetsWorkArguments = z
+  .object({
+    operation: z.enum(["sheets_get", "sheets_create", "sheets_update", "sheets_append"]),
+    spreadsheetId: workspaceNullableIdSchema,
+    range: workspaceNullableTextSchema,
+    title: workspaceNullableTextSchema,
+    sheetName: workspaceNullableTextSchema,
+    values: z.array(z.array(workspaceSheetScalarSchema).max(100)).max(1_000),
+  })
+  .strict()
+  .superRefine((args, context) => {
+    if (["sheets_get", "sheets_update", "sheets_append"].includes(args.operation)) {
+      requireWorkspaceArgument(args.spreadsheetId, "spreadsheetId", args.operation, context);
+      requireWorkspaceArgument(args.range, "range", args.operation, context);
+    }
+    if (args.operation === "sheets_create")
+      requireWorkspaceArgument(args.title, "title", args.operation, context);
+    if (["sheets_update", "sheets_append"].includes(args.operation) && args.values.length === 0) {
+      context.addIssue({
+        code: "custom",
+        path: ["values"],
+        message: `values are required for ${args.operation}`,
+      });
+    }
+  });
+
+const SHEETS_WORK_PARAMETERS = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    operation: { type: "string", enum: ["sheets_get", "sheets_create", "sheets_update", "sheets_append"] },
+    spreadsheetId: { anyOf: [{ type: "string", minLength: 1, maxLength: 2_000 }, { type: "null" }] },
+    range: { anyOf: [{ type: "string", minLength: 1, maxLength: 50_000 }, { type: "null" }] },
+    title: { anyOf: [{ type: "string", minLength: 1, maxLength: 50_000 }, { type: "null" }] },
+    sheetName: { anyOf: [{ type: "string", minLength: 1, maxLength: 50_000 }, { type: "null" }] },
+    values: {
+      type: "array",
+      maxItems: 1_000,
+      items: {
+        type: "array",
+        maxItems: 100,
+        items: { anyOf: [{ type: "string" }, { type: "number" }, { type: "boolean" }, { type: "null" }] },
+      },
+    },
+  },
+  required: ["operation", "spreadsheetId", "range", "title", "sheetName", "values"],
+} as const;
+
+const slidesWorkArguments = z
+  .object({
+    operation: z.enum(["slides_get", "slides_create", "slides_add_text_slide"]),
+    presentationId: workspaceNullableIdSchema,
+    title: workspaceNullableTextSchema,
+    body: workspaceNullableTextSchema,
+  })
+  .strict()
+  .superRefine((args, context) => {
+    if (["slides_get", "slides_add_text_slide"].includes(args.operation)) {
+      requireWorkspaceArgument(args.presentationId, "presentationId", args.operation, context);
+    }
+    if (["slides_create", "slides_add_text_slide"].includes(args.operation)) {
+      requireWorkspaceArgument(args.title, "title", args.operation, context);
+    }
+    if (args.operation === "slides_add_text_slide") {
+      requireWorkspaceArgument(args.body, "body", args.operation, context);
+    }
+  });
+
+const SLIDES_WORK_PARAMETERS = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    operation: { type: "string", enum: ["slides_get", "slides_create", "slides_add_text_slide"] },
+    presentationId: { anyOf: [{ type: "string", minLength: 1, maxLength: 2_000 }, { type: "null" }] },
+    title: { anyOf: [{ type: "string", minLength: 1, maxLength: 50_000 }, { type: "null" }] },
+    body: { anyOf: [{ type: "string", minLength: 1, maxLength: 50_000 }, { type: "null" }] },
+  },
+  required: ["operation", "presentationId", "title", "body"],
+} as const;
+
+const tasksWorkArguments = z
+  .object({
+    operation: z.enum(["tasklists_list", "tasks_list", "tasks_create", "tasks_update"]),
+    taskListId: workspaceNullableIdSchema,
+    taskId: workspaceNullableIdSchema,
+    title: workspaceNullableTextSchema,
+    notes: workspaceNullableTextSchema,
+    due: timestamp.nullable(),
+    status: z.enum(["needsAction", "completed"]).nullable(),
+    showCompleted: z.boolean(),
+    limit: z.number().int().min(1).max(100),
+  })
+  .strict()
+  .superRefine((args, context) => {
+    if (args.operation === "tasks_create") {
+      requireWorkspaceArgument(args.title, "title", args.operation, context);
+    }
+    if (args.operation === "tasks_update") {
+      requireWorkspaceArgument(args.taskListId, "taskListId", args.operation, context);
+      requireWorkspaceArgument(args.taskId, "taskId", args.operation, context);
+      if (args.title === null && args.notes === null && args.due === null && args.status === null) {
+        context.addIssue({
+          code: "custom",
+          path: ["title"],
+          message: "tasks_update needs at least one changed field",
+        });
+      }
+    }
+  });
+
+const TASKS_WORK_PARAMETERS = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    operation: { type: "string", enum: ["tasklists_list", "tasks_list", "tasks_create", "tasks_update"] },
+    taskListId: { anyOf: [{ type: "string", minLength: 1, maxLength: 2_000 }, { type: "null" }] },
+    taskId: { anyOf: [{ type: "string", minLength: 1, maxLength: 2_000 }, { type: "null" }] },
+    title: { anyOf: [{ type: "string", minLength: 1, maxLength: 50_000 }, { type: "null" }] },
+    notes: { anyOf: [{ type: "string", maxLength: 50_000 }, { type: "null" }] },
+    due: { anyOf: [{ type: "string", minLength: 1, maxLength: 100 }, { type: "null" }] },
+    status: { anyOf: [{ type: "string", enum: ["needsAction", "completed"] }, { type: "null" }] },
+    showCompleted: { type: "boolean" },
+    limit: { type: "integer", minimum: 1, maximum: 100 },
+  },
+  required: [
+    "operation",
+    "taskListId",
+    "taskId",
+    "title",
+    "notes",
+    "due",
+    "status",
+    "showCompleted",
+    "limit",
+  ],
+} as const;
+
 type ForegroundCapabilityContext = {
   readonly mode: "conversation" | "family_work";
   readonly input: FlorenceReasonerInput;
@@ -2078,6 +2601,7 @@ type ForegroundCapabilityContext = {
   readonly publicMapResearchContext: string[];
   readonly gmailSources: Map<string, FlorenceConversationalGmailSource>;
   readonly calendarRefs: Set<string>;
+  readonly calendarRunners: Readonly<{ catalog: boolean; window: boolean }>;
   readonly artifacts: Map<string, ResponseFunctionCallOutputItemList>;
   readonly settlements: Map<string, () => void>;
   readonly researchPublicRequest: (
@@ -2092,6 +2616,370 @@ type PrivateAttachmentCapabilityContext = {
   readonly reads: FlorenceGoogleChangesReadTools;
   readonly artifacts: Map<string, ResponseFunctionCallOutputItemList>;
 };
+
+const workspaceWriteOperations = new Set<GoogleWorkspaceOperation["operation"]>([
+  "gmail_send",
+  "gmail_reply",
+  "gmail_modify",
+  "drive_create_folder",
+  "drive_share",
+  "drive_trash",
+  "contacts_create",
+  "contacts_update",
+  "docs_create",
+  "docs_append",
+  "sheets_create",
+  "sheets_update",
+  "sheets_append",
+  "slides_create",
+  "slides_add_text_slide",
+  "tasks_create",
+  "tasks_update",
+]);
+
+function workspaceCapabilityAvailable(context: ForegroundCapabilityContext): boolean {
+  return context.reads.runGoogleWorkspace !== undefined;
+}
+
+function workspaceCapabilityAdmitted(
+  context: ForegroundCapabilityContext,
+  canonicalArguments: JsonValue | undefined,
+): boolean {
+  if (
+    !workspaceCapabilityAvailable(context) ||
+    context.input.currentMessage.moveKind === "reaction" ||
+    !isJsonRecord(canonicalArguments) ||
+    typeof canonicalArguments.operation !== "string"
+  ) {
+    return false;
+  }
+  return (
+    !workspaceWriteOperations.has(canonicalArguments.operation as GoogleWorkspaceOperation["operation"]) ||
+    context.mode === "family_work"
+  );
+}
+
+function canonicalWorkspaceAction(value: unknown): string {
+  if (value === null || typeof value === "string" || typeof value === "boolean") {
+    return JSON.stringify(value);
+  }
+  if (typeof value === "number" && Number.isFinite(value)) return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalWorkspaceAction).join(",")}]`;
+  if (typeof value === "object") {
+    const fields = Object.entries(value)
+      .filter(([, fieldValue]) => fieldValue !== undefined)
+      .sort(([left], [right]) => left.localeCompare(right));
+    return `{${fields
+      .map(([field, fieldValue]) => `${JSON.stringify(field)}:${canonicalWorkspaceAction(fieldValue)}`)
+      .join(",")}}`;
+  }
+  throw unsafeRead("Google Workspace action arguments are invalid");
+}
+
+function workspaceActionKey(context: ForegroundCapabilityContext, operation: unknown): string {
+  return createHash("sha256")
+    .update(
+      canonicalWorkspaceAction({
+        sourceId: context.input.currentMessage.sourceId,
+        operation,
+      }),
+      "utf8",
+    )
+    .digest("hex");
+}
+
+function canonicalGmailRecipients(recipients: readonly string[]): readonly string[] {
+  return [...new Set(recipients.map((recipient) => recipient.trim().toLowerCase()))].sort();
+}
+
+function requiredWorkspaceValue<T>(value: T | null, field: string): T {
+  if (value === null) throw unsafeRead(`Google Workspace ${field} is unavailable`);
+  return value;
+}
+
+function gmailWorkspaceOperation(
+  args: z.infer<typeof gmailWorkArguments>,
+  context: ForegroundCapabilityContext,
+): GoogleWorkspaceOperation {
+  switch (args.operation) {
+    case "gmail_search":
+      return {
+        operation: args.operation,
+        query: requiredWorkspaceValue(args.query, "query"),
+        limit: requiredWorkspaceValue(args.limit, "limit"),
+      };
+    case "gmail_get":
+      return { operation: args.operation, messageId: requiredWorkspaceValue(args.messageId, "messageId") };
+    case "gmail_labels":
+      return { operation: args.operation };
+    case "gmail_send": {
+      const operation = {
+        operation: args.operation,
+        to: args.to,
+        cc: args.cc,
+        bcc: args.bcc,
+        subject: requiredWorkspaceValue(args.subject, "subject"),
+        body: requiredWorkspaceValue(args.body, "body"),
+        bodyFormat: requiredWorkspaceValue(args.bodyFormat, "bodyFormat"),
+        ...(args.threadId ? { threadId: args.threadId } : {}),
+      } as const;
+      const semanticOperation = {
+        ...operation,
+        to: canonicalGmailRecipients(operation.to),
+        cc: canonicalGmailRecipients(operation.cc),
+        bcc: canonicalGmailRecipients(operation.bcc),
+      };
+      return {
+        ...operation,
+        idempotencyKey: workspaceActionKey(context, semanticOperation),
+      };
+    }
+    case "gmail_reply": {
+      const operation = {
+        operation: args.operation,
+        messageId: requiredWorkspaceValue(args.messageId, "messageId"),
+        body: requiredWorkspaceValue(args.body, "body"),
+        bodyFormat: requiredWorkspaceValue(args.bodyFormat, "bodyFormat"),
+      } as const;
+      return {
+        ...operation,
+        idempotencyKey: workspaceActionKey(context, operation),
+      };
+    }
+    case "gmail_modify":
+      return {
+        operation: args.operation,
+        messageId: requiredWorkspaceValue(args.messageId, "messageId"),
+        addLabelIds: args.addLabelIds,
+        removeLabelIds: args.removeLabelIds,
+      };
+  }
+}
+
+function driveWorkspaceOperation(
+  args: z.infer<typeof driveWorkArguments>,
+  context: ForegroundCapabilityContext,
+): GoogleWorkspaceOperation {
+  switch (args.operation) {
+    case "drive_search":
+      return {
+        operation: args.operation,
+        query: requiredWorkspaceValue(args.query, "query"),
+        limit: requiredWorkspaceValue(args.limit, "limit"),
+      };
+    case "drive_get":
+      return { operation: args.operation, fileId: requiredWorkspaceValue(args.fileId, "fileId") };
+    case "drive_create_folder": {
+      const operation = {
+        operation: args.operation,
+        name: requiredWorkspaceValue(args.name, "name"),
+        ...(args.parentId ? { parentId: args.parentId } : {}),
+      } as const;
+      return {
+        ...operation,
+        idempotencyKey: workspaceActionKey(context, operation),
+      };
+    }
+    case "drive_share":
+      return {
+        operation: args.operation,
+        fileId: requiredWorkspaceValue(args.fileId, "fileId"),
+        role: requiredWorkspaceValue(args.role, "role"),
+        type: requiredWorkspaceValue(args.type, "type"),
+        ...(args.email ? { email: args.email } : {}),
+        ...(args.domain ? { domain: args.domain } : {}),
+        notify: args.notify,
+      };
+    case "drive_trash":
+      return { operation: args.operation, fileId: requiredWorkspaceValue(args.fileId, "fileId") };
+  }
+}
+
+function contactsWorkspaceOperation(args: z.infer<typeof contactsWorkArguments>): GoogleWorkspaceOperation {
+  switch (args.operation) {
+    case "contacts_search":
+      return {
+        operation: args.operation,
+        query: requiredWorkspaceValue(args.query, "query"),
+        limit: requiredWorkspaceValue(args.limit, "limit"),
+      };
+    case "contacts_create":
+      return {
+        operation: args.operation,
+        givenName: requiredWorkspaceValue(args.givenName, "givenName"),
+        ...(args.familyName !== null ? { familyName: args.familyName } : {}),
+        emails: requiredWorkspaceValue(args.emails, "emails"),
+        phones: requiredWorkspaceValue(args.phones, "phones"),
+      };
+    case "contacts_update":
+      return {
+        operation: args.operation,
+        resourceName: requiredWorkspaceValue(args.resourceName, "resourceName"),
+        contactSource: requiredWorkspaceValue(args.contactSource, "contactSource"),
+        ...(args.givenName !== null ? { givenName: args.givenName } : {}),
+        ...(args.familyName !== null ? { familyName: args.familyName } : {}),
+        ...(args.emails !== null ? { emails: args.emails } : {}),
+        ...(args.phones !== null ? { phones: args.phones } : {}),
+      };
+  }
+}
+
+function docsWorkspaceOperation(
+  args: z.infer<typeof docsWorkArguments>,
+  context: ForegroundCapabilityContext,
+): GoogleWorkspaceOperation {
+  switch (args.operation) {
+    case "docs_get":
+      return { operation: args.operation, documentId: requiredWorkspaceValue(args.documentId, "documentId") };
+    case "docs_create": {
+      const operation = {
+        operation: args.operation,
+        title: requiredWorkspaceValue(args.title, "title"),
+        ...(args.body !== null ? { body: args.body } : {}),
+      } as const;
+      return {
+        ...operation,
+        idempotencyKey: workspaceActionKey(context, operation),
+      };
+    }
+    case "docs_append":
+      return {
+        operation: args.operation,
+        documentId: requiredWorkspaceValue(args.documentId, "documentId"),
+        text: requiredWorkspaceValue(args.text, "text"),
+        ...(args.tabId ? { tabId: args.tabId } : {}),
+      };
+  }
+}
+
+function sheetsWorkspaceOperation(
+  args: z.infer<typeof sheetsWorkArguments>,
+  context: ForegroundCapabilityContext,
+): GoogleWorkspaceOperation {
+  switch (args.operation) {
+    case "sheets_get":
+      return {
+        operation: args.operation,
+        spreadsheetId: requiredWorkspaceValue(args.spreadsheetId, "spreadsheetId"),
+        range: requiredWorkspaceValue(args.range, "range"),
+      };
+    case "sheets_create": {
+      const operation = {
+        operation: args.operation,
+        title: requiredWorkspaceValue(args.title, "title"),
+        ...(args.sheetName ? { sheetName: args.sheetName } : {}),
+      } as const;
+      return {
+        ...operation,
+        idempotencyKey: workspaceActionKey(context, operation),
+      };
+    }
+    case "sheets_update":
+    case "sheets_append":
+      return {
+        operation: args.operation,
+        spreadsheetId: requiredWorkspaceValue(args.spreadsheetId, "spreadsheetId"),
+        range: requiredWorkspaceValue(args.range, "range"),
+        values: args.values,
+      };
+  }
+}
+
+function slidesWorkspaceOperation(
+  args: z.infer<typeof slidesWorkArguments>,
+  context: ForegroundCapabilityContext,
+): GoogleWorkspaceOperation {
+  switch (args.operation) {
+    case "slides_get":
+      return {
+        operation: args.operation,
+        presentationId: requiredWorkspaceValue(args.presentationId, "presentationId"),
+      };
+    case "slides_create": {
+      const operation = {
+        operation: args.operation,
+        title: requiredWorkspaceValue(args.title, "title"),
+      } as const;
+      return {
+        ...operation,
+        idempotencyKey: workspaceActionKey(context, operation),
+      };
+    }
+    case "slides_add_text_slide":
+      return {
+        operation: args.operation,
+        presentationId: requiredWorkspaceValue(args.presentationId, "presentationId"),
+        title: requiredWorkspaceValue(args.title, "title"),
+        body: requiredWorkspaceValue(args.body, "body"),
+      };
+  }
+}
+
+function tasksWorkspaceOperation(args: z.infer<typeof tasksWorkArguments>): GoogleWorkspaceOperation {
+  switch (args.operation) {
+    case "tasklists_list":
+      return { operation: args.operation };
+    case "tasks_list":
+      return {
+        operation: args.operation,
+        ...(args.taskListId ? { taskListId: args.taskListId } : {}),
+        showCompleted: args.showCompleted,
+        limit: args.limit,
+      };
+    case "tasks_create":
+      return {
+        operation: args.operation,
+        ...(args.taskListId ? { taskListId: args.taskListId } : {}),
+        title: requiredWorkspaceValue(args.title, "title"),
+        ...(args.notes !== null ? { notes: args.notes } : {}),
+        ...(args.due ? { due: args.due } : {}),
+      };
+    case "tasks_update":
+      return {
+        operation: args.operation,
+        taskListId: requiredWorkspaceValue(args.taskListId, "taskListId"),
+        taskId: requiredWorkspaceValue(args.taskId, "taskId"),
+        ...(args.title !== null ? { title: args.title } : {}),
+        ...(args.notes !== null ? { notes: args.notes } : {}),
+        ...(args.due ? { due: args.due } : {}),
+        ...(args.status ? { status: args.status } : {}),
+      };
+  }
+}
+
+async function executeGoogleWorkspaceOperation(
+  context: ForegroundCapabilityContext,
+  operation: GoogleWorkspaceOperation,
+  signal: AbortSignal,
+): Promise<{ readonly output: z.infer<typeof googleWorkspaceResultSchema> }> {
+  return executeReadAdapter(async () => {
+    const runGoogleWorkspace = context.reads.runGoogleWorkspace;
+    if (!runGoogleWorkspace) throw unsafeRead("Google Workspace is unavailable");
+    let result: z.infer<typeof googleWorkspaceResultSchema>;
+    try {
+      result = googleWorkspaceResultSchema.parse(await runGoogleWorkspace(operation, signal));
+    } catch (error) {
+      if (!(error instanceof GoogleWorkspaceError)) throw error;
+      throw new CapabilityAdapterError(
+        error.code === "provider_unavailable"
+          ? "transient"
+          : error.code === "invalid_response" || error.code === "reconciliation_failed"
+            ? "invalid_response"
+            : "permanent",
+        error.code === "provider_unavailable"
+          ? "Google Workspace is temporarily unavailable."
+          : "Google Workspace could not complete that operation.",
+      );
+    }
+    if (result.operation !== operation.operation) {
+      throw new CapabilityAdapterError(
+        "invalid_response",
+        "Google Workspace returned a result for the wrong operation.",
+      );
+    }
+    return { output: result };
+  }, signal);
+}
 
 /**
  * Directly adapted from Pi's immutable per-turn tool list and ordered tool-result
@@ -2369,6 +3257,111 @@ function foregroundCapabilityRegistry(): CapabilityRegistry<ForegroundCapability
       execute: ({ arguments: args, context, signal }) => executeFlightSearchOperation(context, args, signal),
     }),
     defineCapability({
+      name: "gmail_work",
+      description:
+        "Work with the current parent's Gmail. A private chat or durable private task may search, get a message body, or list labels. Durable private family work may also send or reply with a plain/HTML body, or change labels, when that advances the parent's objective. This tool cannot read or send attachments. Set fields unused by the chosen operation to null or empty arrays.",
+      modelSchema: GMAIL_WORK_PARAMETERS,
+      inputSchema: gmailWorkArguments,
+      outputSchema: googleWorkspaceResultSchema,
+      executionMode: "sequential",
+      timeoutMs: 60_000,
+      maxOutputBytes: 150_000,
+      availability: workspaceCapabilityAvailable,
+      admit: ({ context, canonicalArguments }) => workspaceCapabilityAdmitted(context, canonicalArguments),
+      execute: ({ arguments: args, context, signal }) =>
+        executeGoogleWorkspaceOperation(context, gmailWorkspaceOperation(args, context), signal),
+    }),
+    defineCapability({
+      name: "drive_work",
+      description:
+        "Search the current parent's Drive metadata or get metadata for one file. Durable private family work may also create a folder, share a file, or move a file to trash. This tool cannot read file contents, download a PDF or binary, or upload a file. Set fields unused by the chosen operation to null; notify is used only for sharing.",
+      modelSchema: DRIVE_WORK_PARAMETERS,
+      inputSchema: driveWorkArguments,
+      outputSchema: googleWorkspaceResultSchema,
+      executionMode: "sequential",
+      timeoutMs: 60_000,
+      maxOutputBytes: 150_000,
+      availability: workspaceCapabilityAvailable,
+      admit: ({ context, canonicalArguments }) => workspaceCapabilityAdmitted(context, canonicalArguments),
+      execute: ({ arguments: args, context, signal }) =>
+        executeGoogleWorkspaceOperation(context, driveWorkspaceOperation(args, context), signal),
+    }),
+    defineCapability({
+      name: "contacts_work",
+      description:
+        "Search the current parent's Google Contacts. Durable private family work may also create or update a contact; pass the exact contactSource returned by search when updating. For updates, null leaves a field unchanged while an empty emails or phones array explicitly clears that field. Contact creation requires concrete emails and phones arrays, which may be empty. Set other unused fields to null.",
+      modelSchema: CONTACTS_WORK_PARAMETERS,
+      inputSchema: contactsWorkArguments,
+      outputSchema: googleWorkspaceResultSchema,
+      executionMode: "sequential",
+      timeoutMs: 60_000,
+      maxOutputBytes: 100_000,
+      availability: workspaceCapabilityAvailable,
+      admit: ({ context, canonicalArguments }) => workspaceCapabilityAdmitted(context, canonicalArguments),
+      execute: ({ arguments: args, context, signal }) =>
+        executeGoogleWorkspaceOperation(context, contactsWorkspaceOperation(args), signal),
+    }),
+    defineCapability({
+      name: "docs_work",
+      description:
+        "Read a Google Doc, including its tabs. Durable private family work may also create a document or append text; use a tabId returned by docs_get when targeting a specific tab. Set fields unused by the chosen operation to null.",
+      modelSchema: DOCS_WORK_PARAMETERS,
+      inputSchema: docsWorkArguments,
+      outputSchema: googleWorkspaceResultSchema,
+      executionMode: "sequential",
+      timeoutMs: 60_000,
+      maxOutputBytes: 180_000,
+      availability: workspaceCapabilityAvailable,
+      admit: ({ context, canonicalArguments }) => workspaceCapabilityAdmitted(context, canonicalArguments),
+      execute: ({ arguments: args, context, signal }) =>
+        executeGoogleWorkspaceOperation(context, docsWorkspaceOperation(args, context), signal),
+    }),
+    defineCapability({
+      name: "sheets_work",
+      description:
+        "Read a Google Sheets range. Durable private family work may also create a spreadsheet, replace values in a range, or append rows. sheets_update uses UI-style parsing for formulas and typed values; sheets_append preserves supplied scalar values literally. Set fields unused by the chosen operation to null or an empty values array.",
+      modelSchema: SHEETS_WORK_PARAMETERS,
+      inputSchema: sheetsWorkArguments,
+      outputSchema: googleWorkspaceResultSchema,
+      executionMode: "sequential",
+      timeoutMs: 60_000,
+      maxOutputBytes: 180_000,
+      availability: workspaceCapabilityAvailable,
+      admit: ({ context, canonicalArguments }) => workspaceCapabilityAdmitted(context, canonicalArguments),
+      execute: ({ arguments: args, context, signal }) =>
+        executeGoogleWorkspaceOperation(context, sheetsWorkspaceOperation(args, context), signal),
+    }),
+    defineCapability({
+      name: "slides_work",
+      description:
+        "Read a Google Slides presentation. Durable private family work may also create a presentation or add a title-and-body slide. Set fields unused by the chosen operation to null.",
+      modelSchema: SLIDES_WORK_PARAMETERS,
+      inputSchema: slidesWorkArguments,
+      outputSchema: googleWorkspaceResultSchema,
+      executionMode: "sequential",
+      timeoutMs: 60_000,
+      maxOutputBytes: 180_000,
+      availability: workspaceCapabilityAvailable,
+      admit: ({ context, canonicalArguments }) => workspaceCapabilityAdmitted(context, canonicalArguments),
+      execute: ({ arguments: args, context, signal }) =>
+        executeGoogleWorkspaceOperation(context, slidesWorkspaceOperation(args, context), signal),
+    }),
+    defineCapability({
+      name: "tasks_work",
+      description:
+        "List the current parent's Google task lists or tasks. Durable private family work may also create or update a task. Use tasklists_list to discover list IDs, or null taskListId to address the default list; set other unused fields to null.",
+      modelSchema: TASKS_WORK_PARAMETERS,
+      inputSchema: tasksWorkArguments,
+      outputSchema: googleWorkspaceResultSchema,
+      executionMode: "sequential",
+      timeoutMs: 60_000,
+      maxOutputBytes: 100_000,
+      availability: workspaceCapabilityAvailable,
+      admit: ({ context, canonicalArguments }) => workspaceCapabilityAdmitted(context, canonicalArguments),
+      execute: ({ arguments: args, context, signal }) =>
+        executeGoogleWorkspaceOperation(context, tasksWorkspaceOperation(args), signal),
+    }),
+    defineCapability({
       name: "search_gmail",
       description:
         "Search the current adult's Gmail when email context may help answer the request, preserving result and attachment completeness.",
@@ -2445,15 +3438,18 @@ function foregroundCapabilityRegistry(): CapabilityRegistry<ForegroundCapability
     defineCapability({
       name: "list_calendars",
       description:
-        "List every Calendar readable in this conversation and return private display labels with app-scoped references; use before selecting named calendars.",
+        "List every Calendar readable for the current private request and return display labels with references; use before selecting named calendars.",
       modelSchema: CALENDAR_CATALOG_PARAMETERS,
       inputSchema: z.object({}).strict(),
       outputSchema: calendarCatalogOutputSchema,
       executionMode: "parallel",
       timeoutMs: 30_000,
       maxOutputBytes: 50_000,
-      availability: (context) => context.mode === "conversation",
-      admit: ({ context }) => calendarReadIsAdmitted(context.input),
+      availability: (context) =>
+        context.mode === "family_work"
+          ? context.calendarRunners.catalog
+          : context.reads.listCalendars !== undefined,
+      admit: ({ context }) => calendarCatalogIsAdmitted(context),
       execute: async ({ callId, context, signal }) =>
         executeReadAdapter(async () => {
           if (!context.reads.listCalendars) throw unsafeRead("Calendar listing is unavailable");
@@ -2468,18 +3464,22 @@ function foregroundCapabilityRegistry(): CapabilityRegistry<ForegroundCapability
     defineCapability({
       name: "read_calendar_window",
       description:
-        "Read an exact bounded Calendar window. In private, scope can cover all, primary, or app-scoped selected calendars; in the group it covers only the Family Calendar.",
+        "Read an exact bounded Calendar window. In private, scope can cover all, primary, or selected calendars; in a foreground family group it covers only the Family Calendar.",
       modelSchema: CALENDAR_PARAMETERS,
       inputSchema: calendarArguments,
       outputSchema: calendarCapabilityOutputSchema,
       executionMode: "parallel",
       timeoutMs: 90_000,
       maxOutputBytes: 100_000,
-      availability: (context) => context.mode === "conversation",
+      availability: (context) =>
+        context.mode === "family_work"
+          ? context.calendarRunners.window
+          : context.reads.readCalendarWindow !== undefined,
       admit: ({ context, canonicalArguments }) =>
-        calendarReadIsAdmitted(context.input) &&
+        calendarWindowIsAdmitted(context) &&
         isJsonRecord(canonicalArguments) &&
         (canonicalArguments.scope !== "selected" ||
+          context.mode === "family_work" ||
           (Array.isArray(canonicalArguments.calendarRefs) &&
             canonicalArguments.calendarRefs.every(
               (calendarRef) => typeof calendarRef === "string" && context.calendarRefs.has(calendarRef),
@@ -2487,20 +3487,22 @@ function foregroundCapabilityRegistry(): CapabilityRegistry<ForegroundCapability
       execute: async ({ callId, arguments: args, context, signal }) =>
         executeReadAdapter(async () => {
           const connection = context.input.googleConnections[0];
-          if (!connection || !calendarReadIsAdmitted(context.input)) {
-            throw unsafeRead("Calendar connection is unavailable in this conversation");
+          const resourceKind = context.mode === "family_work" ? "personal" : connection?.kind;
+          const readCalendarWindow = context.reads.readCalendarWindow;
+          if (!resourceKind || !readCalendarWindow || !calendarWindowIsAdmitted(context)) {
+            throw unsafeRead("Calendar reading is unavailable for this request");
           }
           const timeMin = Date.parse(args.timeMin);
           const timeMax = Date.parse(args.timeMax);
           if (timeMax <= timeMin || timeMax - timeMin > 31 * 24 * 60 * 60_000) {
             throw unsafeRead("Calendar read window is invalid");
           }
-          const read = calendarWindowReadSchema.parse(await context.reads.readCalendarWindow(args));
+          const read = calendarWindowReadSchema.parse(await readCalendarWindow(args));
           throwIfAborted(signal);
           context.settlements.set(callId, () => {
             if (read.status === "complete") {
               context.calendarReads.push({
-                resourceKind: connection.kind,
+                resourceKind,
                 timeMin,
                 timeMax,
                 events: read.events.map(conversationalCalendarAsWindowEvent),
@@ -2509,7 +3511,7 @@ function foregroundCapabilityRegistry(): CapabilityRegistry<ForegroundCapability
           });
           return {
             output: {
-              resourceKind: connection.kind,
+              resourceKind,
               timeMin: args.timeMin,
               timeMax: args.timeMax,
               ...read,
@@ -2617,13 +3619,15 @@ function familyWorkReads(publicReads: FlorenceFamilyWorkReadTools): FlorenceRead
     settleSources: () => undefined,
     searchGmail: async () => ({ status: "complete", sources: [] }),
     searchFamilyMemory: async () => [],
-    readCalendarWindow: async () => ({
-      status: "unavailable",
-      calendars: [],
-      totalCalendarCount: 0,
-      events: [],
-      totalEventCount: 0,
-    }),
+    readCalendarWindow:
+      publicReads.readCalendarWindow ??
+      (async () => ({
+        status: "unavailable",
+        calendars: [],
+        totalCalendarCount: 0,
+        events: [],
+        totalEventCount: 0,
+      })),
     readSource: async () => null,
     readCurrentImage: async () => {
       throw unsafeRead("Durable family work has no current-message image");
@@ -3410,6 +4414,10 @@ export class FlorenceReasoner {
       publicMapResearchContext,
       gmailSources: new Map(),
       calendarRefs: new Set(),
+      calendarRunners: {
+        catalog: publicReads.listCalendars !== undefined,
+        window: publicReads.readCalendarWindow !== undefined,
+      },
       artifacts: new Map(),
       settlements: new Map(),
       researchPublicRequest: (query, capabilitySignal) =>
@@ -3622,6 +4630,10 @@ export class FlorenceReasoner {
       publicMapResearchContext,
       gmailSources: new Map(),
       calendarRefs: new Set(),
+      calendarRunners: {
+        catalog: reads.listCalendars !== undefined,
+        window: true,
+      },
       artifacts: new Map(),
       settlements: new Map(),
       researchPublicRequest: (query, capabilitySignal) =>
@@ -3988,6 +5000,16 @@ function calendarReadIsAdmitted(input: FlorenceReasonerInput): boolean {
   return input.audience === "private" ? connection.kind === "personal" : connection.kind === "family";
 }
 
+function calendarCatalogIsAdmitted(context: ForegroundCapabilityContext): boolean {
+  if (context.mode === "family_work") return context.calendarRunners.catalog;
+  return context.reads.listCalendars !== undefined && calendarReadIsAdmitted(context.input);
+}
+
+function calendarWindowIsAdmitted(context: ForegroundCapabilityContext): boolean {
+  if (context.mode === "family_work") return context.calendarRunners.window;
+  return calendarReadIsAdmitted(context.input);
+}
+
 async function executeMapsOperation(
   context: ForegroundCapabilityContext,
   request: FlorenceMapsRequest,
@@ -4143,6 +5165,9 @@ async function executeReadAdapter<T>(
   } catch (error) {
     if (isAbortError(error) || signal.aborted) throw error;
     if (error instanceof CapabilityAdapterError) throw error;
+    if (error instanceof GoogleCalendarTransientError) {
+      throw new CapabilityAdapterError("transient", "Google Calendar is temporarily unavailable.");
+    }
     if (error instanceof FlorenceReasonerError) {
       throw new CapabilityAdapterError(
         error.retryable ? "transient" : "permanent",

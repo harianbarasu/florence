@@ -1,4 +1,16 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID } from "node:crypto";
+import {
+  executeGoogleWorkspaceOperation,
+  type GoogleWorkspaceOperation,
+  type GoogleWorkspaceResult,
+} from "./workspace.js";
+
+export type {
+  GoogleWorkspaceJsonValue,
+  GoogleWorkspaceOperation,
+  GoogleWorkspaceResult,
+} from "./workspace.js";
+export { GoogleWorkspaceError } from "./workspace.js";
 
 // Keep these aligned with @florence/artifacts. This package has no workspace dependencies.
 const MAX_GMAIL_IMAGE_BYTES = 20 * 1024 * 1024;
@@ -19,15 +31,20 @@ const MAX_GOOGLE_BASELINE_PAGE_TOKEN_LENGTH = 16_384;
 export const GOOGLE_SCOPES = [
   "openid",
   "email",
-  "https://www.googleapis.com/auth/gmail.readonly",
+  "https://www.googleapis.com/auth/gmail.modify",
   "https://www.googleapis.com/auth/calendar.events.owned",
   "https://www.googleapis.com/auth/calendar.events.readonly",
   "https://www.googleapis.com/auth/calendar.app.created",
   "https://www.googleapis.com/auth/calendar.acls",
   "https://www.googleapis.com/auth/calendar.calendarlist",
+  "https://www.googleapis.com/auth/drive",
+  "https://www.googleapis.com/auth/tasks",
+  "https://www.googleapis.com/auth/contacts",
 ] as const;
 
-export type GoogleScope = (typeof GOOGLE_SCOPES)[number];
+/** Older connections may still persist this superseded scope. */
+const LEGACY_GMAIL_READ_SCOPE = "https://www.googleapis.com/auth/gmail.readonly" as const;
+export type GoogleScope = (typeof GOOGLE_SCOPES)[number] | typeof LEGACY_GMAIL_READ_SCOPE;
 export type GoogleConnectionStatus = "pending" | "active" | "disconnected";
 
 export type GoogleConnectionView = {
@@ -701,6 +718,26 @@ export class GoogleConnection {
 
   status(input: { householdId: string; ownerAdultId: string }): Promise<readonly GoogleConnectionView[]> {
     return this.#store.listActive(input);
+  }
+
+  async runWorkspace(
+    input: {
+      householdId: string;
+      ownerAdultId: string;
+      connectionId: string;
+      operation: GoogleWorkspaceOperation;
+    },
+    signal?: AbortSignal,
+  ): Promise<GoogleWorkspaceResult> {
+    const credential = await this.#store.readActiveGoogleCredential(input);
+    if (!credential) throw new GoogleConnectionError("Active Google connection was not found", "not_found");
+    const accessToken = await this.#accessToken(credential);
+    return executeGoogleWorkspaceOperation({
+      fetch: this.#fetch,
+      accessToken,
+      operation: input.operation,
+      ...(signal ? { signal } : {}),
+    });
   }
 
   async disconnect(input: {

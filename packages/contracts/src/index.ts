@@ -180,6 +180,7 @@ export const googleConnectionSummarySchema = z
     status: z.literal("active"),
     emailLabel: z.email(),
     historyReviewReady: z.boolean(),
+    assistantWorkReady: z.boolean(),
     lastError: nonempty(2_000).nullable(),
   })
   .strict();

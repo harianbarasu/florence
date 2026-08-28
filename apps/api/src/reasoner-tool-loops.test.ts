@@ -1,4 +1,5 @@
 import { type FamilyWorkStateV1, steerFamilyWorkState } from "@florence/database";
+import { GoogleCalendarTransientError, GoogleWorkspaceError } from "@florence/google";
 import { describe, expect, test } from "vitest";
 import {
   type FlorenceDecision,
@@ -850,6 +851,440 @@ describe("Florence reasoner capability cutover", () => {
         continuationItems: [],
         progressRevision: 5,
       },
+    });
+  });
+
+  test("Workspace reads run in private conversation while writes stay in durable work", async () => {
+    const requests: Record<string, unknown>[] = [];
+    const operations: unknown[] = [];
+    let modelTurn = 0;
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        stream(request: Record<string, unknown>) {
+          requests.push(request);
+          modelTurn += 1;
+          return fakeStream(
+            modelTurn === 1
+              ? {
+                  status: "completed",
+                  output_parsed: null,
+                  output: [
+                    functionCall("find-school-file", "drive_work", {
+                      operation: "drive_search",
+                      query: "school enrollment form",
+                      limit: 10,
+                      fileId: null,
+                      name: null,
+                      parentId: null,
+                      role: null,
+                      type: null,
+                      email: null,
+                      domain: null,
+                      notify: false,
+                    }),
+                    functionCall("send-before-durable", "gmail_work", {
+                      operation: "gmail_send",
+                      query: null,
+                      limit: null,
+                      messageId: null,
+                      to: ["school@example.com"],
+                      cc: [],
+                      bcc: [],
+                      subject: "Enrollment status update",
+                      body: "Violet's enrollment paperwork is complete. Please confirm her status is current.",
+                      bodyFormat: "plain",
+                      threadId: null,
+                      addLabelIds: [],
+                      removeLabelIds: [],
+                    }),
+                  ],
+                }
+              : {
+                  status: "completed",
+                  output_parsed: ordinaryDecision({
+                    bubbleText: "I found the enrollment form. I haven’t sent anything.",
+                  }),
+                  output: [],
+                },
+          );
+        },
+      },
+    } as never);
+    const result = await reasoner.decide(foregroundInput(), {
+      ...inertReads(),
+      async runGoogleWorkspace(operation) {
+        operations.push(operation);
+        return {
+          operation: operation.operation,
+          result: {
+            files: [
+              {
+                fileId: "drive-file-1",
+                name: "Enrollment form",
+                mimeType: "application/pdf",
+              },
+            ],
+          },
+        };
+      },
+    });
+
+    expect(operations).toEqual([{ operation: "drive_search", query: "school enrollment form", limit: 10 }]);
+    expect(result.conversation.bubbles[0]?.text).toContain("haven’t sent anything");
+    expect(functionOutputEnvelopes(requests[1])).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          callId: "find-school-file",
+          outcome: "succeeded",
+          output: expect.objectContaining({ operation: "drive_search" }),
+        }),
+        expect.objectContaining({ callId: "send-before-durable", outcome: "protocol_rejected" }),
+      ]),
+    );
+  });
+
+  test("durable Workspace retries keep one semantic identity across new model call IDs", async () => {
+    const emailArguments = {
+      operation: "gmail_send",
+      query: null,
+      limit: null,
+      messageId: null,
+      to: ["school@example.com", "registrar@example.com"],
+      cc: ["office@example.com", "records@example.com"],
+      bcc: ["archive@example.com"],
+      subject: "Enrollment status update",
+      body: "Violet's enrollment paperwork is complete. Please confirm her status is current.",
+      bodyFormat: "plain",
+      threadId: null,
+      addLabelIds: [],
+      removeLabelIds: [],
+    };
+    const retryEmailArguments = {
+      ...emailArguments,
+      to: ["REGISTRAR@EXAMPLE.COM", "School@Example.com", "school@example.com"],
+      cc: ["records@example.com", "OFFICE@EXAMPLE.COM"],
+      bcc: ["ARCHIVE@example.com"],
+    };
+    const modelResponses = [
+      {
+        status: "completed",
+        output_parsed: null,
+        output: [functionCall("send-school-email-first", "gmail_work", emailArguments)],
+      },
+      {
+        status: "completed",
+        output_parsed: null,
+        output: [functionCall("send-school-email-retry", "gmail_work", retryEmailArguments)],
+      },
+      {
+        status: "completed",
+        output_parsed: {
+          outcome: "succeeded",
+          text: "I sent the enrollment email to the school.",
+        },
+        output: [],
+      },
+    ];
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        parse() {
+          const response = modelResponses.shift();
+          if (!response) throw new Error("Unexpected durable Workspace model turn");
+          return response;
+        },
+      },
+    } as never);
+    const state: FamilyWorkStateV1 = {
+      kind: "family_work_v1",
+      version: 1,
+      generation: 0,
+      phase: "ready",
+      claim: null,
+      continuationItems: [],
+      pendingCall: null,
+      steering: [],
+      publicMapResearchContext: [],
+      progressRevision: 0,
+      terminal: null,
+    };
+    const input = {
+      workId: "family-work-workspace-email",
+      objective: "Email the school an enrollment status update and ask them to confirm it is current.",
+      visibility: "private" as const,
+      ownerAdultId: "adult-1",
+      household: {
+        householdId: "household-1",
+        familyLabel: "Test family",
+        timeZone: "America/Los_Angeles",
+        postalCode: "90045",
+        adults: [{ adultId: "adult-1", firstName: "Hari", displayName: "Hari Anbarasu" }],
+        children: [],
+      },
+      state,
+      currentTime: NOW,
+    };
+    const operations: Array<
+      Parameters<NonNullable<Parameters<typeof reasoner.continueFamilyWork>[1]["runGoogleWorkspace"]>>[0]
+    > = [];
+    const runGoogleWorkspace = async (
+      operation: Parameters<
+        NonNullable<Parameters<typeof reasoner.continueFamilyWork>[1]["runGoogleWorkspace"]>
+      >[0],
+    ) => {
+      operations.push(operation);
+      if (operations.length === 1) {
+        throw new GoogleWorkspaceError(
+          "Gmail timed out after accepting the request",
+          "provider_unavailable",
+          {
+            service: "Gmail",
+          },
+        );
+      }
+      return {
+        operation: operation.operation,
+        result: { status: "sent", messageId: "gmail-message-1", threadId: "gmail-thread-1" },
+      };
+    };
+
+    const planned = await reasoner.continueFamilyWork(input, { runGoogleWorkspace });
+    if (planned.kind !== "continue") throw new Error("Workspace email was not planned");
+    expect(planned.state).toMatchObject({
+      phase: "tool_pending",
+      pendingCall: { callId: "send-school-email-first", name: "gmail_work" },
+    });
+    const firstAttempt = await reasoner.continueFamilyWork(
+      { ...input, state: planned.state },
+      { runGoogleWorkspace },
+    );
+    if (firstAttempt.kind !== "continue") throw new Error("Workspace email failure was not settled");
+    expect(firstAttempt.state.continuationItems).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "function_call_output",
+          output: expect.stringContaining('"retryable":true'),
+        }),
+      ]),
+    );
+
+    const retryPlanned = await reasoner.continueFamilyWork(
+      { ...input, state: firstAttempt.state },
+      { runGoogleWorkspace },
+    );
+    if (retryPlanned.kind !== "continue") throw new Error("Workspace email retry was not planned");
+    expect(retryPlanned.state).toMatchObject({
+      phase: "tool_pending",
+      pendingCall: { callId: "send-school-email-retry", name: "gmail_work" },
+    });
+    const retryExecuted = await reasoner.continueFamilyWork(
+      { ...input, state: retryPlanned.state },
+      { runGoogleWorkspace },
+    );
+    if (retryExecuted.kind !== "continue") throw new Error("Workspace email retry was not executed");
+    const terminal = await reasoner.continueFamilyWork(
+      { ...input, state: retryExecuted.state },
+      { runGoogleWorkspace },
+    );
+
+    expect(operations).toHaveLength(2);
+    const firstOperation = operations[0];
+    if (!firstOperation || !("idempotencyKey" in firstOperation)) {
+      throw new Error("Workspace email did not receive an idempotency key");
+    }
+    expect(operations[0]).toMatchObject({
+      operation: "gmail_send",
+      to: ["school@example.com", "registrar@example.com"],
+      subject: "Enrollment status update",
+      idempotencyKey: expect.stringMatching(/^[a-f0-9]{64}$/),
+    });
+    expect(operations[1]).toMatchObject({
+      operation: "gmail_send",
+      to: ["REGISTRAR@EXAMPLE.COM", "School@Example.com", "school@example.com"],
+      idempotencyKey: firstOperation.idempotencyKey,
+    });
+    expect(terminal).toMatchObject({
+      kind: "terminal",
+      outcome: "succeeded",
+      text: "I sent the enrollment email to the school.",
+    });
+  });
+
+  test("durable work lists Calendars and reads a selected reference across checkpoints", async () => {
+    const calendarRef = "calendar-school";
+    const calendarWindowArguments = {
+      timeMin: "2026-08-28T00:00:00.000Z",
+      timeMax: "2026-08-29T00:00:00.000Z",
+      limit: 20,
+      scope: "selected",
+      calendarRefs: [calendarRef],
+    };
+    const modelResponses = [
+      {
+        status: "completed",
+        output_parsed: null,
+        output: [functionCall("list-work-calendars", "list_calendars", {})],
+      },
+      {
+        status: "completed",
+        output_parsed: null,
+        output: [functionCall("read-work-calendar", "read_calendar_window", calendarWindowArguments)],
+      },
+      {
+        status: "completed",
+        output_parsed: null,
+        output: [functionCall("read-work-calendar-retry", "read_calendar_window", calendarWindowArguments)],
+      },
+      {
+        status: "completed",
+        output_parsed: {
+          outcome: "succeeded",
+          text: "Back-to-school night is tomorrow from 4 to 6 PM.",
+        },
+        output: [],
+      },
+    ];
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        parse() {
+          const response = modelResponses.shift();
+          if (!response) throw new Error("Unexpected durable Calendar model turn");
+          return response;
+        },
+      },
+    } as never);
+    const state: FamilyWorkStateV1 = {
+      kind: "family_work_v1",
+      version: 1,
+      generation: 0,
+      phase: "ready",
+      claim: null,
+      continuationItems: [],
+      pendingCall: null,
+      steering: [],
+      publicMapResearchContext: [],
+      progressRevision: 0,
+      terminal: null,
+    };
+    const input = {
+      workId: "family-work-calendar",
+      objective: "Check the School Calendar for tomorrow's schedule.",
+      visibility: "private" as const,
+      ownerAdultId: "adult-1",
+      household: {
+        householdId: "household-1",
+        familyLabel: "Test family",
+        timeZone: "America/Los_Angeles",
+        postalCode: "90045",
+        adults: [{ adultId: "adult-1", firstName: "Hari", displayName: "Hari Anbarasu" }],
+        children: [],
+      },
+      state,
+      currentTime: NOW,
+    };
+    const calendarInputs: unknown[] = [];
+    const reads = {
+      async listCalendars() {
+        return {
+          status: "complete" as const,
+          calendars: [
+            {
+              calendarRef,
+              label: "School",
+              timeZone: "America/Los_Angeles",
+              primary: false,
+              accessRole: "reader" as const,
+              eventCoverage: "readable" as const,
+            },
+          ],
+          totalCalendarCount: 1,
+        };
+      },
+      async readCalendarWindow(calendarInput: {
+        timeMin: string;
+        timeMax: string;
+        limit: number;
+        scope: "all" | "primary" | "selected";
+        calendarRefs: readonly string[];
+      }) {
+        calendarInputs.push(calendarInput);
+        if (calendarInputs.length === 1) {
+          throw new GoogleCalendarTransientError("Calendar timed out");
+        }
+        return {
+          status: "complete" as const,
+          calendars: [
+            {
+              calendarRef,
+              label: "School",
+              timeZone: "America/Los_Angeles",
+              primary: false,
+              accessRole: "reader" as const,
+              status: "complete" as const,
+              eventCount: 1,
+            },
+          ],
+          totalCalendarCount: 1,
+          events: [
+            {
+              eventRef: "event-school-night",
+              providerUpdatedAt: "2026-08-27T19:00:00.000Z",
+              calendarRef,
+              calendarLabel: "School",
+              title: "Back-to-school night",
+              location: "Wish Charter",
+              status: "confirmed" as const,
+              busy: true,
+              intervalKind: "timed" as const,
+              startsAt: "2026-08-28T23:00:00.000Z",
+              endsAt: "2026-08-29T01:00:00.000Z",
+              timeZone: "America/Los_Angeles",
+            },
+          ],
+          totalEventCount: 1,
+        };
+      },
+    };
+
+    const listPlanned = await reasoner.continueFamilyWork(input, reads);
+    if (listPlanned.kind !== "continue") throw new Error("Calendar listing was not planned");
+    const listed = await reasoner.continueFamilyWork({ ...input, state: listPlanned.state }, reads);
+    if (listed.kind !== "continue") throw new Error("Calendar listing was not executed");
+    expect(JSON.stringify(listed.state.continuationItems)).toContain(calendarRef);
+
+    const windowPlanned = await reasoner.continueFamilyWork({ ...input, state: listed.state }, reads);
+    if (windowPlanned.kind !== "continue") throw new Error("Calendar window was not planned");
+    expect(windowPlanned.state).toMatchObject({
+      phase: "tool_pending",
+      pendingCall: { callId: "read-work-calendar", name: "read_calendar_window" },
+    });
+    const transientRead = await reasoner.continueFamilyWork({ ...input, state: windowPlanned.state }, reads);
+    if (transientRead.kind !== "continue") throw new Error("Calendar transient failure was not settled");
+    expect(transientRead.state.continuationItems).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "function_call_output",
+          output: expect.stringContaining('"retryable":true'),
+        }),
+      ]),
+    );
+    const retryPlanned = await reasoner.continueFamilyWork({ ...input, state: transientRead.state }, reads);
+    if (retryPlanned.kind !== "continue") throw new Error("Calendar retry was not planned");
+    expect(retryPlanned.state).toMatchObject({
+      phase: "tool_pending",
+      pendingCall: { callId: "read-work-calendar-retry", name: "read_calendar_window" },
+    });
+    const windowRead = await reasoner.continueFamilyWork({ ...input, state: retryPlanned.state }, reads);
+    if (windowRead.kind !== "continue") throw new Error("Calendar window was not read");
+    const terminal = await reasoner.continueFamilyWork({ ...input, state: windowRead.state }, reads);
+
+    expect(calendarInputs).toEqual([
+      expect.objectContaining({ scope: "selected", calendarRefs: [calendarRef] }),
+      expect.objectContaining({ scope: "selected", calendarRefs: [calendarRef] }),
+    ]);
+    expect(terminal).toMatchObject({
+      kind: "terminal",
+      outcome: "succeeded",
+      text: expect.stringContaining("Back-to-school night"),
     });
   });
 

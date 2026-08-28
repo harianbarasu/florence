@@ -36,11 +36,15 @@ export type GoogleScope =
   | "openid"
   | "email"
   | "https://www.googleapis.com/auth/gmail.readonly"
+  | "https://www.googleapis.com/auth/gmail.modify"
   | "https://www.googleapis.com/auth/calendar.events.readonly"
   | "https://www.googleapis.com/auth/calendar.events.owned"
   | "https://www.googleapis.com/auth/calendar.app.created"
   | "https://www.googleapis.com/auth/calendar.acls"
-  | "https://www.googleapis.com/auth/calendar.calendarlist";
+  | "https://www.googleapis.com/auth/calendar.calendarlist"
+  | "https://www.googleapis.com/auth/drive"
+  | "https://www.googleapis.com/auth/tasks"
+  | "https://www.googleapis.com/auth/contacts";
 
 export class FlorenceStoreConflict extends Error {
   constructor(message: string) {

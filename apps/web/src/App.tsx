@@ -210,7 +210,7 @@ function SetupPage({ setupToken }: { setupToken: string }) {
         <form className="setup-form" onSubmit={(event) => void submitProfile(event)}>
           <SetupHeading
             title="Can Florence stay ahead of things for you?"
-            detail="She’ll look for family things in Gmail and Calendar, remember useful details, add clear official dates to your family calendar, and text when something needs attention."
+            detail="She’ll look across your Google account for family things, remember useful details, handle concrete email, document, spreadsheet, task, and calendar work, and text when something needs attention."
           />
           <label className="setup-attestation">
             <input name="proactiveUseAccepted" type="checkbox" required />
@@ -857,13 +857,13 @@ function GoogleSetupStep({
         </span>
         <div>
           <strong>Google Workspace</strong>
-          <p>Gmail and Calendar</p>
+          <p>Gmail, Calendar, Drive, Docs, Sheets, Slides, Tasks, and Contacts</p>
         </div>
       </div>
       <p className="setup-trust">
-        When Google asks, leave both Gmail and Calendar enabled—Florence can’t connect if either is turned
-        off. Florence keeps your personal email private. With your permission, she may add a clear official
-        family date to the shared calendar. If something is uncertain, she’ll ask first.
+        When Google asks, leave the listed Workspace access enabled so Florence can both find the family
+        context and finish the work you give her. She’ll keep using your existing family setup and shared
+        calendar.
       </p>
       {error && (
         <p className="form-error" role="alert">
@@ -1664,12 +1664,18 @@ function GoogleConnector({ view, callbackStatus }: { view: WorkspaceView; callba
         <p>
           {accounts.length
             ? accounts.map((account) => account.emailLabel).join(", ")
-            : "Connect the Gmail and Calendar account you want Florence to use for you."}
+            : "Connect the Google account you want Florence to use for email, calendars, files, documents, contacts, and tasks."}
         </p>
         {accounts.some((account) => !account.historyReviewReady) && (
           <p>
             Reconnect Google so Florence can finish reviewing the last 90 days across all of your calendars.
             Your family setup will stay in place.
+          </p>
+        )}
+        {accounts.some((account) => account.historyReviewReady && !account.assistantWorkReady) && (
+          <p>
+            Reconnect Google to let Florence finish work in Gmail, Drive, Docs, Sheets, Slides, Tasks, and
+            Contacts. Your family setup and existing calendar stay in place.
           </p>
         )}
         {error && <p className="form-error">{error.message}</p>}
@@ -1686,7 +1692,7 @@ function GoogleConnector({ view, callbackStatus }: { view: WorkspaceView; callba
           </button>
         )}
         {accounts
-          .filter((account) => !account.historyReviewReady)
+          .filter((account) => !account.historyReviewReady || !account.assistantWorkReady)
           .map((account) => (
             <button
               className="button pill"
@@ -1867,9 +1873,9 @@ function GoogleActionConfirmation({
         ) : isReconnect ? (
           <div id={detailId}>
             <p>
-              Florence will open Google so you can approve the access she needs to review your Gmail and all
-              of your calendars. Your current connection stays in place unless that succeeds with the same
-              account.
+              Florence will open Google so you can approve the Workspace access she needs to handle email,
+              calendars, files, documents, contacts, and tasks. Your current connection stays in place unless
+              that succeeds with the same account.
             </p>
             <p>
               Your family, profile, group chat, and shared calendar will stay in place while you reconnect.
@@ -2591,7 +2597,7 @@ function googleSetupError(status: string): string {
     return "Reconnect the same Google account Florence already knows. To switch accounts, delete Google-derived data first, then connect the new account.";
   }
   if (status === "missing_permissions") {
-    return "Google gave Florence only some of the access she needs, so Florence did not save this connection. Google may still list the partial grant: open your Google Account’s third-party connections, select Florence, and remove access there. Then try again and allow both Gmail and Calendar, or choose another account where both are available.";
+    return "Google gave Florence only some of the Workspace access she needs, so Florence did not save this connection. Open your Google Account’s third-party connections, remove Florence’s partial grant, then try again and leave the requested Workspace access enabled.";
   }
   if (status === "authorization_cancelled" || status === "provider_rejected") {
     return "Google wasn’t connected. Nothing changed—try again when you’re ready.";

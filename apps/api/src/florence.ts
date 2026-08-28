@@ -90,6 +90,7 @@ import {
   type GooglePersonalCalendarCatalogRead,
   type GooglePersonalCalendarCatalogTarget,
   type GooglePersonalCalendarWindowRead,
+  type GoogleWorkspaceOperation,
 } from "@florence/google";
 import {
   type LinqClient,
@@ -105,6 +106,7 @@ import type { FlorencePublicPageClient } from "./public-page.js";
 import {
   type FlorenceBoundedPrivateGoogleEvidence,
   type FlorenceCalendarCatalogRead,
+  type FlorenceCalendarWindowRead,
   type FlorenceConversationalGmailSource,
   type FlorenceDecision,
   type FlorenceNarrowFamilyProfile,
@@ -125,6 +127,12 @@ const DEFAULT_PREFERENCES: PreferencesInput = {
   automaticFamilyCalendarEnabled: true,
   privateConflictBusySharingEnabled: false,
 };
+const GOOGLE_WORKSPACE_ACTION_SCOPES = [
+  "https://www.googleapis.com/auth/gmail.modify",
+  "https://www.googleapis.com/auth/drive",
+  "https://www.googleapis.com/auth/tasks",
+  "https://www.googleapis.com/auth/contacts",
+] as const;
 const LOOP_IDLE_MS = 250;
 const RETRY_MS = 15_000;
 const WORK_CUE_MS = 6_000;
@@ -1997,6 +2005,27 @@ export class Florence {
             runFlights: (request, signal) => flights.search(request, signal),
           }
         : {}),
+      ...(this.#google &&
+      activeGoogleConnection &&
+      turn.authority.audience === "private" &&
+      GOOGLE_WORKSPACE_ACTION_SCOPES.every((scope) => activeGoogleConnection.grantedScopes.includes(scope))
+        ? {
+            runGoogleWorkspace: async (operation: GoogleWorkspaceOperation, signal?: AbortSignal) => {
+              const result = await this.#google?.runWorkspace(
+                {
+                  householdId: turn.authority.householdId,
+                  ownerAdultId: turn.authority.senderAdultId,
+                  connectionId: activeGoogleConnection.connectionId,
+                  operation,
+                },
+                signal,
+              );
+              if (!result) throw new Error("Google Workspace is unavailable");
+              googleConnectionIdsUsed.add(activeGoogleConnection.connectionId);
+              return result;
+            },
+          }
+        : {}),
       settleSources: (sources) => {
         for (const source of sources) {
           sourceIndex.set(source.sourceId, source);
@@ -3394,6 +3423,182 @@ export class Florence {
       const publicPages = this.#publicPages;
       const weather = this.#weather;
       const flights = this.#flights;
+      const google = this.#google;
+      const familyWorkOwnerAdultId = work.ownerAdultId;
+      const familyWorkGoogleConnections =
+        google && work.visibility === "private" && familyWorkOwnerAdultId
+          ? await google.status({
+              householdId: work.household.householdId,
+              ownerAdultId: familyWorkOwnerAdultId,
+            })
+          : [];
+      const familyWorkCalendarConnection = familyWorkGoogleConnections.find(
+        (connection) => connection.status === "active",
+      );
+      const familyWorkWorkspaceConnection = familyWorkGoogleConnections.find(
+        (connection) =>
+          connection.status === "active" &&
+          GOOGLE_WORKSPACE_ACTION_SCOPES.every((scope) => connection.grantedScopes.includes(scope)),
+      );
+      const familyWorkHousehold =
+        familyWorkCalendarConnection && familyWorkOwnerAdultId
+          ? await this.#store.readHousehold({
+              householdId: work.household.householdId,
+              viewerAdultId: familyWorkOwnerAdultId,
+            })
+          : null;
+      const familyWorkCalendarRef = (calendarId: string): string => {
+        if (!familyWorkCalendarConnection) throw new Error("Google Calendar is unavailable");
+        return `calendar_${sha256(
+          `${work.workId}\0${familyWorkCalendarConnection.connectionId}\0${calendarId}`,
+        ).slice(0, 32)}`;
+      };
+      const listFamilyWorkCalendars = async (): Promise<FlorenceCalendarCatalogRead> => {
+        if (!google || !familyWorkCalendarConnection || !familyWorkOwnerAdultId) {
+          return { status: "unavailable", calendars: [], totalCalendarCount: 0 };
+        }
+        const read = await google.readPersonalCalendarCatalog({
+          householdId: work.household.householdId,
+          ownerAdultId: familyWorkOwnerAdultId,
+          connectionId: familyWorkCalendarConnection.connectionId,
+          excludedFamilyCalendarId: familyWorkHousehold?.familyCalendarId ?? null,
+        });
+        return {
+          status: read.status,
+          calendars: read.calendars.slice(0, 100).map((calendar) => ({
+            calendarRef: familyWorkCalendarRef(calendar.calendarId),
+            label: calendar.label ?? (calendar.primary ? "Primary calendar" : "Calendar"),
+            timeZone: calendar.timeZone,
+            primary: calendar.primary,
+            accessRole: calendar.accessRole,
+            eventCoverage: calendar.eventCoverage,
+          })),
+          totalCalendarCount: read.totalCalendarCount,
+        };
+      };
+      const readFamilyWorkCalendarWindow = async (input: {
+        timeMin: string;
+        timeMax: string;
+        limit: number;
+        scope: "all" | "primary" | "selected";
+        calendarRefs: readonly string[];
+      }): Promise<FlorenceCalendarWindowRead> => {
+        if (!google || !familyWorkCalendarConnection || !familyWorkOwnerAdultId) {
+          return {
+            status: "unavailable",
+            calendars: [],
+            totalCalendarCount: 0,
+            events: [],
+            totalEventCount: 0,
+          };
+        }
+        let calendarIds: readonly string[] | undefined;
+        if (input.scope === "selected") {
+          const catalog = await google.readPersonalCalendarCatalog({
+            householdId: work.household.householdId,
+            ownerAdultId: familyWorkOwnerAdultId,
+            connectionId: familyWorkCalendarConnection.connectionId,
+            excludedFamilyCalendarId: familyWorkHousehold?.familyCalendarId ?? null,
+          });
+          const idsByRef = new Map(
+            catalog.calendars.map((calendar) => [
+              familyWorkCalendarRef(calendar.calendarId),
+              calendar.calendarId,
+            ]),
+          );
+          const resolved = input.calendarRefs.flatMap((calendarRef) => {
+            const calendarId = idsByRef.get(calendarRef);
+            return calendarId ? [calendarId] : [];
+          });
+          if (resolved.length !== input.calendarRefs.length) {
+            return {
+              status: "unavailable",
+              calendars: [],
+              totalCalendarCount: 0,
+              events: [],
+              totalEventCount: 0,
+            };
+          }
+          calendarIds = resolved;
+        } else if (input.scope === "primary") {
+          const catalog = await google.readPersonalCalendarCatalog({
+            householdId: work.household.householdId,
+            ownerAdultId: familyWorkOwnerAdultId,
+            connectionId: familyWorkCalendarConnection.connectionId,
+            excludedFamilyCalendarId: familyWorkHousehold?.familyCalendarId ?? null,
+          });
+          const primary = catalog.calendars.find((calendar) => calendar.primary);
+          if (!primary) {
+            return {
+              status: "unavailable",
+              calendars: [],
+              totalCalendarCount: 0,
+              events: [],
+              totalEventCount: 0,
+            };
+          }
+          calendarIds = [primary.calendarId];
+        }
+        const read = await google.readPersonalCalendarWindow({
+          householdId: work.household.householdId,
+          ownerAdultId: familyWorkOwnerAdultId,
+          connectionId: familyWorkCalendarConnection.connectionId,
+          excludedFamilyCalendarId: familyWorkHousehold?.familyCalendarId ?? null,
+          timeMin: input.timeMin,
+          timeMax: input.timeMax,
+          ...(calendarIds === undefined ? {} : { calendarIds }),
+          limit: input.limit,
+        });
+        const labels = new Map(read.calendars.map((calendar) => [calendar.calendarId, calendar.label]));
+        const eventRef = (event: GooglePersonalCalendarWindowRead["events"][number]): string =>
+          `event_${sha256(
+            `${work.workId}\0${familyWorkCalendarConnection.connectionId}\0${event.calendarId}\0${event.providerEventId}\0${event.providerRevision}`,
+          ).slice(0, 32)}`;
+        return {
+          status: read.status,
+          calendars: read.calendars.slice(0, 100).map((calendar) => ({
+            calendarRef: familyWorkCalendarRef(calendar.calendarId),
+            label: calendar.label,
+            timeZone: calendar.timeZone,
+            primary: calendar.status === "missing" ? null : calendar.primary,
+            accessRole: calendar.accessRole,
+            status: calendar.status,
+            eventCount: calendar.eventCount,
+          })),
+          totalCalendarCount: read.totalCalendarCount,
+          totalEventCount: read.totalEventCount,
+          events: read.events.map((event) =>
+            event.intervalKind === "all_day"
+              ? {
+                  intervalKind: event.intervalKind,
+                  calendarRef: familyWorkCalendarRef(event.calendarId),
+                  calendarLabel: labels.get(event.calendarId) ?? null,
+                  eventRef: eventRef(event),
+                  title: event.title,
+                  startDate: event.startDate,
+                  endDate: event.endDate,
+                  providerUpdatedAt: event.providerUpdatedAt,
+                  status: event.status,
+                  busy: event.busy,
+                  location: event.location,
+                }
+              : {
+                  intervalKind: event.intervalKind,
+                  calendarRef: familyWorkCalendarRef(event.calendarId),
+                  calendarLabel: labels.get(event.calendarId) ?? null,
+                  eventRef: eventRef(event),
+                  title: event.title,
+                  startsAt: event.startsAt,
+                  endsAt: event.endsAt,
+                  providerUpdatedAt: event.providerUpdatedAt,
+                  status: event.status,
+                  busy: event.busy,
+                  timeZone: event.timeZone,
+                  location: event.location,
+                },
+          ),
+        };
+      };
       const step = await reasoner.continueFamilyWork(
         {
           workId: work.workId,
@@ -3411,6 +3616,26 @@ export class Florence {
           ...(maps ? { runMaps: (request, taskSignal) => maps.run(request, taskSignal) } : {}),
           ...(weather ? { runWeather: (request, taskSignal) => weather.run(request, taskSignal) } : {}),
           ...(flights ? { runFlights: (request, taskSignal) => flights.search(request, taskSignal) } : {}),
+          ...(familyWorkCalendarConnection && familyWorkOwnerAdultId
+            ? {
+                listCalendars: listFamilyWorkCalendars,
+                readCalendarWindow: readFamilyWorkCalendarWindow,
+              }
+            : {}),
+          ...(google && familyWorkWorkspaceConnection && familyWorkOwnerAdultId
+            ? {
+                runGoogleWorkspace: (operation: GoogleWorkspaceOperation, taskSignal?: AbortSignal) =>
+                  google.runWorkspace(
+                    {
+                      householdId: work.household.householdId,
+                      ownerAdultId: familyWorkOwnerAdultId,
+                      connectionId: familyWorkWorkspaceConnection.connectionId,
+                      operation,
+                    },
+                    taskSignal,
+                  ),
+              }
+            : {}),
         },
         signal,
       );
@@ -4664,6 +4889,9 @@ function workspace(
                   emailLabel: connection.emailLabel,
                   historyReviewReady: connection.grantedScopes.includes(
                     "https://www.googleapis.com/auth/calendar.events.readonly",
+                  ),
+                  assistantWorkReady: GOOGLE_WORKSPACE_ACTION_SCOPES.every((scope) =>
+                    connection.grantedScopes.includes(scope),
                   ),
                   lastError: connection.lastError,
                 },

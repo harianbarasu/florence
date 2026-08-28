@@ -391,6 +391,16 @@ const reminderScheduleSchema = z.discriminatedUnion("kind", [
     .strict(),
 ]);
 
+export const florenceHouseholdSafeCandidateSchema = z
+  .object({
+    category: z.enum(["deadline", "conflict", "handoff", "family_date", "loose_end"]),
+    summary: z.string().trim().min(1).max(1_000),
+    urgency: z.enum(["now", "soon", "watch"]),
+    dueAt: timestamp.nullable(),
+    needsAnswer: z.boolean(),
+  })
+  .strict();
+
 export const florenceReasonerInputSchema = z
   .object({
     household: z
@@ -446,6 +456,14 @@ export const florenceReasonerInputSchema = z
           .strict(),
       )
       .max(20),
+    householdDocket: z
+      .object({
+        totalItems: z.number().int().min(0).max(10_000),
+        items: z
+          .array(florenceHouseholdSafeCandidateSchema.extend({ candidateId: opaqueId }).strict())
+          .max(20),
+      })
+      .strict(),
     visibleReminders: z
       .array(
         z
@@ -754,6 +772,7 @@ export const florenceDecisionSchema = z
     followUp: followUpDecisionSchema.nullable(),
     reminder: reminderDecisionSchema.nullable(),
     familyWork: familyWorkDecisionSchema.nullable(),
+    docketCompletions: z.array(opaqueId).max(20).nullable(),
     interest: florenceDurableInterestDecisionSchema.nullable().optional(),
     calendar: calendarDecisionSchema.nullable(),
     householdUpdate: z
@@ -866,16 +885,6 @@ export const florenceNarrowFamilyProfileSchema = z
       )
       .max(12),
     postalCode: z.string().trim().min(1).max(32).nullable(),
-  })
-  .strict();
-
-export const florenceHouseholdSafeCandidateSchema = z
-  .object({
-    category: z.enum(["deadline", "conflict", "handoff", "family_date", "loose_end"]),
-    summary: z.string().trim().min(1).max(1_000),
-    urgency: z.enum(["now", "soon", "watch"]),
-    dueAt: timestamp.nullable(),
-    needsAnswer: z.boolean(),
   })
   .strict();
 
@@ -1082,7 +1091,7 @@ export const florenceHouseholdBriefingInputSchema = z
     familyProfile: florenceNarrowFamilyProfileSchema,
     candidates: z
       .array(florenceHouseholdSafeCandidateSchema.extend({ candidateId: opaqueId }).strict())
-      .max(12),
+      .max(100),
   })
   .strict();
 
@@ -1099,7 +1108,7 @@ export const florenceHouseholdBriefingDecisionSchema = z
       )
       .min(1)
       .max(3),
-    selectedCandidateIds: z.array(opaqueId).max(12),
+    selectedCandidateIds: z.array(opaqueId).max(3),
   })
   .strict();
 
@@ -1527,7 +1536,7 @@ Linq does not provide a trustworthy forwarded-or-pasted marker for the ordinary 
 
 Use currentMessage.replyTo as the exact message the parent replied to when it is present. Use current-message images and PDFs directly when attached. An attached PDF's documentId is its source ID. Use read tools naturally when the answer depends on family memory or available Google context. A Gmail search reports whether its result page, body, and attachment list are complete; never turn a truncated result into an all-clear. When a returned PDF or image attachment could answer the question or change the conclusion, open it in this turn instead of guessing from its filename. Gmail and each adult's personal Calendars are private to their owner and never available in a group turn. In a private turn, Calendar scope "all" means every readable personal Calendar except Florence's Family Calendar; use list_calendars before scope "selected" so you can resolve a named Calendar through its app-scoped reference. The Florence-created family Calendar is household-shared and is the only Google context available in the family group. Never expose an adult_private source in the group. Calendar results name exact coverage; never claim nothing exists, everything is clear, or availability is known from a truncated, partial, or unavailable result. Calendar window results are ephemeral scheduling context: never cite them as sources or turn their contents into memory. Every fact change, finite-monitor decision, interest-discovery decision, and Calendar decision must cite source IDs you actually received.
 
-For a parent document or photo, use judgment before extraction. Lead with the one or two deadlines, conflicts, or decisions that deserve attention; do not dump every date or detail. Distinguish action-needed items, useful dates, stable logistics that may matter later, and one-offs that should remain temporary. When a Calendar connection is available, read it around every useful date before describing availability or a conflict—the adult's personal Calendar in private, or the family Calendar in the group. Mention only meaningful conflicts or uncertainty, never an unrelated event dump. Ask at most one blocking question across the whole turn.
+For a parent document or photo, use judgment before extraction. Lead with the one or two deadlines, conflicts, or decisions that deserve attention; do not dump every date or detail. For each actionable item, preserve the actual outcome, explicit owner or unresolved owner, explicit due date or unresolved date, dependency, acceptance condition, risk, and page or section citation. Preserve modality: may, should, and must are different. Never invent a missing owner, date, dependency, or completion condition. Distinguish action-needed items, useful dates, stable logistics that may matter later, and one-offs that should remain temporary. When a Calendar connection is available, read it around every useful date before describing availability or a conflict—the adult's personal Calendar in private, or the family Calendar in the group. Mention only meaningful conflicts or uncertainty, never an unrelated event dump. Ask at most one blocking question across the whole turn.
 
 The research_public_web tool searches current public information from a concise task-specific query you write. Use it when the request depends on current facts, resolving an identifier, comparing options, or checking status. Include the useful public names, places, dates, identifiers, and constraints already available in the turn instead of requiring the parent to repeat them. The read_public_page tool opens the full clean text of any exact public HTML page or PDF relevant to the task; use it when the parent asks you to read a link, search identifies a promising source, or the exact public URL can be derived from the task and reading it is useful. Search before asking for context the public web can recover; ask at most one focused question only for a consequential constraint that remains genuinely missing after the useful lookup. A flight number is one example of a public identifier, not a special intent. Do the lookup or page read in this turn and report the result or an honest blocker. Never say you will look, prioritize, research, check, or follow up later unless this decision actually creates durable follow-up or familyWork.
 
@@ -1556,6 +1565,8 @@ Before returning a create, read a family-Calendar window that completely covers 
 Facts may be remembered or corrected only when policy.retain is true. Forgetting an existing fact is allowed when retain is false. A reminder, finite monitor, durable family task, durable interest discovery, Calendar offer, or direct Calendar decision may be created only when policy.schedule is true. Never claim that an external message, purchase, booking, or unsupported consequential action happened.
 
 The familyWork field is for a real multi-step task that should keep going after this reply: for example resolving a delayed flight, comparing live alternatives, route time, and weather, or another task that cannot be usefully completed in the ordinary foreground turn. It is not a generic promise, a reminder, a finite evidence monitor, or a substitute for answering a normal question now. Create it when the parent explicitly asks Florence to keep working or when completing the request genuinely needs multiple tool checkpoints. Return one immediate natural acknowledgement bubble that names the work Florence is actually starting; a brief reaction is welcome when it feels natural, but never use it instead of the acknowledgement. Never say the work is complete at acceptance. The current background catalog includes public research, maps, weather, and flight tools and will grow with Florence's other real capabilities; use what is actually available and report a real result, one blocking question, or an honest failure.
+
+householdDocket is the ranked household-safe backlog retained from the complete Google review. Treat it as current structured context, not a reason to volunteer every item. When a parent asks what is on the docket, what needs attention, or what the family is waiting on, reconcile it with visible reminders, active or waiting family work, pending follow-ups, pending Calendar offers, and a near-term family-Calendar read when timing could change the answer. Rank by consequence and time, not source or message count. Lead with at most three unfinished items. For each, say naturally what it is, why it matters now, and the next decision or action without inventing facts beyond the supplied summary, category, dueAt, and needsAnswer. If householdDocket.totalItems exceeds what you show, say how many lower-priority items remain instead of dumping them. Do not treat silence from another person as completion, and do not repeat an unchanged docket item unsolicited merely because it is still present. When the parent clearly says a supplied docket item is handled, finished, cancelled, or no longer relevant, put exactly that candidateId in docketCompletions and acknowledge it naturally. A reply or unambiguous recent referent may identify the item; if more than one supplied item plausibly matches, ask one focused question and return docketCompletions null. Return docketCompletions null when nothing was completed. Never infer completion from thanks, agreement, silence, or a reaction.
 
 Use visibleFamilyWork to answer status questions naturally and to resolve steering or cancellation. Steer only one supplied active or waiting workId when the current Message clearly adds or changes a constraint for that task; carry the parent's meaning faithfully in the concise instruction. Cancel only one supplied active, waiting, or delivering workId when the parent clearly wants that work stopped. A reply or an unambiguous recent referent can resolve “that”; if two tasks plausibly match, ask one focused question and return no familyWork mutation. An unrelated family Message must leave every task untouched. Never expose work IDs, phases, generations, claims, or other machinery in conversation.
 
@@ -1601,7 +1612,7 @@ The application, not you, owns coverage and pagination. You receive at most ten 
 
 Family relevance is strict. Eligible material must directly concern a child's care, school, or activity; household logistics, schedule, commitment, deadline, handoff, or concrete errand; or coordination between the enrolled adults. Adult-only work, finance, account security, passwords, receipts without a family action, marketing, newsletters, and personal administration are adult_only and must be dismissed. Never return adult_only as a finding or fact.
 
-Each finding is one distinct actionable thread. actionAnchor is required: copy one short, case-preserving contiguous span from a cited Gmail subject/body/attachment filename or Calendar title that uniquely identifies this action within that provider item. Two actions from one Gmail source must use different anchors. A Calendar event is one event lifecycle and may support at most one finding in this decision; do not split one Calendar event into several reminders or findings. Do not paraphrase the anchor; Florence hashes it for durable idempotency and does not retain the extra text. privateSummary is concise owner-private wording. urgency and dueAt describe owner-private importance independently of whether anything is safe or useful to share. Set surfaceNow true only for a current or high-priority item that deserves attention when the complete review finishes. A lower-priority unresolved item must set surfaceNow false and include a finite monitor with a concrete end condition and future nextCheck so it remains durable rather than disappearing. candidate is a minimal household-safe conclusion and is allowed only when surfaceNow is true and coordination by the other parent is useful. Never include Gmail sender, subject, quoted prose, attachment detail, source IDs, or unrelated personal Calendar titles in a candidate.
+Each finding is one distinct actionable thread. actionAnchor is required: copy one short, case-preserving contiguous span from a cited Gmail subject/body/attachment filename or Calendar title that uniquely identifies this action within that provider item. Two actions from one Gmail source must use different anchors. A Calendar event is one event lifecycle and may support at most one finding in this decision; do not split one Calendar event into several reminders or findings. Do not paraphrase the anchor; Florence hashes it for durable idempotency and does not retain the extra text. privateSummary is concise owner-private wording. urgency and dueAt describe owner-private importance independently of whether anything is safe or useful to share. Set surfaceNow true only for a current or high-priority item that deserves attention when the complete review finishes. A lower-priority household-safe item may set surfaceNow false and still return candidate so it remains available on the household docket without generating another message. Use a finite monitor only when Florence genuinely needs to reread evidence at a proportionate future time against a concrete end condition; never create a timer merely to guarantee that a deferred scan item gets announced. A private-only lower-priority item with no real monitor, Calendar proposal, or present need may remain unsurfaced. candidate is a minimal household-safe conclusion whenever coordination by the other parent is useful, independent of surfaceNow. Never include Gmail sender, subject, quoted prose, attachment detail, source IDs, or unrelated personal Calendar titles in a candidate.
 
 Personal Calendar evidence remains owner-private. It may create a title-free conflict candidate only for an actual busy family conflict. A clearly shared family date may include a familyCalendar suggestion that cites exactly that Calendar source, copies its exact title and interval, sets location null, leaves candidate null, and leaves monitor null; the application will privately ask the owner before copying or describing it in the family group. Other personal Calendar evidence cannot create a familyCalendar proposal. Gmail may propose a clear official family date, automatic only when unambiguous and otherwise suggest. Any familyCalendar proposal is the finding's one durable resolution path and must not be paired with a finite monitor.
 
@@ -1611,9 +1622,9 @@ currentTime is absolute. Resolve dates in familyProfile.timeZone. Cite only supp
 
 const HOUSEHOLD_BRIEFING_INSTRUCTIONS = `You are Florence speaking in the family's primary iMessage group after separately reviewing each parent's private Google account.
 
-You receive only a narrow shared family profile and household-safe candidate conclusions. You have no tools and no access to source IDs, email metadata or text, attachment contents, Calendar titles, or either parent's private prose. Never invent or request those details. Select every supplied candidate ID exactly once. Concise wording may not omit a distinct candidate.
+You receive only a narrow shared family profile and already ranked household-safe candidate conclusions. You have no tools and no access to source IDs, email metadata or text, attachment contents, Calendar titles, or either parent's private prose. Never invent or request those details. Select the first three supplied candidate IDs, or all of them when fewer than three are supplied. State how many lower-priority candidates remain rather than announcing them all.
 
-Write one to three short, warm iMessage bubbles as a capable household chief of staff, not a report or workflow engine. If there are no consequential household candidates, say only that you do not have a household item to flag right now; do not imply that every private item was readable or irrelevant. Otherwise account for every candidate once. Do not propose or perform Calendar writes, create facts, create monitors, schedule follow-ups, or claim that an external action happened.
+Write one to three short, warm iMessage bubbles as a capable household chief of staff, not a report or workflow engine. If there are no consequential household candidates, say only that you do not have a household item to flag right now; do not imply that every private item was readable or irrelevant. Otherwise account for each selected candidate once. Do not propose or perform Calendar writes, create facts, create monitors, schedule follow-ups, or claim that an external action happened.
 
 Unless one genuinely blocking question is needed, end the final bubble with this exact sentence: "Did I get that right? If I missed something, tell me here." If a blocking question is needed, ask only that one question instead. Output only the strict decision schema.`;
 
@@ -2591,6 +2602,7 @@ function familyWorkReasonerInput(input: FlorenceFamilyWorkInput): FlorenceReason
     recentMessages: [],
     visibleSources: [],
     pendingFollowUps: [],
+    householdDocket: { totalItems: 0, items: [] },
     visibleReminders: [],
     visibleFamilyWork: [],
     visibleInterests: [],
@@ -3080,8 +3092,12 @@ export class FlorenceReasoner {
       if (selected.some((candidateId) => !available.has(candidateId))) {
         throw invalidOutput("OpenAI selected an unavailable household candidate");
       }
-      if (selected.length !== available.size) {
-        throw invalidOutput("OpenAI omitted a household briefing candidate");
+      const expected = input.candidates.slice(0, 3).map((candidate) => candidate.candidateId);
+      if (
+        selected.length !== expected.length ||
+        selected.some((candidateId, index) => candidateId !== expected[index])
+      ) {
+        throw invalidOutput("OpenAI did not select the ranked household briefing candidates");
       }
       return response.output_parsed;
     } catch (error) {
@@ -4212,15 +4228,6 @@ function validatePrivateGoogleBatch(
       throw invalidOutput("A private Google batch repeated an actionable thread");
     }
     distinctFindings.add(identity);
-    if (!finding.surfaceNow && !finding.monitor) {
-      throw invalidOutput("A deferred Google action needs a durable finite monitor");
-    }
-    if (!finding.surfaceNow && finding.candidate) {
-      throw invalidOutput("A deferred Google action cannot enter the immediate household briefing");
-    }
-    if (!finding.surfaceNow && finding.familyCalendar) {
-      throw invalidOutput("A deferred Google action cannot stage a Calendar side effect");
-    }
     if (finding.monitor && Date.parse(finding.monitor.nextCheck) <= now) {
       throw invalidOutput("A Google batch monitor needs a future next check");
     }
@@ -5015,6 +5022,7 @@ function validateDecision(
   const interest = decision.interest ?? null;
   const webAccessPath = decision.webAccessPath ?? null;
   const researchUrls = decision.researchUrls ?? [];
+  const docketCompletions = decision.docketCompletions ?? [];
   const hasVisibleApplicationOutcome =
     decision.householdUpdate !== null ||
     decision.calendar !== null ||
@@ -5024,6 +5032,14 @@ function validateDecision(
     researchUrls.length > 0;
   if (decision.policy.stopMessaging) {
     throw invalidOutput("Only the application may handle an exact carrier channel opt-out");
+  }
+  if (
+    new Set(docketCompletions).size !== docketCompletions.length ||
+    docketCompletions.some(
+      (candidateId) => !input.householdDocket.items.some((item) => item.candidateId === candidateId),
+    )
+  ) {
+    throw invalidOutput("OpenAI completed an unavailable or repeated household docket item");
   }
   if (
     input.currentMessage.moveKind !== "reaction" &&
@@ -5068,6 +5084,7 @@ function validateDecision(
       decision.followUp !== null ||
       decision.reminder !== null ||
       decision.familyWork !== null ||
+      docketCompletions.length > 0 ||
       interest !== null ||
       decision.calendar !== null ||
       decision.householdUpdate !== null ||
@@ -5085,6 +5102,7 @@ function validateDecision(
       decision.followUp !== null ||
       decision.reminder !== null ||
       decision.familyWork !== null ||
+      docketCompletions.length > 0 ||
       interest !== null ||
       decision.calendar !== null ||
       decision.householdUpdate !== null ||
@@ -5092,7 +5110,7 @@ function validateDecision(
       researchUrls.length > 0)
   ) {
     throw invalidOutput(
-      "A reaction cannot change policy, memory, finite monitors, interests, household updates, Calendar state, or web research",
+      "A reaction cannot change policy, memory, docket items, finite monitors, interests, household updates, Calendar state, or web research",
     );
   }
   if (

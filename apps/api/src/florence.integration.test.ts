@@ -33,7 +33,12 @@ import { buildApp, createSessionCallerResolver } from "./app.js";
 import { EnrollmentCodes } from "./enrollment.js";
 import { Florence } from "./florence.js";
 import { createLinqIngress } from "./linq-ingress.js";
-import { type FlorenceDecision, FlorenceReasoner, FlorenceReasonerError } from "./reasoner.js";
+import {
+  type FlorenceDecision,
+  FlorenceReasoner,
+  FlorenceReasonerError,
+  type FlorenceReasonerInput,
+} from "./reasoner.js";
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
 const NOW = Date.parse("2026-08-16T18:00:00.000Z");
@@ -200,12 +205,16 @@ const UNRELATED_ACCOUNT_MONITOR_OBJECTIVE =
 const UNRELATED_ACCOUNT_FACT_SLOT = "adult:retail_account_security";
 const UNRELATED_ACCOUNT_FACT = "The retail account password changed.";
 const PRIVATE_INITIAL_ONLY_FINDING = "The school office contact stays private to this parent.";
-const DISTINCT_CANDIDATE_SHARED_SUMMARY = "Maya’s school item needs family attention.";
-const SHARED_DUPLICATE_CONFLICT_SUMMARY = DISTINCT_CANDIDATE_SHARED_SUMMARY;
-const FOUNDER_FORM_SUMMARY = DISTINCT_CANDIDATE_SHARED_SUMMARY;
-const PARTNER_PERMISSION_SUMMARY = DISTINCT_CANDIDATE_SHARED_SUMMARY;
+const SHARED_DUPLICATE_CONFLICT_SUMMARY = "Fall activity registration needs a family decision.";
+const PARTNER_DUPLICATE_CONFLICT_SUMMARY = "The family still needs to decide on fall registration.";
+const FOUNDER_FORM_SUMMARY = "Maya’s field-trip form still needs a parent response.";
+const PARTNER_PERMISSION_SUMMARY = "Maya’s permission-slip deadline still needs family attention.";
 const FAMILY_MEETING_SUMMARY = "The family meeting is Tuesday at 8:00 PM.";
 const SCHOOL_HANDOFF_SUMMARY = "Friday’s school pickup handoff still needs an owner.";
+const HOUSEHOLD_DOCKET_REQUEST = "What’s on the docket?";
+const HOUSEHOLD_DOCKET_REPLY = "The three most time-sensitive family items are at the top.";
+const HOUSEHOLD_DOCKET_HANDLED = "The permission slip is handled.";
+const HOUSEHOLD_DOCKET_HANDLED_ACK = "Got it—I took the permission slip off the docket.";
 
 const AUTOMATIC_FAMILY_DATE = {
   intervalKind: "all_day" as const,
@@ -1920,6 +1929,9 @@ release("Florence parent journeys", () => {
     let conversationalGoogleSourceId: string | null = null;
     let retainedGoogleMemorySourceId: string | null = null;
     let groupHouseholdFactWasVisible = false;
+    const observedHouseholdDocket: {
+      value: FlorenceReasonerInput["householdDocket"] | null;
+    } = { value: null };
     const publicResearchCapture: {
       mainRequest: Record<string, unknown> | null;
       publicRequests: Record<string, unknown>[];
@@ -2065,6 +2077,20 @@ release("Florence parent journeys", () => {
       pdfBytes: null,
     };
     const harness = await createHarness(async (input, reads, signal, hooks) => {
+      if (input.currentMessage.text === HOUSEHOLD_DOCKET_REQUEST) {
+        observedHouseholdDocket.value = input.householdDocket;
+        return decision({ bubbles: [{ text: HOUSEHOLD_DOCKET_REPLY, delayMs: 0 }] });
+      }
+      if (input.currentMessage.text === HOUSEHOLD_DOCKET_HANDLED) {
+        const candidate = input.householdDocket.items.find(
+          (item) => item.summary === PARTNER_PERMISSION_SUMMARY,
+        );
+        if (!candidate) throw new Error("The handled docket item was not supplied to the reasoner");
+        return decision({
+          bubbles: [{ text: HOUSEHOLD_DOCKET_HANDLED_ACK, delayMs: 0 }],
+          docketCompletions: [candidate.candidateId],
+        });
+      }
       if (
         input.currentMessage.text === PUBLIC_RESEARCH_REQUEST ||
         input.currentMessage.text === PUBLIC_NO_RESULT_REQUEST ||
@@ -2250,14 +2276,19 @@ release("Florence parent journeys", () => {
     if (incompleteWork?.kind !== "initial_household_briefing") {
       throw new Error("The complete private reviews did not produce household briefing work");
     }
-    expect(incompleteWork.candidates).toHaveLength(5);
+    expect(incompleteWork.candidates).toHaveLength(6);
     expect(incompleteWork.candidates.length).toBeGreaterThan(3);
-    expect(
-      incompleteWork.candidates.filter(
-        (candidate) =>
-          candidate.category === "conflict" && candidate.summary === SHARED_DUPLICATE_CONFLICT_SUMMARY,
-      ),
-    ).toHaveLength(1);
+    expect(incompleteWork.candidates.filter((candidate) => candidate.category === "conflict")).toHaveLength(
+      2,
+    );
+    expect(incompleteWork.candidates.map((candidate) => candidate.category)).toEqual([
+      "deadline",
+      "loose_end",
+      "conflict",
+      "conflict",
+      "handoff",
+      "family_date",
+    ]);
     const incompleteCandidate = incompleteWork.candidates[0];
     if (!incompleteCandidate) throw new Error("The incomplete briefing regression needs one candidate");
     await expect(
@@ -2273,16 +2304,24 @@ release("Florence parent journeys", () => {
         ],
         occurredAt: harness.iso(),
       }),
-    ).rejects.toThrow(/omitted or added a distinct finding/i);
+    ).rejects.toThrow(/ranked current docket/i);
+    const wrongRankedCandidates = incompleteWork.candidates.slice(-3);
     await expect(
       harness.store.completeHouseholdInitialBriefing({
         workId: incompleteWork.workId,
-        selectedCandidateIds: incompleteWork.candidates.map((candidate) => candidate.candidateId),
+        selectedCandidateIds: wrongRankedCandidates.map((candidate) => candidate.candidateId),
         familyCalendarCursor: "{}",
-        bubbles: [{ text: HOUSEHOLD_INITIAL_ALL_CLEAR, delayMs: 0 }],
+        bubbles: [
+          {
+            text: `Here’s what’s on the docket:\n${wrongRankedCandidates
+              .map((candidate) => `• ${candidate.summary}`)
+              .join("\n")}\n\nDid I get that right? If I missed something, tell me here.`,
+            delayMs: 0,
+          },
+        ],
         occurredAt: harness.iso(),
       }),
-    ).rejects.toThrow(/omitted or added a distinct finding/i);
+    ).rejects.toThrow(/ranked current docket/i);
     await harness.assertDatabase(
       "An incomplete household docket advanced work, sent an all-clear, or started polling",
       `not exists (
@@ -2294,34 +2333,21 @@ release("Florence parent journeys", () => {
         where id=${sqlLiteral(incompleteWork.workId)}::uuid and status='active'
       )`,
     );
-    const conflictIndex = incompleteWork.candidates.findIndex(
-      (candidate) => candidate.category === "conflict",
-    );
-    const secondParentIndex = incompleteWork.candidates.findIndex(
-      (candidate, index) => index > conflictIndex && candidate.summary === DISTINCT_CANDIDATE_SHARED_SUMMARY,
-    );
-    if (conflictIndex < 1 || secondParentIndex <= conflictIndex) {
-      throw new Error("The briefing metadata regression needs three ordered summary occurrences");
-    }
-    const briefingCandidateSlices = [
-      incompleteWork.candidates.slice(0, conflictIndex),
-      incompleteWork.candidates.slice(conflictIndex, secondParentIndex),
-      incompleteWork.candidates.slice(secondParentIndex),
-    ];
+    const rankedCandidates = incompleteWork.candidates.slice(0, 3);
     await harness.store.completeHouseholdInitialBriefing({
       workId: incompleteWork.workId,
-      selectedCandidateIds: incompleteWork.candidates.map((candidate) => candidate.candidateId),
+      selectedCandidateIds: rankedCandidates.map((candidate) => candidate.candidateId),
       familyCalendarCursor: "{}",
-      bubbles: briefingCandidateSlices.map((candidates, index) => ({
-        text: `${index === 0 ? "Here’s what’s on the docket:" : "And:"}\n${candidates
-          .map((candidate) => `• ${candidate.summary}`)
-          .join("\n")}${
-          index === briefingCandidateSlices.length - 1
-            ? "\n\nDid I get that right? If I missed something, tell me here."
-            : ""
-        }`,
-        delayMs: 0,
-      })),
+      bubbles: [
+        {
+          text: `Here’s what’s on the docket:\n${rankedCandidates
+            .map((candidate) => `• ${candidate.summary}`)
+            .join(
+              "\n",
+            )}\n\nI kept 3 lower-priority items on the docket too. Ask me anytime.\n\nDid I get that right? If I missed something, tell me here.`,
+          delayMs: 0,
+        },
+      ],
       occurredAt: harness.iso(),
     });
     await harness.drain();
@@ -2331,12 +2357,15 @@ release("Florence parent journeys", () => {
         message.providerConversationId === FAMILY_GROUP &&
         message.idempotencyKey.startsWith("initial-household-briefing:"),
     );
-    expect(briefingMessages).toHaveLength(3);
+    expect(briefingMessages).toHaveLength(1);
     const briefing = briefingMessages.map((message) => message.text).join("\n");
-    expect(briefing.split(DISTINCT_CANDIDATE_SHARED_SUMMARY)).toHaveLength(4);
-    for (const summary of [SCHOOL_HANDOFF_SUMMARY, FAMILY_MEETING_SUMMARY]) {
+    for (const summary of rankedCandidates.map((candidate) => candidate.summary)) {
       expect(briefing.split(summary)).toHaveLength(2);
     }
+    for (const summary of [SCHOOL_HANDOFF_SUMMARY, FAMILY_MEETING_SUMMARY]) {
+      expect(briefing).not.toContain(summary);
+    }
+    expect(briefing).toContain("I kept 3 lower-priority items on the docket too. Ask me anytime.");
     expect(briefing).toContain("Did I get that right? If I missed something, tell me here.");
     expect(briefing).not.toMatch(/@example\.com|private calendar detail/i);
     expect(briefing).not.toContain(PRIVATE_INITIAL_ONLY_FINDING);
@@ -2359,34 +2388,55 @@ release("Florence parent journeys", () => {
       ),
     ).toBe(false);
     await harness.assertDatabase(
-      "Identical briefing text crossed candidate metadata boundaries",
+      "The ranked household briefing lost its selected Google evidence metadata",
       `exists (
-        select 1
-        from messages first_message join sources first_source on first_source.id=first_message.source_id
-        join messages middle_message on middle_message.turn_id=first_message.turn_id
-          and middle_message.turn_part=1
-        join sources middle_source on middle_source.id=middle_message.source_id
-        join messages last_message on last_message.turn_id=first_message.turn_id
-          and last_message.turn_part=2
-        join sources last_source on last_source.id=last_message.source_id
-        where first_message.idempotency_key like 'initial-household-briefing:%'
-          and first_message.turn_part=0
-          and first_source.metadata->'privateConflictOwnerAdultIds' is null
-          and last_source.metadata->'privateConflictOwnerAdultIds' is null
-          and middle_source.metadata->'privateConflictOwnerAdultIds'
-            @> ${sqlLiteral(JSON.stringify([harness.founderAdultId, harness.partnerAdultId]))}::jsonb
-          and not exists (
-            select 1
-            from jsonb_array_elements_text(first_source.metadata->'googleSourceIds') first_id(value)
-            join jsonb_array_elements_text(last_source.metadata->'googleSourceIds') last_id(value)
-              on last_id.value=first_id.value
-          )
-          and not exists (
-            select 1
-            from jsonb_array_elements_text(first_source.metadata->'googleActionKeys') first_key(value)
-            join jsonb_array_elements_text(last_source.metadata->'googleActionKeys') last_key(value)
-              on last_key.value=first_key.value
-          )
+        select 1 from messages message join sources source on source.id=message.source_id
+        where message.idempotency_key like 'initial-household-briefing:%'
+          and source.metadata->'privateConflictOwnerAdultIds'
+            is not null
+          and jsonb_array_length(source.metadata->'privateConflictOwnerAdultIds')=1
+          and jsonb_array_length(source.metadata->'googleSourceIds')>=1
+          and jsonb_array_length(source.metadata->'googleActionKeys')>=3
+      )`,
+    );
+
+    const retainedDocket = await harness.store.readHouseholdDocket({
+      householdId: incompleteWork.household.householdId,
+      limit: 20,
+      now: harness.iso(),
+    });
+    expect(retainedDocket.totalItems).toBe(6);
+    expect(retainedDocket.items).toHaveLength(6);
+    await harness.accept("group", "household-docket", HOUSEHOLD_DOCKET_REQUEST, "partner");
+    await harness.drain();
+    expect(observedHouseholdDocket.value?.totalItems).toBe(6);
+    expect(observedHouseholdDocket.value?.items).toHaveLength(6);
+    expect(observedHouseholdDocket.value?.items.slice(0, 3).map((candidate) => candidate.category)).toEqual([
+      "deadline",
+      "loose_end",
+      "conflict",
+    ]);
+    expect(harness.linq.messages.some((message) => message.text === HOUSEHOLD_DOCKET_REPLY)).toBe(true);
+    await harness.accept("group", "household-docket-handled", HOUSEHOLD_DOCKET_HANDLED, "partner");
+    await harness.drain();
+    expect(harness.linq.messages.some((message) => message.text === HOUSEHOLD_DOCKET_HANDLED_ACK)).toBe(true);
+    const docketAfterCompletion = await harness.store.readHouseholdDocket({
+      householdId: incompleteWork.household.householdId,
+      limit: 20,
+      now: harness.iso(),
+    });
+    expect(docketAfterCompletion.totalItems).toBe(5);
+    expect(docketAfterCompletion.items.map((candidate) => candidate.summary)).not.toContain(
+      PARTNER_PERMISSION_SUMMARY,
+    );
+    expect(docketAfterCompletion.items.map((candidate) => candidate.summary)).toContain(FOUNDER_FORM_SUMMARY);
+    await harness.assertDatabase(
+      "The handled docket item did not retain its durable Google action identity",
+      `exists (
+        select 1 from messages message join sources source on source.id=message.source_id
+        where message.provider_message_id='message-household-docket-handled'
+          and jsonb_typeof(source.metadata->'completedGoogleActionKeys')='array'
+          and jsonb_array_length(source.metadata->'completedGoogleActionKeys')>=1
       )`,
     );
 
@@ -2395,7 +2445,7 @@ release("Florence parent journeys", () => {
       expect.arrayContaining([
         expect.objectContaining({
           kind: "monitor",
-          currentConclusion: PRIVATE_INITIAL_ONLY_FINDING,
+          currentConclusion: "The form still needs a parent signature.",
           status: "active",
           visibility: "private",
         }),
@@ -2407,6 +2457,11 @@ release("Florence parent journeys", () => {
         }),
       ]),
     );
+    expect(
+      founderAfterInitialReview.vault?.watches.some(
+        (watch) => watch.currentConclusion === PRIVATE_INITIAL_ONLY_FINDING,
+      ),
+    ).toBe(false);
     const initialHouseholdFact = founderAfterInitialReview.vault?.facts.find(
       (fact) => fact.statement === INITIAL_PRIVATE_SCHOOL_FACT,
     );
@@ -3725,6 +3780,9 @@ release("Florence parent journeys", () => {
       (
         await calendarOnlyHarness.florence.workspaceForAdult(calendarOnlyHarness.partnerAdultId)
       ).vault?.facts.some((fact) => fact.statement === PRIVATE_CALENDAR_FACT),
+    ).toBe(false);
+    expect(
+      harness.linq.messages.some((message) => message.text.startsWith("One more thing from the review:")),
     ).toBe(false);
 
     const initialBoundaryHarness = await createHarness();
@@ -5592,7 +5650,7 @@ function createReasoner(reason: Reason, state: HarnessState): FlorenceReasoner {
               surfaceNow: true,
               candidate: {
                 category: "conflict" as const,
-                summary: SHARED_DUPLICATE_CONFLICT_SUMMARY,
+                summary: PARTNER_DUPLICATE_CONFLICT_SUMMARY,
                 urgency: "soon" as const,
                 dueAt: "2026-08-20T16:00:00.000Z",
                 needsAnswer: true,
@@ -5654,11 +5712,12 @@ function createReasoner(reason: Reason, state: HarnessState): FlorenceReasoner {
       input: Parameters<FlorenceReasoner["synthesizeHouseholdBriefing"]>[0],
     ) => {
       state.briefings.push(input);
+      const selected = input.candidates.slice(0, 3);
       return {
-        selectedCandidateIds: input.candidates.map((candidate) => candidate.candidateId),
+        selectedCandidateIds: selected.map((candidate) => candidate.candidateId),
         bubbles: [
           {
-            text: `Here’s what I found:\n${input.candidates
+            text: `Here’s what I found:\n${selected
               .map((candidate) => `– ${candidate.summary}`)
               .join("\n")}\n\nDid I get that right? If I missed something, tell me here.`,
             delayMs: 0,
@@ -7023,6 +7082,7 @@ function decision(
     followUp?: FlorenceDecision["followUp"];
     reminder?: FlorenceDecision["reminder"];
     familyWork?: FlorenceDecision["familyWork"];
+    docketCompletions?: FlorenceDecision["docketCompletions"];
     interest?: FlorenceDecision["interest"];
     calendar?: FlorenceDecision["calendar"];
     householdUpdate?: FlorenceDecision["householdUpdate"];
@@ -7041,6 +7101,7 @@ function decision(
     followUp: input.followUp ?? null,
     reminder: input.reminder ?? null,
     familyWork: input.familyWork ?? null,
+    docketCompletions: input.docketCompletions ?? null,
     interest: input.interest ?? null,
     calendar: input.calendar ?? null,
     householdUpdate: input.householdUpdate ?? null,

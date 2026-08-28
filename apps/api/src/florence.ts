@@ -69,7 +69,6 @@ import {
   draftGmailEvidence,
   FlorenceStoreConflict,
   gmailEvidenceSourceId,
-  INITIAL_GOOGLE_SCAN_DEFERRED_REASON,
   initialPrivateGoogleScanDigest,
 } from "@florence/database";
 import {
@@ -1295,6 +1294,7 @@ export class Florence {
             followUp: null,
             reminder: null,
             familyWork: null,
+            docketCompletions: null,
             calendar: null,
             householdUpdate: null,
           },
@@ -1518,6 +1518,7 @@ export class Florence {
                   followUp: null,
                   reminder: null,
                   familyWork: null,
+                  docketCompletions: null,
                   calendar: null,
                   householdUpdate: null,
                 },
@@ -1550,6 +1551,7 @@ export class Florence {
                       followUp: null,
                       reminder: null,
                       familyWork: null,
+                      docketCompletions: null,
                       calendar: null,
                       householdUpdate: null,
                     },
@@ -1576,6 +1578,7 @@ export class Florence {
                         followUp: null,
                         reminder: null,
                         familyWork: null,
+                        docketCompletions: null,
                         calendar: null,
                         householdUpdate: null,
                       },
@@ -1757,6 +1760,10 @@ export class Florence {
         why: followUp.why,
         sourceIds: [...followUp.sourceIds],
       })),
+      householdDocket: {
+        totalItems: turn.householdDocket.totalItems,
+        items: turn.householdDocket.items.map((item) => ({ ...item })),
+      },
       visibleReminders: turn.visibleReminders.map((reminder) => ({
         reminderId: reminder.reminderId,
         action: reminder.action,
@@ -2522,9 +2529,13 @@ export class Florence {
         if (familyCalendar.status !== "complete" || !familyCalendar.cursor) {
           throw new Error("The Family Calendar baseline is temporarily unavailable");
         }
+        const selectedCandidates = work.candidates.slice(0, 3);
         const decision = {
-          selectedCandidateIds: work.candidates.map((candidate) => candidate.candidateId),
-          bubbles: householdInitialBriefingBubbles(work.candidates),
+          selectedCandidateIds: selectedCandidates.map((candidate) => candidate.candidateId),
+          bubbles: householdInitialBriefingBubbles(
+            selectedCandidates,
+            work.candidates.length - selectedCandidates.length,
+          ),
         };
         await this.#store.completeHouseholdInitialBriefing({
           workId: work.workId,
@@ -3122,7 +3133,7 @@ export class Florence {
       throw new Error("The initial Google review did not close every Calendar target");
     }
     const completedAt = this.#now();
-    const finalizedFindings = prioritizeInitialGoogleFindings(scan.outcomes.findings, completedAt);
+    const finalizedFindings = prioritizeInitialGoogleFindings(scan.outcomes.findings);
     const bubbles = privateInitialReviewBubbles({
       suggested: [],
       findings: finalizedFindings.filter((finding) => finding.surfaceNow),
@@ -3561,24 +3572,6 @@ export class Florence {
       }
 
       if (work.kind === "finite_monitor") {
-        if (work.visibility === "private" && work.monitor.why === INITIAL_GOOGLE_SCAN_DEFERRED_REASON) {
-          const completedAt = this.#now();
-          await this.#store.completeFiniteMonitor({
-            workId: work.workId,
-            outcome: "complete",
-            privateDetail: `One more thing from the review: ${work.monitor.currentConclusion}`,
-            householdConclusion: null,
-            householdCategory: null,
-            sourceIds: [],
-            currentConclusion: work.monitor.currentConclusion,
-            nextCheck: null,
-            why: INITIAL_GOOGLE_SCAN_DEFERRED_REASON,
-            googleEvidence: [],
-            deliverNotBefore: proactiveDeliveryAt(completedAt, work.household.timeZone, false).toISOString(),
-            occurredAt: completedAt.toISOString(),
-          });
-          return;
-        }
         const googleEvidence = new Map<string, GoogleEvidenceDraft>();
         const split = new Date(Date.parse(currentTime) - 14 * 24 * 60 * 60_000).toISOString();
         const [recent, earlier] =
@@ -4118,16 +4111,15 @@ export class Florence {
         facts: [...mergedFacts.values()],
       };
       const activeMonitorIds = new Set(work.activeMonitors.map((monitor) => monitor.monitorId));
-      const materialFindings = decision.findings.filter((finding) => {
-        if (!finding.materialChange) return false;
-        if (work.kind !== "personal_google_poll") return true;
+      const retainedFindings = decision.findings.filter((finding) => {
+        if (work.kind !== "personal_google_poll") return finding.materialChange;
         const existingMonitorChange =
           finding.monitor !== null &&
           finding.monitor.operation !== "create" &&
           activeMonitorIds.has(finding.monitor.monitorId);
         return finding.familyRelevance !== "adult_only" || existingMonitorChange;
       });
-      const storeFindings = materialFindings.map((finding) => {
+      const storeFindings = retainedFindings.map((finding) => {
         const sharing = privateCalendarSafeBackgroundSharing({
           familyRelevance: finding.familyRelevance,
           conclusion: finding.householdConclusion,
@@ -4165,6 +4157,7 @@ export class Florence {
                 : null,
             householdConclusion: finding.householdConclusion?.summary ?? null,
             householdCategory: finding.householdConclusion?.category ?? null,
+            householdNeedsAnswer: finding.householdConclusion?.needsAnswer ?? false,
             sourceIds: finding.sourceIds,
             actionAnchorDigest: googleFindingActionAnchorDigest(
               finding.sourceIds,
@@ -4175,65 +4168,34 @@ export class Florence {
             dueAt: finding.dueAt,
             monitor: finding.monitor,
             familyCalendar: finding.familyCalendar ?? null,
+            surfaceNow: finding.materialChange,
+            preserveDocket: !finding.materialChange,
           }),
         );
       if (work.kind === "personal_google_poll" && deliveries.length > 3) {
         const urgencyRank = { now: 0, soon: 1, watch: 2 } as const;
+        const dueRank = (delivery: ProactiveDelivery): number =>
+          delivery.dueAt ? Date.parse(delivery.dueAt) : Number.POSITIVE_INFINITY;
         const surfaced = new Set(
           deliveries
             .map((delivery, index) => ({ delivery, index }))
+            .filter(({ delivery }) => delivery.surfaceNow !== false)
             .sort(
               (left, right) =>
                 urgencyRank[left.delivery.urgency] - urgencyRank[right.delivery.urgency] ||
+                dueRank(left.delivery) - dueRank(right.delivery) ||
                 left.index - right.index,
             )
             .slice(0, 3)
             .map(({ index }) => index),
         );
-        deliveries = deliveries.map((delivery, index) =>
-          surfaced.has(index)
-            ? delivery
-            : {
-                ...delivery,
-                privateDetail: null,
-                householdConclusion: null,
-                householdCategory: null,
-                familyCalendar: null,
-                monitor: delivery.monitor
-                  ? delivery.monitor.operation === "complete"
-                    ? {
-                        operation: "create" as const,
-                        monitorId: null,
-                        objective: delivery.monitor.objective,
-                        currentConclusion:
-                          delivery.privateDetail ??
-                          delivery.householdConclusion ??
-                          delivery.monitor.currentConclusion,
-                        endCondition: delivery.monitor.endCondition,
-                        nextCheck: new Date(Date.parse(currentTime) + 24 * 60 * 60_000).toISOString(),
-                        why: INITIAL_GOOGLE_SCAN_DEFERRED_REASON,
-                      }
-                    : { ...delivery.monitor, why: INITIAL_GOOGLE_SCAN_DEFERRED_REASON }
-                  : {
-                      operation: "create" as const,
-                      monitorId: null,
-                      objective:
-                        delivery.privateDetail ??
-                        delivery.householdConclusion ??
-                        "Follow up on a retained family Google item.",
-                      currentConclusion:
-                        delivery.privateDetail ??
-                        delivery.householdConclusion ??
-                        "This retained family item still needs review.",
-                      endCondition: "The item is completed or no longer needs family attention.",
-                      nextCheck: new Date(Date.parse(currentTime) + 24 * 60 * 60_000).toISOString(),
-                      why: INITIAL_GOOGLE_SCAN_DEFERRED_REASON,
-                    },
-              },
-        );
+        deliveries = deliveries.map((delivery, index) => ({
+          ...delivery,
+          surfaceNow: delivery.surfaceNow !== false && surfaced.has(index),
+        }));
       }
       const decidedAt = this.#now();
-      const urgent = deliveries.some((finding) => finding.urgency === "now");
+      const urgent = deliveries.some((finding) => finding.surfaceNow !== false && finding.urgency === "now");
       if (work.kind === "personal_google_poll" && !nextGmailCursor) {
         throw new Error("The personal Google poll did not advance its Gmail cursor");
       }
@@ -4859,6 +4821,7 @@ function enforcePolicy(decision: FlorenceDecision, announceRestrictions: boolean
       followUp: null,
       reminder: null,
       familyWork: null,
+      docketCompletions: null,
       interest: null,
       calendar: null,
       householdUpdate: null,
@@ -4897,6 +4860,7 @@ function enforcePolicy(decision: FlorenceDecision, announceRestrictions: boolean
     followUp: schedule ? decision.followUp : null,
     reminder,
     familyWork: schedule ? decision.familyWork : null,
+    docketCompletions: decision.docketCompletions,
     interest,
     calendar,
     householdUpdate: decision.householdUpdate,
@@ -4948,6 +4912,7 @@ function decisionCommit(
       decision.followUp !== null ||
       decision.reminder !== null ||
       decision.familyWork !== null ||
+      (decision.docketCompletions?.length ?? 0) > 0 ||
       decision.interest != null ||
       decision.calendar !== null ||
       decision.householdUpdate !== null ||
@@ -4964,6 +4929,18 @@ function decisionCommit(
     throw new FlorenceReasonerError("invalid_output", "An inbound reaction has no Florence target");
   }
   const turnId = deterministicUuid(`turn\0${turn.message.sourceId}`);
+  const docketCompletions = decision.docketCompletions ?? [];
+  if (
+    new Set(docketCompletions).size !== docketCompletions.length ||
+    docketCompletions.some(
+      (candidateId) => !turn.householdDocket.items.some((candidate) => candidate.candidateId === candidateId),
+    )
+  ) {
+    throw new FlorenceReasonerError(
+      "invalid_output",
+      "A conversation can complete only supplied household docket items",
+    );
+  }
   const baseBubbles = decision.householdUpdate
     ? []
     : decision.calendar
@@ -5147,6 +5124,7 @@ function decisionCommit(
     cancelMonitorIds: decision.followUp?.operation === "cancel" ? [decision.followUp.followUpId] : [],
     reminderMutation,
     familyWorkMutation,
+    completeDocketCandidateIds: docketCompletions,
     interestMutation: decision.interest ?? null,
     outbound,
     approveCalendarOffers: approval,
@@ -5692,13 +5670,13 @@ function googleFindingActionAnchorDigest(
 
 /**
  * A complete scan can discover far more useful work than belongs in one arrival message. Pick a
- * small globally ranked "now" docket, and turn every other unresolved finding into durable work
- * rather than silently dropping it. This ranking happens after every page has been classified, so
- * a late-page deadline can outrank an early-page watch item.
+ * small globally ranked arrival message while retaining every household-safe candidate on the
+ * docket. Real monitors and Calendar proposals keep their own lifecycle; lower-ranked findings do
+ * not become artificial timers. This runs after every page has been classified, so a late-page
+ * deadline can outrank an early-page watch item.
  */
 function prioritizeInitialGoogleFindings(
   findings: readonly InitialGoogleScanFinding[],
-  now: Date,
 ): InitialGoogleScanFinding[] {
   const urgencyRank = { now: 0, soon: 1, watch: 2 } as const;
   const eligible = findings
@@ -5722,37 +5700,7 @@ function prioritizeInitialGoogleFindings(
     selected.add(candidate.index);
     selectedSummaries.add(candidate.finding.privateSummary);
   }
-  return findings.map((finding, index) => {
-    const surfaceNow = selected.has(index);
-    if (surfaceNow) return { ...finding, surfaceNow };
-    if (finding.monitor) {
-      return {
-        ...finding,
-        surfaceNow: false,
-        familyCalendar: null,
-        monitor: { ...finding.monitor, why: INITIAL_GOOGLE_SCAN_DEFERRED_REASON },
-      };
-    }
-    const candidate = finding.householdCandidate;
-    const dueAt = finding.dueAt ? Date.parse(finding.dueAt) : Number.NaN;
-    const nextCheck = new Date(
-      Number.isFinite(dueAt) && dueAt > now.getTime()
-        ? Math.max(now.getTime() + 60_000, Math.min(dueAt, now.getTime() + 24 * 60 * 60_000))
-        : now.getTime() + 24 * 60 * 60_000,
-    ).toISOString();
-    return {
-      ...finding,
-      surfaceNow: false,
-      familyCalendar: null,
-      monitor: {
-        objective: candidate?.summary ?? finding.privateSummary,
-        currentConclusion: finding.privateSummary,
-        endCondition: "The item is completed or no longer needs family attention.",
-        nextCheck,
-        why: INITIAL_GOOGLE_SCAN_DEFERRED_REASON,
-      },
-    };
-  });
+  return findings.map((finding, index) => ({ ...finding, surfaceNow: selected.has(index) }));
 }
 
 function googleGmailProviderCursor(value: string): GoogleGmailCursor {
@@ -6298,6 +6246,7 @@ function privateInitialReviewFindingSummary(input: {
 
 function householdInitialBriefingBubbles(
   candidates: readonly SharedBriefingCandidate[],
+  deferredCount = 0,
 ): readonly { text: string; delayMs: number }[] {
   if (candidates.length === 0) {
     return [
@@ -6307,9 +6256,13 @@ function householdInitialBriefingBubbles(
       },
     ];
   }
+  const deferred =
+    deferredCount > 0
+      ? `I kept ${deferredCount} lower-priority ${deferredCount === 1 ? "item" : "items"} on the docket too. Ask me anytime.`
+      : null;
   return renderInitialBriefingSections(
     [{ heading: "Here’s what’s on the docket:", items: candidates.map((candidate) => candidate.summary) }],
-    "Did I get that right? If I missed something, tell me here.",
+    [deferred, "Did I get that right? If I missed something, tell me here."].filter(Boolean).join("\n\n"),
     [],
   );
 }

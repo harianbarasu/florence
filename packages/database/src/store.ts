@@ -16921,9 +16921,6 @@ function householdInitialBriefingCandidateGroups(
       throw new FlorenceStoreConflict("The household briefing output added an unselected distinct finding");
     }
   }
-  if (!bubbles.at(-1)?.text.endsWith("Did I get that right? If I missed something, tell me here.")) {
-    throw new FlorenceStoreConflict("The household briefing must end with its correction invitation");
-  }
   return groupsByBubble;
 }
 

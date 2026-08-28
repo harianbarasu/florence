@@ -78,6 +78,7 @@ import {
   type FlorenceTelephonyProvider,
   type FlorenceTelephonyResult,
 } from "./telephony.js";
+import type { VaultReadLevel, VaultReadResult, VaultSearchPage } from "./vault-recall.js";
 import {
   type FlorenceWeatherRequest,
   type FlorenceWeatherResult,
@@ -1541,6 +1542,8 @@ export type FlorenceFamilyWorkReadTools = Pick<
       | "readCalendarWindow"
       | "readCurrentImage"
       | "readCurrentPdf"
+      | "searchVault"
+      | "readVault"
       | "searchFamilyMemory"
       | "readSource"
       | "searchGmail"
@@ -1677,6 +1680,8 @@ export interface FlorenceReadTools {
     bytes: Uint8Array;
   }>;
   listCalendars?(): Promise<FlorenceCalendarCatalogRead>;
+  searchVault?(input: { query: string; cursor: string | null }): Promise<VaultSearchPage>;
+  readVault?(input: { uri: string; level: VaultReadLevel }): Promise<VaultReadResult | null>;
   searchFamilyMemory(input: { query: string; limit: number }): Promise<readonly FlorenceSource[]>;
   readCalendarWindow(input: {
     timeMin: string;
@@ -2021,8 +2026,22 @@ const gmailArguments = z
     limit: z.number().int().min(1).max(20),
   })
   .strict();
-const memoryArguments = z
-  .object({ query: z.string().trim().min(1).max(500), limit: z.number().int().min(1).max(10) })
+const vaultSearchArguments = z
+  .object({
+    query: z.string().trim().min(1).max(500),
+    cursor: z.string().trim().min(1).max(2_000).nullable(),
+  })
+  .strict();
+const vaultReadArguments = z
+  .object({
+    uri: z
+      .string()
+      .trim()
+      .min(1)
+      .max(500)
+      .regex(/^vault:\/\/fact\/[0-9a-f-]+$/i),
+    level: z.enum(["abstract", "overview", "full"]),
+  })
   .strict();
 const sourceArguments = z.object({ sourceId: opaqueId }).strict();
 const calendarArguments = z
@@ -2103,14 +2122,37 @@ const flightSearchArguments = z
   })
   .strict();
 
-const MEMORY_PARAMETERS = {
+const VAULT_SEARCH_PARAMETERS = {
   type: "object",
   additionalProperties: false,
   properties: {
     query: { type: "string", minLength: 1, maxLength: 500 },
-    limit: { type: "integer", minimum: 1, maximum: 10 },
+    cursor: {
+      anyOf: [{ type: "string", minLength: 1, maxLength: 2_000 }, { type: "null" }],
+      description: "Opaque continuation cursor from the preceding search page, or null to start.",
+    },
   },
-  required: ["query", "limit"],
+  required: ["query", "cursor"],
+} as const;
+
+const VAULT_READ_PARAMETERS = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    uri: {
+      type: "string",
+      pattern: "^vault://fact/[0-9a-fA-F-]+$",
+      maxLength: 500,
+      description: "Exact vault:// URI returned by search_vault.",
+    },
+    level: {
+      type: "string",
+      enum: ["abstract", "overview", "full"],
+      description:
+        "abstract identifies it; overview returns the complete memory; full also returns every support.",
+    },
+  },
+  required: ["uri", "level"],
 } as const;
 
 const SOURCE_PARAMETERS = {
@@ -2534,6 +2576,64 @@ const FLIGHT_SEARCH_PARAMETERS = {
 } as const;
 
 const sourceReadOutputSchema = z.object({ sources: z.array(florenceSourceSchema).max(10) }).strict();
+const vaultSearchOutputSchema = z
+  .object({
+    query: z.string().trim().min(1).max(500),
+    results: z.array(
+      z
+        .object({
+          uri: z.string().trim().min(1).max(500),
+          score: z.number().finite(),
+          abstract: z.string().trim().min(1),
+          memoryKind: z.enum(["fact", "preference", "routine", "artifact"]),
+          artifactKind: z.enum(["recipe", "list", "plan", "note", "reference", "other"]).nullable(),
+          title: z.string().trim().min(1).max(300).nullable(),
+          tags: z.array(z.string().trim().min(1).max(80)),
+          updatedAt: timestamp,
+        })
+        .strict(),
+    ),
+    total: z.number().int().min(0),
+    complete: z.boolean(),
+    nextCursor: z.string().trim().min(1).max(2_000).nullable(),
+  })
+  .strict();
+const vaultReadOutputSchema = z
+  .object({
+    result: z
+      .object({
+        uri: z.string().trim().min(1).max(500),
+        level: z.enum(["abstract", "overview", "full"]),
+        memory: z
+          .object({
+            factId: opaqueId,
+            statement: z.string().trim().min(1),
+            memoryKind: z.enum(["fact", "preference", "routine", "artifact"]),
+            artifactKind: z.enum(["recipe", "list", "plan", "note", "reference", "other"]).nullable(),
+            title: z.string().trim().min(1).max(300).nullable(),
+            details: z.string().trim().min(1).nullable(),
+            tags: z.array(z.string().trim().min(1).max(80)),
+            visibility: z.enum(["private", "household"]),
+            updatedAt: timestamp,
+          })
+          .strict(),
+        supports: z.array(
+          z
+            .object({
+              sourceId: opaqueId,
+              kind: z.enum(["linq_message", "gmail", "google_file", "document", "web", "setup", "calendar"]),
+              label: z.string().trim().min(1),
+              visibility: z.enum(["private", "household"]),
+              occurredAt: timestamp,
+              metadata: z.record(z.string(), z.unknown()),
+            })
+            .strict(),
+        ),
+      })
+      .strict()
+      .nullable(),
+  })
+  .strict();
 const calendarCatalogOutputSchema = z
   .object({
     status: z.enum(["complete", "truncated", "partial", "unavailable"]),
@@ -3544,6 +3644,7 @@ type ForegroundCapabilityContext = {
   readonly reads: FlorenceReadTools;
   readonly knownSources: Set<string>;
   readonly knownFacts: Set<string>;
+  readonly knownVaultUris: Set<string>;
   readonly calendarReads: CalendarReadCoverage[];
   readonly publicResearchUrls: Set<string>;
   readonly publicResearchState: { used: boolean };
@@ -4333,26 +4434,55 @@ async function executeBrowserOperation(
 function foregroundCapabilityRegistry(): CapabilityRegistry<ForegroundCapabilityContext> {
   return new CapabilityRegistry([
     defineCapability({
-      name: "search_family_memory",
+      name: "search_vault",
       description:
-        "Search source-linked family memory visible in this conversation. Write query as a concise standalone retrieval query derived from the full conversation: resolve pronouns or references, preserve distinguishing names, identifiers, attributes, and constraints, and omit conversational filler rather than copying the whole utterance.",
-      modelSchema: MEMORY_PARAMETERS,
-      inputSchema: memoryArguments,
-      outputSchema: sourceReadOutputSchema,
+        "Search the household Vault for any remembered fact, preference, routine, or reusable artifact. This directly adapts Hermes/OpenViking's search-to-resource-URI contract. Write a concise standalone retrieval query from the full conversation, preserving names, identifiers, attributes, and constraints. Results are lightweight and return exact vault:// URIs. If the result says complete=false and the current page does not resolve the objective, continue with the returned cursor rather than assuming the Vault has nothing else.",
+      modelSchema: VAULT_SEARCH_PARAMETERS,
+      inputSchema: vaultSearchArguments,
+      outputSchema: vaultSearchOutputSchema,
       executionMode: "parallel",
       executionBoundary: "inline",
       timeoutMs: 20_000,
       maxOutputBytes: 100_000,
+      availability: (context) => context.reads.searchVault !== undefined,
       admit: ({ context }) => context.input.currentMessage.moveKind !== "reaction",
-      execute: async ({ callId, arguments: args, context, signal }) =>
+      execute: async ({ arguments: args, context, signal }) =>
         executeReadAdapter(async () => {
-          const sources = z
-            .array(florenceSourceSchema)
-            .max(10)
-            .parse(await context.reads.searchFamilyMemory(args));
+          const searchVault = context.reads.searchVault;
+          if (!searchVault) throw new CapabilityAdapterError("unavailable", "Vault search is unavailable.");
+          const page = vaultSearchOutputSchema.parse(await searchVault(args));
           throwIfAborted(signal);
-          context.settlements.set(callId, () => accountSources(sources, context));
-          return { output: { sources } };
+          for (const result of page.results) context.knownVaultUris.add(result.uri);
+          return { output: page };
+        }, signal),
+    }),
+    defineCapability({
+      name: "read_vault",
+      description:
+        "Read one exact vault:// URI returned by search_vault. This directly adapts Hermes/OpenViking's tiered read contract: abstract identifies the memory, overview returns its complete usable contents, and full also returns every exact supporting source. Prefer overview for normal use and full when provenance matters.",
+      modelSchema: VAULT_READ_PARAMETERS,
+      inputSchema: vaultReadArguments,
+      outputSchema: vaultReadOutputSchema,
+      executionMode: "parallel",
+      executionBoundary: "inline",
+      timeoutMs: 20_000,
+      maxOutputBytes: 100_000,
+      availability: (context) => context.reads.readVault !== undefined,
+      admit: ({ context, canonicalArguments }) =>
+        context.input.currentMessage.moveKind !== "reaction" &&
+        isJsonRecord(canonicalArguments) &&
+        typeof canonicalArguments.uri === "string" &&
+        context.knownVaultUris.has(canonicalArguments.uri),
+      execute: async ({ arguments: args, context, signal }) =>
+        executeReadAdapter(async () => {
+          const readVault = context.reads.readVault;
+          if (!readVault) throw new CapabilityAdapterError("unavailable", "Vault reading is unavailable.");
+          if (!context.knownVaultUris.has(args.uri)) {
+            throw unsafeRead("OpenAI requested a Vault URI that search did not return");
+          }
+          const result = await readVault(args);
+          throwIfAborted(signal);
+          return { output: vaultReadOutputSchema.parse({ result }) };
         }, signal),
     }),
     defineCapability({
@@ -6377,6 +6507,7 @@ export class FlorenceReasoner {
         source.kind === "memory" && source.recordId ? [source.recordId] : [],
       ),
     );
+    const knownVaultUris = new Set<string>();
     const calendarReads: CalendarReadCoverage[] = [];
     const publicResearchState = { used: false };
     const gmailSources = new Map<string, FlorenceConversationalGmailSource>();
@@ -6394,6 +6525,7 @@ export class FlorenceReasoner {
       reads,
       knownSources,
       knownFacts,
+      knownVaultUris,
       calendarReads,
       publicResearchUrls,
       publicResearchState,
@@ -6754,6 +6886,7 @@ export class FlorenceReasoner {
         source.kind === "memory" && source.recordId ? [source.recordId] : [],
       ),
     );
+    const knownVaultUris = new Set<string>();
     const calendarReads: CalendarReadCoverage[] = [];
     const publicResearchUrls = new Set<string>();
     const publicResearchState = { used: false };
@@ -6766,6 +6899,7 @@ export class FlorenceReasoner {
       reads,
       knownSources,
       knownFacts,
+      knownVaultUris,
       calendarReads,
       publicResearchUrls,
       publicResearchState,

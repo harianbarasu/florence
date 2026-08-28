@@ -140,6 +140,7 @@ import type {
   FlorenceTelephonyOperation,
   FlorenceTelephonyResult,
 } from "./telephony.js";
+import { VaultRecall } from "./vault-recall.js";
 import type { FlorenceWeatherClient } from "./weather.js";
 
 const DEFAULT_PREFERENCES: PreferencesInput = {
@@ -1629,6 +1630,7 @@ export class Florence {
     const members = new Map(turn.household.members.map((member) => [member.id, member.displayName]));
     const memorySourceCorpus = memorySources(turn.facts);
     const searchableMemorySources = representativeMemorySources(memorySourceCorpus);
+    const vaultRecall = new VaultRecall(turn.facts);
     const visibleSources = selectVisibleMemorySources(searchableMemorySources, {
       primary: turnText(turn.message),
       context: [
@@ -1955,6 +1957,8 @@ export class Florence {
           }
         }
       },
+      searchVault: async (input) => vaultRecall.search(input),
+      readVault: async (input) => vaultRecall.read(input),
       searchFamilyMemory: async ({ query, limit }) =>
         searchMemorySources(searchableMemorySources, query).slice(0, limit),
       listCalendars: async (): Promise<FlorenceCalendarCatalogRead> => {
@@ -3546,6 +3550,7 @@ export class Florence {
       if (!familyWorkHousehold) throw new Error("The family task household is unavailable");
       const familyWorkMemoryCorpus = memorySources(familyWorkHousehold.facts);
       const familyWorkSearchableMemory = representativeMemorySources(familyWorkMemoryCorpus);
+      const familyWorkVaultRecall = new VaultRecall(familyWorkHousehold.facts);
       const familyWorkVisibleSources = selectVisibleMemorySources(familyWorkSearchableMemory, {
         primary: work.objective,
         context: [
@@ -4274,6 +4279,8 @@ export class Florence {
           ...(google && familyWorkHousehold.familyCalendarId && familyWorkFamilyCalendarCredentials.length > 0
             ? { runFamilyCalendarWork }
             : {}),
+          searchVault: async (input) => familyWorkVaultRecall.search(input),
+          readVault: async (input) => familyWorkVaultRecall.read(input),
           searchFamilyMemory: async ({ query, limit }) =>
             searchMemorySources(familyWorkSearchableMemory, query).slice(0, limit),
           readSource: async ({ sourceId }) => familyWorkSourceIndex.get(sourceId) ?? null,

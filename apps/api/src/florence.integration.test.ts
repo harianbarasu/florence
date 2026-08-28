@@ -3503,7 +3503,7 @@ release("Florence parent journeys", () => {
       throw new Error("The household briefing grounding regression needs four candidates");
     }
     const naturalBriefing = (summaries: readonly string[]): string =>
-      `Here are the things I’d put at the top: ${summaries.join(" ")}\n\nDid I get that right? If I missed something, tell me here.`;
+      `Here are the things I’d put at the top: ${summaries.join(" ")}\n\nAnything I missed? Tell me and I’ll fix it.`;
     for (const invalidSummaries of [
       rankedSummaries.slice(0, -1),
       [...rankedSummaries, firstRankedSummary],

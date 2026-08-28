@@ -3273,9 +3273,11 @@ Compare the useful family options.
 
   test("durable private work composes visible memory and Gmail attachments inline", async () => {
     const gmail = conversationalGmailSource();
+    const memoryFactId = "11111111-1111-4111-8111-111111111111";
+    const memoryUri = `vault://fact/${memoryFactId}`;
     const memory = {
       sourceId: "memory-pickup-source",
-      recordId: "memory-pickup-fact",
+      recordId: memoryFactId,
       kind: "memory" as const,
       visibility: "adult_private" as const,
       label: "School pickup",
@@ -3287,12 +3289,12 @@ Compare the useful family options.
       {
         status: "completed",
         output_parsed: null,
-        output: [functionCall("memory-search", "search_family_memory", { query: "pickup", limit: 5 })],
+        output: [functionCall("memory-search", "search_vault", { query: "pickup", cursor: null })],
       },
       {
         status: "completed",
         output_parsed: null,
-        output: [functionCall("memory-read", "read_source", { sourceId: memory.sourceId })],
+        output: [functionCall("memory-read", "read_vault", { uri: memoryUri, level: "overview" })],
       },
       {
         status: "completed",
@@ -3374,11 +3376,43 @@ Compare the useful family options.
         currentTime: NOW,
       },
       {
-        async searchFamilyMemory() {
-          return [memory];
+        async searchVault() {
+          return {
+            query: "pickup",
+            results: [
+              {
+                uri: memoryUri,
+                score: 1,
+                abstract: "School pickup is normally at 2:45 PM.",
+                memoryKind: "routine" as const,
+                artifactKind: null,
+                title: "School pickup",
+                tags: ["school", "pickup"],
+                updatedAt: NOW,
+              },
+            ],
+            total: 1,
+            complete: true,
+            nextCursor: null,
+          };
         },
-        async readSource() {
-          return memory;
+        async readVault() {
+          return {
+            uri: memoryUri,
+            level: "overview" as const,
+            memory: {
+              factId: memoryFactId,
+              statement: "School pickup is normally at 2:45 PM.",
+              memoryKind: "routine" as const,
+              artifactKind: null,
+              title: "School pickup",
+              details: "School pickup is normally at 2:45 PM.",
+              tags: ["school", "pickup"],
+              visibility: "private" as const,
+              updatedAt: NOW,
+            },
+            supports: [],
+          };
         },
         async searchGmail() {
           return { status: "complete", sources: [gmail] };
@@ -3403,12 +3437,7 @@ Compare the useful family options.
     });
     expect(attachmentReads).toBe(1);
     expect(((requests[0]?.tools as { name: string }[]) ?? []).map((tool) => tool.name)).toEqual(
-      expect.arrayContaining([
-        "search_family_memory",
-        "read_source",
-        "search_gmail",
-        "read_gmail_attachment",
-      ]),
+      expect.arrayContaining(["search_vault", "read_vault", "search_gmail", "read_gmail_attachment"]),
     );
     expect(JSON.stringify(requests.at(-1)?.input)).toContain("input_file");
     expect(JSON.stringify(requests)).not.toContain("connectionId");

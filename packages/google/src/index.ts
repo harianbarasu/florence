@@ -28,6 +28,7 @@ const CALENDAR_BASELINE_PAGE_SIZE = 50;
 const GMAIL_BASELINE_MAX_WINDOW_MS = 90 * 24 * 60 * 60_000;
 const CALENDAR_BASELINE_MAX_WINDOW_MS = 111 * 24 * 60 * 60_000;
 const MAX_GOOGLE_BASELINE_PAGE_TOKEN_LENGTH = 16_384;
+const PERSONAL_CALENDAR_WINDOW_CURSOR_KIND = "personal_calendar_window_v1" as const;
 
 export const GOOGLE_SCOPES = [
   "openid",
@@ -382,7 +383,7 @@ export type GooglePersonalCalendarWindowEvent = GoogleCalendarWindowEvent & {
   calendarId: string;
 };
 
-/** One complete account-level private Calendar observation across all provider pages. */
+/** One model-sized page over a complete account-level observation across all provider pages. */
 export type GooglePersonalCalendarWindowRead = {
   status: "complete" | "truncated" | "partial" | "unavailable";
   timeMin: string;
@@ -391,6 +392,8 @@ export type GooglePersonalCalendarWindowRead = {
   totalCalendarCount: number;
   events: readonly GooglePersonalCalendarWindowEvent[];
   totalEventCount: number;
+  /** Opaque continuation over the same exact Calendar observation. */
+  nextCursor: string | null;
 };
 
 export type GooglePersonalCalendarCatalogTarget = {
@@ -1734,6 +1737,7 @@ export class GoogleConnection {
     timeMax: string;
     calendarIds?: readonly string[];
     limit?: number;
+    cursor?: string;
   }): Promise<GooglePersonalCalendarWindowRead> {
     const excludedFamilyCalendarId =
       input.excludedFamilyCalendarId === null
@@ -1763,6 +1767,7 @@ export class GoogleConnection {
         totalCalendarCount: 0,
         events,
         totalEventCount: 0,
+        nextCursor: null,
       };
     };
 
@@ -1824,6 +1829,7 @@ export class GoogleConnection {
       timeMin: normalizedTimeMin,
       timeMax: normalizedTimeMax,
       limit,
+      ...(input.cursor === undefined ? {} : { cursor: input.cursor }),
     });
   }
 
@@ -1880,6 +1886,7 @@ export class GoogleConnection {
     timeMin: string;
     timeMax: string;
     limit?: number;
+    cursor?: string;
   }): Promise<GooglePersonalCalendarWindowRead> {
     const calendarId = secondaryCalendarTarget(input.calendarId);
     const timeMin = explicitInstant(input.timeMin);
@@ -1936,6 +1943,7 @@ export class GoogleConnection {
       timeMin: normalizedTimeMin,
       timeMax: normalizedTimeMax,
       limit,
+      ...(input.cursor === undefined ? {} : { cursor: input.cursor }),
     });
   }
 
@@ -1950,6 +1958,7 @@ export class GoogleConnection {
     timeMin: string;
     timeMax: string;
     limit: number;
+    cursor?: string;
   }): Promise<GooglePersonalCalendarWindowRead> {
     const selectedTargets = [...input.readableTargets]
       .filter(
@@ -2047,10 +2056,32 @@ export class GoogleConnection {
     calendars.sort((left, right) => left.calendarId.localeCompare(right.calendarId));
     fullEvents.sort(comparePersonalCalendarWindowEvents);
     const totalEventCount = fullEvents.length;
-    const events = fullEvents.slice(0, input.limit);
+    const queryDigest = personalCalendarWindowQueryDigest(input);
+    const revisionDigest = personalCalendarWindowRevisionDigest(calendars, fullEvents);
+    const offset =
+      input.cursor === undefined
+        ? 0
+        : personalCalendarWindowCursorOffset({
+            cursor: input.cursor,
+            key: this.#key,
+            queryDigest,
+            revisionDigest,
+            totalEventCount,
+          });
+    const nextOffset = Math.min(offset + input.limit, totalEventCount);
+    const events = fullEvents.slice(offset, nextOffset);
+    const nextCursor =
+      nextOffset < totalEventCount
+        ? personalCalendarWindowCursor({
+            key: this.#key,
+            queryDigest,
+            revisionDigest,
+            offset: nextOffset,
+          })
+        : null;
     const incompleteTargets = calendars.filter((calendar) => calendar.status !== "complete");
     const status: GooglePersonalCalendarWindowRead["status"] =
-      incompleteTargets.length === 0 ? (totalEventCount > input.limit ? "truncated" : "complete") : "partial";
+      incompleteTargets.length === 0 ? (nextCursor === null ? "complete" : "truncated") : "partial";
     return {
       status,
       timeMin: input.timeMin,
@@ -2059,6 +2090,7 @@ export class GoogleConnection {
       totalCalendarCount: calendars.length,
       events,
       totalEventCount,
+      nextCursor,
     };
   }
 
@@ -4237,6 +4269,118 @@ function comparePersonalCalendarWindowEvents(
     left.providerEventId.localeCompare(right.providerEventId) ||
     left.providerRevision.localeCompare(right.providerRevision)
   );
+}
+
+function personalCalendarWindowQueryDigest(input: {
+  householdId: string;
+  ownerAdultId: string;
+  connectionId: string;
+  excludedFamilyCalendarId: string | null;
+  selectedCalendarIds: readonly string[] | null;
+  timeMin: string;
+  timeMax: string;
+}): string {
+  return digest(
+    JSON.stringify({
+      kind: PERSONAL_CALENDAR_WINDOW_CURSOR_KIND,
+      householdId: input.householdId,
+      ownerAdultId: input.ownerAdultId,
+      connectionId: input.connectionId,
+      excludedFamilyCalendarId: input.excludedFamilyCalendarId,
+      selectedCalendarIds: input.selectedCalendarIds,
+      timeMin: input.timeMin,
+      timeMax: input.timeMax,
+    }),
+  );
+}
+
+function personalCalendarWindowRevisionDigest(
+  calendars: readonly GooglePersonalCalendarWindowTarget[],
+  events: readonly GooglePersonalCalendarWindowEvent[],
+): string {
+  return digest(
+    JSON.stringify({
+      calendars: calendars.map((calendar) => ({
+        calendarId: calendar.calendarId,
+        label: calendar.label,
+        timeZone: calendar.timeZone,
+        accessRole: calendar.accessRole,
+        primary: calendar.primary,
+        status: calendar.status,
+        eventCount: calendar.eventCount,
+      })),
+      events: events.map((event) => ({
+        calendarId: event.calendarId,
+        providerEventId: event.providerEventId,
+        providerRevision: event.providerRevision,
+      })),
+    }),
+  );
+}
+
+function personalCalendarWindowCursor(input: {
+  key: Buffer;
+  queryDigest: string;
+  revisionDigest: string;
+  offset: number;
+}): string {
+  if (!Number.isSafeInteger(input.offset) || input.offset < 1) {
+    throw new Error("Personal Calendar cursor offset is invalid");
+  }
+  const plaintext = JSON.stringify({
+    kind: PERSONAL_CALENDAR_WINDOW_CURSOR_KIND,
+    queryDigest: input.queryDigest,
+    revisionDigest: input.revisionDigest,
+    offset: input.offset,
+  });
+  return encrypt(plaintext, input.key, personalCalendarWindowCursorAad(input.queryDigest));
+}
+
+function personalCalendarWindowCursorOffset(input: {
+  cursor: string;
+  key: Buffer;
+  queryDigest: string;
+  revisionDigest: string;
+  totalEventCount: number;
+}): number {
+  let value: unknown;
+  try {
+    value = JSON.parse(
+      decrypt(
+        required(input.cursor, "Personal Calendar cursor"),
+        input.key,
+        personalCalendarWindowCursorAad(input.queryDigest),
+      ),
+    );
+  } catch {
+    throw new Error("Personal Calendar cursor is invalid or belongs to another read");
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Personal Calendar cursor payload is invalid");
+  }
+  const payload = value as Record<string, unknown>;
+  if (payload.kind !== PERSONAL_CALENDAR_WINDOW_CURSOR_KIND) {
+    throw new Error("Unsupported Personal Calendar cursor version");
+  }
+  if (payload.queryDigest !== input.queryDigest) {
+    throw new Error("Personal Calendar cursor belongs to another read");
+  }
+  if (payload.revisionDigest !== input.revisionDigest) {
+    throw new Error("Personal Calendar cursor is stale because the Calendar observation changed");
+  }
+  if (
+    !Number.isSafeInteger(payload.offset) ||
+    (payload.offset as number) < 1 ||
+    (payload.offset as number) >= input.totalEventCount
+  ) {
+    throw new Error("Personal Calendar cursor offset is out of range");
+  }
+  return payload.offset as number;
+}
+
+function personalCalendarWindowCursorAad(queryDigest: string): string {
+  assertDigest(queryDigest, "Personal Calendar query digest");
+  return `florence-google-personal-calendar-window-v1\0${queryDigest}`;
 }
 
 function personalCalendarCatalogTarget(

@@ -2057,7 +2057,8 @@ describe("Florence reasoner capability cutover", () => {
           functionCall("read-family-calendar", "read_calendar_window", {
             timeMin: "2026-09-01T00:00:00.000Z",
             timeMax: "2026-09-02T00:00:00.000Z",
-            limit: 50,
+            pageSize: 50,
+            cursor: null,
             scope: "selected",
             calendarRefs: [calendarRef],
           }),
@@ -2220,6 +2221,7 @@ describe("Florence reasoner capability cutover", () => {
           totalCalendarCount: 1,
           events: [],
           totalEventCount: 0,
+          nextCursor: null,
         };
       },
     };
@@ -2924,7 +2926,8 @@ Compare the useful family options.
     const calendarWindowArguments = {
       timeMin: "2026-08-28T00:00:00.000Z",
       timeMax: "2026-08-29T00:00:00.000Z",
-      limit: 20,
+      pageSize: 20,
+      cursor: null,
       scope: "selected",
       calendarRefs: [calendarRef],
     };
@@ -3025,7 +3028,8 @@ Compare the useful family options.
       async readCalendarWindow(calendarInput: {
         timeMin: string;
         timeMax: string;
-        limit: number;
+        pageSize: number;
+        cursor: string | null;
         scope: "all" | "primary" | "selected";
         calendarRefs: readonly string[];
       }) {
@@ -3064,6 +3068,7 @@ Compare the useful family options.
             },
           ],
           totalEventCount: 1,
+          nextCursor: null,
         };
       },
     };
@@ -3486,6 +3491,7 @@ Compare the useful family options.
       ],
       totalCalendarCount: 2,
       totalEventCount: 1,
+      nextCursor: null,
     };
     const responses = [
       {
@@ -3500,7 +3506,8 @@ Compare the useful family options.
           functionCall("calendar-window", "read_calendar_window", {
             timeMin: "2026-08-28T00:00:00.000Z",
             timeMax: "2026-08-29T00:00:00.000Z",
-            limit: 20,
+            pageSize: 20,
+            cursor: null,
             scope: "selected",
             calendarRefs,
           }),
@@ -3916,6 +3923,7 @@ function completeCalendarRead() {
     totalCalendarCount: 0,
     events: [],
     totalEventCount: 0,
+    nextCursor: null,
   };
 }
 

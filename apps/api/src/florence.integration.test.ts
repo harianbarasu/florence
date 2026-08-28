@@ -2846,7 +2846,8 @@ release("Florence parent journeys", () => {
             const personal = await reads.readCalendarWindow?.({
               timeMin: "2026-08-18T07:00:00.000Z",
               timeMax: "2026-08-19T07:00:00.000Z",
-              limit: 50,
+              pageSize: 50,
+              cursor: null,
               scope: "primary",
               calendarRefs: [],
             });
@@ -2858,7 +2859,8 @@ release("Florence parent journeys", () => {
             const shared = await reads.readCalendarWindow?.({
               timeMin: "2026-08-18T07:00:00.000Z",
               timeMax: "2026-08-19T07:00:00.000Z",
-              limit: 50,
+              pageSize: 50,
+              cursor: null,
               scope: "selected",
               calendarRefs: [familyCalendar.calendarRef],
             });
@@ -5248,7 +5250,8 @@ release("Florence parent journeys", () => {
         const calendarRead = await reads.readCalendarWindow({
           timeMin: "2026-08-18T07:00:00.000Z",
           timeMax: "2026-08-19T07:00:00.000Z",
-          limit: 50,
+          pageSize: 50,
+          cursor: null,
           scope: "all",
           calendarRefs: [],
         });
@@ -8650,6 +8653,7 @@ function createGoogle(store: PostgresFlorenceStore, state: HarnessState): Google
         totalCalendarCount: calendars.length,
         events: fullEvents.slice(0, input.limit ?? 50),
         totalEventCount: fullEvents.length,
+        nextCursor: null,
         coverageDigest,
         logicalCoverageDigest: digest(
           JSON.stringify({
@@ -8701,6 +8705,7 @@ function createGoogle(store: PostgresFlorenceStore, state: HarnessState): Google
         totalCalendarCount: 1,
         events: fullEvents.slice(0, input.limit ?? 50),
         totalEventCount: fullEvents.length,
+        nextCursor: null,
         coverageDigest: digest(
           JSON.stringify({
             ...logicalCoverage,
@@ -8895,7 +8900,8 @@ async function calendarTarget(
   const result = await reads.readCalendarWindow({
     timeMin: "2026-08-18T21:30:00.000Z",
     timeMax: "2026-08-18T22:30:00.000Z",
-    limit: 50,
+    pageSize: 50,
+    cursor: null,
     scope: "all",
     calendarRefs: [],
   });

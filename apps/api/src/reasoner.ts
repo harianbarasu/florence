@@ -361,6 +361,7 @@ const calendarWindowReadSchema = z
       )
       .max(100),
     totalEventCount: z.number().int().min(0),
+    nextCursor: z.string().trim().min(1).max(2_000).nullable(),
   })
   .strict();
 
@@ -1623,6 +1624,7 @@ export type FlorenceCalendarWindowRead = {
   totalCalendarCount: number;
   events: z.infer<typeof calendarWindowReadSchema>["events"];
   totalEventCount: number;
+  nextCursor: string | null;
 };
 
 export type FlorenceCalendarCatalogRead = Readonly<{
@@ -1686,7 +1688,8 @@ export interface FlorenceReadTools {
   readCalendarWindow(input: {
     timeMin: string;
     timeMax: string;
-    limit: number;
+    pageSize: number;
+    cursor: string | null;
     scope: "all" | "primary" | "selected";
     calendarRefs: readonly string[];
   }): Promise<FlorenceCalendarWindowRead>;
@@ -2048,7 +2051,8 @@ const calendarArguments = z
   .object({
     timeMin: calendarInstant,
     timeMax: calendarInstant,
-    limit: z.number().int().min(1).max(50),
+    pageSize: z.number().int().min(1).max(50),
+    cursor: z.string().trim().min(1).max(2_000).nullable(),
     scope: z.enum(["all", "primary", "selected"]),
     calendarRefs: z.array(opaqueId).max(50),
   })
@@ -2196,7 +2200,16 @@ const CALENDAR_PARAMETERS = {
   properties: {
     timeMin: { type: "string", minLength: 1, maxLength: 100 },
     timeMax: { type: "string", minLength: 1, maxLength: 100 },
-    limit: { type: "integer", minimum: 1, maximum: 50 },
+    pageSize: {
+      type: "integer",
+      minimum: 1,
+      maximum: 50,
+      description: "Events to return in this model-facing page; this never limits the complete read.",
+    },
+    cursor: {
+      anyOf: [{ type: "string", minLength: 1, maxLength: 2_000 }, { type: "null" }],
+      description: "Opaque continuation cursor from the preceding page, or null to start.",
+    },
     scope: { type: "string", enum: ["all", "primary", "selected"] },
     calendarRefs: {
       type: "array",
@@ -2204,7 +2217,7 @@ const CALENDAR_PARAMETERS = {
       items: { type: "string", minLength: 1, maxLength: 500 },
     },
   },
-  required: ["timeMin", "timeMax", "limit", "scope", "calendarRefs"],
+  required: ["timeMin", "timeMax", "pageSize", "cursor", "scope", "calendarRefs"],
 } as const;
 
 const NULLABLE_SHORT_STRING_PARAMETERS = {
@@ -5152,7 +5165,7 @@ function foregroundCapabilityRegistry(): CapabilityRegistry<ForegroundCapability
     defineCapability({
       name: "read_calendar_window",
       description:
-        "Read an exact bounded Calendar window. In private, scope can cover all, primary, or selected calendars; in a foreground family group it covers only the Family Calendar.",
+        "Read an exact bounded Calendar window. In private, scope can cover all, primary, or selected calendars; in a foreground family group it covers only the Family Calendar. Provider pages are fully exhausted. If nextCursor is not null and the current page does not answer the objective, call again with the same window, scope, calendarRefs, and pageSize plus that cursor.",
       modelSchema: CALENDAR_PARAMETERS,
       inputSchema: calendarArguments,
       outputSchema: calendarCapabilityOutputSchema,
@@ -5189,7 +5202,7 @@ function foregroundCapabilityRegistry(): CapabilityRegistry<ForegroundCapability
           const read = calendarWindowReadSchema.parse(await readCalendarWindow(args));
           throwIfAborted(signal);
           context.settlements.set(callId, () => {
-            if (read.status === "complete") {
+            if (read.status === "complete" || read.status === "truncated") {
               context.calendarReads.push({
                 resourceKind,
                 timeMin,
@@ -5357,6 +5370,7 @@ function familyWorkReads(publicReads: FlorenceFamilyWorkReadTools): FlorenceRead
         totalCalendarCount: 0,
         events: [],
         totalEventCount: 0,
+        nextCursor: null,
       })),
     readSource: publicReads.readSource ?? (async () => null),
     readCurrentImage:

@@ -306,3 +306,216 @@ describe("initial Family Calendar review", () => {
     expect(calendarRequests).toHaveLength(1);
   });
 });
+
+describe("personal Calendar window continuation", () => {
+  test("makes every exhaustively observed event reachable from both account and exact reads", async () => {
+    const connectionId = "connection-1";
+    const householdId = "household-1";
+    const ownerAdultId = "adult-1";
+    const calendarId = "personal-calendar";
+    const key = Buffer.alloc(32, 4);
+    const providerEventRequests: URL[] = [];
+    const fetchMock = vi.fn<typeof fetch>(async (input) => {
+      const url = new URL(String(input));
+      if (url.origin === "https://oauth2.googleapis.com") {
+        return jsonResponse({ access_token: "access-token", token_type: "Bearer" });
+      }
+      if (url.origin !== "https://www.googleapis.com") {
+        throw new Error(`Unexpected provider request: ${url}`);
+      }
+      const target = {
+        id: calendarId,
+        summary: "Personal calendar",
+        timeZone: "America/Los_Angeles",
+        accessRole: "owner",
+        primary: true,
+      };
+      if (url.pathname === `/calendar/v3/users/me/calendarList/${calendarId}`) {
+        return jsonResponse(target);
+      }
+      if (url.pathname === "/calendar/v3/users/me/calendarList") {
+        return jsonResponse({
+          items: [
+            target,
+            {
+              id: "availability-only-calendar",
+              summary: "Availability only",
+              timeZone: "America/Los_Angeles",
+              accessRole: "freeBusyReader",
+              primary: false,
+            },
+          ],
+        });
+      }
+      if (url.pathname === `/calendar/v3/calendars/${calendarId}/events`) {
+        providerEventRequests.push(url);
+        const secondPage = url.searchParams.get("pageToken") === "event-page-2";
+        return jsonResponse({
+          timeZone: "America/Los_Angeles",
+          items: secondPage
+            ? Array.from({ length: 23 }, (_, index) => calendarEvent(index + 50))
+            : Array.from({ length: 50 }, (_, index) => calendarEvent(index)),
+          ...(secondPage ? {} : { nextPageToken: "event-page-2" }),
+        });
+      }
+      throw new Error(`Unexpected provider request: ${url}`);
+    });
+    const store = {
+      async readActiveGoogleCredential() {
+        return {
+          connectionId,
+          householdId,
+          ownerAdultId,
+          refreshTokenEnvelope: refreshTokenEnvelope({ key, connectionId, householdId, ownerAdultId }),
+        };
+      },
+    } as unknown as GoogleConnectionStore;
+    const google = new GoogleConnection({
+      store,
+      clientId: "client-id",
+      clientSecret: "client-secret",
+      redirectUri: "https://app.tryflorence.com/oauth/google/callback",
+      encryptionKey: key,
+      fetch: fetchMock,
+    });
+    const expectedIds = Array.from(
+      { length: 73 },
+      (_, index) => `event-${index.toString().padStart(2, "0")}`,
+    );
+    const timeMin = "2026-08-28T00:00:00.000Z";
+    const timeMax = "2026-09-02T00:00:00.000Z";
+
+    for (const readWindow of [
+      (cursor?: string) =>
+        google.readPersonalCalendarWindow({
+          householdId,
+          ownerAdultId,
+          connectionId,
+          excludedFamilyCalendarId: null,
+          timeMin,
+          timeMax,
+          limit: 20,
+          ...(cursor === undefined ? {} : { cursor }),
+        }),
+      (cursor?: string) =>
+        google.readExactCalendarWindow({
+          householdId,
+          ownerAdultId,
+          connectionId,
+          calendarId,
+          timeMin,
+          timeMax,
+          limit: 20,
+          ...(cursor === undefined ? {} : { cursor }),
+        }),
+    ]) {
+      const observedIds: string[] = [];
+      let cursor: string | undefined;
+      let pageCount = 0;
+      do {
+        const page = await readWindow(cursor);
+        pageCount += 1;
+        expect(page.totalEventCount).toBe(73);
+        observedIds.push(...page.events.map((event) => event.providerEventId));
+        if (page.nextCursor) {
+          expect(page.nextCursor).not.toContain(calendarId);
+          expect(page.nextCursor).not.toContain("event-");
+        }
+        cursor = page.nextCursor ?? undefined;
+      } while (cursor !== undefined);
+
+      expect(pageCount).toBe(4);
+      expect(observedIds).toEqual(expectedIds);
+      expect(new Set(observedIds).size).toBe(73);
+    }
+    expect(providerEventRequests).toHaveLength(16);
+    expect(providerEventRequests.every((url) => url.searchParams.get("maxResults") === "50")).toBe(true);
+  });
+
+  test("rejects stale, query-mismatched, and tampered continuation cursors", async () => {
+    const connectionId = "connection-2";
+    const householdId = "household-2";
+    const ownerAdultId = "adult-2";
+    const calendarId = "changing-calendar";
+    const key = Buffer.alloc(32, 5);
+    let changedRevision = false;
+    const fetchMock = vi.fn<typeof fetch>(async (input) => {
+      const url = new URL(String(input));
+      if (url.origin === "https://oauth2.googleapis.com") {
+        return jsonResponse({ access_token: "access-token", token_type: "Bearer" });
+      }
+      if (url.pathname === "/calendar/v3/users/me/calendarList") {
+        return jsonResponse({
+          items: [
+            {
+              id: calendarId,
+              summary: "Changing calendar",
+              timeZone: "America/Los_Angeles",
+              accessRole: "owner",
+              primary: true,
+            },
+          ],
+        });
+      }
+      if (url.pathname === `/calendar/v3/calendars/${calendarId}/events`) {
+        const events = Array.from({ length: 12 }, (_, index) => calendarEvent(index));
+        if (changedRevision) events[0] = { ...events[0], etag: '"changed-revision"' };
+        return jsonResponse({ timeZone: "America/Los_Angeles", items: events });
+      }
+      throw new Error(`Unexpected provider request: ${url}`);
+    });
+    const store = {
+      async readActiveGoogleCredential() {
+        return {
+          connectionId,
+          householdId,
+          ownerAdultId,
+          refreshTokenEnvelope: refreshTokenEnvelope({ key, connectionId, householdId, ownerAdultId }),
+        };
+      },
+    } as unknown as GoogleConnectionStore;
+    const google = new GoogleConnection({
+      store,
+      clientId: "client-id",
+      clientSecret: "client-secret",
+      redirectUri: "https://app.tryflorence.com/oauth/google/callback",
+      encryptionKey: key,
+      fetch: fetchMock,
+    });
+    const baseInput = {
+      householdId,
+      ownerAdultId,
+      connectionId,
+      excludedFamilyCalendarId: null,
+      timeMin: "2026-08-28T00:00:00.000Z",
+      timeMax: "2026-09-02T00:00:00.000Z",
+      limit: 5,
+    } as const;
+    const first = await google.readPersonalCalendarWindow(baseInput);
+    const cursor = first.nextCursor;
+    expect(cursor).not.toBeNull();
+    if (cursor === null) throw new Error("Expected a Personal Calendar continuation cursor");
+
+    changedRevision = true;
+    await expect(google.readPersonalCalendarWindow({ ...baseInput, cursor })).rejects.toThrow(
+      /cursor is stale/i,
+    );
+
+    changedRevision = false;
+    await expect(
+      google.readPersonalCalendarWindow({
+        ...baseInput,
+        calendarIds: [calendarId],
+        cursor,
+      }),
+    ).rejects.toThrow(/invalid|another read/i);
+
+    const tamperIndex = Math.floor((cursor?.length ?? 0) / 2);
+    const tampered = `${cursor?.slice(0, tamperIndex)}${cursor?.[tamperIndex] === "a" ? "b" : "a"}${cursor?.slice(
+      tamperIndex + 1,
+    )}`;
+    await expect(google.readPersonalCalendarWindow({ ...baseInput, cursor: tampered })).rejects.toThrow(
+      /cursor is invalid/i,
+    );
+  });
+});

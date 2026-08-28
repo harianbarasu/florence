@@ -1857,6 +1857,7 @@ export class Florence {
       timeMin: string;
       timeMax: string;
       limit: number;
+      cursor: string | null;
     }): Promise<
       Readonly<{
         read: GooglePersonalCalendarWindowRead;
@@ -2007,7 +2008,7 @@ export class Florence {
           throw error;
         }
       },
-      readCalendarWindow: async ({ timeMin, timeMax, limit, scope, calendarRefs }) => {
+      readCalendarWindow: async ({ timeMin, timeMax, pageSize, cursor, scope, calendarRefs }) => {
         if (!this.#google || !activeGoogleConnection || !googleOwnerAdultId) {
           return {
             status: "unavailable",
@@ -2015,6 +2016,7 @@ export class Florence {
             totalCalendarCount: 0,
             events: [],
             totalEventCount: 0,
+            nextCursor: null,
           };
         }
         try {
@@ -2027,6 +2029,7 @@ export class Florence {
                 totalCalendarCount: 0,
                 events: [],
                 totalEventCount: 0,
+                nextCursor: null,
               };
             }
             calendarIds = [turn.household.familyCalendarId];
@@ -2042,6 +2045,7 @@ export class Florence {
                 totalCalendarCount: 0,
                 events: [],
                 totalEventCount: 0,
+                nextCursor: null,
               };
             }
             calendarIds = [primary.calendarId];
@@ -2058,7 +2062,8 @@ export class Florence {
                   calendarId: calendarIds?.[0] ?? "",
                   timeMin,
                   timeMax,
-                  limit,
+                  limit: pageSize,
+                  cursor,
                 })
               : {
                   read: await this.#google.readPersonalCalendarWindow({
@@ -2069,7 +2074,8 @@ export class Florence {
                     timeMin,
                     timeMax,
                     ...(calendarIds === undefined ? {} : { calendarIds }),
-                    limit,
+                    limit: pageSize,
+                    ...(cursor === null ? {} : { cursor }),
                   }),
                   credential: {
                     connectionId: activeGoogleConnection.connectionId,
@@ -2112,6 +2118,7 @@ export class Florence {
             })),
             totalCalendarCount: read.totalCalendarCount,
             totalEventCount: read.totalEventCount,
+            nextCursor: read.nextCursor,
             events: read.events.map((event) => {
               const eventRef = calendarEventRefFor(event);
               if (event.title) {
@@ -3663,6 +3670,7 @@ export class Florence {
         timeMin: string;
         timeMax: string;
         limit: number;
+        cursor: string | null;
       }) =>
         this.#readExactFamilyCalendarWindow({
           householdId: work.household.householdId,
@@ -3742,7 +3750,8 @@ export class Florence {
       const readFamilyWorkCalendarWindow = async (input: {
         timeMin: string;
         timeMax: string;
-        limit: number;
+        pageSize: number;
+        cursor: string | null;
         scope: "all" | "primary" | "selected";
         calendarRefs: readonly string[];
       }): Promise<FlorenceCalendarWindowRead> => {
@@ -3753,6 +3762,7 @@ export class Florence {
             totalCalendarCount: 0,
             events: [],
             totalEventCount: 0,
+            nextCursor: null,
           };
         }
         let read: GooglePersonalCalendarWindowRead;
@@ -3765,6 +3775,7 @@ export class Florence {
               totalCalendarCount: 0,
               events: [],
               totalEventCount: 0,
+              nextCursor: null,
             };
           }
           if (
@@ -3777,6 +3788,7 @@ export class Florence {
               totalCalendarCount: 0,
               events: [],
               totalEventCount: 0,
+              nextCursor: null,
             };
           }
           read = (
@@ -3784,7 +3796,8 @@ export class Florence {
               calendarId,
               timeMin: input.timeMin,
               timeMax: input.timeMax,
-              limit: input.limit,
+              limit: input.pageSize,
+              cursor: input.cursor,
             })
           ).read;
         } else {
@@ -3795,6 +3808,7 @@ export class Florence {
               totalCalendarCount: 0,
               events: [],
               totalEventCount: 0,
+              nextCursor: null,
             };
           }
           const familyCalendarId = familyWorkHousehold.familyCalendarId;
@@ -3811,6 +3825,7 @@ export class Florence {
                 totalCalendarCount: 0,
                 events: [],
                 totalEventCount: 0,
+                nextCursor: null,
               };
             }
             read = (
@@ -3818,7 +3833,8 @@ export class Florence {
                 calendarId: familyCalendarId,
                 timeMin: input.timeMin,
                 timeMax: input.timeMax,
-                limit: input.limit,
+                limit: input.pageSize,
+                cursor: input.cursor,
               })
             ).read;
           } else {
@@ -3848,6 +3864,7 @@ export class Florence {
                   totalCalendarCount: 0,
                   events: [],
                   totalEventCount: 0,
+                  nextCursor: null,
                 };
               }
               calendarIds = resolved;
@@ -3860,6 +3877,7 @@ export class Florence {
                   totalCalendarCount: 0,
                   events: [],
                   totalEventCount: 0,
+                  nextCursor: null,
                 };
               }
               calendarIds = [primary.calendarId];
@@ -3872,7 +3890,8 @@ export class Florence {
               timeMin: input.timeMin,
               timeMax: input.timeMax,
               ...(calendarIds === undefined ? {} : { calendarIds }),
-              limit: input.limit,
+              limit: input.pageSize,
+              ...(input.cursor === null ? {} : { cursor: input.cursor }),
             });
           }
         }
@@ -3904,6 +3923,7 @@ export class Florence {
           })),
           totalCalendarCount: read.totalCalendarCount,
           totalEventCount: read.totalEventCount,
+          nextCursor: read.nextCursor,
           events: read.events.map((event) => {
             const ref = rememberFamilyWorkCalendarEvent(event);
             return event.intervalKind === "all_day"
@@ -4101,22 +4121,27 @@ export class Florence {
             request.target.observedEvent.intervalKind === "all_day"
               ? zonedCalendarDateStart(request.target.observedEvent.startDate, familyWorkHousehold.timeZone)
               : new Date(request.target.observedEvent.startsAt);
-          const read: GooglePersonalCalendarWindowRead = (
-            await readFamilyWorkExactCalendarWindow({
-              calendarId,
-              timeMin: new Date(targetStart.getTime() - 60_000).toISOString(),
-              timeMax: new Date(targetStart.getTime() + 60_000).toISOString(),
-              limit: 50,
-            })
-          ).read;
-          if (
-            read.status !== "complete" ||
-            read.calendars.some((calendar) => calendar.status !== "complete")
-          ) {
-            throw new Error("The exact Family Calendar event could not be completely re-read");
-          }
-          for (const event of read.events) rememberFamilyWorkCalendarEvent(event);
-          target = familyWorkCalendarTargets.get(request.target.eventRef) ?? null;
+          let pageCursor: string | null = null;
+          do {
+            const read: GooglePersonalCalendarWindowRead = (
+              await readFamilyWorkExactCalendarWindow({
+                calendarId,
+                timeMin: new Date(targetStart.getTime() - 60_000).toISOString(),
+                timeMax: new Date(targetStart.getTime() + 60_000).toISOString(),
+                limit: 50,
+                cursor: pageCursor,
+              })
+            ).read;
+            if (
+              (read.status !== "complete" && read.status !== "truncated") ||
+              read.calendars.some((calendar) => calendar.status !== "complete")
+            ) {
+              throw new Error("The exact Family Calendar event could not be completely re-read");
+            }
+            for (const event of read.events) rememberFamilyWorkCalendarEvent(event);
+            target = familyWorkCalendarTargets.get(request.target.eventRef) ?? null;
+            pageCursor = read.nextCursor;
+          } while (!target && pageCursor !== null);
         }
         if (
           !target ||
@@ -4148,10 +4173,11 @@ export class Florence {
               timeMin: new Date(cursor).toISOString(),
               timeMax: new Date(end).toISOString(),
               limit: 50,
+              cursor: null,
             })
           ).read;
           if (
-            read.status !== "complete" ||
+            (read.status !== "complete" && read.status !== "truncated") ||
             read.calendars.length !== 1 ||
             read.calendars[0]?.calendarId !== calendarId ||
             read.calendars[0].status !== "complete"
@@ -5854,6 +5880,7 @@ export class Florence {
     timeMin: string;
     timeMax: string;
     limit: number;
+    cursor: string | null;
     credentials: readonly ActiveFamilyCalendarCredential[];
   }): Promise<
     Readonly<{
@@ -5885,6 +5912,7 @@ export class Florence {
           timeMin: input.timeMin,
           timeMax: input.timeMax,
           limit: input.limit,
+          ...(input.cursor === null ? {} : { cursor: input.cursor }),
         });
         const exactTarget = read.calendars.find((calendar) => calendar.calendarId === input.calendarId);
         if (exactTarget?.status === "complete" && exactTarget.accessRole !== "freeBusyReader") {
@@ -5906,6 +5934,7 @@ export class Florence {
         timeMin: input.timeMin,
         timeMax: input.timeMax,
         limit: input.limit,
+        ...(input.cursor === null ? {} : { cursor: input.cursor }),
       }),
       credential: firstCredential,
     };

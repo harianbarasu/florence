@@ -4815,30 +4815,23 @@ export class Florence {
 
       if (work.kind === "finite_monitor") {
         const googleEvidence = new Map<string, GoogleEvidenceDraft>();
-        const split = new Date(Date.parse(currentTime) - 14 * 24 * 60 * 60_000).toISOString();
-        const [recent, earlier] =
+        // The cursor-backed personal Google poll owns exhaustive new-mail discovery. A timed
+        // monitor review rereads only the exact Gmail resources already linked to this monitor.
+        const gmailMessages =
           work.visibility === "private"
-            ? await Promise.all([
-                this.#google.searchGmail({
-                  householdId: work.household.householdId,
-                  ownerAdultId: work.adultId,
-                  connectionId: work.connectionId,
-                  query: "-category:promotions -category:social",
-                  after: split,
-                  before: currentTime,
-                  limit: 20,
-                }),
-                this.#google.searchGmail({
-                  householdId: work.household.householdId,
-                  ownerAdultId: work.adultId,
-                  connectionId: work.connectionId,
-                  query: "-category:promotions -category:social",
-                  after: gmailAfter,
-                  before: split,
-                  limit: 20,
-                }),
-              ])
-            : [null, null];
+            ? await Promise.all(
+                work.gmailSourceAnchors.map((anchor) =>
+                  google.readGmailMessage({
+                    householdId: work.household.householdId,
+                    ownerAdultId: work.adultId,
+                    connectionId: work.connectionId,
+                    messageId: anchor.messageId,
+                    threadId: anchor.threadId,
+                    historyId: anchor.historyId,
+                  }),
+                ),
+              )
+            : [];
         const calendar = await this.#google.readInitialCalendarReview({
           householdId: work.household.householdId,
           ownerAdultId: work.adultId,
@@ -4847,14 +4840,6 @@ export class Florence {
           currentTime,
           limit: 50,
         });
-        const seenMessages = new Set<string>();
-        const gmailMessages = [...(recent?.messages ?? []), ...(earlier?.messages ?? [])].filter(
-          (message) => {
-            if (seenMessages.has(message.messageId)) return false;
-            seenMessages.add(message.messageId);
-            return true;
-          },
-        );
         const gmailSources = gmailMessages.map((message): FlorencePrivateGmailSource => {
           const source = draftGmailEvidence({
             householdId: work.household.householdId,
@@ -4914,8 +4899,7 @@ export class Florence {
               });
         const currentEvidence: FlorenceBoundedPrivateGoogleEvidence = {
           gmail: {
-            status:
-              recent?.status === "truncated" || earlier?.status === "truncated" ? "truncated" : "complete",
+            status: "complete",
             after: gmailAfter,
             before: currentTime,
             sources: gmailSources,

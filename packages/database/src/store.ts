@@ -514,6 +514,13 @@ export type ActiveFiniteMonitor = {
   why: string;
 };
 
+/** Exact retained Gmail resources already grounding a finite monitor. */
+export type FiniteMonitorGmailSourceAnchor = {
+  messageId: string;
+  threadId: string;
+  historyId: string;
+};
+
 export type ProactiveDelivery = {
   privateDetail: string | null;
   householdConclusion: string | null;
@@ -727,6 +734,7 @@ export type DueProactiveWork =
       connectionId: string;
       calendarId: string;
       monitor: ActiveFiniteMonitor;
+      gmailSourceAnchors: readonly FiniteMonitorGmailSourceAnchor[];
     }
   | {
       kind: "interest_monitor";
@@ -3274,6 +3282,36 @@ export class PostgresFlorenceStore {
             order by p.adult_slot,g.created_at,g.id,c.bound_at,c.id limit 1
           `;
           if (context?.calendar_id) {
+            const gmailSourceAnchors =
+              work.visibility === "private"
+                ? (
+                    await sql<{ metadata: JsonValue }[]>`
+                      select source.metadata
+                      from proactive_work_sources link
+                      join sources source on source.id=link.source_id
+                      join google_connections historical
+                        on historical.id::text=source.metadata->>'connectionId'
+                        and historical.household_id=source.household_id
+                        and historical.owner_adult_id=source.owner_adult_id
+                      join google_connections active
+                        on active.id=${context.connection_id}
+                        and active.household_id=historical.household_id
+                        and active.owner_adult_id=historical.owner_adult_id
+                        and active.status='active'
+                        and active.google_subject_digest is not null
+                        and historical.google_subject_digest=active.google_subject_digest
+                      where link.work_id=${work.id} and source.household_id=${work.household_id}
+                        and source.kind='gmail' and source.visibility='private'
+                        and source.owner_adult_id=${context.adult_id}
+                      order by source.occurred_at,source.id
+                      for share of source,historical,active
+                    `
+                  ).map(({ metadata }) => ({
+                    messageId: required(jsonString(metadata, "messageId") ?? "", "Gmail message ID"),
+                    threadId: required(jsonString(metadata, "threadId") ?? "", "Gmail thread ID"),
+                    historyId: required(jsonString(metadata, "historyId") ?? "", "Gmail history ID"),
+                  }))
+                : [];
             return {
               kind: "finite_monitor",
               workId: work.id,
@@ -3284,6 +3322,7 @@ export class PostgresFlorenceStore {
               connectionId: context.connection_id,
               calendarId: context.calendar_id,
               monitor: activeFiniteMonitor(work),
+              gmailSourceAnchors,
             };
           }
           continue;

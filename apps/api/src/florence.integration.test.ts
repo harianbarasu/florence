@@ -443,6 +443,8 @@ type HarnessState = {
   overlapGmailAssessments: number;
   overlapGmailSourceId: string | null;
   monitorEvidenceExercise: boolean;
+  linkedGmailMonitorExercise: boolean;
+  exactGmailReads: Parameters<GoogleConnection["readGmailMessage"]>[0][];
   monitorCancellationActive: boolean;
   silentMonitorSourceId: string | null;
   voicedMonitorSourceId: string | null;
@@ -4692,6 +4694,20 @@ release("Florence parent journeys", () => {
           and objective=${sqlLiteral(UNRELATED_ACCOUNT_MONITOR_OBJECTIVE)}
       )`,
     );
+    const interactiveReadsBeforeDueMonitor = initialBoundaryHarness.state.interactiveGoogleReads;
+    initialBoundaryHarness.state.linkedGmailMonitorExercise = true;
+    initialBoundaryHarness.state.now += 24 * 60 * 60_000;
+    await initialBoundaryHarness.drain();
+    expect(initialBoundaryHarness.state.finiteReviews).toBe(1);
+    expect(initialBoundaryHarness.state.interactiveGoogleReads).toBe(interactiveReadsBeforeDueMonitor);
+    expect(initialBoundaryHarness.state.exactGmailReads).toEqual([
+      expect.objectContaining({
+        ownerAdultId: initialBoundaryHarness.founderAdultId,
+        messageId: "gmail-initial-unrelated-retail-account-alert",
+        threadId: "thread-gmail-initial-unrelated-retail-account-alert",
+        historyId: "101",
+      }),
+    ]);
 
     const initialFactOnlyBoundaryHarness = await createHarness();
     initialFactOnlyBoundaryHarness.state.initialUnrelatedAccountFactOnlyReview = true;
@@ -6318,6 +6334,8 @@ async function createHarness(
     overlapGmailAssessments: 0,
     overlapGmailSourceId: null,
     monitorEvidenceExercise: false,
+    linkedGmailMonitorExercise: false,
+    exactGmailReads: [],
     monitorCancellationActive: false,
     silentMonitorSourceId: null,
     voicedMonitorSourceId: null,
@@ -7107,6 +7125,29 @@ function createReasoner(
     },
     reviewFiniteMonitor: async (input: Parameters<FlorenceReasoner["reviewFiniteMonitor"]>[0]) => {
       state.finiteReviews += 1;
+      if (state.linkedGmailMonitorExercise) {
+        if (input.monitor.objective !== UNRELATED_ACCOUNT_MONITOR_OBJECTIVE) {
+          throw new Error("The due Gmail review selected another monitor");
+        }
+        const [source] = input.evidence.gmail.sources;
+        if (
+          input.evidence.gmail.sources.length !== 1 ||
+          source?.subject !== UNRELATED_ACCOUNT_EMAIL_SUBJECT ||
+          input.evidence.gmail.status !== "complete"
+        ) {
+          throw new Error("The due Gmail review did not receive its exact linked source");
+        }
+        return {
+          outcome: "silent" as const,
+          urgency: "watch" as const,
+          privateDetail: null,
+          householdConclusion: null,
+          sourceIds: [],
+          currentConclusion: input.monitor.currentConclusion,
+          nextCheck: new Date(Date.parse(input.currentTime) + 60 * 60_000).toISOString(),
+          why: input.monitor.why,
+        };
+      }
       const source = input.evidence.calendar.events[0] ?? input.evidence.gmail.sources[0];
       if (!source) throw new Error("Monitor review did not receive current evidence");
       if (state.finiteReviews === 1) {
@@ -7370,6 +7411,29 @@ function createGoogle(store: PostgresFlorenceStore, state: HarnessState): Google
         capturedAt: new Date(state.now).toISOString(),
       };
     },
+    readGmailMessage: async (input: Parameters<GoogleConnection["readGmailMessage"]>[0]) => {
+      await activeCredential(input);
+      state.exactGmailReads.push(input);
+      if (
+        input.messageId !== "gmail-initial-unrelated-retail-account-alert" ||
+        input.threadId !== "thread-gmail-initial-unrelated-retail-account-alert" ||
+        input.historyId !== "101"
+      ) {
+        throw new Error("The due monitor requested an unexpected Gmail source");
+      }
+      return {
+        messageId: input.messageId,
+        threadId: input.threadId,
+        historyId: input.historyId,
+        from: "account@example.test",
+        subject: UNRELATED_ACCOUNT_EMAIL_SUBJECT,
+        sentAt: new Date(NOW - 1_000).toISOString(),
+        text: "Your retail account password was changed.",
+        textStatus: "complete" as const,
+        attachmentsStatus: "complete" as const,
+        attachments: [],
+      };
+    },
     readGmailBaselinePage: async (input: {
       householdId: string;
       ownerAdultId: string;
@@ -7598,6 +7662,9 @@ function createGoogle(store: PostgresFlorenceStore, state: HarnessState): Google
       limit?: number;
     }) => {
       await activeCredential(input);
+      if (state.linkedGmailMonitorExercise && input.query === "-category:promotions -category:social") {
+        throw new Error("A due monitor used the sampled generic Gmail search");
+      }
       state.interactiveGoogleReads += 1;
       const founder = input.ownerAdultId === founderSetup().adultId;
       const recent =

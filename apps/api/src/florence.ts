@@ -47,6 +47,7 @@ import type {
   FamilyCalendarReviewProposal,
   FamilyGroupCreationWork,
   FamilyMemberRecord,
+  FamilyWorkSelectedImage,
   FamilyWorkStateV1,
   FiniteMonitorDraft,
   FiniteMonitorUpdate,
@@ -62,6 +63,7 @@ import type {
   JsonObject,
   LinqAuthority,
   MessagesEnrollmentResult,
+  OutboundNativeMove,
   OutboundNativeMoveDraft,
   PostgresFlorenceStore,
   PreparedInboundContent,
@@ -102,7 +104,9 @@ import {
 import {
   type LinqClient,
   LinqError,
+  type LinqMessagePart,
   type LinqMessageStatusProposal,
+  type LinqNativeMove,
   type LinqReaction,
   type LinqReactionProposal,
 } from "@florence/linq";
@@ -2331,13 +2335,16 @@ export class Florence {
         );
         return "failed";
       }
+      const nativeMove = outbound.nativeMove
+        ? await this.#prepareLinqNativeMove(outbound.nativeMove, outbound.householdId, outbound.sourceId)
+        : null;
       const result =
-        outbound.nativeMove !== null
+        nativeMove !== null
           ? await this.#linq.sendMove({
               idempotencyKey: outbound.idempotencyKey,
               providerConversationId: outbound.providerConversationId,
               expectedAuthority: outbound.expectedAuthority,
-              move: outbound.nativeMove,
+              move: nativeMove,
             })
           : outbound.moveKind === "reaction"
             ? await this.#linq.sendReaction({
@@ -2391,6 +2398,76 @@ export class Florence {
       });
       return retryTransient && error instanceof LinqError && error.retryable ? "claimed" : "failed";
     }
+  }
+
+  async #prepareLinqNativeMove(
+    move: OutboundNativeMove,
+    householdId: string,
+    sourceId: string,
+  ): Promise<LinqNativeMove> {
+    if (move.type !== "message") return move;
+    const parts: LinqMessagePart[] = [];
+    let failedArtifactCount = 0;
+    for (const part of move.parts) {
+      if (part.type !== "media") {
+        parts.push(part);
+        continue;
+      }
+      if (part.source.type === "url") {
+        parts.push({ type: "media", source: part.source });
+        continue;
+      }
+      let providerAttachmentId = part.source.providerAttachmentId;
+      if (!providerAttachmentId) {
+        try {
+          if (!this.#imageVault) {
+            throw new Error("Florence image delivery is not configured");
+          }
+          if (part.source.mimeType === "image/webp") {
+            throw new Error("Messages does not accept the captured image format");
+          }
+          const image = await this.#imageVault.read({
+            householdId,
+            signalId: part.source.signalId,
+            image: { assetId: part.source.assetId, mimeType: part.source.mimeType },
+          });
+          if (image.mimeType !== part.source.mimeType) {
+            throw new Error("The selected browser image changed before delivery");
+          }
+          providerAttachmentId = await this.#linq.uploadAttachment({
+            filename: part.source.filename,
+            mimeType: image.mimeType,
+            bytes: image.bytes,
+          });
+        } catch {
+          failedArtifactCount += 1;
+          continue;
+        }
+        await this.#store.checkpointOutboundArtifactAttachment({
+          sourceId,
+          assetId: part.source.assetId,
+          providerAttachmentId,
+        });
+      }
+      parts.push({
+        type: "media",
+        source: { type: "attachment", providerAttachmentId },
+      });
+    }
+    if (failedArtifactCount > 0) {
+      const note =
+        failedArtifactCount === 1
+          ? "I found a visual too, but it wouldn’t attach just now."
+          : "I found a few visuals too, but they wouldn’t attach just now.";
+      const textIndex = parts.findIndex((part) => part.type === "text");
+      const textPart = textIndex >= 0 ? parts[textIndex] : undefined;
+      if (textPart?.type === "text") {
+        parts[textIndex] = { ...textPart, text: `${textPart.text}\n\n${note}` };
+      } else {
+        parts.unshift({ type: "text", text: note });
+      }
+    }
+    return { type: "message", parts };
   }
 
   async #tryRetryCue(sourceId: string): Promise<boolean> {
@@ -4494,6 +4571,51 @@ export class Florence {
                           };
                         })()
                       : undefined;
+                  const selectedAssetId =
+                    operation.kind === "capture"
+                      ? deterministicUuid(`family-work-browser-image\0${work.workId}\0${pendingCall.callId}`)
+                      : null;
+                  if (
+                    operation.kind === "capture" &&
+                    selectedAssetId &&
+                    pendingCall.attempt > 1 &&
+                    browserSession &&
+                    this.#imageVault
+                  ) {
+                    for (const mimeType of ["image/png", "image/jpeg", "image/webp"] as const) {
+                      try {
+                        const read = await this.#imageVault.read({
+                          householdId: work.household.householdId,
+                          signalId: work.workId,
+                          image: { assetId: selectedAssetId, mimeType },
+                        });
+                        const selectedImage: FamilyWorkSelectedImage = {
+                          assetId: selectedAssetId,
+                          signalId: work.workId,
+                          workId: work.workId,
+                          mimeType: read.mimeType,
+                          filename: browserSelectedImageFilename(
+                            operation.label,
+                            selectedAssetId,
+                            read.mimeType,
+                          ),
+                        };
+                        return {
+                          kind: "page" as const,
+                          reason: "This exact browser image was already captured for the family result.",
+                          url: "",
+                          title: operation.label,
+                          snapshot: "",
+                          refCount: 0,
+                          truncated: false,
+                          screenshot: read,
+                          selectedImage,
+                        };
+                      } catch {
+                        // The exact selected image may not have reached durable storage before interruption.
+                      }
+                    }
+                  }
                   const result = await browser.run(
                     {
                       householdId: work.household.householdId,
@@ -4508,7 +4630,32 @@ export class Florence {
                     taskSignal,
                   );
                   browserSession = result.session;
-                  return result.observation;
+                  if (operation.kind !== "capture") return result.observation;
+                  if (!selectedAssetId || !result.observation.screenshot) {
+                    throw new Error("Kernel did not return the selected browser image");
+                  }
+                  if (!this.#imageVault) {
+                    throw new Error("Florence image persistence is not configured");
+                  }
+                  const stored = await this.#imageVault.store({
+                    assetId: selectedAssetId,
+                    householdId: work.household.householdId,
+                    signalId: work.workId,
+                    declaredMimeType: result.observation.screenshot.mimeType,
+                    bytes: result.observation.screenshot.bytes,
+                  });
+                  const selectedImage: FamilyWorkSelectedImage = {
+                    assetId: stored.image.assetId,
+                    signalId: work.workId,
+                    workId: work.workId,
+                    mimeType: stored.image.mimeType,
+                    filename: browserSelectedImageFilename(
+                      operation.label,
+                      stored.image.assetId,
+                      stored.image.mimeType,
+                    ),
+                  };
+                  return { ...result.observation, selectedImage };
                 },
               }
             : {}),
@@ -7764,6 +7911,21 @@ function browserImageUploadFilename(
 ): string {
   const extension = mimeType === "image/jpeg" ? "jpg" : mimeType === "image/png" ? "png" : "webp";
   return `attachment-${assetId.slice(0, 8)}.${extension}`;
+}
+
+function browserSelectedImageFilename(
+  label: string,
+  assetId: string,
+  mimeType: "image/jpeg" | "image/png" | "image/webp",
+): string {
+  const extension = mimeType === "image/jpeg" ? "jpg" : mimeType === "image/png" ? "png" : "webp";
+  const basename = label
+    .normalize("NFKC")
+    .trim()
+    .replace(/[^\p{L}\p{N}]+/gu, "-")
+    .replace(/^-+|-+$/gu, "")
+    .slice(0, 80);
+  return `${basename || `florence-result-${assetId.slice(0, 8)}`}.${extension}`;
 }
 
 function browserPdfUploadFilename(filename: string, documentId: string): string {

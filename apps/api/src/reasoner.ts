@@ -2,7 +2,12 @@ import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { MAX_IMAGE_BYTES, MAX_PDF_BYTES } from "@florence/artifacts";
 import { memoryPresentationSchema } from "@florence/contracts";
-import type { FamilyWorkOriginContext, FamilyWorkStateV1, SharedFamilyProfile } from "@florence/database";
+import type {
+  FamilyWorkOriginContext,
+  FamilyWorkSelectedImage,
+  FamilyWorkStateV1,
+  SharedFamilyProfile,
+} from "@florence/database";
 import {
   GoogleCalendarTransientError,
   GoogleWorkspaceError,
@@ -1490,6 +1495,7 @@ const familyWorkTerminalDecisionSchema = z
     text: z.string().trim().min(1).max(2_000).nullable().default(null),
     resumeAt: calendarInstant.nullable().default(null),
     progressText: z.string().trim().min(1).max(2_000).nullable().default(null),
+    selectedImageAssetIds: z.array(z.string().uuid()).default([]),
   })
   .strict();
 
@@ -1577,6 +1583,7 @@ export type FlorenceFamilyWorkStep =
       state: FamilyWorkStateV1;
       outcome: "succeeded" | "partial" | "failed";
       text: string;
+      selectedImages?: readonly FamilyWorkSelectedImage[];
     }>;
 
 export type FlorenceSource = z.infer<typeof florenceSourceSchema>;
@@ -1914,7 +1921,7 @@ Treat an unavailable tool, invalid call, empty result, or failed approach as inf
 
 Keep choosing and chaining useful read or investigation tools in the current reasoning pass until there is enough evidence to finish, a real outside effect must be checkpointed, outside state genuinely needs time to change, or one consequential parent choice remains unknowable. The runtime will checkpoint before an outside effect; do not impose a one-tool workflow of your own. If useful work genuinely depends on outside state that cannot reasonably have changed yet, return outcome deferred with a proportionate absolute future resumeAt. Deferred work remains the same task and will wake automatically at that instant. It is not a substitute for using an available tool now, asking a genuinely blocking parent question, or returning a finished result. Use progressText only the first time Florence has something useful to say about the wait; use null on unchanged later checks so the family does not receive repeated status messages. A useful progress note tells the family what materially changed or what Florence is now waiting on in ordinary conversational language; it is not a provider-status translation.
 
-The result object always contains outcome, text, resumeAt, and progressText. For outcome deferred, text must be null, resumeAt must be the absolute future instant, and progressText may be useful text or null. For every other outcome, text must contain the result or question, and both resumeAt and progressText must be null.
+The result object always contains outcome, text, resumeAt, progressText, and selectedImageAssetIds. For outcome deferred, text must be null, resumeAt must be the absolute future instant, progressText may be useful text or null, and selectedImageAssetIds must be empty. For every other outcome, text must contain the result or question and both resumeAt and progressText must be null. A browser capture marked user-visible returns an opaque selected image asset ID. Copy each exact ID into selectedImageAssetIds only when that image materially helps the finished result; routine browser screenshots are for your own inspection and must not be selected. Do not invent an asset ID. Selected images are currently delivered only with a succeeded or partial result, so waiting and failed results leave selectedImageAssetIds empty.
 
 If the accumulated evidence is enough, return a concise terminal result that leads with the useful answer and includes concrete options, times, tradeoffs, completed actions, and direct URLs already present in tool results when helpful. Write it as Florence rejoining the same family conversation: natural, specific, and warm enough for the moment, never like a ticket closing or a machine reporting state. Use outcome succeeded when the requested work is complete, partial when useful results exist but one named source or constraint could not be resolved, failed only when no useful result can be produced, and waiting only when one consequential parent choice remains genuinely blocking after the available tools. A waiting result must ask exactly one focused question in ordinary language. Never say you will keep working unless you actually call another tool in this checkpoint or return a deferred result with an exact resumeAt. Output only the strict result schema when you do not call a tool.`;
 
@@ -3569,6 +3576,15 @@ const browserComputerActionArguments = z
     if (action.type === "sleep") requireValue(action.milliseconds, "milliseconds");
   });
 
+const browserCaptureRegionArguments = z
+  .object({
+    x: z.number().finite().min(0),
+    y: z.number().finite().min(0),
+    width: z.number().finite().positive(),
+    height: z.number().finite().positive(),
+  })
+  .strict();
+
 const browserWorkArguments = z
   .object({
     operation: z.enum([
@@ -3584,6 +3600,7 @@ const browserWorkArguments = z
       "wait",
       "back",
       "screenshot",
+      "capture",
       "playwright",
       "computer",
       "owner_handoff",
@@ -3602,6 +3619,10 @@ const browserWorkArguments = z
     timeoutSeconds: z.number().int().min(1).max(300).nullable(),
     actions: z.array(browserComputerActionArguments).max(50),
     screenshot: z.boolean(),
+    captureSource: z.enum(["viewport", "full_page", "element", "image_resource"]).nullable().default(null),
+    captureLabel: z.string().trim().min(1).max(200).nullable().default(null),
+    selector: z.string().trim().min(1).max(2_000).nullable().default(null),
+    region: browserCaptureRegionArguments.nullable().default(null),
   })
   .strict()
   .superRefine((args, context) => {
@@ -3632,6 +3653,20 @@ const browserWorkArguments = z
     if (args.operation === "scroll") requireValue(args.direction, "direction");
     if (args.operation === "wait") requireValue(args.milliseconds, "milliseconds");
     if (args.operation === "playwright") requireValue(args.code, "code");
+    if (args.operation === "capture") {
+      requireValue(args.captureSource, "captureSource");
+      requireValue(args.captureLabel, "captureLabel");
+      if (args.captureSource === "element" || args.captureSource === "image_resource") {
+        requireValue(args.selector, "selector");
+      }
+      if (args.region !== null && args.captureSource !== "viewport") {
+        context.addIssue({
+          code: "custom",
+          path: ["region"],
+          message: "region is only valid for a viewport capture",
+        });
+      }
+    }
     if (args.operation === "computer" && args.actions.length === 0) {
       context.addIssue({
         code: "custom",
@@ -3713,6 +3748,7 @@ const BROWSER_WORK_PARAMETERS = {
         "wait",
         "back",
         "screenshot",
+        "capture",
         "playwright",
         "computer",
         "owner_handoff",
@@ -3738,6 +3774,30 @@ const BROWSER_WORK_PARAMETERS = {
     },
     actions: { type: "array", maxItems: 50, items: BROWSER_COMPUTER_ACTION_PARAMETERS },
     screenshot: { type: "boolean" },
+    captureSource: {
+      anyOf: [
+        { type: "string", enum: ["viewport", "full_page", "element", "image_resource"] },
+        { type: "null" },
+      ],
+    },
+    captureLabel: { anyOf: [{ type: "string", minLength: 1, maxLength: 200 }, { type: "null" }] },
+    selector: { anyOf: [{ type: "string", minLength: 1, maxLength: 2_000 }, { type: "null" }] },
+    region: {
+      anyOf: [
+        {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            x: { type: "number", minimum: 0 },
+            y: { type: "number", minimum: 0 },
+            width: { type: "number", exclusiveMinimum: 0 },
+            height: { type: "number", exclusiveMinimum: 0 },
+          },
+          required: ["x", "y", "width", "height"],
+        },
+        { type: "null" },
+      ],
+    },
   },
   required: [
     "operation",
@@ -3755,8 +3815,22 @@ const BROWSER_WORK_PARAMETERS = {
     "timeoutSeconds",
     "actions",
     "screenshot",
+    "captureSource",
+    "captureLabel",
+    "selector",
+    "region",
   ],
 } as const;
+
+const familyWorkSelectedImageSchema = z
+  .object({
+    assetId: z.string().uuid(),
+    signalId: z.string().uuid(),
+    workId: z.string().uuid(),
+    mimeType: z.enum(["image/jpeg", "image/png", "image/webp"]),
+    filename: z.string().trim().min(1).max(500),
+  })
+  .strict();
 
 const browserObservationOutputSchema = z
   .object({
@@ -3769,6 +3843,7 @@ const browserObservationOutputSchema = z
     truncated: z.boolean(),
     liveViewUrl: z.string().url().max(4_096).nullable(),
     screenshotAttached: z.boolean(),
+    selectedImage: familyWorkSelectedImageSchema.nullable(),
   })
   .strict();
 
@@ -4552,6 +4627,14 @@ function browserOperation(args: z.infer<typeof browserWorkArguments>): FlorenceB
       return { kind: "back" };
     case "screenshot":
       return { kind: "screenshot" };
+    case "capture":
+      return {
+        kind: "capture",
+        source: requiredWorkspaceValue(args.captureSource, "browser image source"),
+        label: requiredWorkspaceValue(args.captureLabel, "browser image label"),
+        ...(args.selector === null ? {} : { selector: args.selector }),
+        ...(args.region === null ? {} : { region: args.region }),
+      };
     case "playwright":
       return {
         kind: "playwright",
@@ -4617,6 +4700,7 @@ async function executeBrowserOperation(
       truncated: observation.truncated,
       liveViewUrl: observation.liveViewUrl ?? null,
       screenshotAttached: observation.screenshot !== undefined,
+      selectedImage: observation.selectedImage ?? null,
     }),
   };
 }
@@ -4892,7 +4976,7 @@ function foregroundCapabilityRegistry(): CapabilityRegistry<ForegroundCapability
     defineCapability({
       name: "browser_work",
       description:
-        "Use Florence's persistent real browser for any interactive website during durable family work. Prefer one bounded Playwright program to inspect the current DOM, perform related actions, and verify the resulting state. Use native computer actions with a final screenshot when visual or coordinate-level control is more reliable. The compatibility operations can navigate, read an accessibility snapshot, click, type, upload one exact image or PDF from the initiating message, choose options, check boxes, press keys, scroll, wait, go back, capture a screenshot, or hand the live session to the parent for sign-in/MFA. This is a general browser, not a task-specific workflow. Set fields unused by the chosen operation to null, false, or empty arrays.",
+        "Use Florence's persistent real browser for any interactive website during durable family work. Prefer one bounded Playwright program to inspect the current DOM, perform related actions, and verify the resulting state. Use native computer actions with a final screenshot when visual or coordinate-level control is more reliable. Routine screenshot is temporary visual context for you. Capture is different: it deliberately preserves one user-visible browser image for the final conversation, from the viewport or region, full page, rendered element, or original image resource; use it only when the parent asked for an image or the image materially improves the result. The compatibility operations can navigate, read an accessibility snapshot, click, type, upload one exact image or PDF from the initiating message, choose options, check boxes, press keys, scroll, wait, go back, or hand the live session to the parent for sign-in/MFA. This is a general browser, not a task-specific workflow. Set fields unused by the chosen operation to null, false, or empty arrays.",
       modelSchema: BROWSER_WORK_PARAMETERS,
       inputSchema: browserWorkArguments,
       outputSchema: browserObservationOutputSchema,
@@ -5579,6 +5663,10 @@ function familyWorkModelContext(input: FlorenceFamilyWorkInput): JsonValue {
     supersededEdits: reasonerInput.recentMessages,
     activePhoneCall: input.state.activePhoneCall,
     activeTextMessage: input.state.activeTextMessage,
+    selectedBrowserImages: (input.state.browserImages ?? []).map((image) => ({
+      assetId: image.assetId,
+      filename: image.filename,
+    })),
     steering: input.state.steering.map((item) => ({
       text: item.text,
       occurredAt: item.occurredAt,
@@ -5627,6 +5715,41 @@ function compactConsumedFamilyWorkArtifacts(items: readonly unknown[]): JsonValu
       ),
     };
   });
+}
+
+function selectedBrowserImagesFromFamilyWork(
+  items: readonly unknown[],
+  workId: string,
+): ReadonlyMap<string, FamilyWorkSelectedImage> {
+  const selected = new Map<string, FamilyWorkSelectedImage>();
+  for (const item of items) {
+    if (!isJsonRecord(item) || item.type !== "function_call_output") continue;
+    const output = item.output;
+    const texts =
+      typeof output === "string"
+        ? [output]
+        : Array.isArray(output)
+          ? output.flatMap((part) =>
+              isJsonRecord(part) && part.type === "input_text" && typeof part.text === "string"
+                ? [part.text]
+                : [],
+            )
+          : [];
+    for (const text of texts) {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        continue;
+      }
+      if (!isJsonRecord(parsed)) continue;
+      const modelOutput = isJsonRecord(parsed.output) ? parsed.output : parsed;
+      const image = familyWorkSelectedImageSchema.safeParse(modelOutput.selectedImage);
+      if (!image.success || image.data.workId !== workId || image.data.signalId !== workId) continue;
+      selected.set(image.data.assetId, image.data);
+    }
+  }
+  return selected;
 }
 
 function familyWorkProgressWasAlreadyReported(items: readonly unknown[], progressText: string): boolean {
@@ -6805,7 +6928,6 @@ export class FlorenceReasoner {
           store: false,
           include: ["reasoning.encrypted_content", "web_search_call.action.sources"],
           instructions: FAMILY_WORK_INSTRUCTIONS,
-          max_tool_calls: 4,
           max_output_tokens: this.#maxOutputTokens,
           text: {
             format: zodTextFormat(familyWorkTerminalDecisionSchema, "florence_family_work_result"),
@@ -6871,6 +6993,16 @@ export class FlorenceReasoner {
         ...compactConsumedFamilyWorkArtifacts(checkpointInput.state.continuationItems),
         ...jsonResponseItems(result.transcript.slice(modelInput.length)),
       ];
+      const browserImageIndex = new Map(
+        (checkpointInput.state.browserImages ?? []).map((image) => [image.assetId, image] as const),
+      );
+      for (const image of selectedBrowserImagesFromFamilyWork(
+        continuationItems,
+        checkpointInput.workId,
+      ).values()) {
+        browserImageIndex.set(image.assetId, image);
+      }
+      const browserImages = [...browserImageIndex.values()];
       if (result.kind === "yielded") {
         const state = await this.#compactFamilyWorkState(
           checkpointInput,
@@ -6880,6 +7012,7 @@ export class FlorenceReasoner {
             claim: null,
             activePhoneCall,
             activeTextMessage,
+            browserImages,
             continuationItems,
             pendingCall: null,
           },
@@ -6898,6 +7031,7 @@ export class FlorenceReasoner {
             claim: null,
             activePhoneCall,
             activeTextMessage,
+            browserImages,
             continuationItems,
             pendingCall: {
               callId: call.callId,
@@ -6925,6 +7059,7 @@ export class FlorenceReasoner {
             claim: null,
             activePhoneCall,
             activeTextMessage,
+            browserImages,
             continuationItems,
             pendingCall: null,
           },
@@ -6936,6 +7071,23 @@ export class FlorenceReasoner {
         throw invalidOutput("Durable family work returned neither a capability call nor a result");
       }
       const terminal = familyWorkTerminalDecisionSchema.parse(result.response.output_parsed);
+      const selectedImageAssetIds = terminal.selectedImageAssetIds;
+      if (new Set(selectedImageAssetIds).size !== selectedImageAssetIds.length) {
+        throw invalidOutput("Durable family work selected the same browser image more than once");
+      }
+      if (
+        selectedImageAssetIds.length > 0 &&
+        terminal.outcome !== "succeeded" &&
+        terminal.outcome !== "partial"
+      ) {
+        throw invalidOutput("Only a useful completed family-work result may include selected browser images");
+      }
+      const availableSelectedImages = new Map(browserImages.map((image) => [image.assetId, image] as const));
+      const selectedImages = selectedImageAssetIds.map((assetId) => {
+        const image = availableSelectedImages.get(assetId);
+        if (!image) throw invalidOutput("Durable family work selected an unknown browser image");
+        return image;
+      });
       if (activePhoneCall || activeTextMessage) {
         throw invalidOutput(
           "Durable family work cannot pause or finish while a provider call or text is still active; inspect or stop that exact provider effect first",
@@ -6965,6 +7117,7 @@ export class FlorenceReasoner {
             claim: null,
             activePhoneCall,
             activeTextMessage,
+            browserImages,
             continuationItems,
             pendingCall: null,
             progressRevision: checkpointInput.state.progressRevision + (progressText ? 1 : 0),
@@ -6991,6 +7144,7 @@ export class FlorenceReasoner {
             claim: null,
             activePhoneCall,
             activeTextMessage,
+            browserImages,
             continuationItems,
             pendingCall: null,
             progressRevision: checkpointInput.state.progressRevision + 1,
@@ -7011,13 +7165,19 @@ export class FlorenceReasoner {
           claim: null,
           activePhoneCall,
           activeTextMessage,
+          browserImages,
           continuationItems: [],
           pendingCall: null,
           progressRevision: checkpointInput.state.progressRevision + 1,
-          terminal: { outcome: terminal.outcome, text: terminalText },
+          terminal: {
+            outcome: terminal.outcome,
+            text: terminalText,
+            ...(selectedImages.length > 0 ? { selectedImages } : {}),
+          },
         },
         outcome: terminal.outcome,
         text: terminalText,
+        selectedImages,
       };
     } catch (error) {
       if (error instanceof APIUserAbortError || isAbortError(error)) throw error;

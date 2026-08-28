@@ -4,6 +4,7 @@ const LINQ_API_BASE_URL = "https://api.linqapp.com/api/partner/v3";
 const LINQ_WEBHOOK_VERSION = "2026-02-03";
 const MAX_WEBHOOK_BYTES = 1024 * 1024;
 const DEFAULT_MAX_MEDIA_BYTES = 20 * 1024 * 1024;
+const LINQ_MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024;
 const MAX_OBSERVED_CHAT_HANDLES = 32;
 const PRESENCE_REQUEST_TIMEOUT_MS = 1_500;
 
@@ -314,6 +315,12 @@ export type LinqClientOptions = {
 };
 
 export type FetchedLinqMedia = LinqMediaReference & { bytes: Uint8Array };
+
+export type LinqUploadAttachment = {
+  filename: string;
+  mimeType: string;
+  bytes: Uint8Array;
+};
 
 type ObservedReactionTarget = { hasOwnReaction: boolean };
 
@@ -875,6 +882,59 @@ export class LinqClient {
     const bytes = await boundedBody(mediaResponse, this.#maximumMediaBytes);
     if (bytes.byteLength !== sizeBytes) unsafe("Linq attachment length differs from its metadata");
     return { providerAttachmentId: attachmentId, filename, mimeType, sizeBytes, bytes };
+  }
+
+  /** Pre-upload raw bytes to Linq; sending the returned attachment remains a separate committed move. */
+  async uploadAttachment(input: LinqUploadAttachment): Promise<string> {
+    const filename = bounded(input.filename, "Attachment filename", 255);
+    const mimeType = nonempty(input.mimeType, "Attachment content type");
+    const sizeBytes = positiveInteger(input.bytes.byteLength, "Attachment size");
+    if (sizeBytes > LINQ_MAX_ATTACHMENT_BYTES) {
+      fail("configuration", "Linq attachments cannot exceed 100MB");
+    }
+
+    const metadataResponse = await this.request(
+      this.endpoint("attachments"),
+      {
+        method: "POST",
+        headers: this.headers(),
+        redirect: "error",
+        body: JSON.stringify({ filename, content_type: mimeType, size_bytes: sizeBytes }),
+      },
+      "requesting an attachment upload",
+    );
+
+    let attachmentId: string;
+    let uploadUrl: URL;
+    let requiredHeaders: Record<string, string>;
+    try {
+      const payload = object(await metadataResponse.json(), "attachment upload response");
+      attachmentId = bounded(
+        string(payload.attachment_id, "attachment upload response attachment_id"),
+        "Provider attachment ID",
+        500,
+      );
+      literal(payload.http_method, "PUT", "attachment upload response http_method");
+      timestamp(payload.expires_at, "attachment upload response expires_at");
+      safeCdnUrl(string(payload.download_url, "attachment upload response download_url"));
+      uploadUrl = httpsUrl(string(payload.upload_url, "attachment upload response upload_url"), "upload URL");
+      requiredHeaders = stringRecord(payload.required_headers, "attachment upload response required_headers");
+    } catch (error) {
+      if (error instanceof LinqError && error.retryable) throw error;
+      throw retryable("Linq returned invalid attachment upload metadata", error);
+    }
+
+    await this.request(
+      uploadUrl,
+      {
+        method: "PUT",
+        headers: requiredHeaders,
+        redirect: "error",
+        body: input.bytes,
+      },
+      "uploading attachment bytes",
+    );
+    return attachmentId;
   }
 
   private endpoint(path: string): URL {
@@ -1548,6 +1608,29 @@ function safeCdnUrl(value: string): URL {
     unsafe("Linq attachment URL is outside the approved CDN");
   }
   return url;
+}
+
+function httpsUrl(value: string, name: string): URL {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch (error) {
+    throw new LinqError("invalid_payload", `Linq returned an invalid ${name}`, false, { cause: error });
+  }
+  if (url.protocol !== "https:" || url.username || url.password) {
+    fail("invalid_payload", `Linq returned an invalid ${name}`);
+  }
+  return url;
+}
+
+function stringRecord(value: unknown, name: string): Record<string, string> {
+  const parsed = object(value, name);
+  const result: Record<string, string> = Object.create(null) as Record<string, string>;
+  for (const [key, item] of Object.entries(parsed)) {
+    if (!key || /[\r\n]/.test(key)) fail("invalid_payload", `Linq ${name} contains an invalid header name`);
+    result[key] = string(item, `${name} ${key}`);
+  }
+  return result;
 }
 
 async function boundedBody(response: Response, maximumBytes: number): Promise<Uint8Array> {

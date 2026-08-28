@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, open, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -44,7 +44,7 @@ const DEFAULT_KERNEL_PLAYWRIGHT_TIMEOUT_SECONDS = 60;
 const MAX_KERNEL_PLAYWRIGHT_TIMEOUT_SECONDS = 300;
 const MAX_PLAYWRIGHT_CODE_CHARS = 50_000;
 const MAX_COMPUTER_ACTIONS_PER_CALL = 50;
-const MAX_COMPUTER_SCREENSHOT_BYTES = 4 * 1_024 * 1_024;
+const MAX_BROWSER_IMAGE_BYTES = MAX_UPLOAD_BYTES;
 
 export interface FlorenceBrowserSession {
   readonly sessionId: string;
@@ -64,6 +64,18 @@ export type FlorenceBrowserOperation =
   | { readonly kind: "wait"; readonly milliseconds: number }
   | { readonly kind: "back" }
   | { readonly kind: "screenshot" }
+  | {
+      readonly kind: "capture";
+      readonly source: "viewport" | "full_page" | "element" | "image_resource";
+      readonly label: string;
+      readonly selector?: string;
+      readonly region?: {
+        readonly x: number;
+        readonly y: number;
+        readonly width: number;
+        readonly height: number;
+      };
+    }
   | {
       readonly kind: "playwright";
       readonly code: string;
@@ -105,8 +117,16 @@ export type FlorenceBrowserComputerAction =
 export type FlorenceBrowserObservationKind = "page" | "owner_handoff" | "uncertain_effect";
 
 export interface FlorenceBrowserScreenshot {
-  readonly mimeType: "image/jpeg" | "image/png";
-  readonly bytes: Uint8Array<ArrayBuffer>;
+  readonly mimeType: "image/jpeg" | "image/png" | "image/webp";
+  readonly bytes: Uint8Array;
+}
+
+export interface FlorenceBrowserSelectedImage {
+  readonly assetId: string;
+  readonly signalId: string;
+  readonly workId: string;
+  readonly mimeType: "image/jpeg" | "image/png" | "image/webp";
+  readonly filename: string;
 }
 
 export interface FlorenceBrowserObservation {
@@ -119,6 +139,7 @@ export interface FlorenceBrowserObservation {
   readonly truncated: boolean;
   readonly liveViewUrl?: string;
   readonly screenshot?: FlorenceBrowserScreenshot;
+  readonly selectedImage?: FlorenceBrowserSelectedImage;
 }
 
 export interface FlorenceBrowserRunInput {
@@ -318,9 +339,9 @@ export class KernelBrowserClient implements FlorenceBrowserClient {
       AGENT_BROWSER_MAX_OUTPUT_CHARS,
     );
     this.#maxScreenshotBytes = boundedInteger(
-      options.maxScreenshotBytes ?? MAX_COMPUTER_SCREENSHOT_BYTES,
+      options.maxScreenshotBytes ?? MAX_BROWSER_IMAGE_BYTES,
       16 * 1_024,
-      16 * 1_024 * 1_024,
+      MAX_BROWSER_IMAGE_BYTES,
     );
   }
 
@@ -373,6 +394,9 @@ export class KernelBrowserClient implements FlorenceBrowserClient {
           break;
         case "screenshot":
           screenshot = await this.#captureScreenshot(sessionDetails, localSignal);
+          break;
+        case "capture":
+          screenshot = await this.#captureUserVisibleImage(sessionDetails, input.operation, localSignal);
           break;
         case "playwright":
           actionMayHaveHappened = true;
@@ -661,7 +685,7 @@ export class KernelBrowserClient implements FlorenceBrowserClient {
     session: KernelSessionDetails,
     operation: Exclude<
       FlorenceBrowserOperation,
-      | { readonly kind: "snapshot" | "screenshot" | "owner_handoff" }
+      | { readonly kind: "snapshot" | "screenshot" | "capture" | "owner_handoff" }
       | { readonly kind: "playwright" | "computer" }
     >,
     uploadFile: FlorenceBrowserRunInput["uploadFile"],
@@ -809,10 +833,11 @@ export class KernelBrowserClient implements FlorenceBrowserClient {
   async #captureScreenshot(
     session: KernelSessionDetails,
     signal: AbortSignal,
+    region?: { readonly x: number; readonly y: number; readonly width: number; readonly height: number },
   ): Promise<FlorenceBrowserScreenshot> {
     const response = await this.#kernel.browsers.computer.captureScreenshot(
       session.session.sessionId,
-      undefined,
+      region ? { region } : undefined,
       { signal },
     );
     const bytes = await readBoundedResponseBytes(response, this.#maxScreenshotBytes);
@@ -826,6 +851,117 @@ export class KernelBrowserClient implements FlorenceBrowserClient {
       throw invalidProviderResponse("Kernel returned an unreadable browser screenshot.");
     }
     return { mimeType: "image/png", bytes };
+  }
+
+  async #captureUserVisibleImage(
+    session: KernelSessionDetails,
+    operation: Extract<FlorenceBrowserOperation, { readonly kind: "capture" }>,
+    signal: AbortSignal,
+  ): Promise<FlorenceBrowserScreenshot> {
+    switch (operation.source) {
+      case "viewport":
+        return this.#captureScreenshot(session, signal, operation.region);
+      case "full_page":
+        return this.#capturePlaywrightImage(session, { kind: "full_page" }, signal);
+      case "element":
+        return this.#capturePlaywrightImage(
+          session,
+          { kind: "element", selector: requireCaptureSelector(operation.selector) },
+          signal,
+        );
+      case "image_resource": {
+        const selector = requireCaptureSelector(operation.selector);
+        try {
+          return await this.#captureImageResource(session, selector, signal);
+        } catch (error) {
+          if (signal.aborted) throw error;
+          return this.#capturePlaywrightImage(session, { kind: "element", selector }, signal);
+        }
+      }
+    }
+  }
+
+  async #captureImageResource(
+    session: KernelSessionDetails,
+    selector: string,
+    signal: AbortSignal,
+  ): Promise<FlorenceBrowserScreenshot> {
+    const result = await this.#kernel.browsers.playwright.execute(
+      session.session.sessionId,
+      {
+        code: `
+const image = page.locator(${JSON.stringify(selector)}).first();
+await image.waitFor({ state: "visible" });
+return await image.evaluate((element) => {
+  if (!(element instanceof HTMLImageElement)) throw new Error("The selected element is not an image.");
+  return { url: element.currentSrc || element.src };
+});`,
+        timeout_sec: DEFAULT_KERNEL_PLAYWRIGHT_TIMEOUT_SECONDS,
+      },
+      { signal },
+    );
+    if (!result.success || !isRecord(result.result) || typeof result.result.url !== "string") {
+      throw invalidProviderResponse(result.error ?? "The selected image resource was unavailable.");
+    }
+    const url = new URL(result.result.url);
+    if (url.protocol !== "https:" && url.protocol !== "http:") {
+      throw invalidProviderResponse("The selected image resource was unavailable.");
+    }
+    const response = await this.#kernel.browsers.fetch(session.session.sessionId, url, {
+      method: "GET",
+      headers: { accept: "image/webp,image/png,image/jpeg,*/*;q=0.1" },
+      timeout_ms: MAX_KERNEL_PLAYWRIGHT_TIMEOUT_SECONDS * 1_000,
+      signal,
+    });
+    const bytes = await readBoundedResponseBytes(response, this.#maxScreenshotBytes);
+    const mimeType = browserImageMimeType(bytes);
+    if (!mimeType) throw invalidProviderResponse("The selected resource was not a supported image.");
+    if (mimeType === "image/webp") {
+      throw invalidProviderResponse("The selected resource needs a Messages-compatible rendering.");
+    }
+    return { mimeType, bytes };
+  }
+
+  async #capturePlaywrightImage(
+    session: KernelSessionDetails,
+    target: { readonly kind: "full_page" } | { readonly kind: "element"; readonly selector: string },
+    signal: AbortSignal,
+  ): Promise<FlorenceBrowserScreenshot> {
+    const remotePath = `/tmp/florence-browser-image-${randomUUID()}.png`;
+    try {
+      const screenshotCode =
+        target.kind === "full_page"
+          ? `await page.screenshot({ animations: "disabled", caret: "hide", fullPage: true, path: ${JSON.stringify(remotePath)}, type: "png" });`
+          : `
+const target = page.locator(${JSON.stringify(target.selector)}).first();
+await target.waitFor({ state: "visible" });
+await target.screenshot({ animations: "disabled", caret: "hide", path: ${JSON.stringify(remotePath)}, type: "png" });`;
+      const result = await this.#kernel.browsers.playwright.execute(
+        session.session.sessionId,
+        {
+          code: `${screenshotCode}\nreturn true;`,
+          timeout_sec: MAX_KERNEL_PLAYWRIGHT_TIMEOUT_SECONDS,
+        },
+        { signal },
+      );
+      if (!result.success) {
+        throw invalidProviderResponse(result.error ?? "Kernel could not capture the selected browser image.");
+      }
+      const response = await this.#kernel.browsers.fs.readFile(
+        session.session.sessionId,
+        { path: remotePath },
+        { signal },
+      );
+      const bytes = await readBoundedResponseBytes(response, this.#maxScreenshotBytes);
+      if (browserImageMimeType(bytes) !== "image/png") {
+        throw invalidProviderResponse("Kernel returned an unreadable selected browser image.");
+      }
+      return { mimeType: "image/png", bytes };
+    } finally {
+      await this.#kernel.browsers.fs
+        .deleteFile(session.session.sessionId, { path: remotePath }, { signal })
+        .catch(() => undefined);
+    }
   }
 
   async #agentBrowser(
@@ -1076,6 +1212,14 @@ export class BrowserbaseBrowserClient implements FlorenceBrowserClient {
           ? await this.#captureScreenshot(sessionDetails, localSignal)
           : undefined;
 
+      if (input.operation.kind === "capture") {
+        throw new FlorenceBrowserError(
+          "unavailable",
+          "Selected browser images require Florence's Kernel browser.",
+          { retryable: false },
+        );
+      }
+
       if (input.operation.kind !== "snapshot" && input.operation.kind !== "screenshot") {
         if (input.operation.kind !== "owner_handoff") {
           if (input.operation.kind === "playwright" || input.operation.kind === "computer") {
@@ -1277,7 +1421,7 @@ export class BrowserbaseBrowserClient implements FlorenceBrowserClient {
     session: BrowserbaseSessionDetails,
     operation: Exclude<
       FlorenceBrowserOperation,
-      { readonly kind: "snapshot" | "screenshot" | "owner_handoff" }
+      { readonly kind: "snapshot" | "screenshot" | "capture" | "owner_handoff" }
     >,
     uploadFile: FlorenceBrowserRunInput["uploadFile"],
     signal: AbortSignal,
@@ -1776,6 +1920,44 @@ function finiteCoordinate(value: number, label: string): number {
   return value;
 }
 
+function requireCaptureSelector(value: string | undefined): string {
+  const selector = value?.trim();
+  if (!selector || selector.length > 2_000) {
+    throw new FlorenceBrowserError(
+      "invalid_input",
+      "Choose the exact page element Florence should show in the final result.",
+    );
+  }
+  return selector;
+}
+
+function browserImageMimeType(bytes: Uint8Array): "image/jpeg" | "image/png" | "image/webp" | null {
+  if (bytes.byteLength >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+    return "image/jpeg";
+  }
+  if (
+    bytes.byteLength >= 8 &&
+    bytes[0] === 0x89 &&
+    bytes[1] === 0x50 &&
+    bytes[2] === 0x4e &&
+    bytes[3] === 0x47 &&
+    bytes[4] === 0x0d &&
+    bytes[5] === 0x0a &&
+    bytes[6] === 0x1a &&
+    bytes[7] === 0x0a
+  ) {
+    return "image/png";
+  }
+  if (
+    bytes.byteLength >= 12 &&
+    Buffer.from(bytes.subarray(0, 4)).toString("ascii") === "RIFF" &&
+    Buffer.from(bytes.subarray(8, 12)).toString("ascii") === "WEBP"
+  ) {
+    return "image/webp";
+  }
+  return null;
+}
+
 async function readBoundedResponseBytes(
   response: Response,
   maximumBytes: number,
@@ -1995,6 +2177,29 @@ function validateRunInput(input: FlorenceBrowserRunInput): void {
   validateNonEmptyInput(input.callId, "Browser call ID", 500);
   if (!Number.isSafeInteger(input.attempt) || input.attempt < 1) {
     throw new FlorenceBrowserError("invalid_input", "Browser attempt must be a positive integer.");
+  }
+  if (input.operation.kind === "capture") {
+    validateNonEmptyInput(input.operation.label, "Browser image label", 200);
+    if (input.operation.source === "element" || input.operation.source === "image_resource") {
+      requireCaptureSelector(input.operation.selector);
+    } else if (input.operation.selector !== undefined) {
+      throw new FlorenceBrowserError(
+        "invalid_input",
+        "A browser image selector is only valid for an element or image resource.",
+      );
+    }
+    if (input.operation.region) {
+      if (input.operation.source !== "viewport") {
+        throw new FlorenceBrowserError(
+          "invalid_input",
+          "A browser image region is only valid for a viewport capture.",
+        );
+      }
+      const { x, y, width, height } = input.operation.region;
+      if (![x, y, width, height].every(Number.isFinite) || x < 0 || y < 0 || width <= 0 || height <= 0) {
+        throw new FlorenceBrowserError("invalid_input", "The selected browser image region is invalid.");
+      }
+    }
   }
   if (input.operation.kind === "upload") {
     normalizeRef(input.operation.ref);

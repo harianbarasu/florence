@@ -612,6 +612,14 @@ export type FamilyWorkCapabilityReceipt = {
   readonly output: JsonValue;
 };
 
+export type FamilyWorkSelectedImage = {
+  readonly assetId: string;
+  readonly signalId: string;
+  readonly workId: string;
+  readonly mimeType: "image/png" | "image/jpeg" | "image/webp";
+  readonly filename: string;
+};
+
 export type FamilyWorkStateV1 = {
   readonly kind: "family_work_v1";
   readonly version: 1;
@@ -622,6 +630,7 @@ export type FamilyWorkStateV1 = {
     readonly sessionId: string;
     readonly expiresAt: string;
   } | null;
+  readonly browserImages?: readonly FamilyWorkSelectedImage[];
   readonly activePhoneCall: {
     readonly provider: "bland" | "twilio";
     readonly kind: "agent" | "announcement";
@@ -648,6 +657,7 @@ export type FamilyWorkStateV1 = {
   readonly terminal: {
     readonly outcome: "succeeded" | "partial" | "failed" | "cancelled";
     readonly text: string;
+    readonly selectedImages?: readonly FamilyWorkSelectedImage[];
   } | null;
 };
 
@@ -1089,7 +1099,12 @@ export type OutboundNativeMove =
             mention?: { handle: string; range: readonly [start: number, end: number] } | null;
           }
         | { type: "link"; url: string }
-        | { type: "media"; source: { type: "url"; url: string } }
+        | {
+            type: "media";
+            source:
+              | { type: "url"; url: string }
+              | ({ type: "florence_artifact"; providerAttachmentId?: string } & FamilyWorkSelectedImage);
+          }
       )[];
     }
   | {
@@ -1274,6 +1289,7 @@ export type CommitTurnResult = "committed" | "superseded";
 
 export type OutboundMessage = {
   sourceId: string;
+  householdId: string;
   idempotencyKey: string;
   providerConversationId: string;
   expectedAuthority: { audience: Audience; participantIdentityDigests: readonly string[] };
@@ -3566,6 +3582,13 @@ export class PostgresFlorenceStore {
       ) {
         throw new FlorenceStoreConflict("A family work settlement changed its claim generation or steering");
       }
+      if (
+        nextState.browserImages?.some(
+          (image) => image.workId !== input.workId || image.signalId !== input.workId,
+        )
+      ) {
+        throw new FlorenceStoreConflict("A selected browser image belongs to another family task");
+      }
       if (input.result.type === "continue") {
         if (nextState.phase === "waiting" || nextState.phase === "terminal") {
           throw new FlorenceStoreConflict("Continuing family work needs a runnable durable phase");
@@ -3626,6 +3649,9 @@ export class PostgresFlorenceStore {
         }
         if (nextState.progressRevision <= currentState.progressRevision) {
           throw new FlorenceStoreConflict("A family work result must advance its progress revision");
+        }
+        if (nextState.terminal.selectedImages?.some((image) => image.workId !== input.workId)) {
+          throw new FlorenceStoreConflict("A selected family-work image belongs to another task");
         }
         const updated = await sql`
           update proactive_work set task_state=${sql.json(nextState)},status='delivering',
@@ -8415,6 +8441,68 @@ export class PostgresFlorenceStore {
     return rows.length === 1;
   }
 
+  async checkpointOutboundArtifactAttachment(input: {
+    sourceId: string;
+    assetId: string;
+    providerAttachmentId: string;
+  }): Promise<void> {
+    assertUuid(input.sourceId, "Outbound source ID");
+    assertUuid(input.assetId, "Outbound artifact asset ID");
+    const providerAttachmentId = limitedRequiredString(
+      input.providerAttachmentId,
+      500,
+      "Provider attachment ID",
+    );
+    await this.#sql.begin(async (sql) => {
+      const [row] = await sql<{ metadata: JsonValue; status: string }[]>`
+        select source.metadata,message.status
+        from sources source join messages message on message.source_id=source.id
+        where source.id=${input.sourceId} and message.direction='outbound'
+        for update of source,message
+      `;
+      if (row?.status !== "sending") {
+        throw new FlorenceStoreConflict("The outbound artifact is not being delivered");
+      }
+      const move = outboundNativeMoveFromMetadata(row.metadata);
+      if (move?.type !== "message") {
+        throw new FlorenceStoreConflict("The outbound message has no artifact attachment");
+      }
+      let found = false;
+      let changed = false;
+      const parts = move.parts.map((part) => {
+        if (
+          part.type !== "media" ||
+          part.source.type !== "florence_artifact" ||
+          part.source.assetId !== input.assetId
+        ) {
+          return part;
+        }
+        found = true;
+        if (
+          part.source.providerAttachmentId !== undefined &&
+          part.source.providerAttachmentId !== providerAttachmentId
+        ) {
+          throw new FlorenceStoreConflict("The outbound artifact has a different provider attachment");
+        }
+        if (part.source.providerAttachmentId === providerAttachmentId) return part;
+        changed = true;
+        return {
+          ...part,
+          source: { ...part.source, providerAttachmentId },
+        };
+      });
+      if (!found) throw new FlorenceStoreConflict("The outbound artifact attachment no longer exists");
+      if (!changed) return;
+      await sql`
+        update sources set metadata=${sql.json({
+          ...jsonRecord(row.metadata),
+          nativeMove: { type: "message", parts },
+        })}
+        where id=${input.sourceId}
+      `;
+    });
+  }
+
   async outboundDeliveryStatus(sourceId: string): Promise<"pending" | "sending" | "sent" | "failed" | null> {
     assertUuid(sourceId, "Outbound source ID");
     const [row] = await this.#sql<{ status: "pending" | "sending" | "sent" | "failed" }[]>`
@@ -9669,6 +9757,7 @@ export class PostgresFlorenceStore {
     const [row] = await this.#sql<
       {
         source_id: string;
+        household_id: string;
         idempotency_key: string;
         provider_conversation_id: string;
         audience: Audience;
@@ -9681,7 +9770,7 @@ export class PostgresFlorenceStore {
         source_metadata: JsonValue;
       }[]
     >`
-      select m.source_id,m.idempotency_key,c.provider_conversation_id,c.audience,
+      select m.source_id,s.household_id,m.idempotency_key,c.provider_conversation_id,c.audience,
              c.identity_one_digest,c.identity_two_digest,m.move_kind,m.text,m.reaction,
              reply.provider_message_id as reply_provider_message_id,s.metadata as source_metadata
       from messages m join linq_channels c on c.id=m.channel_id
@@ -9693,6 +9782,7 @@ export class PostgresFlorenceStore {
     if (!row) return null;
     return {
       sourceId: row.source_id,
+      householdId: row.household_id,
       idempotencyKey: row.idempotency_key,
       providerConversationId: row.provider_conversation_id,
       expectedAuthority: {
@@ -14897,6 +14987,7 @@ async function checkpointFamilyWorkCapabilityReceipt(
 const FAMILY_WORK_STATE_KEYS = [
   "activePhoneCall",
   "activeTextMessage",
+  "browserImages",
   "browserSession",
   "claim",
   "continuationItems",
@@ -14919,6 +15010,7 @@ function initialFamilyWorkState(): FamilyWorkStateV1 {
     claim: null,
     activePhoneCall: null,
     activeTextMessage: null,
+    browserImages: [],
     browserSession: null,
     continuationItems: [],
     pendingCall: null,
@@ -14926,6 +15018,46 @@ function initialFamilyWorkState(): FamilyWorkStateV1 {
     progressRevision: 0,
     terminal: null,
   };
+}
+
+function familyWorkSelectedImage(value: JsonValue, name: string): FamilyWorkSelectedImage {
+  const image = strictJsonRecord(value, name);
+  assertExactJsonKeys(image, ["assetId", "signalId", "workId", "mimeType", "filename"], name);
+  const assetId = requiredStringField(image, "assetId", `${name} asset ID`);
+  const signalId = requiredStringField(image, "signalId", `${name} signal ID`);
+  const workId = requiredStringField(image, "workId", `${name} work ID`);
+  assertUuid(assetId, `${name} asset ID`);
+  assertUuid(signalId, `${name} signal ID`);
+  assertUuid(workId, `${name} work ID`);
+  const mimeType = image.mimeType;
+  if (mimeType !== "image/png" && mimeType !== "image/jpeg" && mimeType !== "image/webp") {
+    throw new FlorenceStoreConflict(`${name} MIME type is invalid`);
+  }
+  const filename = limitedRequiredString(
+    requiredStringField(image, "filename", `${name} filename`),
+    500,
+    `${name} filename`,
+  );
+  const hasForbiddenFilenameCharacter =
+    filename.includes("/") ||
+    filename.includes("\\") ||
+    [...filename].some((character) => {
+      const codePoint = character.codePointAt(0) ?? 0;
+      return codePoint <= 31 || codePoint === 127;
+    });
+  if (filename !== filename.trim() || hasForbiddenFilenameCharacter) {
+    throw new FlorenceStoreConflict(`${name} filename is invalid`);
+  }
+  return { assetId, signalId, workId, mimeType, filename };
+}
+
+function familyWorkSelectedImages(value: JsonValue, name: string): readonly FamilyWorkSelectedImage[] {
+  if (!Array.isArray(value)) throw new FlorenceStoreConflict(`${name} are invalid`);
+  const images = value.map((image, index) => familyWorkSelectedImage(image, `${name} ${index + 1}`));
+  if (unique(images.map((image) => image.assetId)).length !== images.length) {
+    throw new FlorenceStoreConflict(`${name} contain a duplicate asset`);
+  }
+  return images;
 }
 
 function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWorkStateV1 {
@@ -14945,6 +15077,7 @@ function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWor
   const state = canonical;
   if (state.activePhoneCall === undefined) state.activePhoneCall = null;
   if (state.activeTextMessage === undefined) state.activeTextMessage = null;
+  if (state.browserImages === undefined) state.browserImages = [];
   if (state.browserSession === undefined) state.browserSession = null;
   assertExactJsonKeys(state, FAMILY_WORK_STATE_KEYS, "Family work state");
   if (state.kind !== "family_work_v1" || state.version !== 1) {
@@ -15042,6 +15175,10 @@ function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWor
   }
 
   const continuationItems = jsonArrayField(state, "continuationItems", "Family work continuation");
+  const browserImages = familyWorkSelectedImages(
+    state.browserImages as JsonValue,
+    "Family work browser images",
+  );
   let pendingCall: FamilyWorkStateV1["pendingCall"] = null;
   if (state.pendingCall === undefined) {
     throw new FlorenceStoreConflict("Family work pending call state is invalid");
@@ -15132,7 +15269,12 @@ function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWor
   }
   if (state.terminal !== null) {
     const storedTerminal = strictJsonRecord(state.terminal, "Family work terminal result");
-    assertExactJsonKeys(storedTerminal, ["outcome", "text"], "Family work terminal result");
+    const hasSelectedImages = storedTerminal.selectedImages !== undefined;
+    assertExactJsonKeys(
+      storedTerminal,
+      hasSelectedImages ? ["outcome", "text", "selectedImages"] : ["outcome", "text"],
+      "Family work terminal result",
+    );
     const outcome = storedTerminal.outcome;
     if (outcome !== "succeeded" && outcome !== "partial" && outcome !== "failed" && outcome !== "cancelled") {
       throw new FlorenceStoreConflict("Family work terminal outcome is invalid");
@@ -15144,6 +15286,14 @@ function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWor
         10_000,
         "Family work terminal text",
       ),
+      ...(hasSelectedImages
+        ? {
+            selectedImages: familyWorkSelectedImages(
+              storedTerminal.selectedImages as JsonValue,
+              "Family work terminal selected images",
+            ),
+          }
+        : {}),
     };
   }
   if ((phase === "tool_pending") !== (pendingCall !== null)) {
@@ -15164,6 +15314,7 @@ function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWor
     claim,
     activePhoneCall,
     activeTextMessage,
+    browserImages,
     browserSession,
     continuationItems: [...continuationItems],
     pendingCall,
@@ -15487,6 +15638,7 @@ async function insertFamilyWorkOutbound(
   }
   const resolutionMetadata =
     deliveryKind === "terminal" ? await proactiveFamilyWorkResolutionMetadata(sql, work.id) : null;
+  const selectedImages = deliveryKind === "terminal" ? (state.terminal?.selectedImages ?? []) : [];
   await insertProactiveOutbound(sql, {
     workId: work.id,
     suffix: `family-work:${deliveryKind}:${state.generation}:${state.progressRevision}`,
@@ -15495,6 +15647,20 @@ async function insertFamilyWorkOutbound(
     visibility: work.visibility,
     ownerAdultId: work.owner_adult_id,
     text,
+    ...(selectedImages.length > 0
+      ? {
+          nativeMove: {
+            type: "message" as const,
+            parts: [
+              { type: "text" as const, text },
+              ...selectedImages.map((image) => ({
+                type: "media" as const,
+                source: { type: "florence_artifact" as const, ...image },
+              })),
+            ],
+          },
+        }
+      : {}),
     metadata: {
       familyWorkId: work.id,
       familyWorkGeneration: state.generation,
@@ -15698,6 +15864,7 @@ async function insertProactiveOutbound(
     visibility: Visibility;
     ownerAdultId: string | null;
     text: string;
+    nativeMove?: OutboundNativeMoveDraft;
     metadata?: JsonObject;
     notBefore: Date;
     occurredAt: Date;
@@ -15712,6 +15879,7 @@ async function insertProactiveOutbound(
     idempotencyKey: `proactive:${input.workId}:${stable}`,
     moveKind: "message",
     text: bounded(required(input.text, "Proactive message"), 10_000),
+    ...(input.nativeMove ? { nativeMove: input.nativeMove } : {}),
     turnId: deterministicUuid(`proactive-turn\0${input.workId}\0${stable}`),
     turnPart: 0,
     notBefore: input.notBefore.toISOString(),
@@ -18336,12 +18504,41 @@ function outboundNativeMessagePart(
   if (part.type === "media") {
     assertExactJsonKeys(part, ["type", "source"], "Stored native media");
     const source = strictJsonRecord(part.source as JsonValue, "Stored native media source");
-    assertExactJsonKeys(source, ["type", "url"], "Stored native media source");
-    if (source.type !== "url") throw new FlorenceStoreConflict("Stored native media source is invalid");
-    return {
-      type: "media",
-      source: { type: "url", url: outboundNativeHttpsUrl(source, "Stored native media") },
-    };
+    if (source.type === "url") {
+      assertExactJsonKeys(source, ["type", "url"], "Stored native media source");
+      return {
+        type: "media",
+        source: { type: "url", url: outboundNativeHttpsUrl(source, "Stored native media") },
+      };
+    }
+    if (source.type === "florence_artifact") {
+      const hasProviderAttachmentId = source.providerAttachmentId !== undefined;
+      assertExactJsonKeys(
+        source,
+        hasProviderAttachmentId
+          ? ["type", "assetId", "signalId", "workId", "mimeType", "filename", "providerAttachmentId"]
+          : ["type", "assetId", "signalId", "workId", "mimeType", "filename"],
+        "Stored Florence artifact source",
+      );
+      const { type: _type, providerAttachmentId: _providerAttachmentId, ...artifact } = source;
+      return {
+        type: "media",
+        source: {
+          type: "florence_artifact",
+          ...familyWorkSelectedImage(artifact, "Stored Florence artifact source"),
+          ...(hasProviderAttachmentId
+            ? {
+                providerAttachmentId: limitedRequiredString(
+                  requiredStringField(source, "providerAttachmentId", "Stored provider attachment ID"),
+                  500,
+                  "Stored provider attachment ID",
+                ),
+              }
+            : {}),
+        },
+      };
+    }
+    throw new FlorenceStoreConflict("Stored native media source is invalid");
   }
   throw new FlorenceStoreConflict("Stored native message part type is invalid");
 }

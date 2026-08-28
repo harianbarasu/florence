@@ -93,8 +93,8 @@ Register exactly:
 The Linq API key and webhook signing secret are different credentials. Florence verifies the raw webhook signature, pins the payload version, re-reads the live chat, and requires iMessage plus the exact current participant set before retaining content.
 
 Google currently uses `openid`, `email`, `gmail.modify`, `drive`, `tasks`,
-`contacts`, `calendar.events.owned`, `calendar.events.readonly`,
-`calendar.app.created`, `calendar.acls`, and `calendar.calendarlist`.
+`contacts`, `calendar.events.readonly`, `calendar.app.created`, `calendar.acls`,
+and `calendar.calendarlist`.
 Ordinary Gmail conversation remains private to its owning adult; explicit durable
 work started in the family group uses the initiating parent's Google connection.
 Calendar writes require a current exact instruction or approval and provider

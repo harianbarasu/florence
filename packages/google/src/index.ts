@@ -33,7 +33,6 @@ export const GOOGLE_SCOPES = [
   "openid",
   "email",
   "https://www.googleapis.com/auth/gmail.modify",
-  "https://www.googleapis.com/auth/calendar.events.owned",
   "https://www.googleapis.com/auth/calendar.events.readonly",
   "https://www.googleapis.com/auth/calendar.app.created",
   "https://www.googleapis.com/auth/calendar.acls",
@@ -43,9 +42,13 @@ export const GOOGLE_SCOPES = [
   "https://www.googleapis.com/auth/contacts",
 ] as const;
 
-/** Older connections may still persist this superseded scope. */
+/** Older connections may still persist these superseded scopes. */
 const LEGACY_GMAIL_READ_SCOPE = "https://www.googleapis.com/auth/gmail.readonly" as const;
-export type GoogleScope = (typeof GOOGLE_SCOPES)[number] | typeof LEGACY_GMAIL_READ_SCOPE;
+const LEGACY_CALENDAR_OWNED_SCOPE = "https://www.googleapis.com/auth/calendar.events.owned" as const;
+export type GoogleScope =
+  | (typeof GOOGLE_SCOPES)[number]
+  | typeof LEGACY_GMAIL_READ_SCOPE
+  | typeof LEGACY_CALENDAR_OWNED_SCOPE;
 export type GoogleConnectionStatus = "pending" | "active" | "disconnected";
 
 export type GoogleConnectionView = {

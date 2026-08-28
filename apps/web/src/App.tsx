@@ -860,11 +860,7 @@ function GoogleSetupStep({
           <p>Gmail, Calendar, Drive, Docs, Sheets, Slides, Tasks, and Contacts</p>
         </div>
       </div>
-      <p className="setup-trust">
-        When Google asks, leave the listed Workspace access enabled so Florence can both find the family
-        context and finish the work you give her. She’ll keep using your existing family setup and shared
-        calendar.
-      </p>
+      <GoogleDataDisclosure />
       {error && (
         <p className="form-error" role="alert">
           {error}
@@ -887,6 +883,28 @@ function SetupFrame({ children }: { children: React.ReactNode }) {
         <div className="setup-content">{children}</div>
       </section>
     </main>
+  );
+}
+
+function GoogleDataDisclosure() {
+  return (
+    <aside className="google-data-disclosure" aria-label="How Florence uses Google data">
+      <strong>Before you connect</strong>
+      <p>
+        Florence will use the Google data you authorize to review Gmail and calendars, find and work with
+        Drive files and Workspace documents, manage tasks and contacts, and maintain the Florence-created
+        family calendar. Google content may be sent to Florence’s AI service providers only to complete your
+        requests and household follow-up.
+      </p>
+      <p>
+        Your personal Google content stays private unless you ask Florence to share it or add it to the family
+        calendar. Florence may retain useful family context and review history as described in the{" "}
+        <a href="https://tryflorence.com/privacy" target="_blank" rel="noreferrer">
+          Privacy Policy
+        </a>
+        . You can disconnect Google and delete Google-derived data at any time.
+      </p>
+    </aside>
   );
 }
 
@@ -1621,6 +1639,9 @@ function GoogleConnector({ view, callbackStatus }: { view: WorkspaceView; callba
   );
   const error = start.error ?? disconnect.error ?? deleteGoogleData.error;
   const isPending = start.isPending || disconnect.isPending || deleteGoogleData.isPending;
+  const needsGoogleConsent =
+    !accounts.length ||
+    accounts.some((account) => !account.historyReviewReady || !account.assistantWorkReady);
 
   async function connect() {
     try {
@@ -1678,6 +1699,7 @@ function GoogleConnector({ view, callbackStatus }: { view: WorkspaceView; callba
             Contacts. Your family setup and existing calendar stay in place.
           </p>
         )}
+        {needsGoogleConsent && <GoogleDataDisclosure />}
         {error && <p className="form-error">{error.message}</p>}
       </div>
       <div className="connector-actions">

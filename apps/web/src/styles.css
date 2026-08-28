@@ -1373,6 +1373,38 @@ a {
   line-height: 1.5;
 }
 
+.google-data-disclosure {
+  display: grid;
+  gap: 8px;
+  padding: 13px 14px;
+  border: 1px solid #dfe2e7;
+  border-radius: 12px;
+  background: #f8f9fa;
+  color: #25272b;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.google-data-disclosure strong {
+  font-weight: 600;
+}
+
+.google-data-disclosure p {
+  margin: 0;
+  color: inherit;
+}
+
+.google-data-disclosure a {
+  color: inherit;
+  font-weight: 600;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.connector-copy .google-data-disclosure {
+  margin-top: 10px;
+}
+
 .setup-review-list {
   display: grid;
   overflow: hidden;

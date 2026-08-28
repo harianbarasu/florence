@@ -25,8 +25,8 @@ After conversational Google reads:
 4. linked public-page and PDF reading;
 5. one durable multi-step family task using those tools, including natural acknowledgement, steering, cancellation, meaningful progress, and terminal delivery;
 6. a prioritized household docket;
-7. Gmail communication and broader Google Workspace;
-8. browser/computer use for the long tail of real errands.
+7. Gmail communication and the full useful Google Workspace surface: Drive, Docs, Sheets, Slides, Tasks, and Contacts;
+8. authenticated browser/computer use, inbound live voice, outbound calls and texts, bookings, and real errands—not another search result handoff.
 
 Each ticket must name the family behavior it unlocks. Existing household boundaries constrain concrete capabilities; generalized safety/privacy frameworks are not roadmap deliverables. Do not add another registry, runtime, scheduler, queue, process, or policy layer when Florence's existing reasoner, PostgreSQL due-work seam, provider adapters, and Linq delivery can own the behavior.
 
@@ -48,9 +48,10 @@ Each ticket must name the family behavior it unlocks. Existing household boundar
 - [Port maps, places, routes, and time zones](issues/07-select-maps-weather-and-travel-providers.md) — eight Hermes-derived tools now use a concrete Nominatim, Overpass, Valhalla, and TimeAPI client through Florence's existing reasoner lifecycle, with no provider framework or new infrastructure.
 - [Add live weather and flight disruption help](issues/08-port-maps-weather-and-travel.md) — NOAA/NWS forecasts, observations, and alerts plus Hermes-derived live Kiwi alternatives now turn ordinary weather and flight-number disruption messages into work without a new provider framework.
 - [Port complete reminder control](issues/09-port-complete-reminder-control.md) — durable private and household reminders now support ordinary-language create/list/change/pause/resume/run/cancel and local-time recurrence through the existing due-work/outbox path.
+- [Keep multi-step family work going](issues/10-port-durable-family-work.md) — one Pi/Hermes-adapted PostgreSQL checkpoint loop now acknowledges, resumes, steers, cancels, reports progress, rejects stale workers, and delivers one receipt-confirmed result without a second runtime or progress framework.
 
 ## Fog
 
 - Instinct does not publish its tool inventory or execution architecture, so Florence competes on demonstrated user outcomes rather than guessed internals.
 - Provider selection for weather and flights belongs inside those concrete capability tickets, not in a standalone architecture phase.
-- Purchases, bookings, and calls should be added one real provider workflow at a time after research, travel, reminders, communication, and durable work are functioning.
+- Purchases, bookings, calls, and long-tail browser work should be added one real family workflow at a time after durable work is functioning; they are core product breadth, not an optional connector catalog.

@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import postgres from "postgres";
 
 export type JsonValue = postgres.JSONValue;
@@ -14,6 +14,10 @@ const MAX_PDF_ENVELOPE_BYTES = 20 * 1024 * 1024 + 16 * 1024;
 const GOOGLE_POLL_INTERVAL_MS = 2 * 60_000;
 const INTEREST_CHECK_INTERVAL_MS = 7 * 24 * 60 * 60_000;
 const LINQ_RECEIPT_CLOCK_SKEW_MS = 5 * 60_000;
+const FAMILY_WORK_INITIAL_DELAY_MS = 1_000;
+const FAMILY_WORK_CLAIM_LEASE_MS = 2 * 60_000;
+const MAX_FAMILY_WORK_STATE_BYTES = 256 * 1024;
+const MAX_FAMILY_WORK_COUNTER = 999_999_999;
 // Kept as an on-disk compatibility marker for replicas from before the reply gate stopped expiring.
 // New code only treats this timestamp as a deadline after a signed-link digest has been stored.
 const LEGACY_PARTNER_HANDSHAKE_WINDOW_MS = 24 * 60 * 60_000;
@@ -565,8 +569,69 @@ export type VisibleReminder = {
   createdAt: string;
 };
 
+export type FamilyWorkStateV1 = {
+  readonly kind: "family_work_v1";
+  readonly version: 1;
+  readonly generation: number;
+  readonly phase: "ready" | "tool_pending" | "waiting" | "terminal";
+  readonly claim: { readonly claimId: string; readonly leaseUntil: string } | null;
+  readonly continuationItems: readonly JsonValue[];
+  readonly pendingCall: {
+    readonly callId: string;
+    readonly name: string;
+    readonly argumentsJson: string;
+  } | null;
+  readonly steering: readonly {
+    readonly sourceId: string;
+    readonly text: string;
+    readonly occurredAt: string;
+  }[];
+  readonly publicMapResearchContext: readonly string[];
+  readonly progressRevision: number;
+  readonly terminal: {
+    readonly outcome: "succeeded" | "partial" | "failed" | "cancelled";
+    readonly text: string;
+  } | null;
+};
+
+export type VisibleFamilyWork = {
+  workId: string;
+  objective: string;
+  currentProgress: string;
+  status: "active" | "waiting" | "delivering" | "completed" | "cancelled";
+  createdAt: string;
+};
+
+export type SettleFamilyWorkClaimInput = {
+  workId: string;
+  generation: number;
+  claimId: string;
+  settledAt: string;
+  result:
+    | {
+        type: "continue";
+        state: FamilyWorkStateV1;
+        nextCheckAt: string;
+        progressText?: string | null;
+      }
+    | { type: "waiting"; state: FamilyWorkStateV1; question: string }
+    | { type: "terminal"; state: FamilyWorkStateV1; terminalText: string }
+    | { type: "retry"; state: FamilyWorkStateV1; retryAt: string; error: string };
+};
+
 export type DueProactiveWork =
   | { kind: "reminder"; workId: string }
+  | {
+      kind: "family_task";
+      workId: string;
+      household: SharedFamilyProfile;
+      visibility: Visibility;
+      ownerAdultId: string | null;
+      objective: string;
+      state: FamilyWorkStateV1;
+      claimId: string;
+      generation: number;
+    }
   | {
       kind: "personal_google_poll";
       workId: string;
@@ -884,6 +949,7 @@ export type InboundTurn = {
   currentDocuments?: readonly CurrentMessageDocument[];
   recentMessages: readonly ConversationTurn[];
   pendingFollowUps: readonly PendingFollowUp[];
+  visibleFamilyWork: readonly VisibleFamilyWork[];
   visibleReminders: readonly VisibleReminder[];
   visibleInterests: readonly VisibleHouseholdInterest[];
   pendingCalendarOffers: readonly CalendarOffer[];
@@ -1018,6 +1084,17 @@ export type ReminderMutation =
       reminderId: string;
     };
 
+export type FamilyWorkMutation =
+  | {
+      operation: "create";
+      workId: string;
+      objective: string;
+      visibility: Visibility;
+      ownerAdultId: string | null;
+    }
+  | { operation: "steer"; workId: string; instruction: string }
+  | { operation: "cancel"; workId: string };
+
 export type ApprovedPartnerInvitation = {
   householdId: string;
   founderAdultId: string;
@@ -1047,6 +1124,7 @@ export type CommitTurnInput = {
   cancelMonitorIds?: readonly string[];
   interestMutation?: DurableInterestMutation | null;
   reminderMutation?: ReminderMutation | null;
+  familyWorkMutation?: FamilyWorkMutation | null;
   outbound?: readonly OutboundDraft[];
   calendarOffers?: readonly CalendarOfferDraft[];
   approveCalendarOffers?: readonly CalendarOfferApproval[];
@@ -1229,7 +1307,8 @@ type ProactiveWorkRow = {
     | "family_calendar_poll"
     | "finite_monitor"
     | "interest_monitor"
-    | "reminder";
+    | "reminder"
+    | "family_task";
   visibility: Visibility;
   owner_adult_id: string | null;
   objective: string | null;
@@ -1244,6 +1323,7 @@ type ProactiveWorkRow = {
   next_check_at: Date | null;
   reminder_schedule: JsonValue | null;
   last_run_at: Date | null;
+  task_state: JsonValue | null;
   last_error: string | null;
   created_at: Date;
 };
@@ -2586,11 +2666,53 @@ export class PostgresFlorenceStore {
       const due = await sql<ProactiveWorkRow[]>`
         select * from proactive_work where status='active' and next_check_at<=${now}
           and kind in (
-            'reminder','personal_google_poll','family_calendar_poll','finite_monitor','interest_monitor'
+            'reminder','family_task','personal_google_poll','family_calendar_poll',
+            'finite_monitor','interest_monitor'
           )
         order by next_check_at,id
       `;
       for (const work of due) {
+        if (work.kind === "family_task") {
+          const [familyTask] = await sql<ProactiveWorkRow[]>`
+            select * from proactive_work
+            where id=${work.id} and kind='family_task' and status='active'
+              and next_check_at<=${now}
+            for update skip locked
+          `;
+          if (!familyTask) continue;
+          const state = familyWorkState(familyTask.task_state);
+          if (state.phase === "waiting" || state.phase === "terminal") {
+            throw new FlorenceStoreConflict("Due family work has an invalid durable phase");
+          }
+          if (state.claim && instant(state.claim.leaseUntil) > now) {
+            await sql`
+              update proactive_work set next_check_at=${instant(state.claim.leaseUntil)}
+              where id=${familyTask.id}
+            `;
+            continue;
+          }
+          const claimId = randomUUID();
+          const leaseUntil = new Date(now.getTime() + FAMILY_WORK_CLAIM_LEASE_MS);
+          const claimedState = familyWorkState({
+            ...state,
+            claim: { claimId, leaseUntil: leaseUntil.toISOString() },
+          });
+          await sql`
+            update proactive_work set task_state=${sql.json(claimedState)},next_check_at=${leaseUntil},
+              last_error=null where id=${familyTask.id}
+          `;
+          return {
+            kind: "family_task",
+            workId: familyTask.id,
+            household: await sharedFamilyProfile(sql, familyTask.household_id),
+            visibility: familyTask.visibility,
+            ownerAdultId: familyTask.owner_adult_id,
+            objective: required(familyTask.objective ?? "", "Family work objective"),
+            state: claimedState,
+            claimId,
+            generation: claimedState.generation,
+          };
+        }
         if (work.kind === "reminder") return { kind: "reminder", workId: work.id };
         if (work.kind === "personal_google_poll") {
           const [context] = await sql<
@@ -2768,6 +2890,130 @@ export class PostgresFlorenceStore {
         }
       }
       return null;
+    });
+  }
+
+  /**
+   * One durable effect-sandwich boundary: a claimed step is checkpointed with
+   * its outbound message in the same transaction. Generation plus claim ID is
+   * the CAS token, so steering, cancellation, and lease takeover make late
+   * workers harmless (Pi 4e494929; Hermes 6dcebea7). This does not imply that
+   * the in-process worker itself is restart resumable.
+   */
+  async settleFamilyWorkClaim(input: SettleFamilyWorkClaimInput): Promise<"settled" | "stale"> {
+    assertUuid(input.workId, "Family work ID");
+    assertUuid(input.claimId, "Family work claim ID");
+    familyWorkCounter(input.generation, "Family work generation");
+    const settledAt = instant(input.settledAt);
+    return this.#sql.begin(async (sql) => {
+      const [work] = await sql<ProactiveWorkRow[]>`
+        select * from proactive_work where id=${input.workId} and kind='family_task' for update
+      `;
+      if (work?.status !== "active") return "stale";
+      const currentState = familyWorkState(work.task_state);
+      if (
+        currentState.generation !== input.generation ||
+        currentState.claim?.claimId !== input.claimId ||
+        settledAt > instant(currentState.claim.leaseUntil)
+      ) {
+        return "stale";
+      }
+      const nextState = familyWorkState(input.result.state);
+      if (
+        nextState.generation !== input.generation ||
+        nextState.claim !== null ||
+        !sameFamilyWorkSteering(currentState.steering, nextState.steering)
+      ) {
+        throw new FlorenceStoreConflict("A family work settlement changed its claim generation or steering");
+      }
+      if (input.result.type === "continue") {
+        if (nextState.phase === "waiting" || nextState.phase === "terminal") {
+          throw new FlorenceStoreConflict("Continuing family work needs a runnable durable phase");
+        }
+        const nextCheckAt = instant(input.result.nextCheckAt);
+        if (nextCheckAt < settledAt) {
+          throw new FlorenceStoreConflict("A family work continuation cannot be due in the past");
+        }
+        const progressText =
+          input.result.progressText == null
+            ? null
+            : bounded(required(input.result.progressText, "Family work progress"), 10_000);
+        if (progressText && nextState.progressRevision <= currentState.progressRevision) {
+          throw new FlorenceStoreConflict("Family work progress must advance its revision");
+        }
+        const updated = await sql`
+          update proactive_work set task_state=${sql.json(nextState)},status='active',
+            next_check_at=${nextCheckAt},current_conclusion=${progressText ?? work.current_conclusion},
+            last_error=null where id=${work.id} and kind='family_task' and status='active'
+            and task_state->>'generation'=${String(input.generation)}
+            and task_state->'claim'->>'claimId'=${input.claimId} returning id
+        `;
+        if (updated.length !== 1) return "stale";
+        if (progressText) {
+          await insertFamilyWorkOutbound(sql, work, nextState, "progress", progressText, settledAt);
+        }
+        return "settled";
+      }
+
+      if (input.result.type === "waiting") {
+        if (nextState.phase !== "waiting" || nextState.pendingCall !== null || nextState.terminal !== null) {
+          throw new FlorenceStoreConflict("Waiting family work needs a waiting checkpoint");
+        }
+        if (nextState.progressRevision <= currentState.progressRevision) {
+          throw new FlorenceStoreConflict("A family work question must advance its progress revision");
+        }
+        const question = bounded(required(input.result.question, "Family work question"), 10_000);
+        const updated = await sql`
+          update proactive_work set task_state=${sql.json(nextState)},status='paused',next_check_at=null,
+            current_conclusion=${question},last_error=null
+          where id=${work.id} and kind='family_task' and status='active'
+            and task_state->>'generation'=${String(input.generation)}
+            and task_state->'claim'->>'claimId'=${input.claimId} returning id
+        `;
+        if (updated.length !== 1) return "stale";
+        await insertFamilyWorkOutbound(sql, work, nextState, "waiting", question, settledAt);
+        return "settled";
+      }
+
+      if (input.result.type === "terminal") {
+        const terminalText = bounded(required(input.result.terminalText, "Family work result"), 10_000);
+        if (
+          nextState.phase !== "terminal" ||
+          nextState.pendingCall !== null ||
+          nextState.terminal?.text !== terminalText
+        ) {
+          throw new FlorenceStoreConflict("Terminal family work needs its exact terminal checkpoint");
+        }
+        if (nextState.progressRevision <= currentState.progressRevision) {
+          throw new FlorenceStoreConflict("A family work result must advance its progress revision");
+        }
+        const updated = await sql`
+          update proactive_work set task_state=${sql.json(nextState)},status='delivering',
+            next_check_at=null,current_conclusion=${terminalText},last_error=null
+          where id=${work.id} and kind='family_task' and status='active'
+            and task_state->>'generation'=${String(input.generation)}
+            and task_state->'claim'->>'claimId'=${input.claimId} returning id
+        `;
+        if (updated.length !== 1) return "stale";
+        await insertFamilyWorkOutbound(sql, work, nextState, "terminal", terminalText, settledAt);
+        return "settled";
+      }
+
+      if (nextState.phase === "waiting" || nextState.phase === "terminal") {
+        throw new FlorenceStoreConflict("Retrying family work needs a runnable durable phase");
+      }
+      const retryAt = instant(input.result.retryAt);
+      if (retryAt <= settledAt) {
+        throw new FlorenceStoreConflict("A family work retry must be scheduled in the future");
+      }
+      const updated = await sql`
+        update proactive_work set task_state=${sql.json(nextState)},status='active',
+          next_check_at=${retryAt},last_error=${bounded(required(input.result.error, "Family work retry"), 2_000)}
+        where id=${work.id} and kind='family_task' and status='active'
+          and task_state->>'generation'=${String(input.generation)}
+          and task_state->'claim'->>'claimId'=${input.claimId} returning id
+      `;
+      return updated.length === 1 ? "settled" : "stale";
     });
   }
 
@@ -6123,6 +6369,44 @@ export class PostgresFlorenceStore {
         next_check_at nulls last,created_at desc,id
       limit 100
     `;
+    const familyWorkRows = await this.#sql<
+      {
+        id: string;
+        objective: string;
+        current_conclusion: string;
+        status: "active" | "paused" | "delivering" | "completed" | "cancelled";
+        created_at: Date;
+      }[]
+    >`
+      with current_work as (
+        select id,objective,current_conclusion,status,created_at
+        from proactive_work
+        where household_id=${row.household_id} and kind='family_task'
+          and status in ('active','paused','delivering')
+          and (
+            (${channel.audience === "private"} and visibility='private'
+              and owner_adult_id=${row.sender_adult_id})
+            or (${channel.audience === "group"} and visibility='household'
+              and owner_adult_id is null)
+          )
+        order by created_at,id limit 100
+      ), recent_work as (
+        select id,objective,current_conclusion,status,created_at
+        from proactive_work
+        where household_id=${row.household_id} and kind='family_task'
+          and status in ('completed','cancelled')
+          and (
+            (${channel.audience === "private"} and visibility='private'
+              and owner_adult_id=${row.sender_adult_id})
+            or (${channel.audience === "group"} and visibility='household'
+              and owner_adult_id is null)
+          )
+        order by created_at desc,id desc limit 10
+      )
+      select * from current_work
+      union all
+      select * from recent_work
+    `;
     const interestRows = await this.#sql<
       {
         id: string;
@@ -6308,6 +6592,13 @@ export class PostgresFlorenceStore {
         sourceIds: followUp.source_ids,
         googleBacked: followUp.google_backed,
       })),
+      visibleFamilyWork: familyWorkRows.map((work) => ({
+        workId: work.id,
+        objective: work.objective,
+        currentProgress: work.current_conclusion,
+        status: work.status === "paused" ? "waiting" : work.status,
+        createdAt: work.created_at.toISOString(),
+      })),
       visibleReminders: reminderRows.map((reminder) => ({
         reminderId: reminder.id,
         action: reminder.objective,
@@ -6400,6 +6691,7 @@ export class PostgresFlorenceStore {
           (input.cancelMonitorIds?.length ?? 0) > 0 ||
           input.interestMutation != null ||
           input.reminderMutation != null ||
+          input.familyWorkMutation != null ||
           (input.outbound?.length ?? 0) > 0 ||
           (input.calendarOffers?.length ?? 0) > 0 ||
           (input.approveCalendarOffers?.length ?? 0) > 0 ||
@@ -6825,6 +7117,100 @@ export class PostgresFlorenceStore {
           mutation: input.interestMutation,
           occurredAt: handledAt,
         });
+      }
+
+      if (input.familyWorkMutation) {
+        const mutation = input.familyWorkMutation;
+        if (turn.move_kind === "reaction") {
+          throw new FlorenceStoreUnauthorized("Family work control requires a current parent request");
+        }
+        const expectedVisibility: Visibility = turn.audience === "group" ? "household" : "private";
+        const expectedOwnerAdultId = expectedVisibility === "private" ? turn.sender_adult_id : null;
+        assertUuid(mutation.workId, "Family work ID");
+        if (mutation.operation === "create") {
+          if (mutation.visibility !== expectedVisibility || mutation.ownerAdultId !== expectedOwnerAdultId) {
+            throw new FlorenceStoreUnauthorized(
+              "Family work must stay inside the conversation where it was requested",
+            );
+          }
+          const objective = bounded(required(mutation.objective, "Family work objective"), 4_000);
+          const [sameId] = await sql<ProactiveWorkRow[]>`
+            select * from proactive_work where id=${mutation.workId} for update
+          `;
+          if (sameId) throw new FlorenceStoreConflict("A family work ID was already used");
+          const state = initialFamilyWorkState();
+          await sql`
+            insert into proactive_work (
+              id,household_id,kind,visibility,owner_adult_id,objective,current_conclusion,
+              task_state,status,next_check_at,created_at
+            ) values (${mutation.workId},${turn.household_id},'family_task',${mutation.visibility},
+              ${mutation.ownerAdultId},${objective},'Starting now.',${sql.json(state)},'active',
+              ${new Date(handledAt.getTime() + FAMILY_WORK_INITIAL_DELAY_MS)},${handledAt})
+          `;
+          await sql`
+            insert into proactive_work_sources (work_id,source_id)
+            values (${mutation.workId},${turn.source_id})
+          `;
+        } else {
+          const [work] = await sql<ProactiveWorkRow[]>`
+            select * from proactive_work
+            where id=${mutation.workId} and household_id=${turn.household_id} and kind='family_task'
+              and ((${turn.audience}='group' and visibility='household' and owner_adult_id is null)
+                or (${turn.audience}='private' and visibility='private'
+                  and owner_adult_id=${turn.sender_adult_id}))
+            for update
+          `;
+          if (!work) {
+            throw new FlorenceStoreUnauthorized("That family work does not belong to this conversation");
+          }
+          await sql`
+            insert into proactive_work_sources (work_id,source_id)
+            values (${work.id},${turn.source_id}) on conflict do nothing
+          `;
+          const state = familyWorkState(work.task_state);
+          if (mutation.operation === "steer") {
+            if (work.status === "completed" || work.status === "cancelled") {
+              throw new FlorenceStoreConflict("Finished family work is no longer steerable");
+            }
+            const instruction = bounded(
+              required(mutation.instruction, "Family work steering instruction"),
+              4_000,
+            );
+            const nextState = steerFamilyWorkState(state, {
+              sourceId: turn.source_id,
+              text: instruction,
+              occurredAt: turn.occurred_at.toISOString(),
+            });
+            await terminalizeUnsentFamilyWorkOutbounds(sql, work.id, "steering");
+            await sql`
+              update proactive_work set task_state=${sql.json(nextState)},status='active',
+                next_check_at=${handledAt},last_error=null where id=${work.id}
+            `;
+          } else if (work.status !== "cancelled") {
+            if (work.status === "completed") {
+              throw new FlorenceStoreConflict("Completed family work cannot be cancelled");
+            }
+            const generation = incrementFamilyWorkCounter(state.generation, "Family work generation");
+            const progressRevision = incrementFamilyWorkCounter(
+              state.progressRevision,
+              "Family work progress revision",
+            );
+            const nextState = familyWorkState({
+              ...state,
+              generation,
+              phase: "terminal",
+              claim: null,
+              pendingCall: null,
+              progressRevision,
+              terminal: { outcome: "cancelled", text: "Cancelled." },
+            });
+            await terminalizeUnsentFamilyWorkOutbounds(sql, work.id, "cancellation");
+            await sql`
+              update proactive_work set task_state=${sql.json(nextState)},status='cancelled',
+                next_check_at=null,current_conclusion='Cancelled.',last_error=null where id=${work.id}
+            `;
+          }
+        }
       }
 
       if (input.reminderMutation) {
@@ -7349,6 +7735,7 @@ export class PostgresFlorenceStore {
     const rows = await this.#sql`
       select 1 from messages outbound
       join linq_channels channel on channel.id=outbound.channel_id
+      join sources source on source.id=outbound.source_id
       where outbound.source_id=${sourceId} and outbound.direction='outbound'
         and outbound.status='sending'
         and channel.revoked_at is null and channel.stopped_at is null
@@ -7358,6 +7745,22 @@ export class PostgresFlorenceStore {
             select 1 from messages inbound
             where inbound.source_id=outbound.reply_to_source_id
               and inbound.direction='inbound' and inbound.status='received'
+          )
+        )
+        and (
+          source.metadata->>'familyWorkId' is null
+          or exists (
+            select 1 from proactive_work work
+            where work.id::text=source.metadata->>'familyWorkId' and work.kind='family_task'
+              and work.task_state->>'generation'=source.metadata->>'familyWorkGeneration'
+              and work.task_state->>'progressRevision'=
+                source.metadata->>'familyWorkProgressRevision'
+              and (
+                (source.metadata->>'familyWorkDeliveryKind'='progress' and work.status='active')
+                or (source.metadata->>'familyWorkDeliveryKind'='waiting' and work.status='paused')
+                or (source.metadata->>'familyWorkDeliveryKind'='terminal'
+                  and work.status='delivering')
+              )
           )
         )
     `;
@@ -7428,6 +7831,7 @@ export class PostgresFlorenceStore {
           update messages set receipt_detail=${sql.json(receiptDetail)} where source_id=${input.sourceId}
         `;
         await completeDeliveredOneShotReminder(sql, input.sourceId);
+        await completeDeliveredFamilyWorkTerminal(sql, input.sourceId);
         return;
       }
       const reactionConfirmed =
@@ -7449,6 +7853,7 @@ export class PostgresFlorenceStore {
         where source_id=${input.sourceId}
       `;
       await completeDeliveredOneShotReminder(sql, input.sourceId);
+      await completeDeliveredFamilyWorkTerminal(sql, input.sourceId);
     });
   }
 
@@ -12638,6 +13043,293 @@ function reminderText(action: string): string {
   return `Reminder: ${normalized}${/[.!?]$/u.test(normalized) ? "" : "."}`;
 }
 
+const FAMILY_WORK_STATE_KEYS = [
+  "claim",
+  "continuationItems",
+  "generation",
+  "kind",
+  "pendingCall",
+  "phase",
+  "progressRevision",
+  "publicMapResearchContext",
+  "steering",
+  "terminal",
+  "version",
+] as const;
+
+function initialFamilyWorkState(): FamilyWorkStateV1 {
+  return {
+    kind: "family_work_v1",
+    version: 1,
+    generation: 0,
+    phase: "ready",
+    claim: null,
+    continuationItems: [],
+    pendingCall: null,
+    steering: [],
+    publicMapResearchContext: [],
+    progressRevision: 0,
+    terminal: null,
+  };
+}
+
+function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWorkStateV1 {
+  let serialized: string | undefined;
+  try {
+    serialized = JSON.stringify(value);
+  } catch {
+    throw new FlorenceStoreConflict("Family work state is not JSON serializable");
+  }
+  if (!serialized || Buffer.byteLength(serialized, "utf8") > MAX_FAMILY_WORK_STATE_BYTES) {
+    throw new FlorenceStoreConflict("Family work state exceeds its durable size limit");
+  }
+  const canonical = JSON.parse(serialized) as JsonValue;
+  if (!isRecord(canonical)) {
+    throw new FlorenceStoreConflict("Stored family work state is invalid");
+  }
+  const state = canonical;
+  assertExactJsonKeys(state, FAMILY_WORK_STATE_KEYS, "Family work state");
+  if (state.kind !== "family_work_v1" || state.version !== 1) {
+    throw new FlorenceStoreConflict("Family work state has an unsupported version");
+  }
+  const generation = familyWorkCounter(state.generation, "Family work generation");
+  const progressRevision = familyWorkCounter(state.progressRevision, "Family work progress revision");
+  const phase = state.phase;
+  if (phase !== "ready" && phase !== "tool_pending" && phase !== "waiting" && phase !== "terminal") {
+    throw new FlorenceStoreConflict("Family work state has an invalid phase");
+  }
+
+  let claim: FamilyWorkStateV1["claim"] = null;
+  if (state.claim === undefined) throw new FlorenceStoreConflict("Family work claim state is invalid");
+  if (state.claim !== null) {
+    const storedClaim = strictJsonRecord(state.claim, "Family work claim");
+    assertExactJsonKeys(storedClaim, ["claimId", "leaseUntil"], "Family work claim");
+    const claimId = requiredStringField(storedClaim, "claimId", "Family work claim ID");
+    assertUuid(claimId, "Family work claim ID");
+    claim = {
+      claimId,
+      leaseUntil: instant(
+        requiredStringField(storedClaim, "leaseUntil", "Family work claim lease"),
+      ).toISOString(),
+    };
+  }
+
+  const continuationItems = jsonArrayField(state, "continuationItems", "Family work continuation");
+  let pendingCall: FamilyWorkStateV1["pendingCall"] = null;
+  if (state.pendingCall === undefined) {
+    throw new FlorenceStoreConflict("Family work pending call state is invalid");
+  }
+  if (state.pendingCall !== null) {
+    const storedCall = strictJsonRecord(state.pendingCall, "Family work pending call");
+    assertExactJsonKeys(storedCall, ["argumentsJson", "callId", "name"], "Family work pending call");
+    const callId = limitedRequiredString(
+      requiredStringField(storedCall, "callId", "Family work call ID"),
+      200,
+      "Family work call ID",
+    );
+    const name = limitedRequiredString(
+      requiredStringField(storedCall, "name", "Family work capability name"),
+      200,
+      "Family work capability name",
+    );
+    const argumentsJson = storedCall.argumentsJson;
+    if (typeof argumentsJson !== "string" || argumentsJson.length > 65_536) {
+      throw new FlorenceStoreConflict("Family work call arguments are invalid");
+    }
+    try {
+      JSON.parse(argumentsJson);
+    } catch {
+      throw new FlorenceStoreConflict("Family work call arguments are not JSON");
+    }
+    pendingCall = { callId, name, argumentsJson };
+  }
+
+  const steering = jsonArrayField(state, "steering", "Family work steering").map((item) => {
+    const entry = strictJsonRecord(item, "Family work steering entry");
+    assertExactJsonKeys(entry, ["occurredAt", "sourceId", "text"], "Family work steering entry");
+    const sourceId = requiredStringField(entry, "sourceId", "Family work steering source ID");
+    assertUuid(sourceId, "Family work steering source ID");
+    return {
+      sourceId,
+      text: limitedRequiredString(
+        requiredStringField(entry, "text", "Family work steering text"),
+        4_000,
+        "Family work steering text",
+      ),
+      occurredAt: instant(
+        requiredStringField(entry, "occurredAt", "Family work steering time"),
+      ).toISOString(),
+    };
+  });
+  const steeringSourceIds = steering.map((entry) => entry.sourceId);
+  if (unique(steeringSourceIds).length !== steeringSourceIds.length) {
+    throw new FlorenceStoreConflict("Family work steering contains a duplicate source");
+  }
+  for (let index = 1; index < steering.length; index += 1) {
+    const previous = steering[index - 1];
+    const current = steering[index];
+    if (previous && current && instant(previous.occurredAt) > instant(current.occurredAt)) {
+      throw new FlorenceStoreConflict("Family work steering is out of order");
+    }
+  }
+  const publicMapResearchContext = familyWorkStringArray(
+    state,
+    "publicMapResearchContext",
+    20_000,
+    "Family work map context",
+    false,
+    false,
+  );
+  let terminal: FamilyWorkStateV1["terminal"] = null;
+  if (state.terminal === undefined) {
+    throw new FlorenceStoreConflict("Family work terminal state is invalid");
+  }
+  if (state.terminal !== null) {
+    const storedTerminal = strictJsonRecord(state.terminal, "Family work terminal result");
+    assertExactJsonKeys(storedTerminal, ["outcome", "text"], "Family work terminal result");
+    const outcome = storedTerminal.outcome;
+    if (outcome !== "succeeded" && outcome !== "partial" && outcome !== "failed" && outcome !== "cancelled") {
+      throw new FlorenceStoreConflict("Family work terminal outcome is invalid");
+    }
+    terminal = {
+      outcome,
+      text: limitedRequiredString(
+        requiredStringField(storedTerminal, "text", "Family work terminal text"),
+        10_000,
+        "Family work terminal text",
+      ),
+    };
+  }
+  if ((phase === "tool_pending") !== (pendingCall !== null)) {
+    throw new FlorenceStoreConflict("Family work pending-call state is inconsistent");
+  }
+  if ((phase === "terminal") !== (terminal !== null)) {
+    throw new FlorenceStoreConflict("Family work terminal state is inconsistent");
+  }
+  if ((phase === "waiting" || phase === "terminal") && claim !== null) {
+    throw new FlorenceStoreConflict("Waiting or terminal family work cannot remain claimed");
+  }
+
+  return {
+    kind: "family_work_v1",
+    version: 1,
+    generation,
+    phase,
+    claim,
+    continuationItems: [...continuationItems],
+    pendingCall,
+    steering,
+    publicMapResearchContext,
+    progressRevision,
+    terminal,
+  };
+}
+
+function familyWorkCounter(value: unknown, name: string): number {
+  if (!Number.isSafeInteger(value) || (value as number) < 0 || (value as number) > MAX_FAMILY_WORK_COUNTER) {
+    throw new FlorenceStoreConflict(`${name} is invalid`);
+  }
+  return value as number;
+}
+
+function familyWorkContinuationWithoutPendingCall(state: FamilyWorkStateV1): readonly JsonValue[] {
+  const pendingCall = state.pendingCall;
+  if (!pendingCall) return [...state.continuationItems];
+  let removed = false;
+  const continuationItems = state.continuationItems.filter((item) => {
+    if (removed || !isRecord(item) || item.type !== "function_call" || item.call_id !== pendingCall.callId) {
+      return true;
+    }
+    removed = true;
+    return false;
+  });
+  if (!removed) {
+    throw new FlorenceStoreConflict("Steered family work lost its pending capability call");
+  }
+  return continuationItems;
+}
+
+export function steerFamilyWorkState(
+  stateInput: FamilyWorkStateV1,
+  steering: FamilyWorkStateV1["steering"][number],
+): FamilyWorkStateV1 {
+  const state = familyWorkState(stateInput);
+  return familyWorkState({
+    ...state,
+    generation: incrementFamilyWorkCounter(state.generation, "Family work generation"),
+    phase: "ready",
+    claim: null,
+    continuationItems: familyWorkContinuationWithoutPendingCall(state),
+    pendingCall: null,
+    steering: [...state.steering, steering],
+    terminal: null,
+  });
+}
+
+function incrementFamilyWorkCounter(value: number, name: string): number {
+  familyWorkCounter(value, name);
+  if (value >= MAX_FAMILY_WORK_COUNTER) throw new FlorenceStoreConflict(`${name} is exhausted`);
+  return value + 1;
+}
+
+function strictJsonRecord(value: JsonValue, name: string): Record<string, JsonValue> {
+  if (!isRecord(value)) throw new FlorenceStoreConflict(`${name} is invalid`);
+  return { ...value };
+}
+
+function assertExactJsonKeys(record: Record<string, JsonValue>, keys: readonly string[], name: string): void {
+  if (!sameStrings(Object.keys(record).sort(), [...keys].sort())) {
+    throw new FlorenceStoreConflict(`${name} has an invalid shape`);
+  }
+}
+
+function jsonArrayField(record: Record<string, JsonValue>, key: string, name: string): JsonValue[] {
+  const value = record[key];
+  if (!Array.isArray(value)) throw new FlorenceStoreConflict(`${name} is invalid`);
+  return [...value];
+}
+
+function familyWorkStringArray(
+  record: Record<string, JsonValue>,
+  key: string,
+  maximumLength: number,
+  name: string,
+  requireNonempty = true,
+  requireUnique = true,
+): string[] {
+  const values = jsonArrayField(record, key, name).map((value) => {
+    if (typeof value !== "string" || value.length > maximumLength || (requireNonempty && !value.trim())) {
+      throw new FlorenceStoreConflict(`${name} contains invalid text`);
+    }
+    return value;
+  });
+  if (requireUnique && unique(values).length !== values.length) {
+    throw new FlorenceStoreConflict(`${name} contains a duplicate`);
+  }
+  return values;
+}
+
+function limitedRequiredString(value: string, maximum: number, name: string): string {
+  const normalized = required(value, name);
+  if (normalized.length > maximum) throw new FlorenceStoreConflict(`${name} is too long`);
+  return normalized;
+}
+
+function sameFamilyWorkSteering(
+  left: FamilyWorkStateV1["steering"],
+  right: FamilyWorkStateV1["steering"],
+): boolean {
+  return (
+    left.length === right.length &&
+    left.every(
+      (entry, index) =>
+        entry.sourceId === right[index]?.sourceId &&
+        entry.text === right[index]?.text &&
+        entry.occurredAt === right[index]?.occurredAt,
+    )
+  );
+}
+
 async function activeReminderChannel(
   sql: postgres.TransactionSql,
   work: ProactiveWorkRow,
@@ -12758,6 +13450,72 @@ async function completeDeliveredOneShotReminder(
       and work.kind='reminder' and work.status='delivering'
       and work.reminder_schedule->>'kind'='once'
   `;
+}
+
+type FamilyWorkDeliveryKind = "progress" | "waiting" | "terminal";
+
+async function terminalizeUnsentFamilyWorkOutbounds(
+  sql: postgres.TransactionSql,
+  workId: string,
+  change: "steering" | "cancellation",
+): Promise<void> {
+  await sql`
+    update messages message set status='failed',sending_at=null,retry_at=null,
+      last_error=${`Superseded by family work ${change} before delivery`}
+    from sources source
+    where source.id=message.source_id and source.metadata->>'familyWorkId'=${workId}
+      and message.direction='outbound' and message.status in ('pending','failed')
+  `;
+}
+
+async function completeDeliveredFamilyWorkTerminal(
+  sql: postgres.TransactionSql,
+  sourceId: string,
+): Promise<void> {
+  await sql`
+    update proactive_work work set
+      status=case when work.task_state->'terminal'->>'outcome'='cancelled'
+        then 'cancelled' else 'completed' end,
+      next_check_at=null,last_error=null
+    from sources source
+    where source.id=${sourceId} and source.metadata->>'familyWorkId'=work.id::text
+      and source.metadata->>'familyWorkDeliveryKind'='terminal'
+      and work.kind='family_task' and work.status='delivering'
+      and work.task_state->>'generation'=source.metadata->>'familyWorkGeneration'
+      and work.task_state->>'progressRevision'=
+        source.metadata->>'familyWorkProgressRevision'
+  `;
+}
+
+async function insertFamilyWorkOutbound(
+  sql: postgres.TransactionSql,
+  work: ProactiveWorkRow,
+  state: FamilyWorkStateV1,
+  deliveryKind: FamilyWorkDeliveryKind,
+  text: string,
+  occurredAt: Date,
+): Promise<void> {
+  const channel = await activeReminderChannel(sql, work);
+  if (!channel) {
+    throw new FlorenceStoreConflict("Family work no longer has an active delivery conversation");
+  }
+  await insertProactiveOutbound(sql, {
+    workId: work.id,
+    suffix: `family-work:${deliveryKind}:${state.generation}:${state.progressRevision}`,
+    householdId: work.household_id,
+    channel,
+    visibility: work.visibility,
+    ownerAdultId: work.owner_adult_id,
+    text,
+    metadata: {
+      familyWorkId: work.id,
+      familyWorkGeneration: state.generation,
+      familyWorkProgressRevision: state.progressRevision,
+      familyWorkDeliveryKind: deliveryKind,
+    },
+    notBefore: occurredAt,
+    occurredAt,
+  });
 }
 
 async function insertProactiveOutbound(

@@ -5,7 +5,8 @@ import postgres from "postgres";
 
 export const baselineFile = fileURLToPath(new URL("../sql/001_florence.sql", import.meta.url));
 const remindersFile = fileURLToPath(new URL("../sql/002_reminders.sql", import.meta.url));
-export const migrationFiles = [baselineFile, remindersFile] as const;
+const familyWorkFile = fileURLToPath(new URL("../sql/003_family_work.sql", import.meta.url));
+export const migrationFiles = [baselineFile, remindersFile, familyWorkFile] as const;
 
 export async function migrateDatabase(connectionString: string, sqlFile?: string): Promise<void> {
   const client = postgres(connectionString, { max: 1 });

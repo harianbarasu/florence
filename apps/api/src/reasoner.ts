@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { MAX_IMAGE_BYTES, MAX_PDF_BYTES } from "@florence/artifacts";
+import type { FamilyWorkStateV1, SharedFamilyProfile } from "@florence/database";
 import ffmpegStaticPath from "ffmpeg-static";
 import {
   APIConnectionError,
@@ -22,7 +23,6 @@ import { z } from "zod";
 import {
   CapabilityAdapterError,
   type CapabilityCatalogSnapshot,
-  type CapabilityLifecycleObserver,
   CapabilityRegistry,
   type CapabilityTerminalEnvelope,
   defineCapability,
@@ -454,6 +454,17 @@ export const florenceReasonerInputSchema = z
           .strict(),
       )
       .max(100),
+    visibleFamilyWork: z.array(
+      z
+        .object({
+          workId: opaqueId,
+          objective: shortText,
+          currentProgress: shortText.nullable(),
+          status: z.enum(["active", "waiting", "delivering", "completed", "cancelled"]),
+          createdAt: timestamp,
+        })
+        .strict(),
+    ),
     visibleInterests: z
       .array(
         z
@@ -593,6 +604,33 @@ const reminderDecisionSchema = z.discriminatedUnion("operation", [
   ),
 ]);
 
+const familyWorkDecisionSchema = z.discriminatedUnion("operation", [
+  z
+    .object({
+      operation: z.literal("create"),
+      workId: z.null(),
+      objective: shortText,
+      instruction: z.null(),
+    })
+    .strict(),
+  z
+    .object({
+      operation: z.literal("steer"),
+      workId: opaqueId,
+      objective: z.null(),
+      instruction: shortText,
+    })
+    .strict(),
+  z
+    .object({
+      operation: z.literal("cancel"),
+      workId: opaqueId,
+      objective: z.null(),
+      instruction: z.null(),
+    })
+    .strict(),
+]);
+
 export const florenceDurableInterestDecisionSchema = z.discriminatedUnion("operation", [
   z
     .object({
@@ -708,6 +746,7 @@ export const florenceDecisionSchema = z
     facts: z.array(factDecisionSchema),
     followUp: followUpDecisionSchema.nullable(),
     reminder: reminderDecisionSchema.nullable(),
+    familyWork: familyWorkDecisionSchema.nullable(),
     interest: florenceDurableInterestDecisionSchema.nullable().optional(),
     calendar: calendarDecisionSchema.nullable(),
     householdUpdate: z
@@ -1268,6 +1307,45 @@ const publicRequestResearchDecisionSchema = z
 
 type PublicRequestResearchDecision = z.infer<typeof publicRequestResearchDecisionSchema>;
 
+const familyWorkTerminalDecisionSchema = z
+  .object({
+    outcome: z.enum(["succeeded", "partial", "waiting", "failed"]),
+    text: z.string().trim().min(1).max(2_000),
+  })
+  .strict();
+
+export type FlorenceFamilyWorkTerminalDecision = z.infer<typeof familyWorkTerminalDecisionSchema>;
+
+export type FlorenceFamilyWorkInput = Readonly<{
+  workId: string;
+  objective: string;
+  visibility: "private" | "household";
+  ownerAdultId: string | null;
+  household: SharedFamilyProfile;
+  state: FamilyWorkStateV1;
+  currentTime: string;
+}>;
+
+export type FlorenceFamilyWorkReadTools = Pick<FlorenceReadTools, "runMaps" | "runWeather" | "runFlights">;
+
+export type FlorenceFamilyWorkStep =
+  | Readonly<{
+      kind: "continue";
+      state: FamilyWorkStateV1;
+      progressText: string | null;
+    }>
+  | Readonly<{
+      kind: "waiting";
+      state: FamilyWorkStateV1;
+      question: string;
+    }>
+  | Readonly<{
+      kind: "terminal";
+      state: FamilyWorkStateV1;
+      outcome: "succeeded" | "partial" | "failed";
+      text: string;
+    }>;
+
 export type FlorenceSource = z.infer<typeof florenceSourceSchema>;
 export type FlorenceVoiceNoteInput = z.infer<typeof voiceNoteInputSchema>;
 export type FlorenceReasonerInput = z.infer<typeof florenceReasonerInputSchema>;
@@ -1443,7 +1521,7 @@ Use currentMessage.replyTo as the exact message the parent replied to when it is
 
 For a parent document or photo, use judgment before extraction. Lead with the one or two deadlines, conflicts, or decisions that deserve attention; do not dump every date or detail. Distinguish action-needed items, useful dates, stable logistics that may matter later, and one-offs that should remain temporary. When a Calendar connection is available, read it around every useful date before describing availability or a conflict—the adult's personal Calendar in private, or the family Calendar in the group. Mention only meaningful conflicts or uncertainty, never an unrelated event dump. Ask at most one blocking question across the whole turn.
 
-The isolated research_public_web tool is available for ordinary parent turns. Use it when the request depends on current or public facts, resolving an identifier, comparing options, checking status, or reading a public page. It receives only the parent's sanitized current typed request plus public place candidates returned by a maps tool earlier in this turn; never try to pass private context to it. Search before asking for context the public web can recover; ask at most one focused question only for a consequential constraint that remains genuinely missing after the useful lookup. A flight number is one example of a public identifier, not a special intent. Do the lookup in this turn and report the result or an honest blocker. Never say you will look, prioritize, research, check, or follow up later unless this decision actually creates durable follow-up work.
+The isolated research_public_web tool is available for ordinary parent turns. Use it when the request depends on current or public facts, resolving an identifier, comparing options, checking status, or reading a public page. It receives only the parent's sanitized current typed request plus public place candidates returned by a maps tool earlier in this turn; never try to pass private context to it. Search before asking for context the public web can recover; ask at most one focused question only for a consequential constraint that remains genuinely missing after the useful lookup. A flight number is one example of a public identifier, not a special intent. Do the lookup in this turn and report the result or an honest blocker. Never say you will look, prioritize, research, check, or follow up later unless this decision actually creates durable follow-up or familyWork.
 
 Dedicated maps tools are available for place search, reverse geocoding, nearby places, route distance, turn-by-turn directions, time zones, named areas, and bounding-box search. Prefer them over generic web prose when the parent asks where something is, what is nearby, how far or how long a trip is, how to get there, or what time zone a place uses. Use the household home ZIP from familyProfile for a natural “near me” request, and use a parent-supplied address, landmark, or coordinates directly. Qualify ambiguous place names with the city, state, or country already present in the conversation; if multiple materially different candidates remain, use maps_search, show the useful candidates, and ask one focused question instead of silently choosing the wrong place. For current opening hours, phone numbers, prices, or closures, call web research after the map lookup; Florence automatically gives the isolated researcher the public place candidates returned by maps. Verify traffic with web research only when the route endpoints are already in the parent's current typed request. Maps results may contain one useful tap-to-open map or directions URL that you may copy into a bubble when you did not also use public web research; after web research, omit the map URL and use researchUrls. Preserve the returned OpenStreetMap attribution when using OpenStreetMap-derived results.
 
@@ -1455,7 +1533,7 @@ Search only with the minimum public task details the parent typed or facts learn
 
 When the parent corrects an assumption or fact during the task, incorporate the correction, rerank what matters, preserve still-valid context, and answer once from the corrected premise. Do not restart the conversation or repeat an obsolete result. If a useful next step is a message or email, provide the exact draft and state clearly that it was not sent.
 
-A currentMessage with moveKind reaction is affect or acknowledgement only. Never interpret a reaction as an approval, confirmation, completion, cancellation, instruction, factual correction, memory request, scheduling request, household update, Calendar authority, or channel opt-out. For a reaction turn, all policy values must be false, facts must be empty, and followUp, reminder, interest, calendar, and householdUpdate must be null; use natural silence or a conversational response.
+A currentMessage with moveKind reaction is affect or acknowledgement only. Never interpret a reaction as an approval, confirmation, completion, cancellation, instruction, factual correction, memory request, scheduling request, household update, Calendar authority, or channel opt-out. For a reaction turn, all policy values must be false, facts must be empty, and followUp, reminder, familyWork, interest, calendar, and householdUpdate must be null; use natural silence or a conversational response.
 
 Facts from a group turn are household-visible. Facts from a private turn are always private, including a private correction of an existing household fact. A private turn cannot forget a household fact. Never claim that a private correction or deletion was shared; the parent must make shared changes in the family group.
 
@@ -1467,7 +1545,11 @@ Calendar intervals are explicit. Use intervalKind timed only for an event with e
 
 Before returning a create, read a family-Calendar window that completely covers the proposed event. Before an update or delete, read a complete family-Calendar window and copy the target's app-scoped eventRef and observedEvent exactly from one returned event; never invent or reconstruct a target. An update's read must cover both the observed and replacement intervals. If any necessary read is truncated or unavailable, return null and explain briefly. The general conversation model can never approve a previously offered Calendar event. The application interprets that approval in a separate isolated decision using only the current parent Message and the immutable event Florence already showed. Never put an unverified success claim in conversation bubbles; the application reports a direct Calendar result after execution and provider verification.
 
-Facts may be remembered or corrected only when policy.retain is true. Forgetting an existing fact is allowed when retain is false. A reminder, finite monitor, durable interest discovery, Calendar offer, or direct Calendar decision may be created only when policy.schedule is true. Never claim that an external message, purchase, booking, or unsupported consequential action happened.
+Facts may be remembered or corrected only when policy.retain is true. Forgetting an existing fact is allowed when retain is false. A reminder, finite monitor, durable family task, durable interest discovery, Calendar offer, or direct Calendar decision may be created only when policy.schedule is true. Never claim that an external message, purchase, booking, or unsupported consequential action happened.
+
+The familyWork field is for a real multi-step task that should keep going after this reply: for example resolving a delayed flight, comparing live alternatives, route time, and weather, or another task that cannot be usefully completed in the ordinary foreground turn. It is not a generic promise, a reminder, a finite evidence monitor, or a substitute for answering a normal question now. Create it when the parent explicitly asks Florence to keep working or when completing the request genuinely needs multiple tool checkpoints. Return one immediate natural acknowledgement bubble that names the work Florence is actually starting; a brief reaction is welcome when it feels natural, but never use it instead of the acknowledgement. Never say the work is complete at acceptance. The current background catalog includes public research, maps, weather, and flight tools and will grow with Florence's other real capabilities; use what is actually available and report a real result, one blocking question, or an honest failure.
+
+Use visibleFamilyWork to answer status questions naturally and to resolve steering or cancellation. Steer only one supplied active or waiting workId when the current Message clearly adds or changes a constraint for that task; carry the parent's meaning faithfully in the concise instruction. Cancel only one supplied active, waiting, or delivering workId when the parent clearly wants that work stopped. A reply or an unambiguous recent referent can resolve “that”; if two tasks plausibly match, ask one focused question and return no familyWork mutation. An unrelated family Message must leave every task untouched. Never expose work IDs, phases, generations, claims, or other machinery in conversation.
 
 The reminder field is Florence's complete reminder control. Interpret ordinary language into exactly one of create, list, update, pause, resume, run, or cancel. A private reminder belongs only to that adult and delivers in this thread; a group reminder belongs to the household and delivers in this group.
 
@@ -1570,6 +1652,18 @@ You receive only a parent's current typed request after the application removed 
 When the request contains enough public context, use web search now. When mapResults are present, use the relevant candidate's public name, address, or official website to verify the volatile place detail the parent asked about; do not search every candidate indiscriminately. Resolve public identifiers before declaring information missing, then return a concise factual summary that directly advances the request and one to three direct HTTP(S) source URLs that web search actually returned. For a flight identifier, the summary must state the exact operating date, current status, origin and destination IATA codes, and local scheduled or estimated times when the sources establish them, so the main assistant can search alternatives without asking the parent for the route. A flight number is only one example; apply the same judgment to places, products, schedules, status, comparisons, current events, and other public facts. Do not include URLs in summary.
 
 The application calls you only after the main model requests public research, but sanitation may leave placeholders and no useful public subject. You must still use web search at least once and must never reconstruct an omitted value. If the search does not establish a useful answer, return outcome no_result, a concise honest blocker, and no URLs. Never infer or search for a person's identity, contact details, address, account, booking, confirmation code, credentials, or private records. Never take an external action or promise later work. Output only the strict decision schema.`;
+
+const FAMILY_WORK_INSTRUCTIONS = `You are Florence continuing one durable family-assistant task.
+
+This is real background work, not a chat acknowledgement. Advance the supplied objective by one useful checkpoint. You have the parent's original objective, every later steering instruction in order, prior tool calls and results, the current time, and a narrow family profile. Treat the latest steering as authoritative when it changes an earlier constraint. Do not expose task IDs, state, claims, generations, tool names, or internal process language.
+
+Use the available tools naturally. Public web research resolves current facts and identifiers; dedicated maps, route, time-zone, weather, and flight tools do the structured work they cover. A flight number is an ordinary public identifier: resolve its current operating date, route, and status before searching alternatives. Prefer a second genuinely useful source or specialized tool for a comparison, but never call tools performatively or claim an action without a returned result.
+
+If another read is needed, call exactly one tool and stop this checkpoint. If the accumulated evidence is enough, return a concise terminal result that leads with the useful answer and includes concrete options, times, tradeoffs, and direct URLs already present in tool results when helpful. Use outcome succeeded when the requested comparison is complete, partial when useful results exist but one named source or constraint could not be resolved, failed only when no useful result can be produced, and waiting only when one consequential parent choice remains genuinely blocking after the available reads. A waiting result must ask exactly one focused question. Never say you will keep working unless you actually call another tool in this checkpoint. Output only the strict terminal schema when you do not call a tool.`;
+
+const FAMILY_WORK_CHECKPOINT_MAX_BYTES = 240 * 1024;
+const FAMILY_WORK_CHECKPOINT_LIMIT_TEXT =
+  "I couldn’t finish this one reliably because the accumulated results became too large to carry forward. Please narrow the comparison and I’ll take another pass.";
 
 const privateGmailAttachmentArguments = z
   .object({
@@ -1941,6 +2035,7 @@ const attachmentCapabilityOutputSchema = z
   .strict();
 
 type ForegroundCapabilityContext = {
+  readonly mode: "conversation" | "family_work";
   readonly input: FlorenceReasonerInput;
   readonly reads: FlorenceReadTools;
   readonly knownSources: Set<string>;
@@ -1981,6 +2076,7 @@ function foregroundCapabilityRegistry(): CapabilityRegistry<ForegroundCapability
       executionMode: "parallel",
       timeoutMs: 20_000,
       maxOutputBytes: 100_000,
+      availability: (context) => context.mode === "conversation",
       admit: ({ context }) => context.input.currentMessage.moveKind !== "reaction",
       execute: async ({ callId, arguments: args, context, signal }) =>
         executeReadAdapter(async () => {
@@ -2002,6 +2098,7 @@ function foregroundCapabilityRegistry(): CapabilityRegistry<ForegroundCapability
       executionMode: "parallel",
       timeoutMs: 20_000,
       maxOutputBytes: 100_000,
+      availability: (context) => context.mode === "conversation",
       admit: ({ context, canonicalArguments }) =>
         context.input.currentMessage.moveKind !== "reaction" &&
         isJsonRecord(canonicalArguments) &&
@@ -2201,6 +2298,7 @@ function foregroundCapabilityRegistry(): CapabilityRegistry<ForegroundCapability
       executionMode: "parallel",
       timeoutMs: 20_000,
       maxOutputBytes: 100_000,
+      availability: (context) => context.mode === "conversation",
       admit: ({ context }) =>
         context.input.currentMessage.moveKind !== "reaction" &&
         context.input.audience === "private" &&
@@ -2232,6 +2330,8 @@ function foregroundCapabilityRegistry(): CapabilityRegistry<ForegroundCapability
       executionMode: "sequential",
       timeoutMs: 30_000,
       maxOutputBytes: 4_096,
+      availability: (context) =>
+        context.mode === "conversation" && context.reads.readGmailAttachment !== undefined,
       admit: ({ context, canonicalArguments }) =>
         context.input.audience === "private" &&
         context.input.currentMessage.moveKind !== "reaction" &&
@@ -2272,6 +2372,7 @@ function foregroundCapabilityRegistry(): CapabilityRegistry<ForegroundCapability
       executionMode: "parallel",
       timeoutMs: 30_000,
       maxOutputBytes: 50_000,
+      availability: (context) => context.mode === "conversation",
       admit: ({ context }) => calendarReadIsAdmitted(context.input),
       execute: async ({ callId, context, signal }) =>
         executeReadAdapter(async () => {
@@ -2294,6 +2395,7 @@ function foregroundCapabilityRegistry(): CapabilityRegistry<ForegroundCapability
       executionMode: "parallel",
       timeoutMs: 90_000,
       maxOutputBytes: 100_000,
+      availability: (context) => context.mode === "conversation",
       admit: ({ context, canonicalArguments }) =>
         calendarReadIsAdmitted(context.input) &&
         isJsonRecord(canonicalArguments) &&
@@ -2384,6 +2486,169 @@ function privateAttachmentCapabilityRegistry(): CapabilityRegistry<PrivateAttach
         }, signal),
     }),
   ]);
+}
+
+function familyWorkReasonerInput(input: FlorenceFamilyWorkInput): FlorenceReasonerInput {
+  const owner = input.household.adults.find((adult) => adult.adultId === input.ownerAdultId);
+  const currentAdult = owner ?? input.household.adults[0];
+  const request = [input.objective, ...input.state.steering.map((item) => `Later instruction: ${item.text}`)]
+    .join("\n")
+    .slice(0, 20_000);
+  return {
+    household: {
+      householdId: input.household.householdId,
+      name: input.household.familyLabel,
+      timeZone: input.household.timeZone,
+      adultNames:
+        input.household.adults.length > 0
+          ? input.household.adults.map((adult) => adult.displayName)
+          : ["Parent"],
+      familyProfile: JSON.stringify(input.household),
+    },
+    audience: input.visibility === "household" ? "group" : "private",
+    currentAdultId: currentAdult?.adultId ?? input.workId,
+    currentMessage: {
+      sourceId: input.workId,
+      senderName: currentAdult?.firstName ?? "Family",
+      moveKind: "message",
+      text: request,
+      authoredText: request,
+      voiceTranscriptPresent: false,
+      occurredAt: input.currentTime,
+      images: [],
+      pdfs: [],
+      replyTo: null,
+    },
+    recentMessages: [],
+    visibleSources: [],
+    pendingFollowUps: [],
+    visibleReminders: [],
+    visibleFamilyWork: [],
+    visibleInterests: [],
+    pendingCalendarOffers: [],
+    googleConnections: [],
+  };
+}
+
+function familyWorkReads(publicReads: FlorenceFamilyWorkReadTools): FlorenceReadTools {
+  return {
+    ...publicReads,
+    settleSources: () => undefined,
+    searchGmail: async () => ({ status: "complete", sources: [] }),
+    searchFamilyMemory: async () => [],
+    readCalendarWindow: async () => ({
+      status: "unavailable",
+      calendars: [],
+      totalCalendarCount: 0,
+      events: [],
+      totalEventCount: 0,
+    }),
+    readSource: async () => null,
+    readCurrentImage: async () => {
+      throw unsafeRead("Durable family work has no current-message image");
+    },
+  };
+}
+
+function familyWorkModelContext(input: FlorenceFamilyWorkInput): JsonValue {
+  return {
+    currentTime: input.currentTime,
+    timeZone: input.household.timeZone,
+    objective: input.objective,
+    steering: input.state.steering.map((item) => ({
+      text: item.text,
+      occurredAt: item.occurredAt,
+    })),
+    familyContext: {
+      postalCode: input.household.postalCode,
+      children: input.household.children.map((child) => ({
+        age: child.age,
+        grade: child.grade,
+        school: child.school,
+        activities: [...child.activities],
+      })),
+    },
+  };
+}
+
+function jsonResponseItems(items: readonly ResponseInputItem[]): JsonValue[] {
+  return JSON.parse(JSON.stringify(items)) as JsonValue[];
+}
+
+function storedResponseItems(items: readonly unknown[]): ResponseInputItem[] {
+  if (
+    items.some(
+      (item) =>
+        item === null ||
+        typeof item !== "object" ||
+        Array.isArray(item) ||
+        typeof (item as { type?: unknown }).type !== "string",
+    )
+  ) {
+    throw invalidOutput("Durable family work contains an invalid continuation item");
+  }
+  return structuredClone(items) as ResponseInputItem[];
+}
+
+function familyWorkProgressText(
+  capabilityName: string,
+  terminal: CapabilityTerminalEnvelope,
+  progressRevision: number,
+): string | null {
+  if (progressRevision > 0 || terminal.outcome !== "succeeded") return null;
+  let output: unknown;
+  try {
+    output = (JSON.parse(terminal.modelOutput) as { output?: unknown }).output;
+  } catch {
+    return null;
+  }
+  if (!output || typeof output !== "object") return null;
+  if (capabilityName === "research_public_web") {
+    const summary = (output as { summary?: unknown }).summary;
+    return typeof summary === "string" && summary.trim()
+      ? `${summary.trim()} I’m comparing the workable options now.`.slice(0, 500)
+      : null;
+  }
+  if (capabilityName === "maps_search") {
+    const first = (output as { results?: readonly { displayName?: unknown }[] }).results?.[0]?.displayName;
+    return typeof first === "string" && first.trim()
+      ? `I found ${first.trim()}. I’m checking the route and live options now.`.slice(0, 500)
+      : null;
+  }
+  if (capabilityName === "maps_distance" || capabilityName === "maps_directions") {
+    return "I have the route and travel time. I’m comparing the remaining options now.";
+  }
+  if (capabilityName === "weather_forecast") {
+    return "I checked the live forecast and alerts. I’m folding that into the options now.";
+  }
+  return null;
+}
+
+function familyWorkCheckpointBytes(state: FamilyWorkStateV1): number {
+  return Buffer.byteLength(JSON.stringify(state), "utf8");
+}
+
+function familyWorkCheckpointLimit(
+  state: FamilyWorkStateV1,
+  progressRevision: number,
+): FlorenceFamilyWorkStep {
+  const terminalState: FamilyWorkStateV1 = {
+    ...state,
+    phase: "terminal",
+    claim: null,
+    continuationItems: [],
+    pendingCall: null,
+    steering: [],
+    publicMapResearchContext: [],
+    progressRevision,
+    terminal: { outcome: "failed", text: FAMILY_WORK_CHECKPOINT_LIMIT_TEXT },
+  };
+  return {
+    kind: "terminal",
+    state: terminalState,
+    outcome: "failed",
+    text: FAMILY_WORK_CHECKPOINT_LIMIT_TEXT,
+  };
 }
 
 export class FlorenceReasoner {
@@ -2636,7 +2901,7 @@ export class FlorenceReasoner {
     };
     const attachmentRegistry = privateAttachmentCapabilityRegistry();
     const attachmentCatalog = await attachmentRegistry.catalog(attachmentContext, signal);
-    const observer = workStartedObserver(presentation?.onWorkStarted);
+    const onStart = workStartedCallback(presentation?.onWorkStarted);
     const modelInput: ResponseInput = [
       {
         role: "user",
@@ -2680,7 +2945,7 @@ export class FlorenceReasoner {
           calls: rawCapabilityCalls(calls),
           completion: responseCompletion(response),
           ...(signal ? { signal } : {}),
-          ...(observer ? { observer } : {}),
+          ...(onStart ? { onStart } : {}),
         });
         modelInput.push(...terminalFunctionOutputs(batch.results, attachmentContext.artifacts));
       }
@@ -2780,7 +3045,7 @@ export class FlorenceReasoner {
     };
     const attachmentRegistry = privateAttachmentCapabilityRegistry();
     const attachmentCatalog = await attachmentRegistry.catalog(attachmentContext, signal);
-    const observer = workStartedObserver(presentation?.onWorkStarted);
+    const onStart = workStartedCallback(presentation?.onWorkStarted);
     const modelInput: ResponseInput = [
       {
         role: "user",
@@ -2824,7 +3089,7 @@ export class FlorenceReasoner {
           calls: rawCapabilityCalls(calls),
           completion: responseCompletion(response),
           ...(signal ? { signal } : {}),
-          ...(observer ? { observer } : {}),
+          ...(onStart ? { onStart } : {}),
         });
         modelInput.push(...terminalFunctionOutputs(batch.results, attachmentContext.artifacts));
       }
@@ -3013,6 +3278,186 @@ export class FlorenceReasoner {
     return validatePublicRequestResearch(response.output_parsed, response.output);
   }
 
+  /**
+   * One checkpoint of durable family work. The checkpoint split directly adapts
+   * Pi's intent/effect/settlement boundary (4e494929, docs/harness.md) while the
+   * caller persists it in Florence's existing work row. No worker runtime lives
+   * here: a planned read is stored before this method executes it on a later pass.
+   */
+  async continueFamilyWork(
+    input: FlorenceFamilyWorkInput,
+    publicReads: FlorenceFamilyWorkReadTools,
+    signal?: AbortSignal,
+  ): Promise<FlorenceFamilyWorkStep> {
+    throwIfAborted(signal);
+    if (
+      !input.workId.trim() ||
+      !input.objective.trim() ||
+      !Number.isFinite(Date.parse(input.currentTime)) ||
+      input.state.kind !== "family_work_v1" ||
+      input.state.version !== 1 ||
+      (input.state.phase !== "ready" && input.state.phase !== "tool_pending")
+    ) {
+      throw invalidOutput("Durable family work is not at an executable checkpoint");
+    }
+    if (familyWorkCheckpointBytes(input.state) > FAMILY_WORK_CHECKPOINT_MAX_BYTES) {
+      return familyWorkCheckpointLimit(input.state, input.state.progressRevision + 1);
+    }
+
+    const reasonerInput = familyWorkReasonerInput(input);
+    const reads = familyWorkReads(publicReads);
+    const publicMapResearchContext = [...input.state.publicMapResearchContext];
+    const publicResearchUrls = new Set<string>();
+    const capabilityContext: ForegroundCapabilityContext = {
+      mode: "family_work",
+      input: reasonerInput,
+      reads,
+      knownSources: new Set(),
+      knownFacts: new Set(),
+      calendarReads: [],
+      publicResearchUrls,
+      publicResearchState: { used: false },
+      publicMapResearchContext,
+      gmailSources: new Map(),
+      calendarRefs: new Set(),
+      artifacts: new Map(),
+      settlements: new Map(),
+      researchPublicRequest: (capabilitySignal) =>
+        this.#researchPublicRequest(reasonerInput, [], publicMapResearchContext, capabilitySignal),
+    };
+    const capabilityRegistry = foregroundCapabilityRegistry();
+    const capabilityCatalog = await capabilityRegistry.catalog(capabilityContext, signal);
+
+    if (input.state.phase === "tool_pending") {
+      const pendingCall = input.state.pendingCall;
+      if (!pendingCall) throw invalidOutput("Durable family work lost its planned capability call");
+      const batch = await capabilityRegistry.executeCalls({
+        snapshot: capabilityCatalog,
+        context: capabilityContext,
+        calls: [pendingCall],
+        completion: "complete",
+        ...(signal ? { signal } : {}),
+      });
+      settleForegroundCapabilityResults(batch.results, capabilityContext);
+      const terminal = batch.results[0];
+      if (!terminal) throw invalidOutput("Durable family work produced no capability settlement");
+      const functionOutput = terminalFunctionOutputs([terminal], capabilityContext.artifacts);
+      const progressText = familyWorkProgressText(pendingCall.name, terminal, input.state.progressRevision);
+      const state: FamilyWorkStateV1 = {
+        ...input.state,
+        phase: "ready",
+        claim: null,
+        continuationItems: [...input.state.continuationItems, ...jsonResponseItems(functionOutput)],
+        pendingCall: null,
+        publicMapResearchContext,
+        progressRevision: input.state.progressRevision + (progressText ? 1 : 0),
+      };
+      if (familyWorkCheckpointBytes(state) > FAMILY_WORK_CHECKPOINT_MAX_BYTES) {
+        return familyWorkCheckpointLimit(input.state, input.state.progressRevision + 1);
+      }
+      return { kind: "continue", state, progressText };
+    }
+
+    const modelInput: ResponseInput = [
+      {
+        role: "user",
+        content: [
+          {
+            type: "input_text",
+            text: JSON.stringify(familyWorkModelContext(input)),
+          },
+        ],
+      },
+      ...storedResponseItems(input.state.continuationItems),
+    ];
+    try {
+      const response = await this.#client.responses.parse(
+        {
+          model: this.#model,
+          store: false,
+          include: ["reasoning.encrypted_content"],
+          instructions: FAMILY_WORK_INSTRUCTIONS,
+          input: modelInput,
+          tools: functionTools(capabilityCatalog),
+          parallel_tool_calls: false,
+          ...(capabilityCatalog.tools.length > 0 ? { max_tool_calls: 1 } : {}),
+          max_output_tokens: this.#maxOutputTokens,
+          text: {
+            format: zodTextFormat(familyWorkTerminalDecisionSchema, "florence_family_work_result"),
+          },
+        },
+        { signal },
+      );
+      throwIfAborted(signal);
+      const calls = response.output.filter((item) => item.type === "function_call");
+      if (calls.length > 1) throw invalidOutput("Durable family work planned more than one read step");
+      const appended = jsonResponseItems(continuationItems(response.output));
+      const call = calls[0];
+      if (call) {
+        const state: FamilyWorkStateV1 = {
+          ...input.state,
+          phase: "tool_pending",
+          claim: null,
+          continuationItems: [...input.state.continuationItems, ...appended],
+          pendingCall: {
+            callId: call.call_id,
+            name: call.name,
+            argumentsJson: call.arguments,
+          },
+        };
+        if (familyWorkCheckpointBytes(state) > FAMILY_WORK_CHECKPOINT_MAX_BYTES) {
+          return familyWorkCheckpointLimit(input.state, input.state.progressRevision + 1);
+        }
+        return {
+          kind: "continue",
+          state,
+          progressText: null,
+        };
+      }
+      if (response.output_parsed === null) {
+        throw invalidOutput("Durable family work returned neither a read nor a result");
+      }
+      const terminal = familyWorkTerminalDecisionSchema.parse(response.output_parsed);
+      if (terminal.outcome === "waiting") {
+        const state: FamilyWorkStateV1 = {
+          ...input.state,
+          phase: "waiting",
+          claim: null,
+          continuationItems: [...input.state.continuationItems, ...appended],
+          pendingCall: null,
+          progressRevision: input.state.progressRevision + 1,
+        };
+        if (familyWorkCheckpointBytes(state) > FAMILY_WORK_CHECKPOINT_MAX_BYTES) {
+          return familyWorkCheckpointLimit(input.state, input.state.progressRevision + 1);
+        }
+        return {
+          kind: "waiting",
+          state,
+          question: terminal.text,
+        };
+      }
+      return {
+        kind: "terminal",
+        state: {
+          ...input.state,
+          phase: "terminal",
+          claim: null,
+          continuationItems: [],
+          pendingCall: null,
+          publicMapResearchContext: [],
+          progressRevision: input.state.progressRevision + 1,
+          terminal: { outcome: terminal.outcome, text: terminal.text },
+        },
+        outcome: terminal.outcome,
+        text: terminal.text,
+      };
+    } catch (error) {
+      if (error instanceof APIUserAbortError || isAbortError(error)) throw error;
+      throwIfAborted(signal);
+      throw normalizeError(error);
+    }
+  }
+
   async decide(
     untrustedInput: FlorenceReasonerInput,
     reads: FlorenceReadTools,
@@ -3038,6 +3483,10 @@ export class FlorenceReasoner {
         ) {
           throw invalidOutput("A visible reminder cannot repeat a weekday");
         }
+      }
+      const visibleFamilyWorkIds = input.visibleFamilyWork.map((work) => work.workId);
+      if (new Set(visibleFamilyWorkIds).size !== visibleFamilyWorkIds.length) {
+        throw invalidOutput("Visible family-work IDs must be unique");
       }
       validateVisibleInterests(input);
     } catch (error) {
@@ -3072,6 +3521,7 @@ export class FlorenceReasoner {
     const publicResearchState = { used: false };
     const publicMapResearchContext: string[] = [];
     const capabilityContext: ForegroundCapabilityContext = {
+      mode: "conversation",
       input,
       reads,
       knownSources,
@@ -3094,7 +3544,7 @@ export class FlorenceReasoner {
     };
     const capabilityRegistry = foregroundCapabilityRegistry();
     const capabilityCatalog = await capabilityRegistry.catalog(capabilityContext, signal);
-    const observer = workStartedObserver(presentation?.onWorkStarted);
+    const onStart = workStartedCallback(presentation?.onWorkStarted);
     const currentImages = await Promise.all(
       input.currentMessage.images.map(async (image) => {
         throwIfAborted(signal);
@@ -3189,7 +3639,7 @@ export class FlorenceReasoner {
           calls: rawCapabilityCalls(calls),
           completion: responseCompletion(response),
           ...(signal ? { signal } : {}),
-          ...(observer ? { observer } : {}),
+          ...(onStart ? { onStart } : {}),
         });
         settleForegroundCapabilityResults(batch.results, capabilityContext);
         modelInput.push(...terminalFunctionOutputs(batch.results, capabilityContext.artifacts));
@@ -3389,11 +3839,11 @@ function settleForegroundCapabilityResults(
   }
 }
 
-function workStartedObserver(onWorkStarted?: () => void): CapabilityLifecycleObserver | undefined {
+function workStartedCallback(onWorkStarted?: () => void): (() => void) | undefined {
   if (!onWorkStarted) return undefined;
   let started = false;
-  return (event) => {
-    if (started || (event.phase !== "admitted" && event.phase !== "running")) return;
+  return () => {
+    if (started) return;
     started = true;
     onWorkStarted();
   };
@@ -4709,6 +5159,7 @@ function validateDecision(
     decision.householdUpdate !== null ||
     decision.calendar !== null ||
     decision.reminder?.operation === "run" ||
+    decision.familyWork !== null ||
     webAccessPath !== null ||
     researchUrls.length > 0;
   if (decision.policy.stopMessaging) {
@@ -4738,7 +5189,10 @@ function validateDecision(
   if (!decision.policy.retain && decision.facts.some((fact) => fact.operation !== "forget")) {
     throw invalidOutput("OpenAI retained family memory after declining retention authority");
   }
-  if (!decision.policy.schedule && (decision.followUp !== null || decision.calendar !== null)) {
+  if (
+    !decision.policy.schedule &&
+    (decision.followUp !== null || decision.familyWork !== null || decision.calendar !== null)
+  ) {
     throw invalidOutput("OpenAI scheduled work after declining scheduling authority");
   }
   if (interest && interest.operation !== "stop" && (!decision.policy.retain || !decision.policy.schedule)) {
@@ -4753,6 +5207,7 @@ function validateDecision(
       decision.facts.length > 0 ||
       decision.followUp !== null ||
       decision.reminder !== null ||
+      decision.familyWork !== null ||
       interest !== null ||
       decision.calendar !== null ||
       decision.householdUpdate !== null ||
@@ -4769,6 +5224,7 @@ function validateDecision(
       decision.facts.length > 0 ||
       decision.followUp !== null ||
       decision.reminder !== null ||
+      decision.familyWork !== null ||
       interest !== null ||
       decision.calendar !== null ||
       decision.householdUpdate !== null ||
@@ -4876,6 +5332,40 @@ function validateDecision(
     }
     if (decision.householdUpdate !== null) {
       throw invalidOutput("Reminder control cannot be combined with a private household update");
+    }
+  }
+  if (decision.familyWork) {
+    const familyWork = decision.familyWork;
+    if (input.currentMessage.moveKind === "reaction") {
+      throw invalidOutput("A reaction cannot create or change durable family work");
+    }
+    if (decision.conversation.bubbles.length === 0) {
+      throw invalidOutput("A family-work change requires an immediate visible acknowledgement");
+    }
+    if (familyWork.operation === "create") {
+      if (
+        input.visibleFamilyWork.some(
+          (work) =>
+            (work.status === "active" || work.status === "waiting" || work.status === "delivering") &&
+            work.objective === familyWork.objective,
+        )
+      ) {
+        throw invalidOutput("OpenAI duplicated an active family task");
+      }
+    } else {
+      const visible = input.visibleFamilyWork.find((work) => work.workId === familyWork.workId);
+      if (!visible) throw invalidOutput("OpenAI changed unknown family work");
+      if (familyWork.operation === "steer" && visible.status !== "active" && visible.status !== "waiting") {
+        throw invalidOutput("Only active or waiting family work can be steered");
+      }
+      if (
+        familyWork.operation === "cancel" &&
+        visible.status !== "active" &&
+        visible.status !== "waiting" &&
+        visible.status !== "delivering"
+      ) {
+        throw invalidOutput("Finished family work cannot be cancelled");
+      }
     }
   }
   if (

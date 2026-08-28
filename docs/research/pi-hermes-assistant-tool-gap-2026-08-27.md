@@ -1,5 +1,7 @@
 # Pi and Hermes assistant-tool gap for Florence
 
+> Current product decision, superseding the generic architecture recommendations below: reuse capability-specific Pi/Hermes behavior and the small execution loop directly. Do not build a toolset registry, progressive-discovery layer, MCP connector framework, approval framework, or isolated read-only endpoint in advance. Add full Google Workspace, authenticated browser/computer use, communication, bookings, and errands through named family workflows; introduce shared infrastructure only after a real workflow proves it necessary.
+
 Date: 2026-08-27
 
 Scope: current first-party source and documentation only. Pi is evaluated at release [`v0.84.3`](https://github.com/earendil-works/pi/releases/tag/v0.84.3), Hermes Agent at source commit [`6dcebea`](https://github.com/NousResearch/hermes-agent/tree/6dcebea7fc5d0cc4f621eeaddf52b7d877a5f882), and Florence at commit [`5e7114d`](https://github.com/harianbarasu/florence/tree/5e7114d0cdb79e713f61c0b6013bc29672ce4a2d). The user's separate permission to reuse Pi/Hermes material is taken as given; this is an architecture and product-capability assessment, not a license analysis.
@@ -8,9 +10,9 @@ Scope: current first-party source and documentation only. Pi is evaluated at rel
 
 The earlier conclusion that Florence did not need to take anything from Pi or Hermes was too broad.
 
-- **Pi does not contain the personal-assistant tools Florence is missing.** Its shipped tools are filesystem and shell tools for coding. Pi is useful as a source of TypeScript tool-loop contracts: typed tools, cancellation, real progress events, policy hooks, steering/follow-up queues, and dynamic tool activation.
-- **Hermes does contain a substantial personal-assistant capability surface.** Florence should adapt several parts of it: a tool registry/toolset model, web extraction, safe browser-worker boundaries, scheduled-task CRUD, a generic work lifecycle, progressive tool disclosure, maps/travel connectors, Google Workspace coverage, document workflows, and a curated MCP connector layer.
-- **Florence still should not replace its runtime wholesale with either project.** Pi lacks the assistant tools and durable work engine; Hermes is a Python agent product whose session, credentials, memory, messaging, cron, and execution systems would become a second control plane. Florence's household visibility, adult authority, source provenance, provider reconciliation, and PostgreSQL commit boundary remain the right product kernel.
+- **Pi does not contain the personal-assistant tools Florence is missing.** Its shipped tools are filesystem and shell tools for coding. Florence should directly adapt only its small typed tool loop, cancellation, ordered results, and steering/follow-up behavior.
+- **Hermes does contain a substantial personal-assistant capability surface.** Florence should directly adapt its concrete Google Workspace operations, browser interaction, scheduling, background-work, maps, travel, document, and briefing behavior wherever a named family workflow needs it.
+- **Florence should not import either product wholesale or prebuild their generic infrastructure.** Pi lacks the assistant tools and durable worker; Hermes's Python runtime, registry, progressive-discovery layer, MCP catalog, memory, and cron are not shortcuts to the requested family outcomes.
 
 The right decision is therefore **selective adoption, not no adoption and not wholesale adoption**.
 
@@ -103,9 +105,9 @@ Florence's model-visible foreground tools are currently `search_family_memory`, 
 |---|---|---|---|---|
 | Public search | Yes, isolated current-request search | No | Yes | Florence's privacy isolation is stronger; keep it. |
 | URL/page extraction | No general tool | No | Yes | Add a safe `read_public_page` tool. |
-| Browser/form interaction | No | No | Yes | Add later as an isolated worker with explicit submit approval. |
+| Browser/form interaction | No | No | Yes | Add authenticated browser/computer use through a named family errand, including the real commitment step when requested. |
 | Gmail read/search | Private adult only | No | Skill | Keep Florence's scoped tool; add attachments and full-calendar parity. |
-| Gmail draft/send/reply/labels | No | No | Skill | Add draft first; send/reply only after explicit approval and provider receipt. |
+| Gmail draft/send/reply/labels | No | No | Skill | Port the concrete operations into Florence's existing Google adapter and complete real email workflows. |
 | Calendar read | Bounded scoped window | No | Skill | Expand personal calendar selection; keep provider/audience policy in Florence. |
 | Family Calendar writes | Structured create/update/delete with policy | No | Skill has create/delete | Florence is already stronger for the family use case. |
 | Reminder CRUD/recurrence | Create one-shot only | No | Cron CRUD + Apple skill | Add update/cancel/recurrence using one action-oriented tool. |
@@ -114,10 +116,10 @@ Florence's model-visible foreground tools are currently `search_family_memory`, 
 | Maps/places/routes/timezone | Generic web only | No | Bundled maps skill | Add early. |
 | Flight/hotel specialist search | Generic web only | No | Optional Kiwi/trivago MCP | Add read-only specialist tools early if provider evaluation passes. |
 | Weather | Generic web only | No | No dedicated tool | Add a small deterministic provider. |
-| Files/docs | Image/PDF/voice input; no creation/editing | Coding file tools only | Broad document skills | Add extraction/provenance first; generation later. |
+| Files/docs | Image/PDF/voice input; no creation/editing | Coding file tools only | Broad document skills | Add reading, creation, and editing through concrete Workspace/document workflows. |
 | Memory | Source-linked, visibility-aware family Vault | No assistant memory | Profile memory + session FTS | Keep Florence; do not import Hermes memory semantics. |
 | Messages/reactions | App-owned Linq delivery/reaction with authority | Pi Chat channel patterns | App/gateway-owned; limited reaction tools | Florence already has the right ownership. |
-| MCP/connectors | No | Extension only | Full client/catalog | Build a narrow connector layer after capability/approval metadata exists. |
+| MCP/connectors | No | Extension only | Full client/catalog | Do not build a generic layer in advance; use a provider directly when a named family workflow needs it. |
 | Smart home/music/media generation | No | No | Yes | Optional, later. |
 
 Two existing gaps are especially cheap to close because Florence already has underlying provider support:
@@ -127,7 +129,9 @@ Two existing gaps are especially cheap to close because Florence already has und
 
 Those should be finished before adding a second Google implementation.
 
-## What to take, concretely
+## Historical recommendation record (superseded)
+
+The inventory below records what was evaluated on 2026-08-27. Its registry, progressive-discovery, read-only-browser, generic approval, and MCP-layer recommendations are not the current roadmap. The current decision is the one at the top of this document: port capability-specific behavior into named family workflows and add no shared architecture until the workflow itself demonstrates a need.
 
 ### Reuse mode by source asset
 
@@ -146,7 +150,7 @@ Those should be finished before adding a second Google implementation.
 | Hermes daily brief, weekly review, document-to-action-items, and price-monitor skills | **Direct workflow-content reuse is appropriate.** | Adapt the procedures to household sources, the parental-unit Vault, the 90-day evidence window, and minimal-crossing privacy. |
 | Hermes optional MCP manifests | **Copy catalog metadata only if useful; the tools themselves are external services.** | Connect to selected vendor servers through a Florence-owned allowlisted client. Re-evaluate endpoint terms, auth, schemas, and data handling independently. |
 
-### Take or port now
+### Historical first sequence (superseded)
 
 1. **A uniform tool contract and lifecycle from Pi.** Define every Florence capability with typed input/output, privacy scope, audience, consequence class, approval requirement, cancellation, timeout, concurrency, progress, and terminal outcome. Translate actual `tool_execution_start/update/end` events into reactions/progress; never infer work from model prose. Pi's `AgentTool` and loop types are the best TypeScript reference ([types](https://github.com/earendil-works/pi/blob/v0.84.3/packages/agent/src/types.ts#L360-L409)).
 2. **Hermes's action-oriented scheduling shape.** One reminder/schedule tool should support create/list/update/pause/resume/run/remove rather than separate brittle gates. Florence must store the jobs in PostgreSQL and deliver through its existing outbox; copy the schema/semantics, not Hermes's local scheduler.
@@ -156,7 +160,7 @@ Those should be finished before adding a second Google implementation.
 6. **Hermes's monitor procedures.** Copy the price-monitor rules for exact-item identity, successful foreground baseline, last-known-good state, cooldown, and duplicate alert fingerprint. Copy the daily/weekly brief coverage checklists, then adapt them to Florence's two-adult visibility policy.
 7. **Complete Florence's existing Google reads.** Add conversational attachment reading and selectable/all-calendar reads through Florence's current adapter before considering Drive/Docs/Contacts.
 
-### Take after the first tool tranche
+### Historical later sequence (superseded)
 
 1. **A capability registry/toolset model.** Port the useful shape from Hermes's [`tools/registry.py`](https://github.com/NousResearch/hermes-agent/blob/6dcebea7fc5d0cc4f621eeaddf52b7d877a5f882/tools/registry.py) and [`toolsets.py`](https://github.com/NousResearch/hermes-agent/blob/6dcebea7fc5d0cc4f621eeaddf52b7d877a5f882/toolsets.py): schema, handler, availability check, credentials, consequence class, surface eligibility, and dynamic description. Add Florence-specific fields for household/adult visibility and allowed result audience.
 2. **Progressive tool disclosure.** Hermes replaces large MCP/plugin catalogs with `tool_search`, `tool_describe`, and `tool_call`, while always scoping the catalog to tools granted to that session ([design/source](https://github.com/NousResearch/hermes-agent/blob/6dcebea7fc5d0cc4f621eeaddf52b7d877a5f882/tools/tool_search.py), [docs](https://hermes-agent.nousresearch.com/docs/user-guide/features/tool-search)). Pi also supports additive dynamic tool activation. Florence will need this when its catalog is large; it is unnecessary for five tools.
@@ -175,7 +179,9 @@ Those should be finished before adding a second Google implementation.
 - A model-callable generic cross-channel `send_message`; keep delivery application-owned.
 - Coding Kanban, code review, repository, shell, and project-management tools unless Florence becomes a different product.
 
-## Recommended build order
+## Historical build order (superseded)
+
+This tranche order is retained only as research history and must not be used as the active product plan.
 
 ### Tranche 1: useful read-only assistant
 
@@ -220,8 +226,6 @@ Spotify, Home Assistant, media generation, Todoist, Notion, Dropbox, Canva, Cale
 
 ## Final decision
 
-- **Pi:** take the TypeScript tool contract, lifecycle events, cancellation/progress, policy hooks, steering/follow-up distinction, dynamic activation, and durable-effect specification. Do not take its coding tools or unfinished harness.
-- **Hermes:** take the assistant capability map and port the high-value patterns/tools: web extraction, URL safety, schedules, work ledger, maps, travel connector catalog, monitor procedures, tool registry/toolsets, progressive discovery, and isolated browser boundaries. Do not embed the whole Python runtime.
-- **Florence:** keep its own PostgreSQL authority, source visibility, household policy, provider idempotency, Linq delivery, and Google adapter as the control plane. Build a larger tool arsenal behind those boundaries.
-
-The practical implication is that Florence should indeed become much more tool-capable. The mistake would be equating “more tools” with “give a general agent shell/MCP/browser access.” The useful version is a broad **catalog of narrow, capability-scoped tools** whose starts, progress, approvals, effects, and results Florence can prove.
+- **Pi:** directly adapt the small TypeScript execution-loop behavior, cancellation, source ordering, and steering/follow-up distinction. Do not take its coding tools or unfinished harness.
+- **Hermes:** directly adapt concrete assistant operations and workflows—Google Workspace, browser interaction, schedules, durable delegation behavior, maps/travel, documents, and briefs—where they advance a named Florence task. Do not prebuild its registry, MCP, discovery, or Python runtime.
+- **Florence:** compete on completed outcomes: full useful Workspace, authenticated browser/computer use, live voice, calls/texts, bookings, transactions, cancellations, and errands. Reuse the existing reasoner, PostgreSQL work seam, provider adapters, and Linq delivery until a real workflow proves another shared component is necessary.

@@ -159,6 +159,7 @@ export class Florence {
   readonly #now: () => Date;
   #activeRun: Promise<boolean> | null = null;
   #activeInbound: ActiveInbound | null = null;
+  #activeFamilyWork = new Map<string, { controller: AbortController; promise: Promise<void> }>();
   #pendingInboundAccepts = new Set<Promise<unknown>>();
   #nextArtifactPurgeAt = 0;
   #timer: ReturnType<typeof setTimeout> | null = null;
@@ -1128,6 +1129,9 @@ export class Florence {
     if (this.#timer) clearTimeout(this.#timer);
     this.#timer = null;
     this.#activeInbound?.controller.abort(new Error("Florence is shutting down"));
+    for (const active of this.#activeFamilyWork.values()) {
+      active.controller.abort(new Error("Florence is shutting down"));
+    }
   }
 
   async #runCycle(): Promise<boolean> {
@@ -1188,7 +1192,8 @@ export class Florence {
     }
     const proactiveWork = await this.#store.readNextDueProactiveWork(this.#now().toISOString());
     if (proactiveWork) {
-      await this.#executeProactiveWork(proactiveWork);
+      if (proactiveWork.kind === "family_task") this.#launchFamilyWork(proactiveWork);
+      else await this.#executeProactiveWork(proactiveWork);
       worked = true;
     }
     return worked;
@@ -1285,6 +1290,7 @@ export class Florence {
             facts: [],
             followUp: null,
             reminder: null,
+            familyWork: null,
             calendar: null,
             householdUpdate: null,
           },
@@ -1471,7 +1477,7 @@ export class Florence {
                 webAccessPath: null,
               }
             : requested;
-        await this.#store.commitTurn(
+        const committed = await this.#store.commitTurn(
           decisionCommit(turn, committedDecision, this.#now(), {
             omitReaction: immediateReactionStaged,
             approveCalendarOffer: approval,
@@ -1481,6 +1487,11 @@ export class Florence {
             resolveCalendarEventTarget: context.resolveCalendarEventTarget,
           }),
         );
+        if (committed === "committed" && committedDecision.familyWork?.operation === "cancel") {
+          this.#activeFamilyWork
+            .get(committedDecision.familyWork.workId)
+            ?.controller.abort(new Error("The family task was cancelled"));
+        }
       } catch (error) {
         if (controller.signal.aborted) return;
         if (error instanceof FlorenceReasonerError && !error.retryable) {
@@ -1508,6 +1519,7 @@ export class Florence {
                   facts: [],
                   followUp: null,
                   reminder: null,
+                  familyWork: null,
                   calendar: null,
                   householdUpdate: null,
                 },
@@ -1539,6 +1551,7 @@ export class Florence {
                       facts: [],
                       followUp: null,
                       reminder: null,
+                      familyWork: null,
                       calendar: null,
                       householdUpdate: null,
                     },
@@ -1564,6 +1577,7 @@ export class Florence {
                         facts: [],
                         followUp: null,
                         reminder: null,
+                        familyWork: null,
                         calendar: null,
                         householdUpdate: null,
                       },
@@ -1756,6 +1770,13 @@ export class Florence {
         nextAt: reminder.nextAt,
         lastRunAt: reminder.lastRunAt,
         createdAt: reminder.createdAt,
+      })),
+      visibleFamilyWork: turn.visibleFamilyWork.map((work) => ({
+        workId: work.workId,
+        objective: work.objective,
+        currentProgress: work.currentProgress,
+        status: work.status,
+        createdAt: work.createdAt,
       })),
       visibleInterests: turn.visibleInterests.map((interest) => ({
         interestWorkId: interest.interestWorkId,
@@ -3315,7 +3336,130 @@ export class Florence {
     });
   }
 
-  async #executeProactiveWork(work: DueProactiveWork): Promise<void> {
+  #launchFamilyWork(work: Extract<DueProactiveWork, { kind: "family_task" }>): void {
+    const existing = this.#activeFamilyWork.get(work.workId);
+    if (existing) {
+      existing.controller.abort(new Error("A newer family-task checkpoint was claimed"));
+      void existing.promise.finally(() => this.#launchFamilyWork(work));
+      return;
+    }
+    const controller = new AbortController();
+    const promise = this.#executeFamilyWork(work, controller.signal)
+      .catch(() => undefined)
+      .finally(() => {
+        const active = this.#activeFamilyWork.get(work.workId);
+        if (active?.promise === promise) this.#activeFamilyWork.delete(work.workId);
+        this.#wake();
+      });
+    this.#activeFamilyWork.set(work.workId, { controller, promise });
+  }
+
+  async #executeFamilyWork(
+    work: Extract<DueProactiveWork, { kind: "family_task" }>,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const reasoner = this.#reasoner;
+    if (!reasoner) {
+      await this.#store.settleFamilyWorkClaim({
+        workId: work.workId,
+        generation: work.generation,
+        claimId: work.claimId,
+        settledAt: this.#now().toISOString(),
+        result: {
+          type: "retry",
+          state: { ...work.state, claim: null },
+          retryAt: later(this.#now(), RETRY_MS),
+          error: "Florence's task reasoner is not configured",
+        },
+      });
+      return;
+    }
+    try {
+      const maps = this.#maps;
+      const weather = this.#weather;
+      const flights = this.#flights;
+      const step = await reasoner.continueFamilyWork(
+        {
+          workId: work.workId,
+          objective: work.objective,
+          visibility: work.visibility,
+          ownerAdultId: work.ownerAdultId,
+          household: work.household,
+          state: work.state,
+          currentTime: this.#now().toISOString(),
+        },
+        {
+          ...(maps ? { runMaps: (request, taskSignal) => maps.run(request, taskSignal) } : {}),
+          ...(weather ? { runWeather: (request, taskSignal) => weather.run(request, taskSignal) } : {}),
+          ...(flights ? { runFlights: (request, taskSignal) => flights.search(request, taskSignal) } : {}),
+        },
+        signal,
+      );
+      signal.throwIfAborted();
+      const settledAt = this.#now().toISOString();
+      if (step.kind === "continue") {
+        await this.#store.settleFamilyWorkClaim({
+          workId: work.workId,
+          generation: work.generation,
+          claimId: work.claimId,
+          settledAt,
+          result: {
+            type: "continue",
+            state: step.state,
+            nextCheckAt: settledAt,
+            ...(step.progressText ? { progressText: step.progressText } : {}),
+          },
+        });
+      } else if (step.kind === "waiting") {
+        await this.#store.settleFamilyWorkClaim({
+          workId: work.workId,
+          generation: work.generation,
+          claimId: work.claimId,
+          settledAt,
+          result: { type: "waiting", state: step.state, question: step.question },
+        });
+      } else {
+        await this.#store.settleFamilyWorkClaim({
+          workId: work.workId,
+          generation: work.generation,
+          claimId: work.claimId,
+          settledAt,
+          result: { type: "terminal", state: step.state, terminalText: step.text },
+        });
+      }
+    } catch (error) {
+      if (signal.aborted) {
+        const interruptedAt = this.#now();
+        await this.#store.settleFamilyWorkClaim({
+          workId: work.workId,
+          generation: work.generation,
+          claimId: work.claimId,
+          settledAt: interruptedAt.toISOString(),
+          result: {
+            type: "retry",
+            state: { ...work.state, claim: null },
+            retryAt: later(interruptedAt, 1),
+            error: "The task step was interrupted before its checkpoint and will resume",
+          },
+        });
+        return;
+      }
+      await this.#store.settleFamilyWorkClaim({
+        workId: work.workId,
+        generation: work.generation,
+        claimId: work.claimId,
+        settledAt: this.#now().toISOString(),
+        result: {
+          type: "retry",
+          state: { ...work.state, claim: null },
+          retryAt: later(this.#now(), RETRY_MS),
+          error: errorText(error),
+        },
+      });
+    }
+  }
+
+  async #executeProactiveWork(work: Exclude<DueProactiveWork, { kind: "family_task" }>): Promise<void> {
     if (work.kind === "reminder") {
       await this.#store.fireDueReminder({
         workId: work.workId,
@@ -4706,6 +4850,7 @@ function enforcePolicy(decision: FlorenceDecision, announceRestrictions: boolean
       facts: [],
       followUp: null,
       reminder: null,
+      familyWork: null,
       interest: null,
       calendar: null,
       householdUpdate: null,
@@ -4743,6 +4888,7 @@ function enforcePolicy(decision: FlorenceDecision, announceRestrictions: boolean
     facts: retain ? decision.facts : decision.facts.filter((fact) => fact.operation === "forget"),
     followUp: schedule ? decision.followUp : null,
     reminder,
+    familyWork: schedule ? decision.familyWork : null,
     interest,
     calendar,
     householdUpdate: decision.householdUpdate,
@@ -4793,6 +4939,7 @@ function decisionCommit(
     (decision.facts.length > 0 ||
       decision.followUp !== null ||
       decision.reminder !== null ||
+      decision.familyWork !== null ||
       decision.interest != null ||
       decision.calendar !== null ||
       decision.householdUpdate !== null ||
@@ -4946,6 +5093,24 @@ function decisionCommit(
               reminderId: decision.reminder.reminderId as string,
             }
           : null;
+  const familyWorkMutation: CommitTurnInput["familyWorkMutation"] =
+    decision.familyWork?.operation === "create"
+      ? {
+          operation: "create",
+          workId: deterministicUuid(`family-work\0${turn.message.sourceId}`),
+          objective: decision.familyWork.objective,
+          visibility: turn.authority.audience === "group" ? "household" : "private",
+          ownerAdultId: turn.authority.audience === "group" ? null : turn.authority.senderAdultId,
+        }
+      : decision.familyWork?.operation === "steer"
+        ? {
+            operation: "steer",
+            workId: decision.familyWork.workId,
+            instruction: decision.familyWork.instruction,
+          }
+        : decision.familyWork?.operation === "cancel"
+          ? { operation: "cancel", workId: decision.familyWork.workId }
+          : null;
   const calendar = calendarCommit(turn, decision, options.resolveCalendarEventTarget);
   const approval = options.approveCalendarOffer ? [calendarApproval(options.approveCalendarOffer)] : [];
   const householdUpdate = decision.householdUpdate;
@@ -4973,6 +5138,7 @@ function decisionCommit(
     finiteMonitorUpdates,
     cancelMonitorIds: decision.followUp?.operation === "cancel" ? [decision.followUp.followUpId] : [],
     reminderMutation,
+    familyWorkMutation,
     interestMutation: decision.interest ?? null,
     outbound,
     approveCalendarOffers: approval,

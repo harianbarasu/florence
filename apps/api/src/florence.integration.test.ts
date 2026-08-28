@@ -450,6 +450,247 @@ type HarnessState = {
 
 const release = TEST_DATABASE_URL ? describe : describe.skip;
 
+release("Durable family work store", () => {
+  test("recovers one persisted task and completes only after its terminal receipt", async () => {
+    if (!TEST_DATABASE_URL) throw new Error("TEST_DATABASE_URL is required");
+    const directory = await mkdtemp(join(tmpdir(), "florence-family-work-store-"));
+    const schema = `florence_${randomUUID().replaceAll("-", "")}`;
+    const setupFile = join(directory, "schema.sql");
+    const assertionFile = join(directory, "assert.sql");
+    const migrations = (await Promise.all(migrationFiles.map((file) => readFile(file, "utf8")))).join("\n");
+    const base = Date.parse("2026-08-27T20:00:00.000Z");
+    const at = (offset: number): string => new Date(base + offset).toISOString();
+    const initialState = {
+      kind: "family_work_v1",
+      version: 1,
+      generation: 0,
+      phase: "ready",
+      claim: null,
+      continuationItems: [],
+      pendingCall: null,
+      steering: [],
+      publicMapResearchContext: [],
+      progressRevision: 0,
+      terminal: null,
+    } as const;
+    await writeFile(
+      setupFile,
+      `CREATE SCHEMA "${schema}"; SET search_path TO "${schema}";
+      ${migrations}
+      insert into households (id,name,time_zone)
+      values ('10000000-0000-4000-8000-000000000001','Test','UTC');
+      insert into people (
+        id,household_id,kind,role,adult_slot,display_name,status,identity_subject_digest,
+        consent_version,consented_at,profile,preferences
+      ) values (
+        '10000000-0000-4000-8000-000000000002',
+        '10000000-0000-4000-8000-000000000001','adult','steward',1,'Parent','verified',
+        'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        'v1',${sqlLiteral(at(-10_000))},'{"firstName":"Parent"}'::jsonb,'{}'::jsonb
+      );
+      insert into linq_channels (
+        id,household_id,audience,provider_conversation_id,adult_one_id,identity_one_digest,
+        adult_two_id,identity_two_digest,authority_digest,bound_at
+      ) values (
+        '10000000-0000-4000-8000-000000000004',
+        '10000000-0000-4000-8000-000000000001','private','test-chat',
+        '10000000-0000-4000-8000-000000000002',
+        'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',null,null,
+        '03f42c1de0ff180a3283da8a2bc750995dc47bcd5f09565f1f6b88f9ce8846c2',
+        ${sqlLiteral(at(-10_000))}
+      );
+      insert into proactive_work (
+        id,household_id,kind,visibility,owner_adult_id,objective,reminder_schedule,
+        status,next_check_at,created_at
+      ) values (
+        '10000000-0000-4000-8000-000000000005',
+        '10000000-0000-4000-8000-000000000001','reminder','private',
+        '10000000-0000-4000-8000-000000000002','Check the oven',
+        ${sqlLiteral(JSON.stringify({ kind: "once", at: at(-2_000) }))}::jsonb,
+        'active',${sqlLiteral(at(-2_000))},${sqlLiteral(at(-10_000))}
+      );
+      insert into proactive_work (
+        id,household_id,kind,visibility,owner_adult_id,objective,current_conclusion,
+        task_state,status,next_check_at,created_at
+      ) values (
+        '10000000-0000-4000-8000-000000000003',
+        '10000000-0000-4000-8000-000000000001','family_task','private',
+        '10000000-0000-4000-8000-000000000002','Compare flights','Starting now.',
+        ${sqlLiteral(JSON.stringify(initialState))}::jsonb,'active',
+        ${sqlLiteral(at(-1_000))},${sqlLiteral(at(-9_000))}
+      );`,
+    );
+    const databaseUrl = withSchema(TEST_DATABASE_URL, schema);
+    await migrateDatabase(databaseUrl, setupFile);
+    let store = new PostgresFlorenceStore(databaseUrl);
+    const assertDatabase = async (message: string, conditionSql: string): Promise<void> => {
+      await writeFile(
+        assertionFile,
+        `do $florence_assert$ begin
+          if not (${conditionSql}) then raise exception using message=${sqlLiteral(message)}; end if;
+        end $florence_assert$;`,
+      );
+      await migrateDatabase(databaseUrl, assertionFile);
+    };
+    onTestFinished(async () => {
+      await store.close().catch(() => undefined);
+      await writeFile(setupFile, `DROP SCHEMA IF EXISTS "${schema}" CASCADE;`);
+      await migrateDatabase(TEST_DATABASE_URL, setupFile);
+      await rm(directory, { recursive: true, force: true });
+    });
+
+    const reminder = await store.readNextDueProactiveWork(at(0));
+    expect(reminder).toEqual({ kind: "reminder", workId: "10000000-0000-4000-8000-000000000005" });
+    if (reminder?.kind !== "reminder") throw new Error("The earlier reminder was not due first");
+    await store.fireDueReminder({ workId: reminder.workId, occurredAt: at(0) });
+    const reminderDue = await store.readNextOutbound(at(0));
+    if (!reminderDue) throw new Error("The earlier reminder was not staged first");
+    const reminderOutbound = await store.beginOutbound({ sourceId: reminderDue.sourceId, now: at(0) });
+    if (!reminderOutbound) throw new Error("The reminder outbound was unavailable");
+    await store.completeOutbound({
+      sourceId: reminderOutbound.sourceId,
+      providerMessageId: "provider-reminder",
+      sentAt: at(1),
+    });
+
+    const first = await store.readNextDueProactiveWork(at(2));
+    if (first?.kind !== "family_task") throw new Error("Family work was not claimed");
+    const plannedState = {
+      ...first.state,
+      phase: "tool_pending" as const,
+      claim: null,
+      continuationItems: [
+        {
+          type: "function_call",
+          call_id: "flight-options",
+          name: "flights_search",
+          arguments: "{}",
+          status: "completed",
+        },
+      ],
+      pendingCall: { callId: "flight-options", name: "flights_search", argumentsJson: "{}" },
+    };
+    expect(
+      await store.settleFamilyWorkClaim({
+        workId: first.workId,
+        generation: first.generation,
+        claimId: first.claimId,
+        settledAt: at(10),
+        result: { type: "continue", state: plannedState, nextCheckAt: at(100) },
+      }),
+    ).toBe("settled");
+
+    await store.close();
+    store = new PostgresFlorenceStore(databaseUrl);
+    const interrupted = await store.readNextDueProactiveWork(at(100));
+    if (interrupted?.kind !== "family_task") {
+      throw new Error("Persisted tool-pending work did not survive restart");
+    }
+    expect(interrupted.state.phase).toBe("tool_pending");
+    const takeover = await store.readNextDueProactiveWork(at(120_101));
+    if (takeover?.kind !== "family_task") throw new Error("Expired claim was not recovered");
+    expect(takeover.claimId).not.toBe(interrupted.claimId);
+    expect(
+      await store.settleFamilyWorkClaim({
+        workId: interrupted.workId,
+        generation: interrupted.generation,
+        claimId: interrupted.claimId,
+        settledAt: at(200),
+        result: {
+          type: "continue",
+          state: { ...interrupted.state, claim: null },
+          nextCheckAt: at(300),
+        },
+      }),
+    ).toBe("stale");
+
+    const completedCallState = {
+      ...takeover.state,
+      phase: "ready" as const,
+      claim: null,
+      continuationItems: [
+        ...takeover.state.continuationItems,
+        { type: "function_call_output", call_id: "flight-options", output: '{"returnedCount":2}' },
+      ],
+      pendingCall: null,
+      progressRevision: 1,
+    };
+    expect(
+      await store.settleFamilyWorkClaim({
+        workId: takeover.workId,
+        generation: takeover.generation,
+        claimId: takeover.claimId,
+        settledAt: at(120_200),
+        result: {
+          type: "continue",
+          state: completedCallState,
+          nextCheckAt: at(120_201),
+          progressText: "I found two nonstop alternatives and I’m comparing them now.",
+        },
+      }),
+    ).toBe("settled");
+    const progressDue = await store.readNextOutbound(at(120_200));
+    if (!progressDue) throw new Error("Transactional progress outbound was not staged");
+    const progress = await store.beginOutbound({ sourceId: progressDue.sourceId, now: at(120_200) });
+    if (!progress || !(await store.outboundSendIsCurrent(progress.sourceId))) {
+      throw new Error("Progress outbound was not current");
+    }
+    await store.completeOutbound({
+      sourceId: progress.sourceId,
+      providerMessageId: "provider-progress",
+      sentAt: at(120_201),
+    });
+
+    const finalClaim = await store.readNextDueProactiveWork(at(120_201));
+    if (finalClaim?.kind !== "family_task") throw new Error("Final work was not claimed");
+    const terminalText = "1. Delta nonstop at 7:00 PM. 2. JetBlue nonstop at 8:15 PM.";
+    const terminalState = {
+      ...finalClaim.state,
+      phase: "terminal" as const,
+      claim: null,
+      continuationItems: [],
+      pendingCall: null,
+      publicMapResearchContext: [],
+      progressRevision: 2,
+      terminal: { outcome: "succeeded" as const, text: terminalText },
+    };
+    expect(
+      await store.settleFamilyWorkClaim({
+        workId: finalClaim.workId,
+        generation: finalClaim.generation,
+        claimId: finalClaim.claimId,
+        settledAt: at(120_300),
+        result: { type: "terminal", state: terminalState, terminalText },
+      }),
+    ).toBe("settled");
+    await assertDatabase(
+      "Family work completed before its terminal receipt",
+      `exists (select 1 from proactive_work where id='10000000-0000-4000-8000-000000000003'
+        and status='delivering' and task_state->>'phase'='terminal')`,
+    );
+    const terminalDue = await store.readNextOutbound(at(120_300));
+    if (!terminalDue) throw new Error("Transactional terminal outbound was not staged");
+    const terminal = await store.beginOutbound({ sourceId: terminalDue.sourceId, now: at(120_300) });
+    if (!terminal || !(await store.outboundSendIsCurrent(terminal.sourceId))) {
+      throw new Error("Terminal outbound was not current");
+    }
+    await store.completeOutbound({
+      sourceId: terminal.sourceId,
+      providerMessageId: "provider-terminal",
+      sentAt: at(120_301),
+    });
+    await assertDatabase(
+      "Family work did not complete exactly once after its terminal receipt",
+      `exists (select 1 from proactive_work where id='10000000-0000-4000-8000-000000000003'
+        and status='completed' and task_state->>'progressRevision'='2')
+       and (select count(*)=2 from messages message join sources source on source.id=message.source_id
+        where source.metadata->>'familyWorkId'='10000000-0000-4000-8000-000000000003'
+          and message.status='sent')`,
+    );
+    expect(await store.readNextOutbound(at(120_400))).toBeNull();
+  });
+});
+
 release("Florence parent journeys", () => {
   test("keeps private setup useful and recovers one two-parent family loop without duplicate work", async () => {
     let accessFollowUpHistory: readonly string[] = [];
@@ -6860,6 +7101,7 @@ function decision(
     facts?: FlorenceDecision["facts"];
     followUp?: FlorenceDecision["followUp"];
     reminder?: FlorenceDecision["reminder"];
+    familyWork?: FlorenceDecision["familyWork"];
     interest?: FlorenceDecision["interest"];
     calendar?: FlorenceDecision["calendar"];
     householdUpdate?: FlorenceDecision["householdUpdate"];
@@ -6877,6 +7119,7 @@ function decision(
     facts: input.facts ?? [],
     followUp: input.followUp ?? null,
     reminder: input.reminder ?? null,
+    familyWork: input.familyWork ?? null,
     interest: input.interest ?? null,
     calendar: input.calendar ?? null,
     householdUpdate: input.householdUpdate ?? null,

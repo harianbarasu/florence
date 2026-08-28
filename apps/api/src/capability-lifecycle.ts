@@ -10,8 +10,6 @@ import { z } from "zod";
 
 const MAX_RAW_ARGUMENT_BYTES = 1_048_576;
 const MAX_TOOL_OUTPUT_BYTES = 1_048_576;
-const MAX_PROGRESS_BYTES = 32_768;
-const MAX_PROGRESS_EVENTS = 100;
 const MAX_ENVELOPE_OVERHEAD_BYTES = 4_096;
 const MAX_SAFE_MESSAGE_CHARS = 500;
 
@@ -50,14 +48,11 @@ export interface CapabilityAdapterResult<TOutput> {
   readonly output: TOutput;
 }
 
-export type CapabilityProgressReporter<TProgress> = (progress: TProgress) => void;
-
-export interface CapabilityExecutionInput<TContext, TArguments, TProgress> {
+export interface CapabilityExecutionInput<TContext, TArguments> {
   readonly callId: string;
   readonly arguments: TArguments;
   readonly context: Readonly<TContext>;
   readonly signal: AbortSignal;
-  readonly reportProgress: CapabilityProgressReporter<TProgress>;
 }
 
 export type CapabilityAvailabilityProbe<TContext> = (
@@ -76,35 +71,27 @@ export type CapabilityAdmissionPredicate<TContext> = (
   signal: AbortSignal,
 ) => boolean | Promise<boolean>;
 
-export interface CapabilityDefinition<
-  TContext,
-  TArguments = unknown,
-  TOutput = unknown,
-  TProgress = unknown,
-> {
+export interface CapabilityDefinition<TContext, TArguments = unknown, TOutput = unknown> {
   readonly name: string;
   readonly description: string;
   readonly modelSchema: JsonValue;
   readonly inputSchema: z.ZodType<TArguments>;
   readonly outputSchema: z.ZodType<TOutput>;
-  readonly progressSchema?: z.ZodType<TProgress>;
   readonly executionMode: CapabilityExecutionMode;
   readonly timeoutMs: number;
   readonly maxOutputBytes: number;
-  readonly maxProgressBytes?: number;
-  readonly maxProgressEvents?: number;
   readonly availability?: CapabilityAvailabilityProbe<TContext>;
   readonly admit?: CapabilityAdmissionPredicate<TContext>;
   readonly execute: (
-    input: CapabilityExecutionInput<TContext, TArguments, TProgress>,
+    input: CapabilityExecutionInput<TContext, TArguments>,
   ) => Promise<CapabilityAdapterResult<TOutput>>;
 }
 
 type ErasedCapabilityDefinition<TContext> = CapabilityDefinition<TContext>;
 
 /** Preserve adapter-local schema inference while erasing it at the registry seam. */
-export function defineCapability<TContext, TArguments, TOutput, TProgress = unknown>(
-  definition: CapabilityDefinition<TContext, TArguments, TOutput, TProgress>,
+export function defineCapability<TContext, TArguments, TOutput>(
+  definition: CapabilityDefinition<TContext, TArguments, TOutput>,
 ): CapabilityDefinition<TContext> {
   return definition as unknown as CapabilityDefinition<TContext>;
 }
@@ -138,56 +125,18 @@ export interface CapabilityTerminalEnvelope {
   readonly serializedBytes: number;
 }
 
-export type CapabilityLifecycleEvent =
-  | {
-      readonly phase: "requested";
-      readonly callId: string;
-      readonly capabilityName: string;
-      readonly sourceIndex: number;
-    }
-  | {
-      readonly phase: "admitted";
-      readonly callId: string;
-      readonly capabilityName: string;
-      readonly sourceIndex: number;
-    }
-  | {
-      readonly phase: "running";
-      readonly callId: string;
-      readonly capabilityName: string;
-      readonly sourceIndex: number;
-    }
-  | {
-      readonly phase: "progress";
-      readonly callId: string;
-      readonly capabilityName: string;
-      readonly sourceIndex: number;
-      readonly sequence: number;
-      readonly progress: JsonValue;
-      readonly serializedBytes: number;
-    }
-  | {
-      readonly phase: "terminal";
-      readonly terminal: CapabilityTerminalEnvelope;
-    };
-
-export type CapabilityLifecycleObserver = (event: CapabilityLifecycleEvent) => void | Promise<void>;
-
 export interface ExecuteCapabilityCallsInput<TContext> {
   readonly snapshot: CapabilityCatalogSnapshot;
   readonly context: Readonly<TContext>;
   readonly calls: readonly RawCapabilityCall[];
   readonly completion: CapabilityCompletion;
   readonly signal?: AbortSignal;
-  readonly observer?: CapabilityLifecycleObserver;
-  readonly now?: () => Date;
+  readonly onStart?: () => void;
 }
 
 export interface CapabilityBatchResult {
   /** Terminal envelopes are always returned in assistant source order. */
   readonly results: readonly CapabilityTerminalEnvelope[];
-  /** Lifecycle events preserve emission order; parallel terminals use completion order. */
-  readonly events: readonly CapabilityLifecycleEvent[];
 }
 
 interface NormalizedDefinition<TContext> {
@@ -243,42 +192,30 @@ export class CapabilityRegistry<TContext> {
   async executeCalls(input: ExecuteCapabilityCallsInput<TContext>): Promise<CapabilityBatchResult> {
     const availableNames = new Set(input.snapshot.tools.map((tool) => tool.name));
     const outerSignal = input.signal ?? new AbortController().signal;
-    const events: CapabilityLifecycleEvent[] = [];
     const results: Array<CapabilityTerminalEnvelope | undefined> = new Array(input.calls.length);
     const normalizedCalls = input.calls.map((call, sourceIndex) => normalizeRawCall(call, sourceIndex));
-
-    const emit = (event: CapabilityLifecycleEvent): void => {
-      const frozen = deepFreeze(structuredClone(event)) as CapabilityLifecycleEvent;
-      events.push(frozen);
+    let started = false;
+    const notifyStart = (): void => {
+      if (started) return;
+      started = true;
       try {
-        const observed = input.observer?.(frozen);
-        if (observed && typeof observed.then === "function") void observed.catch(() => undefined);
+        input.onStart?.();
       } catch {
-        // Observers present lifecycle state; they do not participate in execution.
+        // Presentation callbacks do not participate in execution.
       }
     };
-
-    for (const call of normalizedCalls) {
-      emit({
-        phase: "requested",
-        callId: call.callId,
-        capabilityName: call.name,
-        sourceIndex: call.sourceIndex,
-      });
-    }
 
     const terminalize = (call: NormalizedRawCall, terminal: TerminalSeed): CapabilityTerminalEnvelope => {
       const existing = results[call.sourceIndex];
       if (existing) return existing;
       const envelope = buildTerminalEnvelope(call, terminal);
       results[call.sourceIndex] = envelope;
-      emit({ phase: "terminal", terminal: envelope });
       return envelope;
     };
 
     if (outerSignal.aborted) {
       for (const call of normalizedCalls) terminalize(call, cancelledBeforeStart());
-      return freezeBatch(results, events);
+      return freezeBatch(results);
     }
 
     if (input.completion === "truncated") {
@@ -288,7 +225,7 @@ export class CapabilityRegistry<TContext> {
           protocolFailure("truncated_model_output", "The model tool call was truncated and was not run."),
         );
       }
-      return freezeBatch(results, events);
+      return freezeBatch(results);
     }
 
     const duplicateIds = duplicateCallIds(normalizedCalls);
@@ -336,12 +273,7 @@ export class CapabilityRegistry<TContext> {
         continue;
       }
       prepared.push({ call, definition, arguments: parsed.arguments });
-      emit({
-        phase: "admitted",
-        callId: call.callId,
-        capabilityName: call.name,
-        sourceIndex: call.sourceIndex,
-      });
+      notifyStart();
     }
 
     const runOne = async (item: PreparedCall<TContext>): Promise<void> => {
@@ -350,19 +282,12 @@ export class CapabilityRegistry<TContext> {
         terminalize(item.call, cancelledBeforeStart());
         return;
       }
-      emit({
-        phase: "running",
-        callId: item.call.callId,
-        capabilityName: item.call.name,
-        sourceIndex: item.call.sourceIndex,
-      });
       terminalize(
         item.call,
         await runPreparedCall({
           item,
           context: input.context,
           outerSignal,
-          emit,
         }),
       );
     };
@@ -376,7 +301,7 @@ export class CapabilityRegistry<TContext> {
     for (const call of normalizedCalls) {
       if (!results[call.sourceIndex]) terminalize(call, cancelledBeforeStart());
     }
-    return freezeBatch(results, events);
+    return freezeBatch(results);
   }
 }
 
@@ -468,7 +393,6 @@ async function runPreparedCall<TContext>(input: {
   readonly item: PreparedCall<TContext>;
   readonly context: Readonly<TContext>;
   readonly outerSignal: AbortSignal;
-  readonly emit: (event: CapabilityLifecycleEvent) => void;
 }): Promise<TerminalSeed> {
   const { definition } = input.item;
   const controller = new AbortController();
@@ -476,58 +400,6 @@ async function runPreparedCall<TContext>(input: {
   if (input.outerSignal.aborted) controller.abort(input.outerSignal.reason);
   else input.outerSignal.addEventListener("abort", onAbort, { once: true });
   let timer: ReturnType<typeof setTimeout> | undefined;
-  let acceptingUpdates = true;
-  let progressCount = 0;
-  let resolveProgressViolation: ((seed: TerminalSeed) => void) | undefined;
-  const progressViolation = new Promise<TerminalSeed>((resolve) => {
-    resolveProgressViolation = resolve;
-  });
-
-  const failProgressContract = (): void => {
-    if (!acceptingUpdates) return;
-    acceptingUpdates = false;
-    controller.abort(new Error("Capability progress contract violation"));
-    resolveProgressViolation?.(
-      failureSeed("adapter_contract", "The capability returned an invalid progress update.", false),
-    );
-  };
-
-  const reportProgress = (rawProgress: unknown): void => {
-    if (!acceptingUpdates) return;
-    if (!definition.progressSchema) {
-      failProgressContract();
-      return;
-    }
-    progressCount += 1;
-    if (progressCount > (definition.maxProgressEvents ?? 8)) {
-      failProgressContract();
-      return;
-    }
-    const parsed = definition.progressSchema.safeParse(rawProgress);
-    if (!parsed.success) {
-      failProgressContract();
-      return;
-    }
-    try {
-      const progress = cloneCanonicalJson(parsed.data);
-      const serializedBytes = jsonBytes(progress);
-      if (serializedBytes > (definition.maxProgressBytes ?? MAX_PROGRESS_BYTES)) {
-        failProgressContract();
-        return;
-      }
-      input.emit({
-        phase: "progress",
-        callId: input.item.call.callId,
-        capabilityName: input.item.call.name,
-        sourceIndex: input.item.call.sourceIndex,
-        sequence: progressCount,
-        progress,
-        serializedBytes,
-      });
-    } catch {
-      failProgressContract();
-    }
-  };
 
   const execution = Promise.resolve()
     .then(() =>
@@ -536,7 +408,6 @@ async function runPreparedCall<TContext>(input: {
         arguments: input.item.arguments,
         context: input.context,
         signal: controller.signal,
-        reportProgress,
       }),
     )
     .then((result) => normalizeAdapterSuccess(result, definition))
@@ -554,12 +425,10 @@ async function runPreparedCall<TContext>(input: {
   });
 
   try {
-    const terminal = await Promise.race([execution, cutoff, progressViolation]);
-    acceptingUpdates = false;
+    const terminal = await Promise.race([execution, cutoff]);
     void execution.catch(() => undefined);
     return terminal;
   } finally {
-    acceptingUpdates = false;
     if (timer) clearTimeout(timer);
     input.outerSignal.removeEventListener("abort", onAbort);
     if (settleCancellation) input.outerSignal.removeEventListener("abort", settleCancellation);
@@ -622,30 +491,15 @@ function normalizeDefinition<TContext>(
     MAX_TOOL_OUTPUT_BYTES,
     `${name}.maxOutputBytes`,
   );
-  const maxProgressBytes = boundedInteger(
-    definition.maxProgressBytes ?? MAX_PROGRESS_BYTES,
-    1,
-    MAX_PROGRESS_BYTES,
-    `${name}.maxProgressBytes`,
-  );
-  const maxProgressEvents = boundedInteger(
-    definition.maxProgressEvents ?? 8,
-    1,
-    MAX_PROGRESS_EVENTS,
-    `${name}.maxProgressEvents`,
-  );
   return Object.freeze({
     name,
     description,
     modelSchema: cloneCanonicalJson(definition.modelSchema),
     inputSchema: definition.inputSchema,
     outputSchema: definition.outputSchema,
-    ...(definition.progressSchema ? { progressSchema: definition.progressSchema } : {}),
     executionMode: definition.executionMode,
     timeoutMs,
     maxOutputBytes,
-    maxProgressBytes,
-    maxProgressEvents,
     ...(definition.availability ? { availability: definition.availability } : {}),
     ...(definition.admit ? { admit: definition.admit } : {}),
     execute: definition.execute,
@@ -775,16 +629,12 @@ function errorSeed(
   };
 }
 
-function freezeBatch(
-  results: readonly (CapabilityTerminalEnvelope | undefined)[],
-  events: readonly CapabilityLifecycleEvent[],
-): CapabilityBatchResult {
+function freezeBatch(results: readonly (CapabilityTerminalEnvelope | undefined)[]): CapabilityBatchResult {
   if (results.some((result) => !result)) {
-    throw new Error("Capability lifecycle ended without terminalizing every call");
+    throw new Error("Capability execution ended without terminalizing every call");
   }
   return deepFreeze({
     results: results as readonly CapabilityTerminalEnvelope[],
-    events: [...events],
   });
 }
 

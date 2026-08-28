@@ -1,3 +1,4 @@
+import { type FamilyWorkStateV1, steerFamilyWorkState } from "@florence/database";
 import { describe, expect, test } from "vitest";
 import {
   type FlorenceDecision,
@@ -93,7 +94,6 @@ describe("Florence reasoner capability cutover", () => {
     expect(toolNames).toEqual([
       "list_calendars",
       "read_calendar_window",
-      "read_gmail_attachment",
       "read_source",
       "research_public_web",
       "search_family_memory",
@@ -346,7 +346,7 @@ describe("Florence reasoner capability cutover", () => {
     const requests: Record<string, unknown>[] = [];
     const flightRequests: unknown[] = [];
     const statusUrl = "https://www.delta.com/flight-status/search?flightId=DL747";
-    const bookingUrl = "https://www.kiwi.com/deep?from=JFK&to=LAX&date=2026-08-28";
+    const bookingUrl = "https://www.kiwi.com/deep?from=JFK&to=LAX&date=2026-08-27";
     let workStarts = 0;
     let modelTurn = 0;
     const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
@@ -369,7 +369,7 @@ describe("Florence reasoner capability cutover", () => {
                       functionCall("flight-options", "flights_search", {
                         origin: "JFK",
                         destination: "LAX",
-                        departureDate: "2026-08-28",
+                        departureDate: "2026-08-27",
                         returnDate: null,
                         adults: 1,
                         children: 0,
@@ -402,7 +402,7 @@ describe("Florence reasoner capability cutover", () => {
           output_parsed: {
             outcome: "result",
             summary:
-              "DL 747 on August 28, 2026 is delayed from JFK to LAX; scheduled 5:30 PM local departure and 8:46 PM local arrival.",
+              "DL 747 on August 27, 2026 is delayed from JFK to LAX; scheduled 5:30 PM local departure and 8:46 PM local arrival.",
             urls: [statusUrl],
           },
           output: [completedWebSearch(statusUrl)],
@@ -436,7 +436,7 @@ describe("Florence reasoner capability cutover", () => {
         operation: "search",
         origin: "JFK",
         destination: "LAX",
-        departureDate: "2026-08-28",
+        departureDate: "2026-08-27",
         maxStops: 0,
         allowSelfTransfer: false,
         allowOvernightStopovers: false,
@@ -457,6 +457,287 @@ describe("Florence reasoner capability cutover", () => {
         operation: "search",
         returnedCount: 1,
         timeBasis: "provider_local_time_at_each_airport",
+      },
+    });
+  });
+
+  test("durable flight work resumes from its checkpoint, accepts steering, and reaches one result", async () => {
+    const statusUrl = "https://www.delta.com/flight-status/search?flightId=DL747";
+    const bookingUrl = "https://www.kiwi.com/deep?from=JFK&to=LAX&date=2026-08-27";
+    const secondBookingUrl = `${bookingUrl}&option=2`;
+    const firstRequests: Record<string, unknown>[] = [];
+    const firstResponses = [
+      {
+        status: "completed",
+        output_parsed: null,
+        output: [functionCall("durable-flight-status", "research_public_web", {})],
+      },
+      {
+        status: "completed",
+        output_parsed: {
+          outcome: "result",
+          summary: "DL 747 is delayed tonight from JFK to LAX.",
+          urls: [statusUrl],
+        },
+        output: [completedWebSearch(statusUrl)],
+      },
+    ];
+    const firstReasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        parse(request: Record<string, unknown>) {
+          firstRequests.push(request);
+          const response = firstResponses.shift();
+          if (!response) throw new Error("Unexpected first durable-work request");
+          return response;
+        },
+      },
+    } as never);
+    const initialState: FamilyWorkStateV1 = {
+      kind: "family_work_v1",
+      version: 1,
+      generation: 0,
+      phase: "ready",
+      claim: null,
+      continuationItems: [],
+      pendingCall: null,
+      steering: [],
+      publicMapResearchContext: [],
+      progressRevision: 0,
+      terminal: null,
+    };
+    const input = {
+      workId: "family-work-1",
+      objective: "DL 747 is delayed tonight. Find the two best nonstop alternatives; Delta if possible.",
+      visibility: "household" as const,
+      ownerAdultId: null,
+      household: {
+        householdId: "household-1",
+        familyLabel: "Test family",
+        timeZone: "America/Los_Angeles",
+        postalCode: "90045",
+        adults: [
+          { adultId: "adult-1", firstName: "Hari", displayName: "Hari Anbarasu" },
+          { adultId: "adult-2", firstName: "Jackson", displayName: "Jackson Williams" },
+        ],
+        children: [],
+      },
+      state: initialState,
+      currentTime: NOW,
+    };
+
+    const plannedStatus = await firstReasoner.continueFamilyWork(input, {});
+    expect(plannedStatus).toMatchObject({ kind: "continue", state: { phase: "tool_pending" } });
+    if (plannedStatus.kind !== "continue") throw new Error("Status lookup was not planned");
+    const checkedStatus = await firstReasoner.continueFamilyWork(
+      { ...input, state: plannedStatus.state },
+      {},
+    );
+    expect(checkedStatus).toMatchObject({
+      kind: "continue",
+      progressText: expect.stringContaining("DL 747 is delayed"),
+      state: { phase: "ready", progressRevision: 1 },
+    });
+    if (checkedStatus.kind !== "continue") throw new Error("Status lookup did not settle");
+
+    const resumedRequests: Record<string, unknown>[] = [];
+    const resumedResponses = [
+      {
+        status: "completed",
+        output_parsed: null,
+        output: [
+          functionCall("durable-flight-options", "flights_search", {
+            origin: "JFK",
+            destination: "LAX",
+            departureDate: "2026-08-27",
+            returnDate: null,
+            adults: 1,
+            children: 0,
+            infants: 0,
+            cabinClass: "economy",
+            preferredAirlines: ["DL"],
+            maxStops: 0,
+            outboundDepartureHours: { from: 17, to: 23 },
+            maxPrice: null,
+            allowSelfTransfer: false,
+            allowOvernightStopovers: false,
+            allowAirportChanges: false,
+            sort: "quality",
+          }),
+        ],
+      },
+      {
+        status: "completed",
+        output_parsed: null,
+        output: [
+          functionCall("durable-flight-options-steered", "flights_search", {
+            origin: "JFK",
+            destination: "LAX",
+            departureDate: "2026-08-27",
+            returnDate: null,
+            adults: 1,
+            children: 0,
+            infants: 0,
+            cabinClass: "economy",
+            preferredAirlines: ["DL", "B6"],
+            maxStops: 0,
+            outboundDepartureHours: { from: 19, to: 23 },
+            maxPrice: null,
+            allowSelfTransfer: false,
+            allowOvernightStopovers: false,
+            allowAirportChanges: false,
+            sort: "quality",
+          }),
+        ],
+      },
+      {
+        status: "completed",
+        output_parsed: {
+          outcome: "succeeded",
+          text: `1. Delta nonstop at 7:00 PM for $412: ${bookingUrl}\n2. JetBlue nonstop at 8:15 PM for $438: ${secondBookingUrl}`,
+        },
+        output: [],
+      },
+    ];
+    const resumedReasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        parse(request: Record<string, unknown>) {
+          resumedRequests.push(request);
+          const response = resumedResponses.shift();
+          if (!response) throw new Error("Unexpected resumed durable-work request");
+          return response;
+        },
+      },
+    } as never);
+    let flightSearches = 0;
+    const plannedAlternatives = await resumedReasoner.continueFamilyWork(
+      { ...input, state: checkedStatus.state },
+      {
+        async runFlights() {
+          flightSearches += 1;
+          return flightResult(bookingUrl, 2);
+        },
+      },
+    );
+    expect(plannedAlternatives).toMatchObject({
+      kind: "continue",
+      state: { phase: "tool_pending" },
+    });
+    if (plannedAlternatives.kind !== "continue") throw new Error("Alternative search was not planned");
+    const steeredPendingState = steerFamilyWorkState(plannedAlternatives.state, {
+      sourceId: "00000000-0000-4000-8000-000000000001",
+      text: "JetBlue is fine too, but nothing before 7 PM.",
+      occurredAt: "2026-08-27T20:01:00.000Z",
+    });
+    expect(steeredPendingState).toMatchObject({
+      phase: "ready",
+      generation: 1,
+      pendingCall: null,
+    });
+    expect(JSON.stringify(steeredPendingState.continuationItems)).not.toContain("durable-flight-options");
+    expect(JSON.stringify(steeredPendingState.continuationItems)).toContain("durable-flight-status");
+    const replannedAlternatives = await resumedReasoner.continueFamilyWork(
+      { ...input, state: steeredPendingState },
+      {
+        async runFlights() {
+          flightSearches += 1;
+          return flightResult(bookingUrl, 2);
+        },
+      },
+    );
+    if (replannedAlternatives.kind !== "continue") {
+      throw new Error("Steered alternative search was not replanned");
+    }
+    const searchedAlternatives = await resumedReasoner.continueFamilyWork(
+      { ...input, state: replannedAlternatives.state },
+      {
+        async runFlights() {
+          flightSearches += 1;
+          return flightResult(bookingUrl, 2);
+        },
+      },
+    );
+    if (searchedAlternatives.kind !== "continue") throw new Error("Alternative search did not settle");
+    const terminal = await resumedReasoner.continueFamilyWork(
+      { ...input, state: searchedAlternatives.state },
+      {},
+    );
+
+    expect(flightSearches).toBe(1);
+    expect(JSON.stringify(resumedRequests[1]?.input)).toContain(
+      "JetBlue is fine too, but nothing before 7 PM.",
+    );
+    expect(JSON.parse(replannedAlternatives.state.pendingCall?.argumentsJson ?? "{}")).toMatchObject({
+      departureDate: "2026-08-27",
+      preferredAirlines: ["DL", "B6"],
+      outboundDepartureHours: { from: 19, to: 23 },
+    });
+    expect(terminal).toMatchObject({
+      kind: "terminal",
+      outcome: "succeeded",
+      text: expect.stringContaining("1. Delta nonstop"),
+      state: { phase: "terminal", progressRevision: 2 },
+    });
+    if (terminal.kind !== "terminal") throw new Error("Durable flight work did not finish");
+    expect(terminal.text).toContain("2. JetBlue nonstop");
+    expect(terminal.text).toContain(bookingUrl);
+    expect(terminal.text).toContain(secondBookingUrl);
+  });
+
+  test("durable work ends cleanly before an oversized checkpoint can retry forever", async () => {
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        parse() {
+          throw new Error("An oversized durable checkpoint must not reach the model");
+        },
+      },
+    } as never);
+    const state: FamilyWorkStateV1 = {
+      kind: "family_work_v1",
+      version: 1,
+      generation: 3,
+      phase: "ready",
+      claim: null,
+      continuationItems: [
+        {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: "x".repeat(241 * 1024) }],
+        },
+      ],
+      pendingCall: null,
+      steering: [],
+      publicMapResearchContext: [],
+      progressRevision: 4,
+      terminal: null,
+    };
+
+    const result = await reasoner.continueFamilyWork(
+      {
+        workId: "family-work-large",
+        objective: "Compare the useful options.",
+        visibility: "household",
+        ownerAdultId: null,
+        household: {
+          householdId: "household-1",
+          familyLabel: "Test family",
+          timeZone: "America/Los_Angeles",
+          postalCode: "90045",
+          adults: [{ adultId: "adult-1", firstName: "Hari", displayName: "Hari Anbarasu" }],
+          children: [],
+        },
+        state,
+        currentTime: NOW,
+      },
+      {},
+    );
+
+    expect(result).toMatchObject({
+      kind: "terminal",
+      outcome: "failed",
+      state: {
+        phase: "terminal",
+        continuationItems: [],
+        progressRevision: 5,
       },
     });
   });
@@ -977,6 +1258,7 @@ function foregroundInput(): FlorenceReasonerInput {
     visibleSources: [],
     pendingFollowUps: [],
     visibleReminders: [],
+    visibleFamilyWork: [],
     visibleInterests: [],
     pendingCalendarOffers: [],
     googleConnections: [
@@ -996,6 +1278,7 @@ function ordinaryDecision(input: { bubbleText?: string; researchUrls?: string[] 
     facts: [],
     followUp: null,
     reminder: null,
+    familyWork: null,
     interest: null,
     calendar: null,
     householdUpdate: null,
@@ -1155,38 +1438,80 @@ function weatherResult() {
   };
 }
 
-function flightResult(bookingUrl: string) {
+function flightSegment(carrier: string, carrierName: string, flightNumber: string) {
+  return {
+    from: "JFK",
+    to: "LAX",
+    fromCity: "New York",
+    toCity: "Los Angeles",
+    fromName: "John F. Kennedy International Airport",
+    toName: "Los Angeles International Airport",
+    fromCountry: "US",
+    toCountry: "US",
+    departureTime: "2026-08-27T19:00:00",
+    arrivalTime: "2026-08-27T22:00:00",
+    durationSeconds: 21_600,
+    carrier,
+    carrierName,
+    flightNumber,
+    cabinClass: "M",
+  };
+}
+
+function flightResult(bookingUrl: string, returnedCount = 1) {
+  const first = {
+    id: "alternative-1",
+    price: 412,
+    priceFormatted: "$412",
+    totalDurationSeconds: 21_600,
+    bookingUrl,
+    imageId: null,
+    baggage: null,
+    outbound: {
+      from: "JFK",
+      to: "LAX",
+      departureTime: "2026-08-27T19:00:00",
+      arrivalTime: "2026-08-27T22:00:00",
+      durationSeconds: 21_600,
+      stops: 0,
+      route: ["JFK", "LAX"],
+      cabinClass: "M",
+      segments: [flightSegment("DL", "Delta", "DL 321")],
+    },
+    inbound: null,
+    highlights: ["cheapest" as const, "shortest" as const, "earliest" as const],
+  };
+  const second = {
+    id: "alternative-2",
+    price: 438,
+    priceFormatted: "$438",
+    totalDurationSeconds: 21_900,
+    bookingUrl: `${bookingUrl}&option=2`,
+    imageId: null,
+    baggage: null,
+    outbound: {
+      from: "JFK",
+      to: "LAX",
+      departureTime: "2026-08-27T20:15:00",
+      arrivalTime: "2026-08-27T23:20:00",
+      durationSeconds: 21_900,
+      stops: 0,
+      route: ["JFK", "LAX"],
+      cabinClass: "M",
+      segments: [flightSegment("B6", "JetBlue", "B6 523")],
+    },
+    inbound: null,
+    highlights: [] as ("cheapest" | "shortest" | "earliest")[],
+  };
+  const itineraries = returnedCount > 1 ? [first, second] : [first];
   return {
     operation: "search" as const,
     query: "JFK to LAX",
     currency: "USD",
     passengers: { adults: 1, children: 0, infants: 0 },
-    resultsCount: 1,
-    returnedCount: 1,
-    itineraries: [
-      {
-        id: "alternative-1",
-        price: 412,
-        priceFormatted: "$412",
-        totalDurationSeconds: 21_600,
-        bookingUrl,
-        imageId: null,
-        baggage: null,
-        outbound: {
-          from: "JFK",
-          to: "LAX",
-          departureTime: "2026-08-28T19:00:00",
-          arrivalTime: "2026-08-28T22:00:00",
-          durationSeconds: 21_600,
-          stops: 0,
-          route: ["JFK", "LAX"],
-          cabinClass: "M",
-          segments: [],
-        },
-        inbound: null,
-        highlights: ["cheapest" as const, "shortest" as const, "earliest" as const],
-      },
-    ],
+    resultsCount: returnedCount,
+    returnedCount,
+    itineraries,
     searchTimeMs: 250,
     error: null,
     highlights: {

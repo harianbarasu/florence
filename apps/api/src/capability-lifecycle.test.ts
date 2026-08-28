@@ -10,7 +10,6 @@ import {
 type TestContext = { readonly householdId: string };
 type TestArguments = { readonly query: string };
 type TestOutput = { readonly value: string };
-type TestProgress = { readonly note: string };
 
 const context = { householdId: "household-1" } satisfies TestContext;
 const modelSchema = {
@@ -21,15 +20,14 @@ const modelSchema = {
 } as const satisfies JsonValue;
 
 function testCapability(
-  overrides: Partial<CapabilityDefinition<TestContext, TestArguments, TestOutput, TestProgress>> = {},
+  overrides: Partial<CapabilityDefinition<TestContext, TestArguments, TestOutput>> = {},
 ): CapabilityDefinition<TestContext> {
-  return defineCapability<TestContext, TestArguments, TestOutput, TestProgress>({
+  return defineCapability<TestContext, TestArguments, TestOutput>({
     name: "lookup",
     description: "Look something up.",
     modelSchema,
     inputSchema: z.object({ query: z.string().min(1) }).strict(),
     outputSchema: z.object({ value: z.string() }).strict(),
-    progressSchema: z.object({ note: z.string() }).strict(),
     executionMode: "parallel",
     timeoutMs: 100,
     maxOutputBytes: 4_096,
@@ -80,9 +78,6 @@ describe("capability execution", () => {
       "invalid_arguments",
     ]);
     expect(truncated.results[0]?.errorCode).toBe("truncated_model_output");
-    expect(
-      [...malformed.events, ...truncated.events].filter((event) => event.phase === "terminal"),
-    ).toHaveLength(3);
   });
 
   test("timeout and cancellation each produce exactly one terminal result", async () => {
@@ -117,47 +112,20 @@ describe("capability execution", () => {
       calls: [rawCall("cancel", "weather")],
       completion: "complete",
       signal: controller.signal,
-      observer(event) {
-        if (event.phase === "running") controller.abort();
+      onStart() {
+        queueMicrotask(() => controller.abort());
       },
     });
 
     expect(timedOut.results[0]).toMatchObject({ outcome: "failed", errorCode: "timeout" });
     expect(cancelled.results[0]).toMatchObject({ outcome: "cancelled", errorCode: "cancelled" });
-    expect(timedOut.events.filter((event) => event.phase === "terminal")).toHaveLength(1);
-    expect(cancelled.events.filter((event) => event.phase === "terminal")).toHaveLength(1);
+    expect(timedOut.results).toHaveLength(1);
+    expect(cancelled.results).toHaveLength(1);
   });
 
-  test("late progress cannot replace a completed terminal", async () => {
-    let reportLate: ((progress: TestProgress) => void) | undefined;
-    const registry = new CapabilityRegistry([
-      testCapability({
-        async execute({ reportProgress }) {
-          reportLate = reportProgress;
-          reportProgress({ note: "working" });
-          return { output: { value: "done" } };
-        },
-      }),
-    ]);
-    const snapshot = await registry.catalog(context);
-    const batch = await registry.executeCalls({
-      snapshot,
-      context,
-      calls: [rawCall("complete", "weather")],
-      completion: "complete",
-    });
-    const eventCount = batch.events.length;
-
-    reportLate?.({ note: "too late" });
-    await Promise.resolve();
-
-    expect(batch.results[0]).toMatchObject({ outcome: "succeeded", errorCode: null });
-    expect(batch.events).toHaveLength(eventCount);
-    expect(batch.events.filter((event) => event.phase === "terminal")).toHaveLength(1);
-  });
-
-  test("parallel terminals emit in completion order while results retain source order", async () => {
+  test("parallel execution retains source order and starts presentation once", async () => {
     const releaseFirst = deferred<void>();
+    const onStart = vi.fn();
     const registry = new CapabilityRegistry([
       testCapability({
         async execute({ arguments: args }) {
@@ -174,11 +142,10 @@ describe("capability execution", () => {
       context,
       calls: [rawCall("first-call", "first"), rawCall("second-call", "second")],
       completion: "complete",
+      onStart,
     });
 
-    expect(
-      batch.events.flatMap((event) => (event.phase === "terminal" ? [event.terminal.callId] : [])),
-    ).toEqual(["second-call", "first-call"]);
+    expect(onStart).toHaveBeenCalledOnce();
     expect(batch.results.map((result) => result.callId)).toEqual(["first-call", "second-call"]);
     expect(
       batch.results.map(

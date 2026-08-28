@@ -124,6 +124,7 @@ import {
   type FlorenceDecision,
   type FlorenceFamilyCalendarWorkRequest,
   type FlorenceFamilyCalendarWorkResult,
+  type FlorenceHouseholdAvailabilityRead,
   type FlorenceNarrowFamilyProfile,
   type FlorencePrivateCalendarEvent,
   type FlorencePrivateGmailSource,
@@ -157,6 +158,10 @@ const GOOGLE_WORKSPACE_ACTION_SCOPES = [
   "https://www.googleapis.com/auth/drive",
   "https://www.googleapis.com/auth/tasks",
   "https://www.googleapis.com/auth/contacts",
+] as const;
+const GOOGLE_CALENDAR_READ_SCOPES = [
+  "https://www.googleapis.com/auth/calendar.events.readonly",
+  "https://www.googleapis.com/auth/calendar.calendarlist",
 ] as const;
 const LOOP_IDLE_MS = 250;
 const RETRY_MS = 15_000;
@@ -1966,6 +1971,17 @@ export class Florence {
       readVault: async (input) => vaultRecall.read(input),
       searchFamilyMemory: async ({ query, limit }) =>
         searchMemorySources(searchableMemorySources, query).slice(0, limit),
+      ...(turn.authority.audience === "group"
+        ? {
+            readHouseholdAvailability: async (window: { timeMin: string; timeMax: string }) => {
+              const household = await this.#store.readHousehold({
+                householdId: turn.authority.householdId,
+              });
+              if (!household) throw new Error("The household is unavailable");
+              return this.#readHouseholdAvailability({ household, ...window });
+            },
+          }
+        : {}),
       listCalendars: async (): Promise<FlorenceCalendarCatalogRead> => {
         if (!this.#google || !activeGoogleConnection || !googleOwnerAdultId) {
           return {
@@ -4387,6 +4403,15 @@ export class Florence {
           searchFamilyMemory: async ({ query, limit }) =>
             searchMemorySources(familyWorkSearchableMemory, query).slice(0, limit),
           readSource: async ({ sourceId }) => familyWorkSourceIndex.get(sourceId) ?? null,
+          ...(work.visibility === "household"
+            ? {
+                readHouseholdAvailability: (window: { timeMin: string; timeMax: string }) =>
+                  this.#readHouseholdAvailability({
+                    household: familyWorkHousehold,
+                    ...window,
+                  }),
+              }
+            : {}),
           ...(google && familyWorkCalendarConnection && familyWorkExecutionAdultId
             ? {
                 searchGmail: async ({ query, after, before, limit }) => {
@@ -5967,6 +5992,143 @@ export class Florence {
     if (!this.#google) return false;
     const connections = await this.#google.status({ householdId, ownerAdultId: adultId });
     return connections.some((connection) => connection.status === "active");
+  }
+
+  async #readHouseholdAvailability(input: {
+    household: HouseholdRecord;
+    timeMin: string;
+    timeMax: string;
+  }): Promise<FlorenceHouseholdAvailabilityRead> {
+    const timeMinMs = Date.parse(input.timeMin);
+    const timeMaxMs = Date.parse(input.timeMax);
+    if (!Number.isFinite(timeMinMs) || !Number.isFinite(timeMaxMs) || timeMaxMs <= timeMinMs) {
+      throw new Error("Household availability requires a valid half-open time window");
+    }
+
+    const google = this.#google;
+    const adults = input.household.members
+      .filter((member) => member.kind === "adult" && member.status === "verified")
+      .sort((left, right) => (left.adultSlot ?? 3) - (right.adultSlot ?? 3));
+    const readAdult = async (
+      adult: FamilyMemberRecord,
+    ): Promise<FlorenceHouseholdAvailabilityRead["participants"][number]> => {
+      if (adult.preferences.privateConflictBusySharingEnabled !== true) {
+        return { adultName: adult.displayName, coverage: "not_shared", busyIntervals: [] };
+      }
+      const activeConnections = input.household.googleConnections.filter(
+        (connection) => connection.ownerAdultId === adult.id && connection.status === "active",
+      );
+      if (activeConnections.length === 0) {
+        return { adultName: adult.displayName, coverage: "not_connected", busyIntervals: [] };
+      }
+      if (!google) {
+        return { adultName: adult.displayName, coverage: "unavailable", busyIntervals: [] };
+      }
+      const readableConnections = activeConnections.filter((connection) =>
+        GOOGLE_CALENDAR_READ_SCOPES.every((scope) => connection.grantedScopes.includes(scope)),
+      );
+      if (readableConnections.length === 0) {
+        return { adultName: adult.displayName, coverage: "unavailable", busyIntervals: [] };
+      }
+      const hasUnreadableActiveConnection = readableConnections.length !== activeConnections.length;
+
+      const settled = await Promise.allSettled(
+        readableConnections.map((connection) =>
+          readTitleFreeAvailabilityRange({
+            timeMin: input.timeMin,
+            timeMax: input.timeMax,
+            readPage: ({ timeMin, timeMax, cursor }) =>
+              google.readPersonalCalendarWindow({
+                householdId: input.household.id,
+                ownerAdultId: adult.id,
+                connectionId: connection.connectionId,
+                excludedFamilyCalendarId: input.household.familyCalendarId,
+                timeMin,
+                timeMax,
+                limit: 50,
+                ...(cursor === null ? {} : { cursor }),
+              }),
+          }),
+        ),
+      );
+      const reads = settled.flatMap((result) => (result.status === "fulfilled" ? [result.value] : []));
+      const busyIntervals = unionBusyIntervals(reads.flatMap((read) => read.busyIntervals));
+      const allComplete =
+        !hasUnreadableActiveConnection &&
+        settled.length > 0 &&
+        settled.every((result) => result.status === "fulfilled" && result.value.coverage === "complete");
+      const anyReliable = reads.some((read) => read.coverage !== "unavailable");
+      return {
+        adultName: adult.displayName,
+        coverage: allComplete ? "complete" : anyReliable ? "partial" : "unavailable",
+        busyIntervals,
+      };
+    };
+
+    const readFamilyCalendar = async (): Promise<FlorenceHouseholdAvailabilityRead["familyCalendar"]> => {
+      const calendarId = input.household.familyCalendarId;
+      if (!calendarId) return { coverage: "not_configured", busyIntervals: [] };
+      if (!google) return { coverage: "unavailable", busyIntervals: [] };
+      const credentials = await this.#store.readActiveFamilyCalendarCredentials({
+        householdId: input.household.id,
+      });
+      if (credentials.length === 0) return { coverage: "unavailable", busyIntervals: [] };
+      const read = await readTitleFreeAvailabilityRange({
+        timeMin: input.timeMin,
+        timeMax: input.timeMax,
+        readPage: async ({ timeMin, timeMax, cursor }) =>
+          (
+            await this.#readExactFamilyCalendarWindow({
+              householdId: input.household.id,
+              calendarId,
+              timeMin,
+              timeMax,
+              limit: 50,
+              cursor,
+              credentials,
+            })
+          ).read,
+      });
+      return { coverage: read.coverage, busyIntervals: [...read.busyIntervals] };
+    };
+
+    const [participantSettlements, familySettlements] = await Promise.all([
+      Promise.allSettled(adults.map(readAdult)),
+      Promise.allSettled([readFamilyCalendar()]),
+    ]);
+    const participants = participantSettlements.map((settlement, index) => {
+      if (settlement.status === "fulfilled") return settlement.value;
+      const adult = adults[index];
+      if (!adult) throw new Error("Household availability lost an adult result");
+      return { adultName: adult.displayName, coverage: "unavailable" as const, busyIntervals: [] };
+    });
+    const familySettlement = familySettlements[0];
+    const familyCalendar =
+      familySettlement?.status === "fulfilled"
+        ? familySettlement.value
+        : { coverage: "unavailable" as const, busyIntervals: [] };
+    const mergedBusyIntervals = unionBusyIntervals([
+      ...participants.flatMap((participant) => participant.busyIntervals),
+      ...familyCalendar.busyIntervals,
+    ]);
+    const allComplete =
+      participants.every((participant) => participant.coverage === "complete") &&
+      familyCalendar.coverage === "complete";
+    const anyReliable =
+      participants.some(
+        (participant) => participant.coverage === "complete" || participant.coverage === "partial",
+      ) ||
+      familyCalendar.coverage === "complete" ||
+      familyCalendar.coverage === "partial";
+    return {
+      status: allComplete ? "complete" : anyReliable ? "partial" : "unavailable",
+      timeMin: input.timeMin,
+      timeMax: input.timeMax,
+      timeZone: input.household.timeZone,
+      participants,
+      familyCalendar,
+      mergedBusyIntervals,
+    };
   }
 
   async #readExactFamilyCalendarCatalog(input: {
@@ -8402,6 +8564,168 @@ function unionBusyIntervals(
     if (Date.parse(interval.endsAt) > Date.parse(previous.endsAt)) previous.endsAt = interval.endsAt;
   }
   return union;
+}
+
+type TitleFreeAvailabilityRead = Readonly<{
+  coverage: "complete" | "partial" | "unavailable";
+  busyIntervals: readonly { startsAt: string; endsAt: string }[];
+}>;
+
+const MAX_GOOGLE_CALENDAR_WINDOW_MS = 31 * 24 * 60 * 60_000;
+
+/**
+ * Directly adapts OpenInstinct's check_calendar_availability contract and
+ * per-calendar failure handling (480045d, google_workspace_read.ts and
+ * calendar.ts), with Hermes's exact half-open window and complete-scope
+ * discipline (daily-brief.md). Florence uses its existing exhaustive Google
+ * adapter instead of OpenInstinct's bounded freebusy request.
+ */
+async function readTitleFreeAvailabilityRange(input: {
+  timeMin: string;
+  timeMax: string;
+  readPage: (input: {
+    timeMin: string;
+    timeMax: string;
+    cursor: string | null;
+  }) => Promise<GooglePersonalCalendarWindowRead>;
+}): Promise<TitleFreeAvailabilityRead> {
+  const rangeStart = Date.parse(input.timeMin);
+  const rangeEnd = Date.parse(input.timeMax);
+  if (!Number.isFinite(rangeStart) || !Number.isFinite(rangeEnd) || rangeEnd <= rangeStart) {
+    throw new Error("Availability range is invalid");
+  }
+
+  const busyIntervals: { startsAt: string; endsAt: string }[] = [];
+  let complete = true;
+  let reliable = false;
+  for (let chunkStart = rangeStart; chunkStart < rangeEnd; ) {
+    const chunkEnd = Math.min(rangeEnd, chunkStart + MAX_GOOGLE_CALENDAR_WINDOW_MS);
+    const [settlement] = await Promise.allSettled([
+      readTitleFreeAvailabilityChunk({
+        timeMin: new Date(chunkStart).toISOString(),
+        timeMax: new Date(chunkEnd).toISOString(),
+        readPage: input.readPage,
+      }),
+    ]);
+    if (!settlement || settlement.status === "rejected") {
+      complete = false;
+    } else {
+      busyIntervals.push(...settlement.value.busyIntervals);
+      if (settlement.value.coverage !== "complete") complete = false;
+      if (settlement.value.coverage !== "unavailable") reliable = true;
+    }
+    chunkStart = chunkEnd;
+  }
+  return {
+    coverage: complete && reliable ? "complete" : reliable ? "partial" : "unavailable",
+    busyIntervals: unionBusyIntervals(busyIntervals),
+  };
+}
+
+async function readTitleFreeAvailabilityChunk(input: {
+  timeMin: string;
+  timeMax: string;
+  readPage: (input: {
+    timeMin: string;
+    timeMax: string;
+    cursor: string | null;
+  }) => Promise<GooglePersonalCalendarWindowRead>;
+}): Promise<TitleFreeAvailabilityRead> {
+  const expectedTimeMin = Date.parse(input.timeMin);
+  const expectedTimeMax = Date.parse(input.timeMax);
+  const busyIntervals: { startsAt: string; endsAt: string }[] = [];
+  const seenCursors = new Set<string>();
+  let cursor: string | null = null;
+  let complete = true;
+  let reliable = false;
+  let expectedTotalEventCount: number | null = null;
+  let observedEventCount = 0;
+
+  while (true) {
+    let read: GooglePersonalCalendarWindowRead;
+    try {
+      read = await input.readPage({ timeMin: input.timeMin, timeMax: input.timeMax, cursor });
+    } catch {
+      complete = false;
+      break;
+    }
+    if (Date.parse(read.timeMin) !== expectedTimeMin || Date.parse(read.timeMax) !== expectedTimeMax) {
+      complete = false;
+      break;
+    }
+
+    const completeCalendars = read.calendars.filter(
+      (calendar) =>
+        calendar.status === "complete" &&
+        calendar.accessRole !== "freeBusyReader" &&
+        calendar.timeZone !== null,
+    );
+    const calendarTimeZones = new Map(
+      read.calendars.flatMap((calendar) =>
+        calendar.timeZone === null ? [] : ([[calendar.calendarId, calendar.timeZone]] as const),
+      ),
+    );
+    if (expectedTotalEventCount === null) expectedTotalEventCount = read.totalEventCount;
+    if (
+      expectedTotalEventCount !== read.totalEventCount ||
+      read.totalCalendarCount !== read.calendars.length
+    ) {
+      complete = false;
+    }
+    observedEventCount += read.events.length;
+    const pageReliable =
+      read.status === "complete" || read.status === "truncated" || completeCalendars.length > 0;
+    if (pageReliable) reliable = true;
+    if (
+      read.status === "partial" ||
+      read.status === "unavailable" ||
+      completeCalendars.length !== read.calendars.length
+    ) {
+      complete = false;
+    }
+
+    for (const event of read.events) {
+      if (!event.busy) continue;
+      const calendarTimeZone = calendarTimeZones.get(event.calendarId);
+      if (event.intervalKind === "all_day" && !calendarTimeZone) {
+        complete = false;
+        continue;
+      }
+      let bounds: { startsAt: string; endsAt: string };
+      try {
+        bounds = calendarWindowBounds(event, calendarTimeZone ?? "UTC");
+      } catch {
+        complete = false;
+        continue;
+      }
+      const startsAt = Math.max(expectedTimeMin, Date.parse(bounds.startsAt));
+      const endsAt = Math.min(expectedTimeMax, Date.parse(bounds.endsAt));
+      if (Number.isFinite(startsAt) && Number.isFinite(endsAt) && endsAt > startsAt) {
+        busyIntervals.push({
+          startsAt: new Date(startsAt).toISOString(),
+          endsAt: new Date(endsAt).toISOString(),
+        });
+      }
+    }
+
+    const nextCursor = read.nextCursor;
+    if (nextCursor === null) {
+      if (read.status === "truncated") complete = false;
+      if (expectedTotalEventCount !== observedEventCount) complete = false;
+      break;
+    }
+    if (read.status === "complete" || seenCursors.has(nextCursor)) {
+      complete = false;
+      break;
+    }
+    seenCursors.add(nextCursor);
+    cursor = nextCursor;
+  }
+
+  return {
+    coverage: complete && reliable ? "complete" : reliable ? "partial" : "unavailable",
+    busyIntervals: unionBusyIntervals(busyIntervals),
+  };
 }
 
 function familyCalendarMonthWindows(

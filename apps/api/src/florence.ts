@@ -116,6 +116,7 @@ const DEFAULT_PREFERENCES: PreferencesInput = {
 const LOOP_IDLE_MS = 250;
 const RETRY_MS = 15_000;
 const WORK_CUE_MS = 6_000;
+type OutboundDeliveryDisposition = "sent_now" | "already_sent" | "claimed" | "failed";
 const ARTIFACT_PURGE_INTERVAL_MS = 60 * 60_000;
 const QUIET_START_HOUR = 20;
 const QUIET_END_HOUR = 7;
@@ -427,11 +428,14 @@ export class Florence {
     const household = await this.#householdForAdult(input.adultId);
     const adult = household.members.find((member) => member.id === input.adultId && member.kind === "adult");
     if (adult?.adultSlot === 2) {
-      await this.#store.completePartnerOnboarding({
+      const firstName = profileString(adult.profile, "firstName") ?? adult.displayName;
+      const completionSourceId = await this.#store.completePartnerOnboarding({
         householdId: household.id,
         adultId: adult.id,
+        completionText: `Your side is all set, ${firstName}. I’m finishing the shared family setup now, and I’ll let you both know in the family thread when it’s ready.`,
         occurredAt: this.#now().toISOString(),
       });
+      if (completionSourceId) await this.#deliverOutbound(completionSourceId);
     }
     if (adult?.adultSlot === 1 && profileString(adult.profile, "onboardingCompletedAt")) {
       await this.#stageFounderHandoff(connection);
@@ -1263,6 +1267,7 @@ export class Florence {
       return;
     }
     if (!this.#reasoner) {
+      await this.#tryTurnCue(turn.message.sourceId, "retry");
       await this.#store.retryInbound({
         sourceId: turn.message.sourceId,
         retryAt: later(this.#now(), RETRY_MS),
@@ -1296,6 +1301,7 @@ export class Florence {
         if (interpretation.sendInvitation) approvedPartnerInvitation = turn.pendingPartnerInvitation;
       } catch (error) {
         if (error instanceof FlorenceReasonerError && error.retryable) {
+          await this.#tryTurnCue(turn.message.sourceId, "retry");
           await this.#store.retryInbound({
             sourceId: turn.message.sourceId,
             retryAt: later(this.#now(), RETRY_MS),
@@ -1325,6 +1331,7 @@ export class Florence {
         if (interpretation.approve) approvedCalendarOffer = offer;
       } catch (error) {
         if (error instanceof FlorenceReasonerError && error.retryable) {
+          await this.#tryTurnCue(turn.message.sourceId, "retry");
           await this.#store.retryInbound({
             sourceId: turn.message.sourceId,
             retryAt: later(this.#now(), RETRY_MS),
@@ -1368,15 +1375,22 @@ export class Florence {
     let typing = false;
     let workTimer: ReturnType<typeof setTimeout> | null = null;
     let workCue: Promise<void> | null = null;
+    let reactionCue: Promise<void> | null = null;
+    let substantiveWorkStarted = false;
     let immediateReactionStaged = false;
+    const startWork = () => {
+      if (substantiveWorkStarted) return;
+      substantiveWorkStarted = true;
+      workTimer = setTimeout(() => {
+        if (controller.signal.aborted) return;
+        workCue = this.#tryTurnCue(turn.message.sourceId, "work").then(() => undefined);
+      }, WORK_CUE_MS);
+      reactionCue = this.#tryTurnCue(turn.message.sourceId, "reaction").then((staged) => {
+        immediateReactionStaged = staged;
+      });
+    };
     try {
-      if (attachmentJob) {
-        workTimer = setTimeout(() => {
-          if (controller.signal.aborted) return;
-          workCue = this.#tryTurnCue(turn.message.sourceId, "work").then(() => undefined);
-        }, WORK_CUE_MS);
-        immediateReactionStaged = await this.#tryTurnCue(turn.message.sourceId, "reaction");
-      }
+      if (attachmentJob) startWork();
       controller.signal.throwIfAborted();
       typing =
         turn.authority.audience === "private" &&
@@ -1387,10 +1401,19 @@ export class Florence {
         }));
       const context = await this.#reasonerContext(turn);
       controller.signal.throwIfAborted();
-      const decision = await this.#reasoner.decide(context.input, context.reads, controller.signal);
+      const decision = await this.#reasoner.decide(context.input, context.reads, controller.signal, {
+        onWorkStarted: startWork,
+        protectedPublicSearchValues: [
+          ...turn.household.members.flatMap((member) =>
+            member.messagesAddress ? [member.messagesAddress] : [],
+          ),
+          ...(this.#linqSenderPhoneNumber ? [this.#linqSenderPhoneNumber] : []),
+        ],
+      });
       if (workTimer) clearTimeout(workTimer);
       workTimer = null;
       if (workCue) await workCue;
+      if (reactionCue) await reactionCue;
       controller.signal.throwIfAborted();
       const guarded = this.#appendRequestedWebAccess(
         turn,
@@ -1438,6 +1461,7 @@ export class Florence {
         if (workTimer) clearTimeout(workTimer);
         workTimer = null;
         if (workCue) await workCue;
+        if (reactionCue) await reactionCue;
         if (approvedCalendarOffer || approvedPartnerInvitation) {
           const actionText =
             approvedCalendarOffer && approvedPartnerInvitation
@@ -1475,7 +1499,7 @@ export class Florence {
           );
         } else {
           await this.#store.commitTurn(
-            attachmentJob
+            substantiveWorkStarted
               ? decisionCommit(
                   turn,
                   {
@@ -1485,7 +1509,7 @@ export class Florence {
                       reaction: null,
                       bubbles: [
                         {
-                          text: "I couldn’t finish reading that reliably, so I didn’t retain, schedule, or send anything.",
+                          text: "I couldn’t finish that reliably. I didn’t make or send any changes.",
                           delayMs: 0,
                         },
                       ],
@@ -1509,7 +1533,7 @@ export class Florence {
                         reaction: null,
                         bubbles: [
                           {
-                            text: "I’m here. I didn’t quite get that—say it one more way?",
+                            text: "I hit a snag answering that. I didn’t make or send any changes—please try once more.",
                             delayMs: 0,
                           },
                         ],
@@ -1526,6 +1550,11 @@ export class Florence {
         }
         return;
       }
+      if (workTimer) clearTimeout(workTimer);
+      workTimer = null;
+      if (workCue) await workCue;
+      if (reactionCue) await reactionCue;
+      await this.#tryTurnCue(turn.message.sourceId, "retry");
       await this.#store.retryInbound({
         sourceId: turn.message.sourceId,
         retryAt: later(this.#now(), RETRY_MS),
@@ -1534,6 +1563,7 @@ export class Florence {
     } finally {
       if (workTimer) clearTimeout(workTimer);
       if (workCue) await workCue;
+      if (reactionCue) await reactionCue;
       if (typing) {
         await this.#setTyping({
           providerConversationId: turn.authority.providerConversationId,
@@ -1861,9 +1891,14 @@ export class Florence {
     };
   }
 
-  async #deliverOutbound(sourceId: string, retryTransient = true): Promise<void> {
+  async #deliverOutbound(sourceId: string, retryTransient = true): Promise<OutboundDeliveryDisposition> {
     const outbound = await this.#store.beginOutbound({ sourceId, now: this.#now().toISOString() });
-    if (!outbound) return;
+    if (!outbound) {
+      const status = await this.#store.outboundDeliveryStatus(sourceId);
+      if (status === "sent") return "already_sent";
+      if (status === "pending" || status === "sending") return "claimed";
+      return "failed";
+    }
     try {
       const observed = await this.#linq.observeChat(outbound.providerConversationId);
       const groupObservation = await this.reconcileObservedFamilyGroup({
@@ -1872,7 +1907,14 @@ export class Florence {
         participantIdentityDigests: observed.participantIdentityDigests,
         occurredAt: this.#now().toISOString(),
       });
-      if (groupObservation === "mismatch" || groupObservation === "retired") return;
+      if (groupObservation === "mismatch" || groupObservation === "retired") return "failed";
+      if (!(await this.#store.outboundSendIsCurrent(sourceId))) {
+        await this.#store.failSendingOutbound(
+          sourceId,
+          "The progress cue was no longer current before provider delivery",
+        );
+        return "failed";
+      }
       const result =
         outbound.moveKind === "reaction"
           ? await this.#linq.sendReaction({
@@ -1912,8 +1954,10 @@ export class Florence {
           },
           sentAt: result.occurredAt,
         });
+        return "sent_now";
       } else {
         await this.#store.retryOutbound({ sourceId, retryAt: null, error: result.detail });
+        return "failed";
       }
     } catch (error) {
       await this.#store.retryOutbound({
@@ -1922,10 +1966,11 @@ export class Florence {
           retryTransient && error instanceof LinqError && error.retryable ? later(this.#now(), 5_000) : null,
         error: errorText(error),
       });
+      return retryTransient && error instanceof LinqError && error.retryable ? "claimed" : "failed";
     }
   }
 
-  async #tryTurnCue(sourceId: string, cue: "reaction" | "work"): Promise<boolean> {
+  async #tryTurnCue(sourceId: string, cue: "reaction" | "work" | "retry"): Promise<boolean> {
     try {
       const cueSourceId = await this.#store.stageTurnCue({
         sourceId,
@@ -1933,8 +1978,8 @@ export class Florence {
         occurredAt: this.#now().toISOString(),
       });
       if (!cueSourceId) return false;
-      await this.#deliverOutbound(cueSourceId, false);
-      return true;
+      const disposition = await this.#deliverOutbound(cueSourceId, false);
+      return disposition === "sent_now" || disposition === "already_sent";
     } catch {
       // A progress cue is optional. The substantive answer remains the product outcome.
       return false;
@@ -3810,7 +3855,7 @@ export class Florence {
             `Want me to text ${profileString(partner.profile, "firstName") ?? partner.displayName} at ${maskPhoneNumber(partnerPhone)} so they can set up their side?`,
           ]
         : [`Your side is ready, ${founderFirstName}.`];
-    await this.#store.stageFounderHandoff({
+    const completionSourceId = await this.#store.stageFounderHandoff({
       householdId: household.id,
       adultId: connection.ownerAdultId,
       channelId: channel.id,
@@ -3818,6 +3863,7 @@ export class Florence {
       texts,
       occurredAt: this.#now().toISOString(),
     });
+    await this.#deliverOutbound(completionSourceId);
   }
 
   async #hasActiveGoogle(householdId: string, adultId: string): Promise<boolean> {

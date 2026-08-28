@@ -4903,10 +4903,12 @@ export class PostgresFlorenceStore {
   async completePartnerOnboarding(input: {
     householdId: string;
     adultId: string;
+    completionText: string;
     occurredAt: string;
-  }): Promise<FamilyMemberRecord> {
+  }): Promise<string | null> {
     const occurredAt = instant(input.occurredAt);
-    const adult = await this.#sql.begin(async (sql) => {
+    const completionText = required(input.completionText, "Partner setup completion message");
+    return this.#sql.begin(async (sql) => {
       const [row] = await sql<PersonRow[]>`
         select * from people where household_id=${input.householdId} and id=${input.adultId}
           and kind='adult' and role='steward' and adult_slot=2 for update
@@ -4949,18 +4951,41 @@ export class PostgresFlorenceStore {
       if (!google) {
         throw new FlorenceStoreUnauthorized("Partner onboarding requires an active Google connection");
       }
+      const completionSourceId = deterministicUuid(
+        `partner-onboarding-complete\0${input.householdId}\0${input.adultId}`,
+      );
       const completedAt = jsonRecord(row.profile).onboardingCompletedAt;
-      if (typeof completedAt === "string" && completedAt.length > 0) return row;
-      const [updated] = await sql<PersonRow[]>`
+      if (typeof completedAt === "string" && completedAt.length > 0) {
+        instant(completedAt);
+        const [staged] = await sql<{ source_id: string }[]>`
+          select source_id from messages where source_id=${completionSourceId}
+            and direction='outbound' and channel_id=${channel.id}
+        `;
+        return staged?.source_id ?? null;
+      }
+      const [adult] = await sql<PersonRow[]>`
         update people set profile=profile||${sql.json({
           onboardingCompletedAt: occurredAt.toISOString(),
         })},updated_at=${occurredAt}
         where id=${row.id} returning *
       `;
-      return updated;
+      if (!adult) throw new Error("Partner onboarding completion was not stored");
+      await insertOutbound(sql, {
+        sourceId: completionSourceId,
+        idempotencyKey: `partner-onboarding-complete:${input.householdId}:${input.adultId}`,
+        moveKind: "message",
+        text: completionText,
+        turnId: completionSourceId,
+        turnPart: 0,
+        notBefore: occurredAt.toISOString(),
+        householdId: input.householdId,
+        channelId: channel.id,
+        visibility: "private",
+        ownerAdultId: input.adultId,
+        occurredAt,
+      });
+      return completionSourceId;
     });
-    if (!adult) throw new Error("Partner onboarding completion was not stored");
-    return personRecord(adult);
   }
 
   async reconcileObservedFamilyGroup(input: {
@@ -5620,7 +5645,7 @@ export class PostgresFlorenceStore {
 
   async stageTurnCue(input: {
     sourceId: string;
-    cue: "reaction" | "work";
+    cue: "reaction" | "work" | "retry";
     occurredAt: string;
   }): Promise<string | null> {
     assertUuid(input.sourceId, "Inbound source ID");
@@ -5651,8 +5676,15 @@ export class PostgresFlorenceStore {
         idempotencyKey: `cue:${rootSourceId}:${input.cue}`,
         moveKind: input.cue === "reaction" ? "reaction" : "message",
         ...(input.cue === "reaction"
-          ? { reaction: "emphasize", replyToSourceId: rootSourceId, turnPart: -1 as const }
-          : { text: "I’m looking through this now.", turnPart: 0 as const }),
+          ? { reaction: "like", replyToSourceId: turn.source_id, turnPart: -1 as const }
+          : {
+              text:
+                input.cue === "work"
+                  ? "I’m on it—checking now."
+                  : "I hit a temporary snag. I’m trying again now.",
+              replyToSourceId: turn.source_id,
+              turnPart: input.cue === "work" ? (0 as const) : (1 as const),
+            }),
         turnId: cueTurnId,
         notBefore: occurredAt.toISOString(),
         householdId: turn.household_id,
@@ -5661,6 +5693,12 @@ export class PostgresFlorenceStore {
         ownerAdultId: turn.owner_adult_id,
         occurredAt,
       });
+      await sql`
+        update messages set status='pending',sending_at=null,retry_at=null,last_error=null,
+          reply_to_source_id=${turn.source_id},not_before=${occurredAt}
+        where source_id=${sourceId} and direction='outbound' and status='failed'
+          and last_error='Superseded before delivery by a newer message in this conversation'
+      `;
       return sourceId;
     });
   }
@@ -6816,6 +6854,16 @@ export class PostgresFlorenceStore {
         and sending_at<=${stale} and idempotency_key like 'cue:%'
     `;
     await this.#sql`
+      update messages cue set status='failed',sending_at=null,retry_at=null,
+        last_error='The progress cue was no longer current before delivery'
+      where cue.direction='outbound' and cue.status='pending' and cue.idempotency_key like 'cue:%'
+        and not exists (
+          select 1 from messages inbound
+          where inbound.source_id=cue.reply_to_source_id and inbound.direction='inbound'
+            and inbound.status='received'
+        )
+    `;
+    await this.#sql`
       update messages set status='pending',sending_at=null,retry_at=${current},
         last_error='Recovering an idempotent Linq send after interruption'
       where direction='outbound' and move_kind in ('message','reply')
@@ -6843,10 +6891,30 @@ export class PostgresFlorenceStore {
           )
         )
     `;
+    await this.#sql`
+      update messages later set status='failed',sending_at=null,retry_at=null,
+        last_error='An earlier setup message failed before delivery'
+      where later.direction='outbound' and later.status='pending'
+        and later.idempotency_key like 'founder-handoff:%'
+        and exists (
+          select 1 from messages earlier
+          where earlier.turn_id=later.turn_id and earlier.turn_part<later.turn_part
+            and earlier.direction='outbound' and earlier.status='failed'
+        )
+    `;
     const [row] = await this.#sql<{ source_id: string }[]>`
       select m.source_id from messages m join sources s on s.id=m.source_id
       where m.direction='outbound' and m.status='pending'
         and coalesce(m.retry_at,m.not_before)<=${current}
+        and m.idempotency_key not like 'cue:%'
+        and (
+          m.idempotency_key not like 'founder-handoff:%'
+          or not exists (
+            select 1 from messages earlier
+            where earlier.turn_id=m.turn_id and earlier.turn_part<m.turn_part
+              and earlier.direction='outbound' and earlier.status<>'sent'
+          )
+        )
       order by coalesce(m.retry_at,m.not_before),s.occurred_at,m.turn_part,m.source_id limit 1
     `;
     return row ? this.#readOutbound(row.source_id) : null;
@@ -6859,6 +6927,14 @@ export class PostgresFlorenceStore {
         and s.id=m.source_id
         and m.direction='outbound' and m.status='pending'
         and c.revoked_at is null and c.stopped_at is null
+        and (
+          m.idempotency_key not like 'founder-handoff:%'
+          or not exists (
+            select 1 from messages earlier
+            where earlier.turn_id=m.turn_id and earlier.turn_part<m.turn_part
+              and earlier.direction='outbound' and earlier.status<>'sent'
+          )
+        )
         and not exists (
           select 1
           from jsonb_array_elements_text(
@@ -6873,6 +6949,42 @@ export class PostgresFlorenceStore {
         ) returning m.source_id
     `;
     return started.length === 1 ? this.#readOutbound(input.sourceId) : null;
+  }
+
+  async outboundSendIsCurrent(sourceId: string): Promise<boolean> {
+    assertUuid(sourceId, "Outbound source ID");
+    const rows = await this.#sql`
+      select 1 from messages outbound
+      where outbound.source_id=${sourceId} and outbound.direction='outbound'
+        and outbound.status='sending'
+        and (
+          outbound.idempotency_key not like 'cue:%'
+          or exists (
+            select 1 from messages inbound
+            where inbound.source_id=outbound.reply_to_source_id
+              and inbound.direction='inbound' and inbound.status='received'
+          )
+        )
+    `;
+    return rows.length === 1;
+  }
+
+  async outboundDeliveryStatus(sourceId: string): Promise<"pending" | "sending" | "sent" | "failed" | null> {
+    assertUuid(sourceId, "Outbound source ID");
+    const [row] = await this.#sql<{ status: "pending" | "sending" | "sent" | "failed" }[]>`
+      select status from messages
+      where source_id=${sourceId} and direction='outbound'
+    `;
+    return row?.status ?? null;
+  }
+
+  async failSendingOutbound(sourceId: string, error: string): Promise<void> {
+    assertUuid(sourceId, "Outbound source ID");
+    await this.#sql`
+      update messages set status='failed',sending_at=null,retry_at=null,
+        last_error=${bounded(required(error, "Outbound failure"), 2_000)}
+      where source_id=${sourceId} and direction='outbound' and status='sending'
+    `;
   }
 
   async completeOutbound(input: {
@@ -7541,21 +7653,23 @@ export class PostgresFlorenceStore {
     providerConversationId: string;
     texts: readonly string[];
     occurredAt: string;
-  }): Promise<readonly string[]> {
+  }): Promise<string> {
     if (input.texts.length < 1 || input.texts.length > 3) {
       throw new FlorenceStoreConflict("The founder handoff needs one to three message bubbles");
     }
     const texts = input.texts.map((text, index) => required(text, `Founder handoff bubble ${index + 1}`));
     const providerConversationId = required(input.providerConversationId, "Linq conversation ID");
     const occurredAt = instant(input.occurredAt);
+    const completionSourceId = deterministicUuid(
+      `founder-handoff\0${input.householdId}\0${input.adultId}\0${0}`,
+    );
 
-    return this.#sql.begin(async (sql) => {
+    await this.#sql.begin(async (sql) => {
       const handoff = founderHandoffIdentity(
         input.householdId,
         input.adultId,
         await householdLinqIncarnationScope(sql, input.householdId),
       );
-      const sourceIds = texts.map((_, index) => handoff.part(index).sourceId);
       const [channel] = await sql<ChannelRow[]>`
         select c.* from linq_channels c
         join people p on p.household_id=c.household_id and p.id=c.adult_one_id
@@ -7615,7 +7729,7 @@ export class PostgresFlorenceStore {
         ) {
           throw new FlorenceStoreConflict("The founder handoff was already staged with different content");
         }
-        return existing.map((message) => message.source_id);
+        return;
       }
 
       for (const [index, text] of texts.entries()) {
@@ -7635,8 +7749,8 @@ export class PostgresFlorenceStore {
           occurredAt,
         });
       }
-      return sourceIds;
     });
+    return completionSourceId;
   }
 
   async markPendingFailure(input: {
@@ -12684,6 +12798,11 @@ async function markInboundSuperseded(
   newerSourceId: string,
   handledAt: Date,
 ): Promise<void> {
+  const [prior] = await sql<{ channel_id: string; metadata: JsonValue }[]>`
+    select m.channel_id,s.metadata from messages m join sources s on s.id=m.source_id
+    where m.source_id=${priorSourceId} and m.direction='inbound' for update of m
+  `;
+  if (!prior) throw new FlorenceStoreConflict("The superseded inbound message does not exist");
   const [newer] = await sql<{ metadata: JsonValue }[]>`
     select metadata from sources where id=${newerSourceId} for update
   `;
@@ -12704,11 +12823,14 @@ async function markInboundSuperseded(
     where source_id=${priorSourceId} and direction='inbound' and status='received'
   `;
   const finalTurnId = deterministicUuid(`turn\0${priorSourceId}`);
+  const rootSourceId = await supersessionRoot(sql, prior.channel_id, priorSourceId, prior.metadata);
+  const cueTurnId = deterministicUuid(`cue-turn\0${rootSourceId}`);
   const calendarId = deterministicUuid(`calendar\0${priorSourceId}`);
   await sql`
-    update messages set status='failed',retry_at=null,
+    update messages set status='failed',sending_at=null,retry_at=null,
       last_error='Superseded before delivery by a newer message in this conversation'
-    where direction='outbound' and status='pending' and turn_id=${finalTurnId}
+    where direction='outbound' and status in ('pending','sending')
+      and turn_id in (${finalTurnId},${cueTurnId})
   `;
   await sql`
     delete from calendar_actions action where action.status='offered'

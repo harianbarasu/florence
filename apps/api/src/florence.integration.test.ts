@@ -31,7 +31,7 @@ import { buildApp, createSessionCallerResolver } from "./app.js";
 import { EnrollmentCodes } from "./enrollment.js";
 import { Florence } from "./florence.js";
 import { createLinqIngress } from "./linq-ingress.js";
-import { type FlorenceDecision, type FlorenceReasoner, FlorenceReasonerError } from "./reasoner.js";
+import { type FlorenceDecision, FlorenceReasoner, FlorenceReasonerError } from "./reasoner.js";
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
 const NOW = Date.parse("2026-08-16T18:00:00.000Z");
@@ -83,6 +83,9 @@ const PARTNER_SETUP_EXPIRED_NOTICE =
   "Alex’s Florence setup link expired, so I stopped the invitation. I won’t message them again unless you ask me to send a fresh one.";
 const PARTNER_SETUP_DELIVERY_FAILURE_NOTICE =
   "I couldn’t deliver Alex’s Florence setup link, so I stopped the invitation. I won’t message them again unless you ask me to try again.";
+const PARTNER_SETUP_COMPLETE_ACK =
+  "Your side is all set, Alex. I’m finishing the shared family setup now, and I’ll let you both know in the family thread when it’s ready.";
+const FOUNDER_SETUP_COMPLETE_ACK = "Your side is ready, Hari.";
 const NATIVE_TEXT = "Forwarded from school: Maya’s field-trip form is due Tuesday.";
 const NATIVE_LINK = "https://school.example/fall-field-trip";
 const VOICE_TRANSCRIPT = "The teacher said the form still needs one parent signature.";
@@ -90,6 +93,34 @@ const INTEREST_REQUEST = "Maya likes soccer. Keep an eye out for a good family m
 const INTEREST_RECOMMENDATION =
   "The Bay City women’s match this Saturday fits the family calendar and looks worth considering.";
 const INTEREST_URL = "https://example.com/bay-city-family-soccer";
+const PUBLIC_RESEARCH_REQUEST =
+  "My wife Alex Anbarasu’s flight is delayed tonight. Can you find the best alternatives? DL 747 is her original flight. Email me at hari@example.com.";
+const PUBLIC_RESEARCH_REPLY =
+  "DL 747 is JFK to LAX. The nonstop is delayed, and the earliest practical Delta alternative leaves later tonight.";
+const PUBLIC_RESEARCH_URL = "https://www.delta.com/flight-status/search";
+const PUBLIC_NO_RESULT_REQUEST = "Can you verify public product identifier 9780143127796 on 2026-08-27?";
+const PUBLIC_NO_RESULT_REPLY =
+  "I checked, but I couldn’t verify a useful public match for that identifier and date.";
+const PUBLIC_NO_RESULT_SOURCE = "https://example.com/products/9780143127796";
+const PUBLIC_SHORT_IDENTIFIER_REQUEST = "Search X";
+const PUBLIC_SHORT_IDENTIFIER_REPLY = "X is the public social platform formerly known as Twitter.";
+const PUBLIC_SHORT_IDENTIFIER_URL = "https://x.com/";
+const PUBLIC_CONCEPT_REQUEST =
+  "What is an access token, what are the best password managers, and what is confirmation code format? " +
+  "https://www.youtube.com/watch?v=dQw4w9WgXcQ";
+const PUBLIC_CONCEPT_REPLY = "Those are public security concepts, and the supplied video is identifiable.";
+const PUBLIC_CONCEPT_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ";
+const PRIVATE_ONLY_PUBLIC_RESEARCH_REQUEST =
+  `Search for Hari Anbarasu at hari@example.com, ${FOUNDER_PHONE}, 310-555-1212, ` +
+  "http://localhost:3000/reset?token=secret123, " +
+  "https://user:pass@example.com/reset?token=secret456, " +
+  "file:///Users/Hari/secrets.txt, ftp://user:pass@10.0.0.2/file, " +
+  "localhost:3000/private?token=secret789, http://[::ffff:127.0.0.1]/private, " +
+  "confirmation code ABC123.";
+const PRIVATE_ONLY_PUBLIC_RESEARCH_REPLY =
+  "I can’t put those private details into public search. What public subject should I look up?";
+const CLARIFICATION_ONLY_REQUEST = "Can you compare the two choices?";
+const CLARIFICATION_ONLY_REPLY = "Which two choices do you mean?";
 const GROUP_REPAIR_NOTICE =
   "The people in our family thread changed, so I stopped using it. I’ll make a fresh thread with just the two of you.";
 const PRIVATE_SCHOOL_FACT_SLOT = "child:maya:school";
@@ -119,7 +150,11 @@ const PAGINATED_CALENDAR_TITLE = "Maya’s archived school open-house planning n
 const PAGINATED_CALENDAR_FOLLOW_UP = "Maya’s school open-house plan still needs a family decision.";
 const HOUSEHOLD_INITIAL_ALL_CLEAR =
   "I finished reviewing both parents’ last 90 days of Gmail and Calendar. Nothing needs attention right now, and I’ll keep watching.";
-const CONVERSATION_RECOVERY_REPLY = "I’m here. I didn’t quite get that—say it one more way?";
+const CONVERSATION_RECOVERY_REPLY =
+  "I hit a snag answering that. I didn’t make or send any changes—please try once more.";
+const TRANSIENT_RETRY_REQUEST = "Can you check in with me?";
+const TRANSIENT_RETRY_CUE = "I hit a temporary snag. I’m trying again now.";
+const TRANSIENT_RETRY_REPLY = "I’m back—what would you like me to check?";
 const STALE_RECEIPT_QUESTION = "Can you confirm this delivery is current?";
 const STALE_RECEIPT_REPLY = "This reply must have a current provider receipt.";
 const ONE_SHOT_REMINDER_REQUEST = "Remind me to pick up the kids at 2:45 today.";
@@ -396,7 +431,15 @@ release("Florence parent journeys", () => {
     let failNextReinviteConversation = false;
     let contradictNextSuccessfulPartnerInvitation = false;
     let failNextGroupGreeting = false;
+    let transientRetryAttempts = 0;
     const harness = await createHarness(async (input) => {
+      if (input.currentMessage.text === TRANSIENT_RETRY_REQUEST) {
+        transientRetryAttempts += 1;
+        if (transientRetryAttempts === 1) {
+          throw new FlorenceReasonerError("transient", "Fake temporary model failure");
+        }
+        return decision({ bubbles: [{ text: TRANSIENT_RETRY_REPLY, delayMs: 0 }] });
+      }
       if (
         failNextGroupGreeting &&
         input.audience === "group" &&
@@ -506,7 +549,16 @@ release("Florence parent journeys", () => {
         familyLabel: "Client-chosen Family",
       } as never),
     ).rejects.toThrow();
+    const founderMessagesBeforeFamilyProfile = harness.linq.messages.filter(
+      (message) => message.providerConversationId === PRIVATE_FOUNDER,
+    ).length;
     await harness.completeFamilyProfile();
+    expect(
+      harness.linq.messages
+        .filter((message) => message.providerConversationId === PRIVATE_FOUNDER)
+        .slice(founderMessagesBeforeFamilyProfile)
+        .map((message) => message.text),
+    ).toEqual([FOUNDER_SETUP_COMPLETE_ACK]);
     const founderAfterFamilyProfile = await harness.florence.workspaceForAdult(harness.founderAdultId);
     expect(founderAfterFamilyProfile.vault?.members).toEqual(
       expect.arrayContaining([
@@ -612,7 +664,7 @@ release("Florence parent journeys", () => {
     expect(
       harness.linq.messages.filter(
         (message) =>
-          message.providerConversationId === PRIVATE_FOUNDER && message.text === "Your side is ready, Hari.",
+          message.providerConversationId === PRIVATE_FOUNDER && message.text === FOUNDER_SETUP_COMPLETE_ACK,
       ),
     ).toHaveLength(1);
     expect(
@@ -994,7 +1046,16 @@ release("Florence parent journeys", () => {
         and (select count(*)=2 from people where kind='adult')
         and (select count(*)=1 from people where kind='adult' and adult_slot=2 and status='verified')`,
     );
+    const partnerMessagesBeforeGoogleCompletion = harness.linq.messages.filter(
+      (message) => message.providerConversationId === PRIVATE_PARTNER,
+    ).length;
     await harness.activatePartnerGoogle();
+    expect(
+      harness.linq.messages
+        .filter((message) => message.providerConversationId === PRIVATE_PARTNER)
+        .slice(partnerMessagesBeforeGoogleCompletion)
+        .map((message) => message.text),
+    ).toEqual([PARTNER_SETUP_COMPLETE_ACK]);
     harness.state.familyCalendarProvisioningFailuresRemaining = 1;
     await expect(harness.drain()).rejects.toThrow(
       "Linq has not confirmed sending the family group introduction",
@@ -1216,6 +1277,24 @@ release("Florence parent journeys", () => {
       )`,
     );
 
+    await harness.accept("group", "group-transient-retry", TRANSIENT_RETRY_REQUEST);
+    await harness.drain();
+    expect(
+      harness.linq.messages.filter(
+        (message) => message.providerConversationId === FAMILY_GROUP && message.text === TRANSIENT_RETRY_CUE,
+      ),
+    ).toHaveLength(1);
+    expect(harness.linq.messages.some((message) => message.text === TRANSIENT_RETRY_REPLY)).toBe(false);
+    harness.state.now += 16_000;
+    await harness.drain();
+    expect(transientRetryAttempts).toBe(2);
+    expect(
+      harness.linq.messages.filter(
+        (message) => message.providerConversationId === FAMILY_GROUP && message.text === TRANSIENT_RETRY_CUE,
+      ),
+    ).toHaveLength(1);
+    expect(harness.linq.messages.some((message) => message.text === TRANSIENT_RETRY_REPLY)).toBe(true);
+
     const privateAccessLinksBeforeRequest = harness.accessLinksFor(PRIVATE_FOUNDER).length;
     await harness.accept("private", "calendar-web-access", WEB_CALENDAR_ACCESS_REQUEST);
     await harness.drain();
@@ -1370,6 +1449,187 @@ release("Florence parent journeys", () => {
     let conversationalGoogleSourceId: string | null = null;
     let retainedGoogleMemorySourceId: string | null = null;
     let groupHouseholdFactWasVisible = false;
+    const publicResearchCapture: {
+      mainRequest: Record<string, unknown> | null;
+      publicRequests: Record<string, unknown>[];
+    } = { mainRequest: null, publicRequests: [] };
+    let publicResearchModelTurns = 0;
+    let publicSearchTurns = 0;
+    let publicResearchNeedsFinal = false;
+    let publicFinalReply = PUBLIC_RESEARCH_REPLY;
+    let publicFinalUrls = [PUBLIC_RESEARCH_URL];
+    const publicResearchReasoner = new FlorenceReasoner({ apiKey: "test-openai-key", model: "test-model" }, {
+      responses: {
+        stream: (request: Record<string, unknown>) => {
+          publicResearchModelTurns += 1;
+          if (!publicResearchNeedsFinal) {
+            publicResearchNeedsFinal = true;
+            publicResearchCapture.mainRequest ??= request;
+            const call = {
+              id: "public-research-tool-output",
+              type: "function_call",
+              call_id: "public-research-tool-call",
+              name: "research_public_web",
+              arguments: "{}",
+              status: "completed",
+            };
+            return fakeResponseStream(
+              [
+                {
+                  type: "response.output_item.added",
+                  item: call,
+                  output_index: 0,
+                  sequence_number: 1,
+                },
+              ],
+              {
+                output_parsed: null,
+                output: [call],
+              },
+            );
+          }
+          publicResearchNeedsFinal = false;
+          return fakeResponseStream([], {
+            output_parsed: decision({
+              bubbles: [{ text: publicFinalReply, delayMs: 0 }],
+              researchUrls: publicFinalUrls,
+            }),
+            output: [],
+          });
+        },
+        parse: (request: Record<string, unknown>) => {
+          publicResearchCapture.publicRequests.push(request);
+          publicSearchTurns += 1;
+          const serializedInput = JSON.stringify(request.input);
+          const noResult = serializedInput.includes("9780143127796");
+          const shortIdentifier = serializedInput.includes(PUBLIC_SHORT_IDENTIFIER_REQUEST);
+          const publicConcept = serializedInput.includes("dQw4w9WgXcQ");
+          publicFinalReply = noResult
+            ? PUBLIC_NO_RESULT_REPLY
+            : publicConcept
+              ? PUBLIC_CONCEPT_REPLY
+              : shortIdentifier
+                ? PUBLIC_SHORT_IDENTIFIER_REPLY
+                : PUBLIC_RESEARCH_REPLY;
+          publicFinalUrls = noResult
+            ? []
+            : [
+                publicConcept
+                  ? PUBLIC_CONCEPT_URL
+                  : shortIdentifier
+                    ? PUBLIC_SHORT_IDENTIFIER_URL
+                    : PUBLIC_RESEARCH_URL,
+              ];
+          return {
+            output_parsed: {
+              outcome: noResult ? "no_result" : "result",
+              summary: publicFinalReply,
+              urls: publicFinalUrls,
+            },
+            output: [
+              {
+                id: "web-search-flight-options",
+                type: "web_search_call",
+                status: "completed",
+                action: {
+                  type: "search",
+                  query: noResult
+                    ? "9780143127796 2026-08-27"
+                    : publicConcept
+                      ? "access token password managers confirmation code format YouTube video"
+                      : shortIdentifier
+                        ? "X public identifier"
+                        : "DL 747 current route status alternatives tonight",
+                  sources: [
+                    {
+                      type: "url",
+                      url: noResult
+                        ? PUBLIC_NO_RESULT_SOURCE
+                        : publicConcept
+                          ? PUBLIC_CONCEPT_URL
+                          : shortIdentifier
+                            ? PUBLIC_SHORT_IDENTIFIER_URL
+                            : PUBLIC_RESEARCH_URL,
+                    },
+                  ],
+                },
+              },
+            ],
+          };
+        },
+      },
+    } as never);
+    const clarificationReasoner = new FlorenceReasoner({ apiKey: "test-openai-key", model: "test-model" }, {
+      responses: {
+        stream: () =>
+          fakeResponseStream([], {
+            output_parsed: decision({
+              bubbles: [{ text: CLARIFICATION_ONLY_REPLY, delayMs: 0 }],
+            }),
+            output: [],
+          }),
+      },
+    } as never);
+    let privacyBoundarySearchCalls = 0;
+    const privateOnlyCapture: {
+      mainRequest: Record<string, unknown> | null;
+      publicRequest: Record<string, unknown> | null;
+    } = { mainRequest: null, publicRequest: null };
+    let privateOnlyNeedsFinal = false;
+    const privacyBoundaryReasoner = new FlorenceReasoner({ apiKey: "test-openai-key", model: "test-model" }, {
+      responses: {
+        stream: (request: Record<string, unknown>) => {
+          privateOnlyCapture.mainRequest ??= request;
+          if (!privateOnlyNeedsFinal) {
+            privateOnlyNeedsFinal = true;
+            const call = {
+              id: "private-only-public-tool-output",
+              type: "function_call",
+              call_id: "private-only-public-tool-call",
+              name: "research_public_web",
+              arguments: "{}",
+              status: "completed",
+            };
+            return fakeResponseStream(
+              [
+                {
+                  type: "response.output_item.added",
+                  item: call,
+                  output_index: 0,
+                  sequence_number: 1,
+                },
+              ],
+              { output_parsed: null, output: [call] },
+            );
+          }
+          return fakeResponseStream([], {
+            output_parsed: decision({
+              bubbles: [{ text: PRIVATE_ONLY_PUBLIC_RESEARCH_REPLY, delayMs: 0 }],
+            }),
+            output: [],
+          });
+        },
+        parse: (request: Record<string, unknown>) => {
+          privacyBoundarySearchCalls += 1;
+          privateOnlyCapture.publicRequest = request;
+          return {
+            output_parsed: {
+              outcome: "no_result",
+              summary: "The sanitized request did not contain a useful public subject.",
+              urls: [],
+            },
+            output: [
+              {
+                id: "private-boundary-web-search",
+                type: "web_search_call",
+                status: "completed",
+                action: { type: "search", query: "private detail omitted", sources: [] },
+              },
+            ],
+          };
+        },
+      },
+    } as never);
     const nativeObservation: {
       audience: string | null;
       text: string | null;
@@ -1385,7 +1645,21 @@ release("Florence parent journeys", () => {
       imageBytes: null,
       pdfBytes: null,
     };
-    const harness = await createHarness(async (input, reads) => {
+    const harness = await createHarness(async (input, reads, signal, hooks) => {
+      if (
+        input.currentMessage.text === PUBLIC_RESEARCH_REQUEST ||
+        input.currentMessage.text === PUBLIC_NO_RESULT_REQUEST ||
+        input.currentMessage.text === PUBLIC_SHORT_IDENTIFIER_REQUEST ||
+        input.currentMessage.text === PUBLIC_CONCEPT_REQUEST
+      ) {
+        return publicResearchReasoner.decide(input, reads, signal, hooks);
+      }
+      if (input.currentMessage.text === CLARIFICATION_ONLY_REQUEST) {
+        return clarificationReasoner.decide(input, reads, signal, hooks);
+      }
+      if (input.currentMessage.text === PRIVATE_ONLY_PUBLIC_RESEARCH_REQUEST) {
+        return privacyBoundaryReasoner.decide(input, reads, signal, hooks);
+      }
       if (input.currentMessage.text === GOOGLE_MEMORY_REPLY_QUESTION) {
         const retained = input.visibleSources.find(
           (source) => source.kind === "memory" && source.text === UPDATED_PRIVATE_SCHOOL_FACT,
@@ -1778,6 +2052,113 @@ release("Florence parent journeys", () => {
           ${sqlLiteral(`private-event-${harness.partnerAdultId}`)}
         ))
       )`,
+    );
+
+    const publicResearchReactionsBefore = harness.linq.reactions.length;
+    const publicResearchTimelineBefore = harness.state.timeline.length;
+    await harness.accept("group", "public-identifier-research", PUBLIC_RESEARCH_REQUEST, "partner");
+    await harness.drain();
+    expect(publicResearchModelTurns).toBe(2);
+    expect(publicSearchTurns).toBe(1);
+    expect(publicResearchCapture.mainRequest?.tools).toEqual(
+      expect.arrayContaining([expect.objectContaining({ type: "function", name: "research_public_web" })]),
+    );
+    expect(publicResearchCapture.mainRequest?.tools).not.toEqual(
+      expect.arrayContaining([expect.objectContaining({ type: "web_search" })]),
+    );
+    expect(publicResearchCapture.publicRequests[0]?.tools).toEqual(
+      expect.arrayContaining([expect.objectContaining({ type: "web_search" })]),
+    );
+    expect(publicResearchCapture.publicRequests[0]?.include).toEqual(
+      expect.arrayContaining(["web_search_call.action.sources"]),
+    );
+    expect(publicResearchCapture.publicRequests[0]?.tool_choice).toBe("required");
+    const isolatedPublicInput = JSON.stringify(publicResearchCapture.publicRequests[0]?.input);
+    expect(isolatedPublicInput).toContain("DL 747");
+    expect(isolatedPublicInput).not.toMatch(/Alex|Maya|Anbarasu|hari@example\.com|familyProfile|gmail/iu);
+    expect(
+      harness.linq.messages.filter(
+        (message) =>
+          message.providerConversationId === FAMILY_GROUP &&
+          (message.text === PUBLIC_RESEARCH_REPLY || message.text === PUBLIC_RESEARCH_URL),
+      ),
+    ).toHaveLength(2);
+    expect(harness.linq.reactions.slice(publicResearchReactionsBefore)).toEqual([
+      expect.objectContaining({
+        providerConversationId: FAMILY_GROUP,
+        targetProviderMessageId: "message-public-identifier-research",
+        reaction: "like",
+      }),
+    ]);
+    const publicResearchTimeline = harness.state.timeline.slice(publicResearchTimelineBefore);
+    expect(publicResearchTimeline.indexOf("reaction:like:message-public-identifier-research")).toBeLessThan(
+      publicResearchTimeline.indexOf(`message:${PUBLIC_RESEARCH_REPLY}`),
+    );
+    await harness.assertDatabase(
+      "A foreground public lookup created fake background work",
+      `not exists (
+        select 1 from proactive_work work
+        join proactive_work_sources link on link.work_id=work.id
+        where link.source_id=${sqlLiteral(inboundSourceId("event-public-identifier-research"))}::uuid
+      )`,
+    );
+    const publicSearchesBeforeNoResult = publicSearchTurns;
+    const reactionsBeforeNoResult = harness.linq.reactions.length;
+    await harness.accept("group", "public-no-result-research", PUBLIC_NO_RESULT_REQUEST, "partner");
+    await harness.drain();
+    expect(publicSearchTurns).toBe(publicSearchesBeforeNoResult + 1);
+    const isolatedNumericPublicInput = JSON.stringify(publicResearchCapture.publicRequests[1]?.input);
+    expect(isolatedNumericPublicInput).toContain("9780143127796");
+    expect(isolatedNumericPublicInput).toContain("2026-08-27");
+    expect(harness.linq.messages.some((message) => message.text === PUBLIC_NO_RESULT_REPLY)).toBe(true);
+    expect(harness.linq.messages.some((message) => message.text === PUBLIC_NO_RESULT_SOURCE)).toBe(false);
+    expect(harness.linq.reactions.slice(reactionsBeforeNoResult)).toEqual([
+      expect.objectContaining({
+        providerConversationId: FAMILY_GROUP,
+        targetProviderMessageId: "message-public-no-result-research",
+        reaction: "like",
+      }),
+    ]);
+    const searchesBeforeShortIdentifier = publicSearchTurns;
+    await harness.accept("group", "public-short-identifier", PUBLIC_SHORT_IDENTIFIER_REQUEST, "partner");
+    await harness.drain();
+    expect(publicSearchTurns).toBe(searchesBeforeShortIdentifier + 1);
+    expect(JSON.stringify(publicResearchCapture.publicRequests[2]?.input)).toContain(
+      PUBLIC_SHORT_IDENTIFIER_REQUEST,
+    );
+    expect(harness.linq.messages.some((message) => message.text === PUBLIC_SHORT_IDENTIFIER_REPLY)).toBe(
+      true,
+    );
+    expect(harness.linq.messages.some((message) => message.text === PUBLIC_SHORT_IDENTIFIER_URL)).toBe(true);
+    const searchesBeforePublicConcept = publicSearchTurns;
+    await harness.accept("group", "public-concept-search", PUBLIC_CONCEPT_REQUEST, "partner");
+    await harness.drain();
+    expect(publicSearchTurns).toBe(searchesBeforePublicConcept + 1);
+    const isolatedPublicConceptInput = JSON.stringify(publicResearchCapture.publicRequests[3]?.input);
+    expect(isolatedPublicConceptInput).toContain("access token");
+    expect(isolatedPublicConceptInput).toContain("password managers");
+    expect(isolatedPublicConceptInput).toContain("confirmation code format");
+    expect(isolatedPublicConceptInput).toContain(PUBLIC_CONCEPT_URL);
+    expect(harness.linq.messages.some((message) => message.text === PUBLIC_CONCEPT_REPLY)).toBe(true);
+    const reactionsAfterPublicResearch = harness.linq.reactions.length;
+    await harness.accept("group", "clarification-only", CLARIFICATION_ONLY_REQUEST, "partner");
+    await harness.drain();
+    expect(harness.linq.reactions).toHaveLength(reactionsAfterPublicResearch);
+    expect(harness.linq.messages.some((message) => message.text === CLARIFICATION_ONLY_REPLY)).toBe(true);
+
+    await harness.accept("private", "private-only-public-research", PRIVATE_ONLY_PUBLIC_RESEARCH_REQUEST);
+    await harness.drain();
+    expect(privacyBoundarySearchCalls).toBe(1);
+    expect(privateOnlyCapture.mainRequest?.tools).toEqual(
+      expect.arrayContaining([expect.objectContaining({ type: "function", name: "research_public_web" })]),
+    );
+    const privateBoundaryInput = JSON.stringify(privateOnlyCapture.publicRequest?.input);
+    expect(privateBoundaryInput).not.toMatch(
+      /Hari|Anbarasu|hari@example\.com|15555550101|310-555-1212|localhost|secret123|secret456|secret789|user:pass|Users\/Hari|10\.0\.0\.2|127\.0\.0\.1|ABC123/iu,
+    );
+    expect(privateBoundaryInput).toMatch(/private (?:detail|URL) omitted/iu);
+    expect(harness.linq.messages.some((message) => message.text === PRIVATE_ONLY_PUBLIC_RESEARCH_REPLY)).toBe(
+      true,
     );
 
     await harness.accept("private", "ordinary-unused-email", ORDINARY_UNUSED_GMAIL_QUESTION);
@@ -4279,6 +4660,7 @@ class FakeLinq {
 
   async sendReaction(input: LinqSendReaction) {
     this.reactions.push(input);
+    this.state.timeline.push(`reaction:${input.reaction}:${input.targetProviderMessageId}`);
     return {
       status: "committed" as const,
       providerState: "reaction_added" as const,
@@ -5953,6 +6335,17 @@ function createGoogle(store: PostgresFlorenceStore, state: HarnessState): Google
   } as unknown as GoogleConnection;
 }
 
+function fakeResponseStream(events: readonly unknown[], response: unknown) {
+  return {
+    async *[Symbol.asyncIterator]() {
+      for (const event of events) yield event;
+    },
+    async finalResponse() {
+      return response;
+    },
+  };
+}
+
 function decision(
   input: {
     bubbles?: FlorenceDecision["conversation"]["bubbles"];
@@ -5962,6 +6355,7 @@ function decision(
     calendar?: FlorenceDecision["calendar"];
     householdUpdate?: FlorenceDecision["householdUpdate"];
     webAccessPath?: FlorenceDecision["webAccessPath"];
+    researchUrls?: FlorenceDecision["researchUrls"];
   } = {},
 ): FlorenceDecision {
   return {
@@ -5977,6 +6371,7 @@ function decision(
     calendar: input.calendar ?? null,
     householdUpdate: input.householdUpdate ?? null,
     webAccessPath: input.webAccessPath ?? null,
+    researchUrls: input.researchUrls ?? null,
   };
 }
 

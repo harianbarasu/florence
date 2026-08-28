@@ -448,8 +448,6 @@ export class KiwiFlightSearchClient implements FlorenceFlightsClient {
   }
 }
 
-export const defaultFlorenceFlightsClient: FlorenceFlightsClient = new KiwiFlightSearchClient();
-
 function toKiwiArguments(request: ParsedFlightRequest): Record<string, unknown> {
   const arguments_: Record<string, unknown> = {
     flyFrom: request.origin,

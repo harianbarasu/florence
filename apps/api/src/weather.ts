@@ -828,5 +828,3 @@ function abortableSleep(milliseconds: number, signal: AbortSignal): Promise<void
     signal.addEventListener("abort", onAbort, { once: true });
   });
 }
-
-export const defaultFlorenceWeatherClient: FlorenceWeatherClient = new NwsWeatherClient();

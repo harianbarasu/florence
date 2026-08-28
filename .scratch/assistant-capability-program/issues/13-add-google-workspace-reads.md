@@ -1,7 +1,7 @@
 Label: wayfinder:task
 Type: task
 Status: open
-Blocked by: 01, 02, 04
+Blocked by: 01, 04
 
 # Add the useful Google Workspace surface
 

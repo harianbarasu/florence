@@ -1438,12 +1438,6 @@ export class Florence {
         controller.signal.throwIfAborted();
         const decision = await this.#reasoner.decide(context.input, context.reads, controller.signal, {
           onWorkStarted: startWork,
-          protectedPublicSearchValues: [
-            ...turn.household.members.flatMap((member) =>
-              member.messagesAddress ? [member.messagesAddress] : [],
-            ),
-            ...(this.#linqSenderPhoneNumber ? [this.#linqSenderPhoneNumber] : []),
-          ],
         });
         if (workTimer) clearTimeout(workTimer);
         workTimer = null;

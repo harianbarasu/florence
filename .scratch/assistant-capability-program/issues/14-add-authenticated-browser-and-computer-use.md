@@ -1,7 +1,7 @@
 Label: wayfinder:task
 Type: task
 Status: open
-Blocked by: 02, 04, 06, 10
+Blocked by: 04, 06, 10
 
 # Give Florence authenticated browser and computer use
 

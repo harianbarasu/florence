@@ -7,15 +7,15 @@ Blocked by: 04
 
 ## Question
 
-How can Florence follow a parent-supplied or search-result link, read the useful content from a public page or PDF, and bring the answer back into the conversation instead of stopping at search snippets?
+How can Florence choose or follow an exact relevant link, read the useful content from a public page or PDF, and bring the answer back into the conversation instead of stopping at search snippets?
 
 Directly port and adapt Hermes's `tools/url_safety.py`, `tools/web_result_cache.py`, bounded-output helpers in `tools/web_tools.py`, and the closest integration cases. Keep URL validation, redirects, timeouts, and byte bounds inside this concrete reader; do not create a reusable safety subsystem.
 
 ## Answer
 
-Florence can now read the actual clean text of a public HTML page, plain-text page, Markdown page, or PDF that a parent put in the conversation or that public research returned. The same concrete tool is available in an ordinary turn and at a persisted durable-work checkpoint, so Florence can follow a result, inspect the source, and answer from the page instead of stopping at a search snippet or promising to look later.
+Florence can now read the actual clean text of a public HTML page, plain-text page, Markdown page, or PDF relevant to the task. The same concrete tool is available in an ordinary turn and at a persisted durable-work checkpoint, so Florence can follow a supplied link, choose and inspect a useful source itself, and answer from the page instead of stopping at search snippets or promising to look later.
 
-The reader is one adapter on Florence's existing tool lifecycle. It fetches and extracts locally, follows bounded redirects, returns a deterministic 15,000-character head/tail view, and keeps a small successful-result memory cache. It does not add a provider framework, browser runtime, queue, database state, policy registry, generalized safety layer, or another research abstraction. The reasoner admits only links already supplied by the parent or returned by research; a model-invented URL is rejected rather than fetched.
+The reader is one adapter on Florence's existing tool lifecycle. It fetches and extracts locally, follows bounded redirects, returns a deterministic 15,000-character head/tail view, and keeps a small successful-result memory cache. It does not add a provider framework, browser runtime, queue, database state, policy registry, generalized safety layer, or another research abstraction. Florence may read any exact public HTTP(S) page relevant to the task; the reader itself handles network and content validation.
 
 ### Upstream reuse
 
@@ -30,4 +30,4 @@ The reader is one adapter on Florence's existing tool lifecycle. It fetches and 
 - `pnpm check` passes: lint, every workspace typecheck, 38 tests with 4 existing database-gated tests skipped, and all builds.
 - `pnpm --filter @florence/api exec vitest run src/public-page.test.ts src/reasoner-tool-loops.test.ts` passes 19 focused tests.
 - A live probe reads `https://example.com` as clean HTML and W3C's public `dummy.pdf` as local PDF text.
-- Focused coverage proves parent-supplied page reads, verified search-result follow-through, durable PDF work across checkpoints, successful cache behavior, redirect revalidation, unsupported/oversized response failures, and rejection of a model-invented URL.
+- Focused coverage proves parent-supplied and task-selected page reads, search-result follow-through, durable PDF work across checkpoints, successful cache behavior, redirect revalidation, and unsupported or oversized response failures.

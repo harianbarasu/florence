@@ -18,19 +18,9 @@ export type JsonValue = JsonPrimitive | readonly JsonValue[] | { readonly [key: 
 
 export type CapabilityExecutionMode = "parallel" | "sequential";
 export type CapabilityCompletion = "complete" | "truncated";
-export type CapabilityTerminalOutcome =
-  | "succeeded"
-  | "failed"
-  | "cancelled"
-  | "unknown"
-  | "protocol_rejected";
+export type CapabilityTerminalOutcome = "succeeded" | "failed" | "cancelled" | "protocol_rejected";
 
-export type CapabilityAdapterErrorCode =
-  | "unavailable"
-  | "invalid_response"
-  | "transient"
-  | "permanent"
-  | "unknown";
+export type CapabilityAdapterErrorCode = "unavailable" | "invalid_response" | "transient" | "permanent";
 
 export class CapabilityAdapterError extends Error {
   readonly code: CapabilityAdapterErrorCode;

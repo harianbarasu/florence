@@ -8,7 +8,7 @@
     "dev": "tsx watch src/server.ts",
     "reset:production": "node dist/reset-production.js",
     "start": "node dist/start.js",
-    "test": "vitest run src/florence.integration.test.ts",
+    "test": "vitest run src",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {

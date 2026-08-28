@@ -33,6 +33,7 @@ Standing product constraints:
 - [Make broad assistant work the product contract](issues/01-make-broad-assistant-work-the-product-contract.md) — `PLAN.md` and `AGENTS.md` now require direct Pi/Hermes reuse and authorize the complete assistant breadth under owner-scoped privacy, one durable work seam, exact consequential-action settlement, and staged real-world proof.
 - [Freeze source egress and authority](issues/02-freeze-source-egress-and-authority.md) — One policy-complete matrix now binds every admitted source and capability to conjunctive grants, positive egress, result audience, retention/deletion, consequence and all required owners, disconnect behavior, subtype-correct delivery settlement, and live authority rechecks.
 - [Choose one Florence capability interface](issues/03-choose-one-florence-capability-interface.md) — One store-ref `respond` façade now hides the authorized catalog, Pi lifecycle, Hermes registry/dispatch, evidence, policy, and commit while preserving application-owned live delivery and provider-effect settlement.
+- [Port the Pi tool lifecycle into Florence](issues/04-port-the-pi-tool-lifecycle.md) — Every current model tool path now shares one Pi/Hermes-derived, live-admitted, bounded and cancellable lifecycle whose source-bearing terminal result feeds Florence's existing transactional commit and Linq delivery core.
 
 ## Fog
 

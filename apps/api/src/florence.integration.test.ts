@@ -1674,7 +1674,6 @@ release("Florence parent journeys", () => {
         const connection = input.googleConnections.find((candidate) => candidate.kind === "personal");
         if (!connection) throw new Error("The private Gmail connection is missing");
         const [source] = await reads.searchGmail({
-          connectionId: connection.connectionId,
           query: GOOGLE_CITED_REPLY_QUERY,
           limit: 10,
         });
@@ -1688,7 +1687,6 @@ release("Florence parent journeys", () => {
         const connection = input.googleConnections.find((candidate) => candidate.kind === "personal");
         if (!connection) throw new Error("The private Gmail connection is missing");
         const [source] = await reads.searchGmail({
-          connectionId: connection.connectionId,
           query: ORDINARY_UNUSED_GMAIL_QUERY,
           limit: 10,
         });
@@ -6399,7 +6397,6 @@ async function calendarTarget(
   const connection = input.googleConnections.find((candidate) => candidate.kind === "family");
   if (!connection) throw new Error("Family Calendar connection is missing");
   const result = await reads.readCalendarWindow({
-    connectionId: connection.connectionId,
     timeMin: "2026-08-18T21:30:00.000Z",
     timeMax: "2026-08-18T22:30:00.000Z",
     limit: 50,

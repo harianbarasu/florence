@@ -5,6 +5,31 @@ export type JsonValue = postgres.JSONValue;
 export type JsonObject = Readonly<Record<string, JsonValue>>;
 export type Visibility = "private" | "household";
 export type Audience = "private" | "group";
+declare const inboundTurnRefBrand: unique symbol;
+declare const enrolledTurnRefBrand: unique symbol;
+
+/**
+ * Opaque locator for one due inbound row. The store is the only producer; possession grants no
+ * household or provider authority and every consumer must reload live state.
+ */
+export type InboundTurnRef = Readonly<{
+  sourceId: string;
+  [inboundTurnRefBrand]: true;
+}>;
+
+/** Opaque locator for an inbound the application has classified as an enrolled-parent turn. */
+export type EnrolledTurnRef = Readonly<{
+  sourceId: string;
+  [enrolledTurnRefBrand]: true;
+}>;
+
+function inboundTurnRef(sourceId: string): InboundTurnRef {
+  return Object.freeze({ sourceId }) as InboundTurnRef;
+}
+
+function enrolledTurnRef(sourceId: string): EnrolledTurnRef {
+  return Object.freeze({ sourceId }) as EnrolledTurnRef;
+}
 export type ImageReference = {
   assetId: string;
   mimeType: "image/jpeg" | "image/png" | "image/webp" | "image/heic";
@@ -967,6 +992,8 @@ export type CommitTurnInput = {
   sourceId: string;
   googleEvidence?: readonly GoogleEvidenceDraft[];
   googleConnectionIdsUsed?: readonly string[];
+  sourceIdsUsed?: readonly string[];
+  factVersionsUsed?: readonly Readonly<{ factId: string; updatedAt: string }>[];
   facts?: readonly FactDraft[];
   deleteFactIds?: readonly string[];
   finiteMonitors?: readonly FiniteMonitorDraft[];
@@ -4993,6 +5020,7 @@ export class PostgresFlorenceStore {
     audience: Audience;
     participantIdentityDigests: readonly string[];
     occurredAt: string;
+    inboundSourceId?: string;
   }): Promise<FamilyGroupObservationResult | null> {
     const providerConversationId = required(
       input.providerConversationId,
@@ -5007,13 +5035,24 @@ export class PostgresFlorenceStore {
       throw new FlorenceStoreConflict("Observed family group membership is invalid");
     }
     const occurredAt = instant(input.occurredAt);
+    if (input.inboundSourceId) assertUuid(input.inboundSourceId, "Observed inbound source ID");
     return this.#sql.begin(async (sql) => {
       const [channel] = await sql<ChannelRow[]>`
         select * from linq_channels where provider_conversation_id=${providerConversationId}
           and audience='group' order by bound_at desc,id desc limit 1 for update
       `;
       if (!channel) return null;
-      if (channel.revoked_at !== null) return "retired";
+      if (channel.revoked_at !== null) {
+        await settleObservedChannelInbounds(sql, {
+          channelId: channel.id,
+          expectedSourceId: input.inboundSourceId ?? null,
+          handledAt: occurredAt,
+          inboundError: "The family thread participants changed before Florence could answer",
+          outboundError: "The family thread participants changed before delivery",
+          effectError: "The family thread participants changed before provider execution",
+        });
+        return "retired";
+      }
       if (input.audience === "group" && sameStrings(channelIdentityDigests(channel), observed)) {
         return "current";
       }
@@ -5059,6 +5098,14 @@ export class PostgresFlorenceStore {
           occurredAt,
         });
       }
+      await settleObservedChannelInbounds(sql, {
+        channelId: channel.id,
+        expectedSourceId: input.inboundSourceId ?? null,
+        handledAt: occurredAt,
+        inboundError: "The family thread participants changed before Florence could answer",
+        outboundError: "The family thread participants changed before delivery",
+        effectError: "The family thread participants changed before provider execution",
+      });
       return "mismatch";
     });
   }
@@ -5664,6 +5711,7 @@ export class PostgresFlorenceStore {
         select m.source_id,s.household_id,m.channel_id,s.visibility,s.owner_adult_id,s.metadata
         from messages m join sources s on s.id=m.source_id join linq_channels c on c.id=m.channel_id
         where m.source_id=${input.sourceId} and m.direction='inbound' and m.status='received'
+          and coalesce(m.retry_at,m.not_before)<=${occurredAt}
           and c.revoked_at is null and c.stopped_at is null
         for update of m
       `;
@@ -5703,12 +5751,37 @@ export class PostgresFlorenceStore {
     });
   }
 
-  async readNextInbound(now: string = new Date().toISOString()): Promise<InboundTurn | null> {
+  async readNextInbound(now: string = new Date().toISOString()): Promise<InboundTurnRef | null> {
     const current = instant(now);
     await this.#sql`
       update documents set content_envelope=null
       where retained=false and discard_after<=${current} and content_envelope is not null
     `;
+    const [row] = await this.#sql<{ source_id: string }[]>`
+      select m.source_id
+      from messages m join sources s on s.id=m.source_id
+      join linq_channels c on c.id=m.channel_id
+      where m.direction='inbound' and m.status='received'
+        and coalesce(m.retry_at,m.not_before)<=${current}
+        and c.revoked_at is null and c.stopped_at is null
+      order by coalesce(m.retry_at,m.not_before),s.occurred_at,m.source_id limit 1
+    `;
+    return row ? inboundTurnRef(row.source_id) : null;
+  }
+
+  /**
+   * Promote only a store-produced locator after setup versus enrolled classification. The result
+   * remains a locator, never a grant; reads and commits independently recheck live state.
+   */
+  enrolledTurn(ref: InboundTurnRef): EnrolledTurnRef {
+    return enrolledTurnRef(ref.sourceId);
+  }
+
+  async readInboundTurn(
+    ref: InboundTurnRef | EnrolledTurnRef,
+    now: string = new Date().toISOString(),
+  ): Promise<InboundTurn | null> {
+    const current = instant(now);
     const [row] = await this.#sql<
       {
         source_id: string;
@@ -5728,10 +5801,9 @@ export class PostgresFlorenceStore {
              m.reply_to_source_id,s.metadata,s.occurred_at
       from messages m join sources s on s.id=m.source_id
       join linq_channels c on c.id=m.channel_id
-      where m.direction='inbound' and m.status='received'
+      where m.source_id=${ref.sourceId} and m.direction='inbound' and m.status='received'
         and coalesce(m.retry_at,m.not_before)<=${current}
         and c.revoked_at is null and c.stopped_at is null
-      order by coalesce(m.retry_at,m.not_before),s.occurred_at,m.source_id limit 1
     `;
     if (!row) return null;
     const [channel] = await this.#sql<ChannelRow[]>`select * from linq_channels where id=${row.channel_id}`;
@@ -6192,7 +6264,9 @@ export class PostgresFlorenceStore {
           c.provider_conversation_id,c.adult_one_id,c.identity_one_digest,c.adult_two_id,
           c.identity_two_digest,c.authority_digest,c.bound_at,s.metadata as source_metadata
         from messages m join sources s on s.id=m.source_id join linq_channels c on c.id=m.channel_id
-        where m.source_id=${input.sourceId} and m.direction='inbound' for update of m,s
+        where m.source_id=${input.sourceId} and m.direction='inbound'
+          and coalesce(m.retry_at,m.not_before)<=${handledAt}
+        for update of m,s
       `;
       if (!turn) throw new FlorenceStoreConflict("The inbound message is no longer awaiting a turn");
       if (turn.revoked_at || turn.stopped_at) {
@@ -6234,7 +6308,7 @@ export class PostgresFlorenceStore {
         ) {
           throw new FlorenceStoreConflict("Stopping Messages cannot commit any other turn mutations");
         }
-        await stopMessagesChannel(sql, turn.channel_id, handledAt);
+        await stopMessagesChannel(sql, turn.channel_id, handledAt, turn.source_id);
         const handled = await sql`
           update messages set status='handled',handled_at=${handledAt},retry_at=null,last_error=null
           where source_id=${turn.source_id} and direction='inbound' and status='received'
@@ -6385,6 +6459,47 @@ export class PostgresFlorenceStore {
         ...googleConnectionIdsUsed,
         ...googleFactConnections.map((connection) => connection.id),
       ]).sort();
+      const sourceIdsUsed = unique(input.sourceIdsUsed ?? []).sort();
+      // Mirrors the bounded model-visible turn surface (memory, recent messages, pending work,
+      // offers, and current documents) plus bounded successful tool results.
+      if (sourceIdsUsed.length > 400) {
+        throw new FlorenceStoreConflict("A conversation turn used too many source supports");
+      }
+      for (const sourceId of sourceIdsUsed) assertUuid(sourceId, "Used source ID");
+      const factVersionsUsed = (input.factVersionsUsed ?? []).map((support) => ({
+        factId: support.factId,
+        updatedAt: instant(support.updatedAt).toISOString(),
+      }));
+      if (
+        factVersionsUsed.length > 400 ||
+        new Set(factVersionsUsed.map((support) => support.factId)).size !== factVersionsUsed.length
+      ) {
+        throw new FlorenceStoreConflict("A conversation turn used invalid fact supports");
+      }
+      for (const support of factVersionsUsed) assertUuid(support.factId, "Used fact ID");
+      if (factVersionsUsed.length > 0) {
+        const visibleFacts = await sql<{ id: string; updated_at: Date }[]>`
+          select id,updated_at from facts where household_id=${turn.household_id}
+            and id in ${sql(factVersionsUsed.map((support) => support.factId))}
+            and (
+              (${turn.audience}='group' and visibility='household')
+              or (${turn.audience}='private' and (
+                visibility='household'
+                or (visibility='private' and owner_adult_id=${turn.sender_adult_id})
+              ))
+            ) for share
+        `;
+        const versions = new Map(visibleFacts.map((fact) => [fact.id, fact.updated_at.toISOString()]));
+        if (
+          visibleFacts.length !== factVersionsUsed.length ||
+          factVersionsUsed.some((support) => versions.get(support.factId) !== support.updatedAt)
+        ) {
+          throw new FlorenceStoreConflict("A fact changed before the conversation turn could commit");
+        }
+      }
+      const committedFactVersions = new Map(
+        factVersionsUsed.map((support) => [support.factId, support.updatedAt]),
+      );
       if (
         turn.audience === "group" &&
         calendarMutations &&
@@ -6403,8 +6518,18 @@ export class PostgresFlorenceStore {
           ...(input.facts ?? []).flatMap((fact) => [...fact.sourceIds]),
           ...(input.finiteMonitors ?? []).flatMap((monitor) => [...monitor.sourceIds]),
           ...(input.finiteMonitorUpdates ?? []).flatMap((monitor) => [...monitor.sourceIds]),
+          ...sourceIdsUsed,
         ]),
       });
+      if (sourceIdsUsed.length > 0) {
+        await assertSourcesVisible(
+          sql,
+          turn.household_id,
+          turn.audience,
+          turn.sender_adult_id,
+          sourceIdsUsed,
+        );
+      }
 
       if (input.partnerInvitationApproval) {
         assertUuid(input.partnerInvitationApproval.adultId, "Partner invitation adult ID");
@@ -6516,6 +6641,7 @@ export class PostgresFlorenceStore {
         for (const sourceId of unique(fact.sourceIds)) {
           await sql`insert into fact_sources (fact_id,source_id) values (${factId},${sourceId})`;
         }
+        committedFactVersions.set(factId, handledAt.toISOString());
       }
       for (const factId of unique(input.deleteFactIds ?? [])) {
         assertUuid(factId, "Forgotten fact ID");
@@ -6531,6 +6657,7 @@ export class PostgresFlorenceStore {
             "A turn tried to forget a fact outside its conversation audience",
           );
         }
+        committedFactVersions.delete(factId);
       }
 
       for (const monitor of input.finiteMonitors ?? []) {
@@ -6652,6 +6779,17 @@ export class PostgresFlorenceStore {
         });
       }
 
+      const factVersionDependencies = [...committedFactVersions]
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([factId, updatedAt]) => ({ factId, updatedAt }));
+      const outboundDependencyMetadata: JsonObject = {
+        ...(googleDependencyConnectionIds.length > 0
+          ? { googleConnectionIds: [...googleDependencyConnectionIds] }
+          : {}),
+        ...(sourceIdsUsed.length > 0 ? { sourceIdsUsed } : {}),
+        ...(factVersionDependencies.length > 0 ? { factVersionsUsed: factVersionDependencies } : {}),
+      };
+
       for (const outbound of input.outbound ?? []) {
         if (outbound.replyToSourceId) {
           await assertSourcesVisible(sql, turn.household_id, turn.audience, turn.sender_adult_id, [
@@ -6665,8 +6803,8 @@ export class PostgresFlorenceStore {
           parentSourceId: turn.source_id,
           visibility: turn.visibility,
           ownerAdultId: turn.visibility === "private" ? turn.sender_adult_id : null,
-          ...(googleDependencyConnectionIds.length > 0
-            ? { metadata: { googleConnectionIds: [...googleDependencyConnectionIds] } }
+          ...(Object.keys(outboundDependencyMetadata).length > 0
+            ? { metadata: outboundDependencyMetadata }
             : {}),
           occurredAt: handledAt,
         });
@@ -6840,6 +6978,76 @@ export class PostgresFlorenceStore {
     if (updated.length !== 1) throw new FlorenceStoreConflict("The inbound message is no longer retryable");
   }
 
+  async settleInboundAuthorityLoss(input: {
+    sourceId: string;
+    handledAt: string;
+    error: string;
+    observedAuthority?: {
+      audience: Audience;
+      participantIdentityDigests: readonly string[];
+    };
+  }): Promise<"committed" | "authority_lost" | "superseded" | "retry_scheduled" | null> {
+    const handledAt = instant(input.handledAt);
+    const observedIdentityDigests = input.observedAuthority
+      ? sortedDigests(input.observedAuthority.participantIdentityDigests)
+      : null;
+    if (
+      observedIdentityDigests &&
+      (observedIdentityDigests.length > 31 ||
+        new Set(observedIdentityDigests).size !== observedIdentityDigests.length)
+    ) {
+      throw new FlorenceStoreConflict("Observed Messages authority is invalid");
+    }
+    return this.#sql.begin(async (sql) => {
+      const [turn] = await sql<
+        {
+          channel_id: string;
+          status: "received" | "handled";
+          retry_at: Date | null;
+          not_before: Date;
+          last_error: string | null;
+        }[]
+      >`
+        select message.channel_id,message.status,message.retry_at,message.not_before,message.last_error
+        from messages message
+        where message.source_id=${input.sourceId} and message.direction='inbound'
+        for update of message
+      `;
+      if (!turn) throw new FlorenceStoreConflict("The inbound message no longer exists");
+      if (turn.status === "handled") {
+        if (turn.last_error?.startsWith("Superseded by")) return "superseded";
+        return turn.last_error ? "authority_lost" : "committed";
+      }
+      if ((turn.retry_at ?? turn.not_before) > handledAt) return "retry_scheduled";
+      const [channel] = await sql<ChannelRow[]>`
+        select * from linq_channels where id=${turn.channel_id} for update
+      `;
+      if (!channel) throw new FlorenceStoreConflict("The inbound Messages channel no longer exists");
+      const observedMismatch =
+        input.observedAuthority !== undefined &&
+        (input.observedAuthority.audience !== channel.audience ||
+          !sameStrings(channelIdentityDigests(channel), observedIdentityDigests ?? []));
+      if (channel.revoked_at === null && channel.stopped_at === null && !observedMismatch) {
+        return null;
+      }
+      if (observedMismatch && channel.revoked_at === null) {
+        await sql`
+          update linq_channels set revoked_at=${handledAt},stopped_at=coalesce(stopped_at,${handledAt})
+          where id=${channel.id} and revoked_at is null
+        `;
+      }
+      await settleObservedChannelInbounds(sql, {
+        channelId: channel.id,
+        expectedSourceId: input.sourceId,
+        handledAt,
+        inboundError: input.error,
+        outboundError: "Messages authority was lost before delivery",
+        effectError: "Messages authority was lost before provider execution",
+      });
+      return "authority_lost";
+    });
+  }
+
   async readNextOutbound(now: string = new Date().toISOString()): Promise<OutboundMessage | null> {
     const current = instant(now);
     const stale = new Date(current.getTime() - 2 * 60_000);
@@ -6954,15 +7162,94 @@ export class PostgresFlorenceStore {
   async outboundSendIsCurrent(sourceId: string): Promise<boolean> {
     assertUuid(sourceId, "Outbound source ID");
     const rows = await this.#sql`
-      select 1 from messages outbound
+      select 1 from messages outbound join sources outbound_source on outbound_source.id=outbound.source_id
+      join linq_channels current_channel on current_channel.id=outbound.channel_id
       where outbound.source_id=${sourceId} and outbound.direction='outbound'
         and outbound.status='sending'
+        and current_channel.revoked_at is null and current_channel.stopped_at is null
+        and not exists (
+          select 1
+          from jsonb_array_elements_text(
+            case when jsonb_typeof(outbound_source.metadata->'privateConflictOwnerAdultIds')='array'
+              then outbound_source.metadata->'privateConflictOwnerAdultIds' else '[]'::jsonb end
+          ) conflict_owner(adult_id)
+          where not exists (
+            select 1 from people person where person.household_id=outbound_source.household_id
+              and person.id=conflict_owner.adult_id::uuid and person.kind='adult'
+              and person.status='verified'
+              and person.preferences->'privateConflictBusySharingEnabled'='true'::jsonb
+          )
+        )
         and (
           outbound.idempotency_key not like 'cue:%'
           or exists (
             select 1 from messages inbound
             where inbound.source_id=outbound.reply_to_source_id
               and inbound.direction='inbound' and inbound.status='received'
+          )
+        )
+        and not exists (
+          select 1
+          from jsonb_to_recordset(
+            case when jsonb_typeof(outbound_source.metadata->'factVersionsUsed')='array'
+              then outbound_source.metadata->'factVersionsUsed' else '[]'::jsonb end
+          ) as support("factId" text,"updatedAt" text)
+          where not exists (
+            select 1 from facts retained_fact
+            where retained_fact.id=support."factId"::uuid
+              and retained_fact.household_id=outbound_source.household_id
+              and retained_fact.updated_at=support."updatedAt"::timestamptz
+              and (
+                (outbound_source.visibility='household' and retained_fact.visibility='household')
+                or (outbound_source.visibility='private' and (
+                  retained_fact.visibility='household'
+                  or (retained_fact.visibility='private'
+                    and retained_fact.owner_adult_id=outbound_source.owner_adult_id)
+                ))
+              )
+          )
+        )
+        and not exists (
+          select 1
+          from jsonb_array_elements_text(
+            case when jsonb_typeof(outbound_source.metadata->'sourceIdsUsed')='array'
+              then outbound_source.metadata->'sourceIdsUsed' else '[]'::jsonb end
+          ) support(source_id)
+          where not exists (
+            select 1 from sources retained
+            where retained.id=support.source_id::uuid
+              and retained.household_id=outbound_source.household_id
+              and (
+                (outbound_source.visibility='household' and retained.visibility='household')
+                or (outbound_source.visibility='private' and (
+                  retained.visibility='household'
+                  or (retained.visibility='private'
+                    and retained.owner_adult_id=outbound_source.owner_adult_id)
+                ))
+              )
+          )
+        )
+        and not exists (
+          select 1
+          from jsonb_array_elements_text(
+            case when jsonb_typeof(outbound_source.metadata->'googleConnectionIds')='array'
+              then outbound_source.metadata->'googleConnectionIds' else '[]'::jsonb end
+          ) dependency(connection_id)
+          where not exists (
+            select 1 from google_connections connection join households household
+              on household.id=connection.household_id
+            where connection.id=dependency.connection_id::uuid
+              and connection.household_id=outbound_source.household_id
+              and connection.status='active'
+              and (
+                (outbound_source.visibility='private'
+                  and connection.owner_adult_id=outbound_source.owner_adult_id)
+                or (outbound_source.visibility='household'
+                  and connection.id in (
+                    household.family_calendar_owner_connection_id,
+                    household.family_calendar_partner_connection_id
+                  ))
+              )
           )
         )
     `;
@@ -12865,10 +13152,57 @@ function supersessionMetadataId(metadata: JsonValue, key: string): string | null
   return value;
 }
 
+async function settleObservedChannelInbounds(
+  sql: postgres.TransactionSql,
+  input: {
+    channelId: string;
+    expectedSourceId: string | null;
+    handledAt: Date;
+    inboundError: string;
+    outboundError: string;
+    effectError: string;
+    preserveInboundSourceId?: string | null;
+  },
+): Promise<void> {
+  if (input.expectedSourceId) {
+    const [expected] = await sql<{ source_id: string }[]>`
+      select source_id from messages where source_id=${input.expectedSourceId}
+        and channel_id=${input.channelId}
+        and direction='inbound' for update
+    `;
+    if (!expected) {
+      throw new FlorenceStoreConflict("Observed family-group inbound does not belong to that thread");
+    }
+  }
+  await sql`
+    update messages set status='failed',sending_at=null,retry_at=null,
+      last_error=${bounded(input.outboundError, 2_000)}
+    where channel_id=${input.channelId} and direction='outbound' and status in ('pending','sending')
+  `;
+  await sql`
+    update calendar_actions set status='failed',retry_at=null,
+      last_error=${bounded(input.effectError, 2_000)}
+    where status='pending' and approval_source_id in (
+      select source_id from messages where channel_id=${input.channelId}
+        and direction='inbound' and status='received'
+        and (${input.preserveInboundSourceId ?? null}::uuid is null
+          or source_id<>${input.preserveInboundSourceId ?? null})
+    )
+  `;
+  await sql`
+    update messages set status='handled',handled_at=${input.handledAt},retry_at=null,
+      last_error=${bounded(input.inboundError, 2_000)}
+    where channel_id=${input.channelId} and direction='inbound' and status='received'
+      and (${input.preserveInboundSourceId ?? null}::uuid is null
+        or source_id<>${input.preserveInboundSourceId ?? null})
+  `;
+}
+
 async function stopMessagesChannel(
   sql: postgres.TransactionSql,
   channelId: string,
   stoppedAt: Date,
+  committingSourceId: string | null = null,
 ): Promise<void> {
   const stopped = await sql`
     update linq_channels set stopped_at=coalesce(stopped_at,${stoppedAt})
@@ -12877,11 +13211,15 @@ async function stopMessagesChannel(
   if (stopped.length !== 1) {
     throw new FlorenceStoreConflict("The Messages channel is no longer active");
   }
-  await sql`
-    update messages set status='failed',sending_at=null,retry_at=null,
-      last_error='Messages were stopped by this adult'
-    where channel_id=${channelId} and direction='outbound' and status='pending'
-  `;
+  await settleObservedChannelInbounds(sql, {
+    channelId,
+    expectedSourceId: committingSourceId,
+    preserveInboundSourceId: committingSourceId,
+    handledAt: stoppedAt,
+    inboundError: "Messages were stopped by this adult",
+    outboundError: "Messages were stopped by this adult",
+    effectError: "Messages were stopped before provider execution",
+  });
   await sql`
     update people partner set invitation_approval_source_id=null,invitation_approved_at=null,
       invitation_retry_at=null,invitation_last_error=null,updated_at=${stoppedAt}

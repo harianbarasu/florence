@@ -36,6 +36,7 @@ import type {
   CommitTurnInput,
   CompleteFounderOnboardingInput,
   DueProactiveWork,
+  EnrolledTurnRef,
   FactDraft,
   FactRecord,
   FamilyCalendarReviewProposal,
@@ -47,6 +48,7 @@ import type {
   HouseholdRecord,
   InboundPreparationContext,
   InboundTurn,
+  InboundTurnRef,
   InitialGoogleScanFact,
   InitialGoogleScanFinding,
   InitialIntelligenceWork,
@@ -65,6 +67,7 @@ import {
   calendarEvidenceSourceId,
   draftCalendarEvidence,
   draftGmailEvidence,
+  FlorenceStoreConflict,
   gmailEvidenceSourceId,
   INITIAL_GOOGLE_SCAN_DEFERRED_REASON,
   initialPrivateGoogleScanDigest,
@@ -92,6 +95,11 @@ import {
   type LinqReaction,
   type LinqReactionProposal,
 } from "@florence/linq";
+import {
+  createFlorenceCapabilities,
+  type FlorenceCapabilities,
+  type RespondReceipt,
+} from "./capabilities.js";
 import type { EnrollmentCodes, WebAccessPath } from "./enrollment.js";
 import {
   type FlorenceBoundedPrivateGoogleEvidence,
@@ -136,6 +144,7 @@ export class Florence {
   readonly #linq: LinqClient;
   readonly #google: GoogleConnection | null;
   readonly #reasoner: FlorenceReasoner | null;
+  readonly #capabilities: FlorenceCapabilities;
   readonly #enrollmentCodes: EnrollmentCodes;
   readonly #imageVault: EncryptedImageVault | null;
   readonly #messagesUrl: string | null;
@@ -171,6 +180,9 @@ export class Florence {
     this.#linqSenderPhoneNumber = nullableText(input.linqSenderPhoneNumber ?? null);
     this.#setupOrigin = input.setupOrigin ? normalizedOrigin(input.setupOrigin) : null;
     this.#now = input.now ?? (() => new Date());
+    this.#capabilities = createFlorenceCapabilities(async (turn: EnrolledTurnRef, signal: AbortSignal) => {
+      return this.#respondEnrolled(turn, signal);
+    });
   }
 
   async workspaceForAdult(adultId: string): Promise<WorkspaceView> {
@@ -959,6 +971,7 @@ export class Florence {
     audience: "private" | "group";
     participantIdentityDigests: readonly string[];
     occurredAt: string;
+    inboundSourceId?: string;
   }) {
     const result = await this.#store.reconcileObservedFamilyGroup(input);
     if (result === "mismatch") this.#wake();
@@ -1105,6 +1118,7 @@ export class Florence {
     this.#started = false;
     if (this.#timer) clearTimeout(this.#timer);
     this.#timer = null;
+    this.#activeInbound?.controller.abort(new Error("Florence is shutting down"));
   }
 
   async #runCycle(): Promise<boolean> {
@@ -1188,10 +1202,34 @@ export class Florence {
     }
   }
 
-  async #handleInbound(turn: InboundTurn): Promise<void> {
+  async #handleInbound(ref: InboundTurnRef): Promise<void> {
+    const turn = await this.#store.readInboundTurn(ref, this.#now().toISOString());
+    if (!turn) return;
     const observed = await this.#linq.observeChat(turn.authority.providerConversationId);
-    if (!sameAuthority(observed, turn.authority)) {
-      await this.#store.commitTurn({ sourceId: turn.message.sourceId, handledAt: this.#now().toISOString() });
+    const groupObservation = await this.reconcileObservedFamilyGroup({
+      providerConversationId: turn.authority.providerConversationId,
+      audience: observed.audience,
+      participantIdentityDigests: observed.participantIdentityDigests,
+      occurredAt: this.#now().toISOString(),
+      inboundSourceId: turn.message.sourceId,
+    });
+    if (
+      groupObservation === "mismatch" ||
+      groupObservation === "retired" ||
+      !sameAuthority(observed, turn.authority)
+    ) {
+      const disposition = await this.#store.settleInboundAuthorityLoss({
+        sourceId: turn.message.sourceId,
+        handledAt: this.#now().toISOString(),
+        error: "Messages authority changed before Florence could answer",
+        observedAuthority: {
+          audience: observed.audience,
+          participantIdentityDigests: observed.participantIdentityDigests,
+        },
+      });
+      if (!disposition) {
+        throw new Error("Observed Messages authority changed without a durable authority transition");
+      }
       return;
     }
     const sender = turn.household.members.find(
@@ -1203,10 +1241,11 @@ export class Florence {
     const onboardingComplete = Boolean(sender && profileString(sender.profile, "onboardingCompletedAt"));
     if (turn.authority.audience === "private" && (!googleActive || !onboardingComplete)) {
       if (turn.message.moveKind === "reaction") {
-        await this.#store.commitTurn({
+        const result = await this.#store.commitTurn({
           sourceId: turn.message.sourceId,
           handledAt: this.#now().toISOString(),
         });
+        respondReceipt(turn.message.sourceId, result);
         return;
       }
       const stage = googleActive ? "family_profile" : "connect_google";
@@ -1237,16 +1276,17 @@ export class Florence {
         }
       }
       if (stopMessaging) {
-        await this.#store.commitTurn({
+        const result = await this.#store.commitTurn({
           sourceId: turn.message.sourceId,
           stopChannel: true,
           handledAt: this.#now().toISOString(),
         });
+        respondReceipt(turn.message.sourceId, result);
         return;
       }
       const accessUrl = this.#issueWebAccessUrl(turn, "/");
       if (accessUrl) bubbles.push({ text: accessUrl, delayMs: 0 });
-      await this.#store.commitTurn(
+      const result = await this.#store.commitTurn(
         decisionCommit(
           turn,
           {
@@ -1264,86 +1304,78 @@ export class Florence {
           this.#now(),
         ),
       );
+      respondReceipt(turn.message.sourceId, result);
       return;
+    }
+    await this.#capabilities.respond(this.#store.enrolledTurn(ref), new AbortController().signal);
+  }
+
+  async #respondEnrolled(ref: EnrolledTurnRef, outerSignal: AbortSignal): Promise<RespondReceipt> {
+    const turn = await this.#store.readInboundTurn(ref, this.#now().toISOString());
+    if (!turn) {
+      const disposition = await this.#store.settleInboundAuthorityLoss({
+        sourceId: ref.sourceId,
+        handledAt: this.#now().toISOString(),
+        error: "The enrolled turn was no longer authorized when Florence reloaded it",
+      });
+      if (!disposition) {
+        throw new Error("An unavailable enrolled turn had no durable terminal disposition");
+      }
+      return { sourceId: ref.sourceId, disposition };
+    }
+    const observed = await this.#linq.observeChat(turn.authority.providerConversationId);
+    const groupObservation = await this.reconcileObservedFamilyGroup({
+      providerConversationId: turn.authority.providerConversationId,
+      audience: observed.audience,
+      participantIdentityDigests: observed.participantIdentityDigests,
+      occurredAt: this.#now().toISOString(),
+      inboundSourceId: turn.message.sourceId,
+    });
+    if (
+      groupObservation === "mismatch" ||
+      groupObservation === "retired" ||
+      !sameAuthority(observed, turn.authority)
+    ) {
+      const disposition = await this.#store.settleInboundAuthorityLoss({
+        sourceId: turn.message.sourceId,
+        handledAt: this.#now().toISOString(),
+        error: "Messages authority changed before Florence could answer",
+        observedAuthority: {
+          audience: observed.audience,
+          participantIdentityDigests: observed.participantIdentityDigests,
+        },
+      });
+      if (!disposition) {
+        throw new Error("Observed Messages authority changed without a durable authority transition");
+      }
+      return { sourceId: turn.message.sourceId, disposition };
     }
     if (!this.#reasoner) {
-      await this.#tryTurnCue(turn.message.sourceId, "retry");
-      await this.#store.retryInbound({
-        sourceId: turn.message.sourceId,
-        retryAt: later(this.#now(), RETRY_MS),
-        error: "Florence reasoning is not configured",
-      });
-      return;
-    }
-
-    let approvedCalendarOffer: InboundTurn["pendingCalendarOffers"][number] | null = null;
-    let approvedPartnerInvitation: InboundTurn["pendingPartnerInvitation"] = null;
-    const typedApprovalText = turn.message.authoredText?.trim() || null;
-    if (
-      turn.authority.audience === "private" &&
-      turn.message.moveKind !== "reaction" &&
-      typedApprovalText !== null &&
-      turn.pendingPartnerInvitation &&
-      approvalReplyTargetsPrompt(
-        turn.message.replyToSourceId,
-        turn.pendingPartnerInvitation.approvalPromptSourceId,
-      )
-    ) {
+      void this.#tryTurnCue(turn.message.sourceId, "retry");
       try {
-        const interpretation = await this.#reasoner.interpretPartnerInvitationApproval({
-          currentMessage: { text: typedApprovalText },
-          partner: {
-            adultId: turn.pendingPartnerInvitation.adultId,
-            firstName: turn.pendingPartnerInvitation.firstName,
-            maskedPhoneNumber: turn.pendingPartnerInvitation.maskedPhoneNumber,
-          },
+        await this.#store.retryInbound({
+          sourceId: turn.message.sourceId,
+          retryAt: later(this.#now(), RETRY_MS),
+          error: "Florence reasoning is not configured",
         });
-        if (interpretation.sendInvitation) approvedPartnerInvitation = turn.pendingPartnerInvitation;
+        return { sourceId: turn.message.sourceId, disposition: "retry_scheduled" };
       } catch (error) {
-        if (error instanceof FlorenceReasonerError && error.retryable) {
-          await this.#tryTurnCue(turn.message.sourceId, "retry");
-          await this.#store.retryInbound({
+        if (error instanceof FlorenceStoreConflict) {
+          const disposition = await this.#store.settleInboundAuthorityLoss({
             sourceId: turn.message.sourceId,
-            retryAt: later(this.#now(), RETRY_MS),
-            error: errorText(error),
+            handledAt: this.#now().toISOString(),
+            error: "The enrolled turn changed while Florence was scheduling its retry",
           });
-          return;
+          if (disposition) return { sourceId: turn.message.sourceId, disposition };
         }
-        if (!(error instanceof FlorenceReasonerError)) throw error;
-      }
-    }
-    if (
-      turn.message.moveKind !== "reaction" &&
-      typedApprovalText !== null &&
-      turn.pendingCalendarOffers.length === 1 &&
-      approvalReplyTargetsPrompt(
-        turn.message.replyToSourceId,
-        turn.pendingCalendarOffers[0]?.approvalPromptSourceId ?? null,
-      )
-    ) {
-      const offer = turn.pendingCalendarOffers[0];
-      if (!offer) throw new Error("The sole Calendar offer disappeared");
-      try {
-        const interpretation = await this.#reasoner.interpretCalendarApproval({
-          currentMessage: { text: typedApprovalText, occurredAt: turn.message.occurredAt },
-          event: offer.event,
-        });
-        if (interpretation.approve) approvedCalendarOffer = offer;
-      } catch (error) {
-        if (error instanceof FlorenceReasonerError && error.retryable) {
-          await this.#tryTurnCue(turn.message.sourceId, "retry");
-          await this.#store.retryInbound({
-            sourceId: turn.message.sourceId,
-            retryAt: later(this.#now(), RETRY_MS),
-            error: errorText(error),
-          });
-          return;
-        }
-        if (!(error instanceof FlorenceReasonerError)) throw error;
+        throw error;
       }
     }
 
     const controller = new AbortController();
+    const abortFromOuter = () => controller.abort(outerSignal?.reason);
+    outerSignal?.addEventListener("abort", abortFromOuter, { once: true });
+    if (outerSignal?.aborted) abortFromOuter();
     const latestInbound = turn.supersededMessages.reduce(
       (latest, message) =>
         isLaterInbound(message.occurredAt, message.sourceId, latest.occurredAt, latest.sourceId)
@@ -1364,122 +1396,176 @@ export class Florence {
       ]),
     };
     this.#activeInbound = active;
-    const expectedAuthority = {
-      audience: turn.authority.audience,
-      participantIdentityDigests: turn.authority.expectedParticipantIdentityDigests,
-    };
-    const attachmentJob =
-      turn.message.images.length > 0 ||
-      (turn.currentDocuments?.length ?? 0) > 0 ||
-      turn.supersededMessages.some((message) => message.images.length > 0);
-    let typing = false;
-    let workTimer: ReturnType<typeof setTimeout> | null = null;
-    let workCue: Promise<void> | null = null;
-    let reactionCue: Promise<void> | null = null;
-    let substantiveWorkStarted = false;
-    let immediateReactionStaged = false;
-    const startWork = () => {
-      if (substantiveWorkStarted) return;
-      substantiveWorkStarted = true;
-      workTimer = setTimeout(() => {
-        if (controller.signal.aborted) return;
-        workCue = this.#tryTurnCue(turn.message.sourceId, "work").then(() => undefined);
-      }, WORK_CUE_MS);
-      reactionCue = this.#tryTurnCue(turn.message.sourceId, "reaction").then((staged) => {
-        immediateReactionStaged = staged;
+    const receiptAfterStoreConflict = async (error: string): Promise<RespondReceipt | null> => {
+      const disposition = await this.#store.settleInboundAuthorityLoss({
+        sourceId: turn.message.sourceId,
+        handledAt: this.#now().toISOString(),
+        error,
       });
+      return disposition ? { sourceId: turn.message.sourceId, disposition } : null;
     };
+    const scheduleRetry = async (error: string): Promise<RespondReceipt> => {
+      try {
+        await this.#store.retryInbound({
+          sourceId: turn.message.sourceId,
+          retryAt: later(this.#now(), RETRY_MS),
+          error,
+        });
+        return { sourceId: turn.message.sourceId, disposition: "retry_scheduled" };
+      } catch (retryError) {
+        if (retryError instanceof FlorenceStoreConflict) {
+          const receipt = await receiptAfterStoreConflict(
+            "The enrolled turn changed while Florence was scheduling its retry",
+          );
+          if (receipt) return receipt;
+        }
+        throw retryError;
+      }
+    };
+    const settleAbort = async (): Promise<RespondReceipt> => {
+      if (active.latestSourceId !== turn.message.sourceId) {
+        return { sourceId: turn.message.sourceId, disposition: "superseded" };
+      }
+      const stillAuthorized = await this.#store.readInboundTurn(ref, this.#now().toISOString());
+      if (!stillAuthorized) {
+        const disposition = await this.#store.settleInboundAuthorityLoss({
+          sourceId: turn.message.sourceId,
+          handledAt: this.#now().toISOString(),
+          error: "Messages authority changed while Florence was working",
+        });
+        if (!disposition) {
+          throw new Error("An unavailable enrolled turn had no durable terminal disposition");
+        }
+        return { sourceId: turn.message.sourceId, disposition };
+      }
+      try {
+        return await scheduleRetry("Florence's active turn was interrupted before it could commit");
+      } catch (error) {
+        if (error instanceof FlorenceStoreConflict) {
+          const receipt = await receiptAfterStoreConflict(
+            "The enrolled turn changed while Florence was settling cancellation",
+          );
+          if (receipt) return receipt;
+        }
+        throw error;
+      }
+    };
+    const releaseActive = () => {
+      outerSignal?.removeEventListener("abort", abortFromOuter);
+      if (this.#activeInbound === active) this.#activeInbound = null;
+    };
+
     try {
-      if (attachmentJob) startWork();
-      controller.signal.throwIfAborted();
-      typing =
+      let approvedCalendarOffer: InboundTurn["pendingCalendarOffers"][number] | null = null;
+      let approvedPartnerInvitation: InboundTurn["pendingPartnerInvitation"] = null;
+      const typedApprovalText = turn.message.authoredText?.trim() || null;
+      if (
         turn.authority.audience === "private" &&
-        (await this.#setTyping({
-          providerConversationId: turn.authority.providerConversationId,
-          expectedAuthority,
-          active: true,
-        }));
-      const context = await this.#reasonerContext(turn);
-      controller.signal.throwIfAborted();
-      const decision = await this.#reasoner.decide(context.input, context.reads, controller.signal, {
-        onWorkStarted: startWork,
-        protectedPublicSearchValues: [
-          ...turn.household.members.flatMap((member) =>
-            member.messagesAddress ? [member.messagesAddress] : [],
-          ),
-          ...(this.#linqSenderPhoneNumber ? [this.#linqSenderPhoneNumber] : []),
-        ],
-      });
-      if (workTimer) clearTimeout(workTimer);
-      workTimer = null;
-      if (workCue) await workCue;
-      if (reactionCue) await reactionCue;
-      controller.signal.throwIfAborted();
-      const guarded = this.#appendRequestedWebAccess(
-        turn,
-        enforcePolicy(decision, turn.message.moveKind !== "reaction"),
-      );
-      const approval = approvedCalendarOffer;
-      const partnerApproval = guarded.policy.stopMessaging ? null : approvedPartnerInvitation;
-      const committedDecision =
-        approval || partnerApproval
-          ? {
-              ...guarded,
-              policy: { ...guarded.policy, schedule: true, stopMessaging: false },
-              conversation: {
-                replyToCurrentMessage: true,
-                reaction: null,
-                bubbles: [
-                  {
-                    text:
-                      approval && partnerApproval
-                        ? `Got it—I’ll add that calendar item and text ${partnerApproval.firstName} now.`
-                        : approval
-                          ? "Got it—I’ll add that calendar item now."
-                          : `Got it—I’ll text ${partnerApproval?.firstName ?? "your partner"} now.`,
-                    delayMs: 0,
-                  },
-                ],
+        turn.message.moveKind !== "reaction" &&
+        typedApprovalText !== null &&
+        turn.pendingPartnerInvitation &&
+        approvalReplyTargetsPrompt(
+          turn.message.replyToSourceId,
+          turn.pendingPartnerInvitation.approvalPromptSourceId,
+        )
+      ) {
+        try {
+          const interpretation = await this.#reasoner.interpretPartnerInvitationApproval(
+            {
+              currentMessage: { text: typedApprovalText },
+              partner: {
+                adultId: turn.pendingPartnerInvitation.adultId,
+                firstName: turn.pendingPartnerInvitation.firstName,
+                maskedPhoneNumber: turn.pendingPartnerInvitation.maskedPhoneNumber,
               },
-              calendar: null,
-              householdUpdate: null,
-              webAccessPath: null,
-            }
-          : guarded;
-      await this.#store.commitTurn(
-        decisionCommit(turn, committedDecision, this.#now(), {
-          omitReaction: immediateReactionStaged,
-          approveCalendarOffer: approval,
-          approvePartnerInvitation: partnerApproval,
-          googleEvidence: context.googleEvidence(),
-          googleConnectionIdsUsed: context.googleConnectionIdsUsed(),
-        }),
-      );
-    } catch (error) {
-      if (controller.signal.aborted) return;
-      if (error instanceof FlorenceReasonerError && !error.retryable) {
-        if (workTimer) clearTimeout(workTimer);
-        workTimer = null;
-        if (workCue) await workCue;
-        if (reactionCue) await reactionCue;
-        if (approvedCalendarOffer || approvedPartnerInvitation) {
-          const actionText =
-            approvedCalendarOffer && approvedPartnerInvitation
-              ? `Got it—I’ll add that calendar item and text ${approvedPartnerInvitation.firstName} now.`
-              : approvedCalendarOffer
-                ? "Got it—I’ll add that calendar item now."
-                : `Got it—I’ll text ${approvedPartnerInvitation?.firstName ?? "your partner"} now.`;
-          await this.#store.commitTurn(
+            },
+            controller.signal,
+          );
+          if (interpretation.sendInvitation) approvedPartnerInvitation = turn.pendingPartnerInvitation;
+        } catch (error) {
+          if (error instanceof FlorenceReasonerError && error.retryable) {
+            void this.#tryTurnCue(turn.message.sourceId, "retry");
+            return scheduleRetry(errorText(error));
+          }
+          if (controller.signal.aborted) {
+            return settleAbort();
+          }
+          if (!(error instanceof FlorenceReasonerError)) throw error;
+        }
+      }
+      if (
+        turn.message.moveKind !== "reaction" &&
+        typedApprovalText !== null &&
+        turn.pendingCalendarOffers.length === 1 &&
+        approvalReplyTargetsPrompt(
+          turn.message.replyToSourceId,
+          turn.pendingCalendarOffers[0]?.approvalPromptSourceId ?? null,
+        )
+      ) {
+        const offer = turn.pendingCalendarOffers[0];
+        if (!offer) throw new Error("The sole Calendar offer disappeared");
+        try {
+          const interpretation = await this.#reasoner.interpretCalendarApproval(
+            {
+              currentMessage: { text: typedApprovalText, occurredAt: turn.message.occurredAt },
+              event: offer.event,
+            },
+            controller.signal,
+          );
+          if (interpretation.approve) approvedCalendarOffer = offer;
+        } catch (error) {
+          if (error instanceof FlorenceReasonerError && error.retryable) {
+            void this.#tryTurnCue(turn.message.sourceId, "retry");
+            return scheduleRetry(errorText(error));
+          }
+          if (controller.signal.aborted) {
+            return settleAbort();
+          }
+          if (!(error instanceof FlorenceReasonerError)) throw error;
+        }
+      }
+      const expectedAuthority = {
+        audience: turn.authority.audience,
+        participantIdentityDigests: turn.authority.expectedParticipantIdentityDigests,
+      };
+      const presentation = { typingStart: null as Promise<boolean> | null };
+      let workTimer: ReturnType<typeof setTimeout> | null = null;
+      let capabilityAdmitted = false;
+      let substantiveWorkStarted = false;
+      const admitWork = () => {
+        if (capabilityAdmitted) return;
+        capabilityAdmitted = true;
+        if (turn.authority.audience === "private") {
+          presentation.typingStart = this.#setTyping({
+            providerConversationId: turn.authority.providerConversationId,
+            expectedAuthority,
+            active: true,
+          });
+        }
+        void this.#tryTurnCue(turn.message.sourceId, "reaction");
+      };
+      const startWork = () => {
+        admitWork();
+        if (substantiveWorkStarted) return;
+        substantiveWorkStarted = true;
+        workTimer = setTimeout(() => {
+          if (controller.signal.aborted) return;
+          void this.#tryTurnCue(turn.message.sourceId, "work");
+        }, WORK_CUE_MS);
+      };
+      const commitSafeFailure = async (): Promise<RespondReceipt> => {
+        try {
+          const result = await this.#store.commitTurn(
             decisionCommit(
               turn,
               {
-                policy: { retain: false, schedule: true, stopMessaging: false },
+                policy: { retain: false, schedule: false, stopMessaging: false },
                 conversation: {
                   replyToCurrentMessage: true,
                   reaction: null,
                   bubbles: [
                     {
-                      text: actionText,
+                      text: "I couldn’t safely finish that. I didn’t retain, schedule, or send any changes.",
                       delayMs: 0,
                     },
                   ],
@@ -1490,29 +1576,105 @@ export class Florence {
                 householdUpdate: null,
               },
               this.#now(),
-              {
-                omitReaction: immediateReactionStaged,
-                approveCalendarOffer: approvedCalendarOffer,
-                approvePartnerInvitation: approvedPartnerInvitation,
-              },
+              { omitReaction: capabilityAdmitted },
             ),
           );
-        } else {
-          await this.#store.commitTurn(
-            substantiveWorkStarted
-              ? decisionCommit(
+          return respondReceipt(turn.message.sourceId, result);
+        } catch (commitError) {
+          if (commitError instanceof FlorenceStoreConflict) {
+            const receipt = await receiptAfterStoreConflict(
+              "The enrolled turn changed during its safe fallback commit",
+            );
+            if (receipt) return receipt;
+          }
+          throw commitError;
+        }
+      };
+      try {
+        controller.signal.throwIfAborted();
+        const context = await this.#reasonerContext(turn, ref as EnrolledTurnRef);
+        controller.signal.throwIfAborted();
+        const decision = await this.#reasoner.decide(context.input, context.reads, controller.signal, {
+          onLifecycleEvent(event) {
+            if (event.phase === "admitted") admitWork();
+            if (event.phase === "running") startWork();
+          },
+          protectedPublicSearchValues: [
+            ...turn.household.members.flatMap((member) =>
+              member.messagesAddress ? [member.messagesAddress] : [],
+            ),
+            ...(this.#linqSenderPhoneNumber ? [this.#linqSenderPhoneNumber] : []),
+          ],
+        });
+        if (workTimer) clearTimeout(workTimer);
+        workTimer = null;
+        controller.signal.throwIfAborted();
+        const guarded = this.#appendRequestedWebAccess(
+          turn,
+          enforcePolicy(decision, turn.message.moveKind !== "reaction"),
+        );
+        const approval = approvedCalendarOffer;
+        const partnerApproval = guarded.policy.stopMessaging ? null : approvedPartnerInvitation;
+        const committedDecision =
+          approval || partnerApproval
+            ? {
+                ...guarded,
+                policy: { ...guarded.policy, schedule: true, stopMessaging: false },
+                conversation: {
+                  replyToCurrentMessage: true,
+                  reaction: null,
+                  bubbles: [
+                    {
+                      text:
+                        approval && partnerApproval
+                          ? `Got it—I’ll add that calendar item and text ${partnerApproval.firstName} now.`
+                          : approval
+                            ? "Got it—I’ll add that calendar item now."
+                            : `Got it—I’ll text ${partnerApproval?.firstName ?? "your partner"} now.`,
+                      delayMs: 0,
+                    },
+                  ],
+                },
+                calendar: null,
+                householdUpdate: null,
+                webAccessPath: null,
+              }
+            : guarded;
+        const result = await this.#store.commitTurn(
+          decisionCommit(turn, committedDecision, this.#now(), {
+            omitReaction: capabilityAdmitted,
+            approveCalendarOffer: approval,
+            approvePartnerInvitation: partnerApproval,
+            googleEvidence: context.googleEvidence(),
+            googleConnectionIdsUsed: context.googleConnectionIdsUsed(),
+            sourceIdsUsed: context.sourceIdsUsed(),
+            factVersionsUsed: context.factVersionsUsed(),
+          }),
+        );
+        return respondReceipt(turn.message.sourceId, result);
+      } catch (error) {
+        if (controller.signal.aborted) return settleAbort();
+        if (error instanceof FlorenceReasonerError && !error.retryable) {
+          if (workTimer) clearTimeout(workTimer);
+          workTimer = null;
+          try {
+            let result: Awaited<ReturnType<PostgresFlorenceStore["commitTurn"]>>;
+            if (approvedCalendarOffer || approvedPartnerInvitation) {
+              const actionText =
+                approvedCalendarOffer && approvedPartnerInvitation
+                  ? `Got it—I’ll add that calendar item and text ${approvedPartnerInvitation.firstName} now.`
+                  : approvedCalendarOffer
+                    ? "Got it—I’ll add that calendar item now."
+                    : `Got it—I’ll text ${approvedPartnerInvitation?.firstName ?? "your partner"} now.`;
+              result = await this.#store.commitTurn(
+                decisionCommit(
                   turn,
                   {
-                    policy: { retain: false, schedule: false, stopMessaging: false },
+                    policy: { retain: false, schedule: true, stopMessaging: false },
                     conversation: {
                       replyToCurrentMessage: true,
                       reaction: null,
-                      bubbles: [
-                        {
-                          text: "I couldn’t finish that reliably. I didn’t make or send any changes.",
-                          delayMs: 0,
-                        },
-                      ],
+                      bubbles: [{ text: actionText, delayMs: 0 }],
                     },
                     facts: [],
                     followUp: null,
@@ -1520,72 +1682,166 @@ export class Florence {
                     householdUpdate: null,
                   },
                   this.#now(),
-                  { omitReaction: immediateReactionStaged },
-                )
-              : turn.message.moveKind === "reaction"
-                ? { sourceId: turn.message.sourceId, handledAt: this.#now().toISOString() }
-                : decisionCommit(
-                    turn,
-                    {
-                      policy: { retain: false, schedule: false, stopMessaging: false },
-                      conversation: {
-                        replyToCurrentMessage: true,
-                        reaction: null,
-                        bubbles: [
-                          {
-                            text: "I hit a snag answering that. I didn’t make or send any changes—please try once more.",
-                            delayMs: 0,
-                          },
-                        ],
+                  {
+                    omitReaction: capabilityAdmitted,
+                    approveCalendarOffer: approvedCalendarOffer,
+                    approvePartnerInvitation: approvedPartnerInvitation,
+                  },
+                ),
+              );
+            } else {
+              result = await this.#store.commitTurn(
+                substantiveWorkStarted
+                  ? decisionCommit(
+                      turn,
+                      {
+                        policy: { retain: false, schedule: false, stopMessaging: false },
+                        conversation: {
+                          replyToCurrentMessage: true,
+                          reaction: null,
+                          bubbles: [
+                            {
+                              text: "I couldn’t finish that reliably. I didn’t make or send any changes.",
+                              delayMs: 0,
+                            },
+                          ],
+                        },
+                        facts: [],
+                        followUp: null,
+                        calendar: null,
+                        householdUpdate: null,
                       },
-                      facts: [],
-                      followUp: null,
-                      calendar: null,
-                      householdUpdate: null,
-                    },
-                    this.#now(),
-                    { omitReaction: immediateReactionStaged },
-                  ),
-          );
+                      this.#now(),
+                      { omitReaction: capabilityAdmitted },
+                    )
+                  : turn.message.moveKind === "reaction"
+                    ? { sourceId: turn.message.sourceId, handledAt: this.#now().toISOString() }
+                    : decisionCommit(
+                        turn,
+                        {
+                          policy: { retain: false, schedule: false, stopMessaging: false },
+                          conversation: {
+                            replyToCurrentMessage: true,
+                            reaction: null,
+                            bubbles: [
+                              {
+                                text: "I hit a snag answering that. I didn’t make or send any changes—please try once more.",
+                                delayMs: 0,
+                              },
+                            ],
+                          },
+                          facts: [],
+                          followUp: null,
+                          calendar: null,
+                          householdUpdate: null,
+                        },
+                        this.#now(),
+                        { omitReaction: capabilityAdmitted },
+                      ),
+              );
+            }
+            return respondReceipt(turn.message.sourceId, result);
+          } catch (commitError) {
+            if (commitError instanceof FlorenceStoreConflict) {
+              const receipt = await receiptAfterStoreConflict(
+                "The enrolled turn changed during nonretryable failure settlement",
+              );
+              if (receipt) return receipt;
+              return commitSafeFailure();
+            }
+            throw commitError;
+          }
         }
-        return;
+        if (error instanceof FlorenceStoreConflict) {
+          const receipt = await receiptAfterStoreConflict(
+            "The enrolled turn lost its durable authority before commit",
+          );
+          if (receipt) return receipt;
+
+          try {
+            const fallback = await this.#store.commitTurn(
+              decisionCommit(
+                turn,
+                {
+                  policy: { retain: false, schedule: false, stopMessaging: false },
+                  conversation: {
+                    replyToCurrentMessage: true,
+                    reaction: null,
+                    bubbles: [
+                      {
+                        text: "I couldn’t safely finish that. I didn’t retain, schedule, or send any changes.",
+                        delayMs: 0,
+                      },
+                    ],
+                  },
+                  facts: [],
+                  followUp: null,
+                  calendar: null,
+                  householdUpdate: null,
+                },
+                this.#now(),
+                { omitReaction: capabilityAdmitted },
+              ),
+            );
+            return respondReceipt(turn.message.sourceId, fallback);
+          } catch (fallbackError) {
+            if (fallbackError instanceof FlorenceStoreConflict) {
+              const terminal = await receiptAfterStoreConflict(
+                "The enrolled turn lost its durable authority during fallback commit",
+              );
+              if (terminal) return terminal;
+            }
+            throw fallbackError;
+          }
+        }
+        if (workTimer) clearTimeout(workTimer);
+        workTimer = null;
+        void this.#tryTurnCue(turn.message.sourceId, "retry");
+        return scheduleRetry(errorText(error));
+      } finally {
+        if (workTimer) clearTimeout(workTimer);
+        const stopTyping = () =>
+          this.#setTyping({
+            providerConversationId: turn.authority.providerConversationId,
+            expectedAuthority,
+            active: false,
+          });
+        if (presentation.typingStart) {
+          void stopTyping();
+          void presentation.typingStart.then((started) => (started ? stopTyping() : false));
+        }
       }
-      if (workTimer) clearTimeout(workTimer);
-      workTimer = null;
-      if (workCue) await workCue;
-      if (reactionCue) await reactionCue;
-      await this.#tryTurnCue(turn.message.sourceId, "retry");
-      await this.#store.retryInbound({
-        sourceId: turn.message.sourceId,
-        retryAt: later(this.#now(), RETRY_MS),
-        error: errorText(error),
-      });
     } finally {
-      if (workTimer) clearTimeout(workTimer);
-      if (workCue) await workCue;
-      if (reactionCue) await reactionCue;
-      if (typing) {
-        await this.#setTyping({
-          providerConversationId: turn.authority.providerConversationId,
-          expectedAuthority,
-          active: false,
-        });
-      }
-      if (this.#activeInbound === active) this.#activeInbound = null;
+      releaseActive();
     }
   }
 
-  async #reasonerContext(turn: InboundTurn): Promise<{
+  async #reasonerContext(
+    turn: InboundTurn,
+    ref: EnrolledTurnRef,
+  ): Promise<{
     input: FlorenceReasonerInput;
     reads: FlorenceReadTools;
     googleEvidence: () => readonly GoogleEvidenceDraft[];
     googleConnectionIdsUsed: () => readonly string[];
+    sourceIdsUsed: () => readonly string[];
+    factVersionsUsed: () => readonly Readonly<{ factId: string; updatedAt: string }>[];
   }> {
     const members = new Map(turn.household.members.map((member) => [member.id, member.displayName]));
     const visibleSources = memorySources(turn.facts);
     const sourceIndex = new Map(visibleSources.map((source) => [source.sourceId, source]));
     const googleEvidence = new Map<string, GoogleEvidenceDraft>();
+    const pendingGoogleEvidence = new Map<string, GoogleEvidenceDraft>();
     const googleConnectionIdsUsed = new Set<string>();
+    const sourceIdsUsed = new Set<string>();
+    const factVersionsUsed = new Map(turn.facts.map((fact) => [fact.id, fact.updatedAt]));
+    const factSourceIds = new Map(
+      turn.facts.map((fact) => [fact.id, new Set(fact.sources.map((source) => source.id))]),
+    );
+    const pendingMemoryDependencies = new Map<
+      string,
+      Readonly<{ factId: string; updatedAt: string; sourceIds: readonly string[] }>
+    >();
     const visibility = turn.authority.audience === "group" ? "shared" : "adult_private";
     const currentDocuments = (turn.currentDocuments ?? []).slice(-3);
     const jobMessages = [...turn.supersededMessages, turn.message];
@@ -1657,6 +1913,9 @@ export class Florence {
         if (connection.status === "active") googleConnectionIdsUsed.add(connection.connectionId);
       }
     }
+    const activeGoogleConnection = googleConnections.find(
+      (connection) => connection.status === "active" && connection.emailLabel,
+    );
     const input: FlorenceReasonerInput = {
       household: {
         householdId: turn.household.id,
@@ -1736,32 +1995,164 @@ export class Florence {
         event: offer.event,
         sourceIds: [offer.approvalPromptSourceId],
       })),
-      googleConnections: googleConnections.flatMap((connection) =>
-        connection.status === "active" && connection.emailLabel
-          ? [
-              {
-                connectionId: connection.connectionId,
-                emailLabel:
-                  turn.authority.audience === "group"
-                    ? (turn.household.familyCalendarLabel ?? turn.household.name)
-                    : connection.emailLabel,
-                calendarId: turn.authority.audience === "group" ? turn.household.familyCalendarId : null,
-                kind: turn.authority.audience === "group" ? ("family" as const) : ("personal" as const),
-              },
-            ]
-          : [],
-      ),
+      googleConnections: activeGoogleConnection
+        ? [
+            {
+              emailLabel:
+                turn.authority.audience === "group"
+                  ? (turn.household.familyCalendarLabel ?? turn.household.name)
+                  : requiredText(activeGoogleConnection.emailLabel, "Google account label"),
+              calendarAvailable:
+                turn.authority.audience === "private" || turn.household.familyCalendarId !== null,
+              kind: turn.authority.audience === "group" ? ("family" as const) : ("personal" as const),
+            },
+          ]
+        : [],
     };
 
+    for (const sourceId of [
+      turn.message.sourceId,
+      ...(repliedMessage ? [repliedMessage.sourceId] : []),
+      ...turn.recentMessages.map((message) => message.sourceId),
+      ...turn.supersededMessages.map((message) => message.sourceId),
+      ...currentDocuments.map((document) => document.id),
+      ...turn.facts.flatMap((fact) => fact.sources.map((source) => source.id)),
+      ...turn.pendingFollowUps.flatMap((followUp) => [...followUp.sourceIds]),
+      ...turn.pendingCalendarOffers.map((offer) => offer.approvalPromptSourceId),
+    ]) {
+      sourceIdsUsed.add(sourceId);
+    }
+
+    const currentGoogleGrant = async (): Promise<boolean> => {
+      if (!this.#google || !activeGoogleConnection) return false;
+      if (turn.authority.audience === "private") {
+        const statuses = await this.#google.status({
+          householdId: turn.authority.householdId,
+          ownerAdultId: turn.authority.senderAdultId,
+        });
+        return statuses.some(
+          (connection) =>
+            connection.connectionId === activeGoogleConnection.connectionId && connection.status === "active",
+        );
+      }
+      const credential = await this.#store.readActiveFamilyCalendarCredential({
+        householdId: turn.authority.householdId,
+      });
+      if (!credential || credential.connectionId !== activeGoogleConnection.connectionId) return false;
+      const statuses = await this.#google.status({
+        householdId: turn.authority.householdId,
+        ownerAdultId: credential.ownerAdultId,
+      });
+      return statuses.some(
+        (connection) =>
+          connection.connectionId === activeGoogleConnection.connectionId && connection.status === "active",
+      );
+    };
+    const reloadAuthorizedTurn = async (): Promise<InboundTurn | null> => {
+      const current = await this.#store.readInboundTurn(ref, this.#now().toISOString());
+      if (!current) return null;
+      const observed = await this.#linq.observeChat(current.authority.providerConversationId);
+      const groupObservation = await this.reconcileObservedFamilyGroup({
+        providerConversationId: current.authority.providerConversationId,
+        audience: observed.audience,
+        participantIdentityDigests: observed.participantIdentityDigests,
+        occurredAt: this.#now().toISOString(),
+        inboundSourceId: current.message.sourceId,
+      });
+      if (
+        groupObservation === "mismatch" ||
+        groupObservation === "retired" ||
+        !sameAuthority(observed, current.authority)
+      ) {
+        await this.#store.settleInboundAuthorityLoss({
+          sourceId: current.message.sourceId,
+          handledAt: this.#now().toISOString(),
+          error: "Messages authority changed during capability admission",
+          observedAuthority: {
+            audience: observed.audience,
+            participantIdentityDigests: observed.participantIdentityDigests,
+          },
+        });
+        return null;
+      }
+      return current;
+    };
+    const reachableSourceIds = (current: InboundTurn): Set<string> =>
+      new Set([
+        current.message.sourceId,
+        ...(current.replyTarget ? [current.replyTarget.sourceId] : []),
+        ...current.recentMessages.map((message) => message.sourceId),
+        ...current.supersededMessages.map((message) => message.sourceId),
+        ...(current.currentDocuments ?? []).map((document) => document.id),
+        ...current.facts.flatMap((fact) => fact.sources.map((source) => source.id)),
+        ...current.pendingFollowUps.flatMap((followUp) => [...followUp.sourceIds]),
+        ...current.pendingCalendarOffers.map((offer) => offer.approvalPromptSourceId),
+      ]);
+
     const reads: FlorenceReadTools = {
-      searchFamilyMemory: async ({ query, limit }) => searchSources(visibleSources, query).slice(0, limit),
-      readCalendarWindow: async ({ connectionId, timeMin, timeMax, limit }) => {
-        if (
-          !this.#google ||
-          !googleConnections.some(
-            (connection) => connection.connectionId === connectionId && connection.status === "active",
-          )
-        ) {
+      admitCapability: async ({ phase, capabilityName, canonicalArguments }) => {
+        if (phase === "catalog") return true;
+        const current = await reloadAuthorizedTurn();
+        if (!current) return false;
+        if (capabilityName === "search_gmail" || capabilityName === "read_calendar_window") {
+          return currentGoogleGrant();
+        }
+        if (capabilityName === "read_source") {
+          const sourceId =
+            isRecord(canonicalArguments) && typeof canonicalArguments.sourceId === "string"
+              ? canonicalArguments.sourceId
+              : null;
+          if (!sourceId) return false;
+          if (reachableSourceIds(current).has(sourceId)) return true;
+          return googleEvidence.has(sourceId) && (await currentGoogleGrant());
+        }
+        return true;
+      },
+      settleSources: (sources) => {
+        for (const source of sources) {
+          sourceIndex.set(source.sourceId, source);
+          if (source.kind === "memory" && source.recordId) {
+            const pending = pendingMemoryDependencies.get(source.sourceId);
+            if (pending?.factId === source.recordId) {
+              factVersionsUsed.set(pending.factId, pending.updatedAt);
+              factSourceIds.set(pending.factId, new Set(pending.sourceIds));
+            }
+            const retainedSourceIds = factSourceIds.get(source.recordId);
+            if (retainedSourceIds?.has(source.sourceId)) sourceIdsUsed.add(source.sourceId);
+          } else {
+            sourceIdsUsed.add(source.sourceId);
+          }
+          const evidence = pendingGoogleEvidence.get(source.sourceId);
+          if (evidence) {
+            pendingGoogleEvidence.delete(source.sourceId);
+            googleEvidence.set(source.sourceId, evidence);
+            googleConnectionIdsUsed.add(evidence.connectionId);
+          }
+        }
+      },
+      settleCalendarRead: (status) => {
+        if (status !== "unavailable" && activeGoogleConnection) {
+          googleConnectionIdsUsed.add(activeGoogleConnection.connectionId);
+        }
+      },
+      searchFamilyMemory: async ({ query, limit }) => {
+        const current = await this.#store.readInboundTurn(ref, this.#now().toISOString());
+        if (!current) return [];
+        const found = searchSources(memorySources(current.facts), query).slice(0, limit);
+        for (const source of found) {
+          const fact = current.facts.find((candidate) => candidate.id === source.recordId);
+          if (fact) {
+            pendingMemoryDependencies.set(source.sourceId, {
+              factId: fact.id,
+              updatedAt: fact.updatedAt,
+              sourceIds: fact.sources.map((support) => support.id),
+            });
+          }
+        }
+        return found;
+      },
+      readCalendarWindow: async ({ timeMin, timeMax, limit }) => {
+        if (!this.#google || !activeGoogleConnection) {
           return { status: "unavailable", events: [] };
         }
         try {
@@ -1771,7 +2162,7 @@ export class Florence {
               turn.authority.audience === "group"
                 ? requiredText(familyCalendarOwner?.id ?? null, "Family Calendar owner")
                 : turn.authority.senderAdultId,
-            connectionId,
+            connectionId: activeGoogleConnection.connectionId,
             ...(turn.authority.audience === "group" && turn.household.familyCalendarId
               ? { calendarId: turn.household.familyCalendarId }
               : {}),
@@ -1779,7 +2170,6 @@ export class Florence {
             timeMax,
             limit,
           });
-          if (read.status !== "unavailable") googleConnectionIdsUsed.add(connectionId);
           return {
             status: read.status,
             events: read.events.map((event) =>
@@ -1814,7 +2204,25 @@ export class Florence {
           throw error;
         }
       },
-      readSource: async ({ sourceId }) => sourceIndex.get(sourceId) ?? null,
+      readSource: async ({ sourceId }) => {
+        const current = await this.#store.readInboundTurn(ref, this.#now().toISOString());
+        if (!current) return null;
+        const currentMemory = memorySources(current.facts).find((source) => source.sourceId === sourceId);
+        if (currentMemory) {
+          const fact = current.facts.find((candidate) => candidate.id === currentMemory.recordId);
+          if (fact) {
+            pendingMemoryDependencies.set(currentMemory.sourceId, {
+              factId: fact.id,
+              updatedAt: fact.updatedAt,
+              sourceIds: fact.sources.map((support) => support.id),
+            });
+          }
+          return currentMemory;
+        }
+        return reachableSourceIds(current).has(sourceId) || googleEvidence.has(sourceId)
+          ? (sourceIndex.get(sourceId) ?? null)
+          : null;
+      },
       readCurrentImage: async ({ assetId, mimeType }) => {
         const image = currentImages.find(
           (candidate) => candidate.assetId === assetId && candidate.mimeType === mimeType,
@@ -1851,26 +2259,25 @@ export class Florence {
           now: this.#now(),
         });
       },
-      searchGmail: async ({ connectionId, query, limit }) => {
-        if (!this.#google || turn.authority.audience !== "private") return [];
+      searchGmail: async ({ query, limit }) => {
+        if (!this.#google || !activeGoogleConnection || turn.authority.audience !== "private") return [];
         const evidence = await this.#google.searchGmail({
           householdId: turn.authority.householdId,
           ownerAdultId: turn.authority.senderAdultId,
-          connectionId,
+          connectionId: activeGoogleConnection.connectionId,
           query,
           limit,
         });
-        googleConnectionIdsUsed.add(connectionId);
         return evidence.messages.map((message) => {
-          const source = draftGmailEvidence({
+          const draft = draftGmailEvidence({
             householdId: turn.authority.householdId,
             ownerAdultId: turn.authority.senderAdultId,
-            connectionId,
+            connectionId: activeGoogleConnection.connectionId,
             ...message,
           });
-          googleEvidence.set(source.id, source);
+          pendingGoogleEvidence.set(draft.id, draft);
           const result: FlorenceSource = {
-            sourceId: source.id,
+            sourceId: draft.id,
             recordId: null,
             kind: "gmail",
             visibility: "adult_private",
@@ -1878,7 +2285,6 @@ export class Florence {
             occurredAt: message.sentAt,
             text: modelSafeGmailText(message.text),
           };
-          sourceIndex.set(result.sourceId, result);
           return result;
         });
       },
@@ -1888,6 +2294,11 @@ export class Florence {
       reads,
       googleEvidence: () => [...googleEvidence.values()],
       googleConnectionIdsUsed: () => [...googleConnectionIdsUsed],
+      sourceIdsUsed: () => [...sourceIdsUsed],
+      factVersionsUsed: () =>
+        [...factVersionsUsed]
+          .sort(([left], [right]) => left.localeCompare(right))
+          .map(([factId, updatedAt]) => ({ factId, updatedAt })),
     };
   }
 
@@ -1911,7 +2322,7 @@ export class Florence {
       if (!(await this.#store.outboundSendIsCurrent(sourceId))) {
         await this.#store.failSendingOutbound(
           sourceId,
-          "The progress cue was no longer current before provider delivery",
+          "The outbound dependency or Messages authority was no longer current before provider delivery",
         );
         return "failed";
       }
@@ -3975,6 +4386,17 @@ export class Florence {
   }
 }
 
+function respondReceipt(
+  sourceId: string,
+  result: "committed" | "superseded",
+  committedDisposition: RespondReceipt["disposition"] = "committed",
+): RespondReceipt {
+  return {
+    sourceId,
+    disposition: result === "superseded" ? "superseded" : committedDisposition,
+  };
+}
+
 function workspace(
   adultId: string,
   household: HouseholdRecord | null,
@@ -4239,6 +4661,8 @@ function decisionCommit(
     approvePartnerInvitation?: InboundTurn["pendingPartnerInvitation"];
     googleEvidence?: readonly GoogleEvidenceDraft[];
     googleConnectionIdsUsed?: readonly string[];
+    sourceIdsUsed?: readonly string[];
+    factVersionsUsed?: readonly Readonly<{ factId: string; updatedAt: string }>[];
   } = {},
 ): CommitTurnInput {
   if (decision.policy.stopMessaging) {
@@ -4422,6 +4846,8 @@ function decisionCommit(
     sourceId: turn.message.sourceId,
     googleEvidence: options.googleEvidence ?? [],
     googleConnectionIdsUsed: options.googleConnectionIdsUsed ?? [],
+    sourceIdsUsed: options.sourceIdsUsed ?? [],
+    factVersionsUsed: options.factVersionsUsed ?? [],
     facts,
     deleteFactIds,
     finiteMonitors,

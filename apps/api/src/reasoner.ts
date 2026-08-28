@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { MAX_IMAGE_BYTES, MAX_PDF_BYTES } from "@florence/artifacts";
 import ffmpegStaticPath from "ffmpeg-static";
 import {
@@ -17,9 +18,18 @@ import type {
   ResponseInput,
   ResponseInputItem,
   ResponseOutputItem,
-  Tool,
 } from "openai/resources/responses/responses";
 import { z } from "zod";
+import {
+  CapabilityAdapterError,
+  type CapabilityCatalogSnapshot,
+  type CapabilityLifecycleObserver,
+  CapabilityRegistry,
+  type CapabilitySource,
+  type CapabilityTerminalEnvelope,
+  defineCapability,
+  type JsonValue,
+} from "./capability-lifecycle.js";
 
 const MAX_VOICE_NOTE_BYTES = 20 * 1024 * 1024;
 const VOICE_TRANSCODE_SAMPLE_RATE = 16_000;
@@ -27,6 +37,71 @@ const VOICE_TRANSCODE_MAX_AUDIO_SECONDS = 600;
 const MAX_TRANSCODED_VOICE_BYTES = 44 + VOICE_TRANSCODE_MAX_AUDIO_SECONDS * VOICE_TRANSCODE_SAMPLE_RATE * 2;
 const MAX_VOICE_TRANSCRIPT_CHARS = 19_000;
 const VOICE_TRANSCODE_TIMEOUT_MS = 45_000;
+/**
+ * Direct port of Pi's provider classifier precedence (pi 4e494929,
+ * packages/ai/src/utils/retry.ts:3-68,209-228). Florence intentionally ports
+ * classification only: the scheduler may stage a fresh turn, but this reasoner
+ * never blindly reruns a model or tool call.
+ */
+const NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN = new RegExp(
+  [
+    "GoUsageLimitError",
+    "FreeUsageLimitError",
+    "Monthly usage limit reached",
+    "available balance",
+    "insufficient_quota",
+    "out of budget",
+    "quota exceeded",
+    "billing",
+  ].join("|"),
+  "i",
+);
+const RETRYABLE_PROVIDER_ERROR_PATTERN = new RegExp(
+  [
+    "overloaded",
+    "rate.?limit",
+    "too many requests",
+    "429",
+    "500",
+    "502",
+    "503",
+    "504",
+    "524",
+    "service.?unavailable",
+    "server.?error",
+    "internal.?error",
+    "provider.?returned.?error",
+    "exceeded request buffer limit while retrying upstream",
+    "network.?error",
+    "connection.?error",
+    "connection.?refused",
+    "connection.?lost",
+    "other side closed",
+    "fetch failed",
+    "getaddrinfo",
+    "ENOTFOUND",
+    "EAI_AGAIN",
+    "upstream.?connect",
+    "reset before headers",
+    "socket hang up",
+    "socket connection was closed",
+    "timed? out",
+    "timeout",
+    "terminated",
+    "websocket.?closed",
+    "websocket.?error",
+    "ended without",
+    "stream ended before message_stop",
+    "stream ended before a terminal response event",
+    "http2 request did not get a response",
+    "retry delay",
+    "you can retry your request",
+    "try your request again",
+    "please retry your request",
+    "ResourceExhausted",
+  ].join("|"),
+  "i",
+);
 const ffmpegPath = ffmpegStaticPath as unknown as string | null;
 const opaqueId = z.string().trim().min(1).max(500);
 const shortText = z.string().trim().min(1).max(2_000);
@@ -260,9 +335,8 @@ export const florenceReasonerInputSchema = z
     googleConnections: z.array(
       z
         .object({
-          connectionId: opaqueId,
           emailLabel: z.string().trim().min(1).max(500),
-          calendarId: z.string().trim().min(1).max(1_000).nullable(),
+          calendarAvailable: z.boolean(),
           kind: z.enum(["personal", "family"]),
           writesEnabled: z.boolean().optional(),
         })
@@ -1054,7 +1128,7 @@ export type FlorenceCalendarWindowRead = {
 };
 
 type CalendarReadCoverage = {
-  connectionId: string;
+  resourceKind: "personal" | "family";
   timeMin: number;
   timeMax: number;
   events: readonly z.infer<typeof calendarWindowEventSchema>[];
@@ -1063,14 +1137,16 @@ type CalendarReadCoverage = {
 type PrivateGoogleSource = FlorencePrivateGmailSource | FlorencePrivateCalendarEvent;
 
 export interface FlorenceReadTools {
-  searchGmail(input: {
-    connectionId: string;
-    query: string;
-    limit: number;
-  }): Promise<readonly FlorenceSource[]>;
+  admitCapability(input: {
+    phase: "catalog" | "dispatch";
+    capabilityName: string;
+    canonicalArguments: JsonValue | undefined;
+  }): Promise<boolean>;
+  settleSources(sources: readonly FlorenceSource[]): void;
+  settleCalendarRead(status: FlorenceCalendarWindowRead["status"]): void;
+  searchGmail(input: { query: string; limit: number }): Promise<readonly FlorenceSource[]>;
   searchFamilyMemory(input: { query: string; limit: number }): Promise<readonly FlorenceSource[]>;
   readCalendarWindow(input: {
-    connectionId: string;
     timeMin: string;
     timeMax: string;
     limit: number;
@@ -1086,8 +1162,8 @@ export interface FlorenceReadTools {
   }>;
 }
 
-export interface FlorenceDecisionHooks {
-  onWorkStarted(): void;
+export interface FlorenceCapabilityPresentation {
+  onLifecycleEvent?: CapabilityLifecycleObserver;
   protectedPublicSearchValues?: readonly string[];
 }
 
@@ -1271,25 +1347,18 @@ const privateGmailAttachmentArguments = z
   })
   .strict();
 
-const PRIVATE_GMAIL_ATTACHMENT_TOOL: FunctionTool = {
-  type: "function",
-  name: "read_private_gmail_attachment",
-  description: "Read one supported PDF, JPEG, PNG, or WebP attachment referenced by a Gmail search result.",
-  strict: true,
-  parameters: {
-    type: "object",
-    additionalProperties: false,
-    properties: {
-      sourceId: { type: "string", minLength: 1, maxLength: 500 },
-      attachmentId: { type: "string", minLength: 1, maxLength: 500 },
-    },
-    required: ["sourceId", "attachmentId"],
+const PRIVATE_GMAIL_ATTACHMENT_PARAMETERS = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    sourceId: { type: "string", minLength: 1, maxLength: 500 },
+    attachmentId: { type: "string", minLength: 1, maxLength: 500 },
   },
-};
+  required: ["sourceId", "attachmentId"],
+} as const;
 
 const gmailArguments = z
   .object({
-    connectionId: opaqueId,
     query: z.string().trim().min(1).max(500),
     limit: z.number().int().min(1).max(10),
   })
@@ -1300,91 +1369,357 @@ const memoryArguments = z
 const sourceArguments = z.object({ sourceId: opaqueId }).strict();
 const calendarArguments = z
   .object({
-    connectionId: opaqueId,
     timeMin: calendarInstant,
     timeMax: calendarInstant,
     limit: z.number().int().min(1).max(50),
   })
   .strict();
 
-const MEMORY_TOOL: FunctionTool = {
-  type: "function",
-  name: "search_family_memory",
-  description: "Search source-linked family memory visible in this conversation.",
-  strict: true,
-  parameters: {
-    type: "object",
-    additionalProperties: false,
-    properties: {
-      query: { type: "string", minLength: 1, maxLength: 500 },
-      limit: { type: "integer", minimum: 1, maximum: 10 },
-    },
-    required: ["query", "limit"],
+const MEMORY_PARAMETERS = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    query: { type: "string", minLength: 1, maxLength: 500 },
+    limit: { type: "integer", minimum: 1, maximum: 10 },
   },
+  required: ["query", "limit"],
+} as const;
+
+const SOURCE_PARAMETERS = {
+  type: "object",
+  additionalProperties: false,
+  properties: { sourceId: { type: "string", minLength: 1, maxLength: 500 } },
+  required: ["sourceId"],
+} as const;
+
+const PUBLIC_RESEARCH_PARAMETERS = {
+  type: "object",
+  additionalProperties: false,
+  properties: {},
+  required: [],
+} as const;
+
+const GMAIL_PARAMETERS = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    query: { type: "string", minLength: 1, maxLength: 500 },
+    limit: { type: "integer", minimum: 1, maximum: 10 },
+  },
+  required: ["query", "limit"],
+} as const;
+
+const CALENDAR_PARAMETERS = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    timeMin: { type: "string", minLength: 1, maxLength: 100 },
+    timeMax: { type: "string", minLength: 1, maxLength: 100 },
+    limit: { type: "integer", minimum: 1, maximum: 50 },
+  },
+  required: ["timeMin", "timeMax", "limit"],
+} as const;
+
+const sourceReadOutputSchema = z.object({ sources: z.array(florenceSourceSchema).max(10) }).strict();
+const calendarCapabilityOutputSchema = calendarWindowReadSchema
+  .extend({
+    resourceKind: z.enum(["personal", "family"]),
+    timeMin: calendarInstant,
+    timeMax: calendarInstant,
+  })
+  .strict();
+const attachmentCapabilityOutputSchema = z
+  .object({
+    sourceId: opaqueId,
+    attachmentId: opaqueId,
+    filename: z.string().trim().min(1).max(500),
+    mimeType: z.enum(["application/pdf", "image/jpeg", "image/png", "image/webp"]),
+    sizeBytes: z.number().int().min(1).max(Math.max(MAX_IMAGE_BYTES, MAX_PDF_BYTES)),
+  })
+  .strict();
+
+type ForegroundCapabilityContext = {
+  readonly input: FlorenceReasonerInput;
+  readonly reads: FlorenceReadTools;
+  readonly knownSources: Set<string>;
+  readonly knownFacts: Set<string>;
+  readonly calendarReads: CalendarReadCoverage[];
+  readonly publicResearchUrls: Set<string>;
+  readonly publicResearchState: { used: boolean };
+  readonly settlements: Map<string, () => void>;
+  readonly turnSource: CapabilitySource;
+  readonly researchPublicRequest: (signal: AbortSignal) => Promise<PublicRequestResearchDecision>;
 };
 
-const SOURCE_TOOL: FunctionTool = {
-  type: "function",
-  name: "read_source",
-  description: "Read a source already referenced in the supplied turn or a search result.",
-  strict: true,
-  parameters: {
-    type: "object",
-    additionalProperties: false,
-    properties: { sourceId: { type: "string", minLength: 1, maxLength: 500 } },
-    required: ["sourceId"],
-  },
+type PrivateAttachmentCapabilityContext = {
+  readonly connectionId: string;
+  readonly gmailSources: ReadonlyMap<string, FlorencePrivateGmailSource>;
+  readonly reads: FlorenceGoogleChangesReadTools;
+  readonly turnSource: CapabilitySource;
+  readonly artifacts: Map<string, ResponseFunctionCallOutputItemList>;
 };
 
-const PUBLIC_RESEARCH_TOOL: FunctionTool = {
-  type: "function",
-  name: "research_public_web",
-  description:
-    "Research the parent's current typed request in Florence's isolated public-only web context. Takes no private context or query arguments.",
-  strict: true,
-  parameters: {
-    type: "object",
-    additionalProperties: false,
-    properties: {},
-    required: [],
-  },
-};
+/**
+ * Directly adapted from Pi's immutable per-turn tool list and ordered tool-result
+ * reduction (pi 4e494929, packages/agent/src/agent-loop.ts:374-580), combined
+ * with Hermes's single registry entry for catalog and dispatch
+ * (hermes-agent 6dcebea7, tools/registry.py:452-534,1044-1168). Florence owns
+ * only the household admission predicates and evidence projection below.
+ */
+function foregroundCapabilityRegistry(): CapabilityRegistry<ForegroundCapabilityContext> {
+  return new CapabilityRegistry([
+    defineCapability({
+      name: "search_family_memory",
+      description: "Search source-linked family memory visible in this conversation.",
+      modelSchema: MEMORY_PARAMETERS,
+      inputSchema: memoryArguments,
+      outputSchema: sourceReadOutputSchema,
+      consequence: "read_only",
+      executionMode: "parallel",
+      timeoutMs: 20_000,
+      maxOutputBytes: 100_000,
+      provenance: { provider: "florence", adapter: "family-memory", operation: "search" },
+      admit: ({ context, phase, canonicalArguments }) =>
+        context.input.currentMessage.moveKind !== "reaction" &&
+        context.reads.admitCapability({
+          phase,
+          capabilityName: "search_family_memory",
+          canonicalArguments,
+        }),
+      execute: async ({ callId, arguments: args, context, signal }) =>
+        executeReadAdapter(async () => {
+          const sources = z
+            .array(florenceSourceSchema)
+            .max(10)
+            .parse(await context.reads.searchFamilyMemory(args));
+          throwIfAborted(signal);
+          context.settlements.set(callId, () => accountSources(sources, context));
+          return {
+            output: { sources },
+            sources: adapterSources(sources, context.turnSource, context.input),
+          };
+        }, signal),
+    }),
+    defineCapability({
+      name: "read_source",
+      description: "Read a source already referenced in the supplied turn or a search result.",
+      modelSchema: SOURCE_PARAMETERS,
+      inputSchema: sourceArguments,
+      outputSchema: sourceReadOutputSchema,
+      consequence: "read_only",
+      executionMode: "parallel",
+      timeoutMs: 20_000,
+      maxOutputBytes: 100_000,
+      provenance: { provider: "florence", adapter: "source-store", operation: "read" },
+      admit: ({ context, phase, canonicalArguments }) =>
+        context.input.currentMessage.moveKind !== "reaction" &&
+        (canonicalArguments === undefined ||
+          (isJsonRecord(canonicalArguments) &&
+            typeof canonicalArguments.sourceId === "string" &&
+            context.knownSources.has(canonicalArguments.sourceId))) &&
+        context.reads.admitCapability({
+          phase,
+          capabilityName: "read_source",
+          canonicalArguments,
+        }),
+      execute: async ({ callId, arguments: args, context, signal }) =>
+        executeReadAdapter(async () => {
+          if (!context.knownSources.has(args.sourceId)) {
+            throw unsafeRead("OpenAI requested an unreferenced source");
+          }
+          const source = await context.reads.readSource(args);
+          throwIfAborted(signal);
+          const sources = z
+            .array(florenceSourceSchema)
+            .max(1)
+            .parse(source ? [source] : []);
+          context.settlements.set(callId, () => accountSources(sources, context));
+          return {
+            output: { sources },
+            sources: adapterSources(sources, context.turnSource, context.input),
+          };
+        }, signal),
+    }),
+    defineCapability({
+      name: "research_public_web",
+      description:
+        "Research the parent's current typed request in Florence's isolated public-only web context. Takes no private context or query arguments.",
+      modelSchema: PUBLIC_RESEARCH_PARAMETERS,
+      inputSchema: z.object({}).strict(),
+      outputSchema: publicRequestResearchDecisionSchema,
+      consequence: "read_only",
+      executionMode: "sequential",
+      timeoutMs: 30_000,
+      maxOutputBytes: 20_000,
+      provenance: { provider: "openai", adapter: "isolated-public-web", operation: "research" },
+      admit: ({ context, phase, canonicalArguments }) =>
+        context.input.currentMessage.moveKind !== "reaction" &&
+        context.input.currentMessage.authoredText !== null &&
+        context.reads.admitCapability({
+          phase,
+          capabilityName: "research_public_web",
+          canonicalArguments,
+        }),
+      execute: async ({ callId, context, signal }) =>
+        executeReadAdapter(async () => {
+          const research = await context.researchPublicRequest(signal);
+          context.settlements.set(callId, () => {
+            context.publicResearchState.used ||= research.outcome === "result";
+            for (const url of research.urls) context.publicResearchUrls.add(url);
+          });
+          return {
+            output: research,
+            sources: [
+              context.turnSource,
+              ...research.urls.map((url) =>
+                publicCapabilitySource(url, context.input.currentMessage.occurredAt),
+              ),
+            ],
+          };
+        }, signal),
+    }),
+    defineCapability({
+      name: "search_gmail",
+      description: "Search the current adult's connected Gmail when private email context is needed.",
+      modelSchema: GMAIL_PARAMETERS,
+      inputSchema: gmailArguments,
+      outputSchema: sourceReadOutputSchema,
+      consequence: "read_only",
+      executionMode: "parallel",
+      timeoutMs: 20_000,
+      maxOutputBytes: 100_000,
+      provenance: { provider: "google", adapter: "gmail-read", operation: "search" },
+      admit: ({ context, phase, canonicalArguments }) =>
+        context.input.currentMessage.moveKind !== "reaction" &&
+        context.input.audience === "private" &&
+        context.input.googleConnections.some((connection) => connection.kind === "personal") &&
+        context.reads.admitCapability({ phase, capabilityName: "search_gmail", canonicalArguments }),
+      execute: async ({ callId, arguments: args, context, signal }) =>
+        executeReadAdapter(async () => {
+          const sources = z
+            .array(florenceSourceSchema)
+            .max(10)
+            .parse(await context.reads.searchGmail(args));
+          throwIfAborted(signal);
+          if (sources.some((source) => source.visibility !== "adult_private" || source.kind !== "gmail")) {
+            throw unsafeRead("Gmail returned incorrectly scoped evidence");
+          }
+          context.settlements.set(callId, () => accountSources(sources, context));
+          return {
+            output: { sources },
+            sources: adapterSources(sources, context.turnSource, context.input),
+          };
+        }, signal),
+    }),
+    defineCapability({
+      name: "read_calendar_window",
+      description:
+        "Read a bounded window from the Calendar connection available in this conversation to check useful dates and conflicts, and before proposing or creating an event.",
+      modelSchema: CALENDAR_PARAMETERS,
+      inputSchema: calendarArguments,
+      outputSchema: calendarCapabilityOutputSchema,
+      consequence: "read_only",
+      executionMode: "parallel",
+      timeoutMs: 20_000,
+      maxOutputBytes: 100_000,
+      provenance: { provider: "google", adapter: "calendar-read", operation: "window" },
+      admit: ({ context, phase, canonicalArguments }) =>
+        calendarReadIsAdmitted(context.input) &&
+        context.reads.admitCapability({
+          phase,
+          capabilityName: "read_calendar_window",
+          canonicalArguments,
+        }),
+      execute: async ({ callId, arguments: args, context, signal }) =>
+        executeReadAdapter(async () => {
+          const connection = context.input.googleConnections[0];
+          if (!connection || !calendarReadIsAdmitted(context.input)) {
+            throw unsafeRead("Calendar connection is unavailable in this conversation");
+          }
+          const timeMin = Date.parse(args.timeMin);
+          const timeMax = Date.parse(args.timeMax);
+          if (timeMax <= timeMin || timeMax - timeMin > 31 * 24 * 60 * 60_000) {
+            throw unsafeRead("Calendar read window is invalid");
+          }
+          const read = calendarWindowReadSchema.parse(await context.reads.readCalendarWindow(args));
+          throwIfAborted(signal);
+          context.settlements.set(callId, () => {
+            context.reads.settleCalendarRead(read.status);
+            if (read.status === "complete") {
+              context.calendarReads.push({
+                resourceKind: connection.kind,
+                timeMin,
+                timeMax,
+                events: read.events,
+              });
+            }
+          });
+          return {
+            output: {
+              resourceKind: connection.kind,
+              timeMin: args.timeMin,
+              timeMax: args.timeMax,
+              ...read,
+            },
+            sources: [context.turnSource],
+          };
+        }, signal),
+    }),
+  ]);
+}
 
-const GMAIL_TOOL: FunctionTool = {
-  type: "function",
-  name: "search_gmail",
-  description: "Search the current adult's connected Gmail when private email context is needed.",
-  strict: true,
-  parameters: {
-    type: "object",
-    additionalProperties: false,
-    properties: {
-      connectionId: { type: "string", minLength: 1, maxLength: 500 },
-      query: { type: "string", minLength: 1, maxLength: 500 },
-      limit: { type: "integer", minimum: 1, maximum: 10 },
-    },
-    required: ["connectionId", "query", "limit"],
-  },
-};
-
-const CALENDAR_TOOL: FunctionTool = {
-  type: "function",
-  name: "read_calendar_window",
-  description:
-    "Read a bounded window from the Calendar connection available in this conversation to check useful dates and conflicts, and before proposing or creating an event.",
-  strict: true,
-  parameters: {
-    type: "object",
-    additionalProperties: false,
-    properties: {
-      connectionId: { type: "string", minLength: 1, maxLength: 500 },
-      timeMin: { type: "string", minLength: 1, maxLength: 100 },
-      timeMax: { type: "string", minLength: 1, maxLength: 100 },
-      limit: { type: "integer", minimum: 1, maximum: 50 },
-    },
-    required: ["connectionId", "timeMin", "timeMax", "limit"],
-  },
-};
+function privateAttachmentCapabilityRegistry(): CapabilityRegistry<PrivateAttachmentCapabilityContext> {
+  return new CapabilityRegistry([
+    defineCapability({
+      name: "read_private_gmail_attachment",
+      description: "Read one supported PDF, JPEG, PNG, or WebP attachment referenced by a Gmail result.",
+      modelSchema: PRIVATE_GMAIL_ATTACHMENT_PARAMETERS,
+      inputSchema: privateGmailAttachmentArguments,
+      outputSchema: attachmentCapabilityOutputSchema,
+      consequence: "read_only",
+      executionMode: "sequential",
+      timeoutMs: 30_000,
+      maxOutputBytes: 4_096,
+      provenance: { provider: "google", adapter: "gmail-attachment", operation: "read" },
+      availability: (context) => context.gmailSources.size > 0,
+      admit: ({ context, canonicalArguments }) => {
+        if (canonicalArguments === undefined) return context.gmailSources.size > 0;
+        if (!isJsonRecord(canonicalArguments)) return false;
+        const sourceId = canonicalArguments.sourceId;
+        const attachmentId = canonicalArguments.attachmentId;
+        return (
+          typeof sourceId === "string" &&
+          typeof attachmentId === "string" &&
+          context.gmailSources
+            .get(sourceId)
+            ?.attachments.some((attachment) => attachment.attachmentId === attachmentId) === true
+        );
+      },
+      execute: async ({ callId, arguments: args, context, signal }) =>
+        executeReadAdapter(async () => {
+          const source = context.gmailSources.get(args.sourceId);
+          const reference = source?.attachments.find(
+            (attachment) => attachment.attachmentId === args.attachmentId,
+          );
+          if (!source || !reference) {
+            throw unsafeRead("OpenAI requested an attachment outside the authorized Gmail evidence");
+          }
+          const verified = await readVerifiedGmailAttachment(
+            context.connectionId,
+            source,
+            reference,
+            context.reads,
+            signal,
+          );
+          context.artifacts.set(callId, verified.content);
+          return {
+            output: verified.metadata,
+            sources: [privateGoogleCapabilitySource(source, context.turnSource)],
+          };
+        }, signal),
+    }),
+  ]);
+}
 
 export class FlorenceReasoner {
   readonly #client: OpenAI;
@@ -1613,6 +1948,7 @@ export class FlorenceReasoner {
     untrustedInput: FlorencePrivateGoogleBatchInput,
     reads: FlorenceGoogleChangesReadTools,
     signal?: AbortSignal,
+    presentation?: FlorenceCapabilityPresentation,
   ): Promise<FlorencePrivateGoogleBatchDecision> {
     throwIfAborted(signal);
     let input: FlorencePrivateGoogleBatchInput;
@@ -1627,8 +1963,20 @@ export class FlorenceReasoner {
         source.kind === "gmail" ? [[source.sourceId, source] as const] : [],
       ),
     );
+    const attachmentContext: PrivateAttachmentCapabilityContext = {
+      connectionId: input.googleConnection.connectionId,
+      gmailSources,
+      reads,
+      turnSource: privateReviewCapabilitySource(input.adult.adultId, input.currentTime),
+      artifacts: new Map(),
+    };
+    const attachmentRegistry = privateAttachmentCapabilityRegistry();
+    const attachmentCatalog = await attachmentRegistry.catalog(attachmentContext, signal);
     const modelInput: ResponseInput = [
-      { role: "user", content: [{ type: "input_text", text: JSON.stringify(input) }] },
+      {
+        role: "user",
+        content: [{ type: "input_text", text: JSON.stringify(privateGoogleModelInput(input)) }],
+      },
     ];
     try {
       for (let turn = 0; turn < 4; turn += 1) {
@@ -1639,7 +1987,7 @@ export class FlorenceReasoner {
             include: ["reasoning.encrypted_content"],
             instructions: PRIVATE_GOOGLE_BATCH_INSTRUCTIONS,
             input: modelInput,
-            tools: [PRIVATE_GMAIL_ATTACHMENT_TOOL],
+            tools: functionTools(attachmentCatalog),
             parallel_tool_calls: false,
             max_tool_calls: 3,
             max_output_tokens: this.#maxOutputTokens,
@@ -1661,20 +2009,16 @@ export class FlorenceReasoner {
           return validatePrivateGoogleBatch(response.output_parsed, input);
         }
         modelInput.push(...continuationItems(response.output));
-        for (const call of calls) {
-          modelInput.push({
-            type: "function_call_output",
-            call_id: call.call_id,
-            output: await runGoogleChangeAttachmentRead(
-              call.name,
-              call.arguments,
-              input.googleConnection.connectionId,
-              gmailSources,
-              reads,
-              signal,
-            ),
-          });
-        }
+        const batch = await attachmentRegistry.executeCalls({
+          snapshot: attachmentCatalog,
+          context: attachmentContext,
+          calls: rawCapabilityCalls(calls),
+          completion: responseCompletion(response),
+          turnSource: attachmentContext.turnSource,
+          ...(signal ? { signal } : {}),
+          ...(presentation?.onLifecycleEvent ? { observer: presentation.onLifecycleEvent } : {}),
+        });
+        modelInput.push(...terminalFunctionOutputs(batch.results, attachmentContext.artifacts));
       }
       throw invalidOutput("OpenAI exceeded Florence's Google batch attachment turn limit");
     } catch (error) {
@@ -1747,6 +2091,7 @@ export class FlorenceReasoner {
     untrustedInput: FlorenceGoogleChangesAssessmentInput,
     reads: FlorenceGoogleChangesReadTools,
     signal?: AbortSignal,
+    presentation?: FlorenceCapabilityPresentation,
   ): Promise<FlorenceGoogleChangesAssessmentDecision> {
     throwIfAborted(signal);
     let input: FlorenceGoogleChangesAssessmentInput;
@@ -1763,10 +2108,19 @@ export class FlorenceReasoner {
     }
 
     const gmailSources = new Map(input.evidence.gmail.sources.map((source) => [source.sourceId, source]));
+    const attachmentContext: PrivateAttachmentCapabilityContext = {
+      connectionId: input.googleConnection.connectionId,
+      gmailSources,
+      reads,
+      turnSource: privateReviewCapabilitySource(input.adult.adultId, input.currentTime),
+      artifacts: new Map(),
+    };
+    const attachmentRegistry = privateAttachmentCapabilityRegistry();
+    const attachmentCatalog = await attachmentRegistry.catalog(attachmentContext, signal);
     const modelInput: ResponseInput = [
       {
         role: "user",
-        content: [{ type: "input_text", text: JSON.stringify(input) }],
+        content: [{ type: "input_text", text: JSON.stringify(privateGoogleModelInput(input)) }],
       },
     ];
     try {
@@ -1778,7 +2132,7 @@ export class FlorenceReasoner {
             include: ["reasoning.encrypted_content"],
             instructions: GOOGLE_CHANGES_ASSESSMENT_INSTRUCTIONS,
             input: modelInput,
-            tools: [PRIVATE_GMAIL_ATTACHMENT_TOOL],
+            tools: functionTools(attachmentCatalog),
             parallel_tool_calls: false,
             max_tool_calls: 3,
             max_output_tokens: this.#maxOutputTokens,
@@ -1800,20 +2154,16 @@ export class FlorenceReasoner {
           return validateGoogleChangesAssessment(response.output_parsed, input);
         }
         modelInput.push(...continuationItems(response.output));
-        for (const call of calls) {
-          modelInput.push({
-            type: "function_call_output",
-            call_id: call.call_id,
-            output: await runGoogleChangeAttachmentRead(
-              call.name,
-              call.arguments,
-              input.googleConnection.connectionId,
-              gmailSources,
-              reads,
-              signal,
-            ),
-          });
-        }
+        const batch = await attachmentRegistry.executeCalls({
+          snapshot: attachmentCatalog,
+          context: attachmentContext,
+          calls: rawCapabilityCalls(calls),
+          completion: responseCompletion(response),
+          turnSource: attachmentContext.turnSource,
+          ...(signal ? { signal } : {}),
+          ...(presentation?.onLifecycleEvent ? { observer: presentation.onLifecycleEvent } : {}),
+        });
+        modelInput.push(...terminalFunctionOutputs(batch.results, attachmentContext.artifacts));
       }
       throw invalidOutput("OpenAI exceeded Florence's Google-change attachment turn limit");
     } catch (error) {
@@ -1858,7 +2208,7 @@ export class FlorenceReasoner {
           input: [
             {
               role: "user",
-              content: [{ type: "input_text", text: JSON.stringify(input) }],
+              content: [{ type: "input_text", text: JSON.stringify(privateGoogleModelInput(input)) }],
             },
           ],
           tools: [],
@@ -2002,7 +2352,7 @@ export class FlorenceReasoner {
     untrustedInput: FlorenceReasonerInput,
     reads: FlorenceReadTools,
     signal?: AbortSignal,
-    hooks?: FlorenceDecisionHooks,
+    presentation?: FlorenceCapabilityPresentation,
   ): Promise<FlorenceDecision> {
     throwIfAborted(signal);
     let input: FlorenceReasonerInput;
@@ -2020,7 +2370,7 @@ export class FlorenceReasoner {
       input.audience === "group" &&
       (input.visibleSources.some((source) => source.visibility !== "shared") ||
         input.googleConnections.some(
-          (connection) => connection.kind !== "family" || connection.calendarId === null,
+          (connection) => connection.kind !== "family" || !connection.calendarAvailable,
         ))
     ) {
       throw unsafeRead("Private adult context cannot enter a group turn");
@@ -2041,14 +2391,24 @@ export class FlorenceReasoner {
       ),
     );
     const calendarReads: CalendarReadCoverage[] = [];
-    const tools: Tool[] = input.currentMessage.moveKind === "reaction" ? [] : [MEMORY_TOOL, SOURCE_TOOL];
-    if (input.currentMessage.moveKind !== "reaction" && input.currentMessage.authoredText !== null) {
-      tools.push(PUBLIC_RESEARCH_TOOL);
-    }
-    if (input.currentMessage.moveKind !== "reaction" && input.googleConnections.length > 0) {
-      if (input.audience === "private") tools.push(GMAIL_TOOL);
-      tools.push(CALENDAR_TOOL);
-    }
+    const publicResearchUrls = new Set<string>();
+    const publicResearchState = { used: false };
+    const turnSource = foregroundTurnCapabilitySource(input);
+    const capabilityContext: ForegroundCapabilityContext = {
+      input,
+      reads,
+      knownSources,
+      knownFacts,
+      calendarReads,
+      publicResearchUrls,
+      publicResearchState,
+      settlements: new Map(),
+      turnSource,
+      researchPublicRequest: (capabilitySignal) =>
+        this.#researchPublicRequest(input, presentation?.protectedPublicSearchValues ?? [], capabilitySignal),
+    };
+    const capabilityRegistry = foregroundCapabilityRegistry();
+    const capabilityCatalog = await capabilityRegistry.catalog(capabilityContext, signal);
     const currentImages = await Promise.all(
       input.currentMessage.images.map(async (image) => {
         throwIfAborted(signal);
@@ -2094,15 +2454,6 @@ export class FlorenceReasoner {
         content: [{ type: "input_text", text: JSON.stringify(input) }, ...currentImages, ...currentPdfs],
       },
     ];
-    const publicResearchUrls = new Set<string>();
-    let publicResearchUsed = false;
-    let workStarted = false;
-    const startWork = () => {
-      if (workStarted) return;
-      workStarted = true;
-      hooks?.onWorkStarted();
-    };
-
     try {
       for (let turn = 0; turn < 5; turn += 1) {
         throwIfAborted(signal);
@@ -2113,7 +2464,7 @@ export class FlorenceReasoner {
             include: ["reasoning.encrypted_content"],
             instructions: INSTRUCTIONS,
             input: modelInput,
-            tools,
+            tools: functionTools(capabilityCatalog),
             parallel_tool_calls: false,
             max_tool_calls: 4,
             max_output_tokens: this.#maxOutputTokens,
@@ -2121,20 +2472,9 @@ export class FlorenceReasoner {
           },
           { signal },
         );
-        for await (const event of stream) {
-          if (
-            event.type === "response.output_item.added" &&
-            event.item.type === "function_call" &&
-            [
-              "research_public_web",
-              "search_family_memory",
-              "read_source",
-              "search_gmail",
-              "read_calendar_window",
-            ].includes(event.item.name)
-          ) {
-            startWork();
-          }
+        for await (const _event of stream) {
+          // Tool-request stream deltas are deliberately presentation-inert.
+          // Only the registry's admitted/running lifecycle may cue visible work.
         }
         const response = await stream.finalResponse();
         throwIfAborted(signal);
@@ -2152,43 +2492,22 @@ export class FlorenceReasoner {
             knownFacts,
             calendarReads,
             publicResearchUrls,
-            publicResearchUsed,
+            publicResearchState.used,
           );
         }
         modelInput.push(...continuationItems(response.output));
-        for (const call of calls) {
-          throwIfAborted(signal);
-          startWork();
-          let output: string;
-          if (call.name === "research_public_web") {
-            z.object({}).strict().parse(JSON.parse(call.arguments));
-            const research = await this.#researchPublicRequest(
-              input,
-              hooks?.protectedPublicSearchValues ?? [],
-              signal,
-            );
-            publicResearchUsed ||= research.outcome === "result";
-            for (const url of research.urls) publicResearchUrls.add(url);
-            output = JSON.stringify(research);
-          } else {
-            output = await runReadTool(
-              call.name,
-              call.arguments,
-              input,
-              reads,
-              knownSources,
-              knownFacts,
-              calendarReads,
-              signal,
-            );
-          }
-          modelInput.push({
-            type: "function_call_output",
-            call_id: call.call_id,
-            output,
-          });
-          throwIfAborted(signal);
-        }
+        const batch = await capabilityRegistry.executeCalls({
+          snapshot: capabilityCatalog,
+          context: capabilityContext,
+          calls: rawCapabilityCalls(calls),
+          completion: responseCompletion(response),
+          turnSource,
+          ...(signal ? { signal } : {}),
+          ...(presentation?.onLifecycleEvent ? { observer: presentation.onLifecycleEvent } : {}),
+        });
+        settleForegroundCapabilityResults(batch.results, capabilityContext);
+        modelInput.push(...terminalFunctionOutputs(batch.results));
+        throwIfAborted(signal);
       }
       throw invalidOutput("OpenAI exceeded Florence's read-tool turn limit");
     } catch (error) {
@@ -2210,34 +2529,16 @@ export function createFlorenceReasonerFromEnv(env: NodeJS.ProcessEnv = process.e
   });
 }
 
-async function runGoogleChangeAttachmentRead(
-  name: string,
-  rawArguments: string,
-  connectionId: string,
-  gmailSources: ReadonlyMap<string, FlorencePrivateGmailSource>,
-  reads: FlorenceGoogleChangesReadTools,
-  signal?: AbortSignal,
-): Promise<ResponseFunctionCallOutputItemList> {
-  throwIfAborted(signal);
-  if (name !== "read_private_gmail_attachment") {
-    throw unsafeRead("OpenAI requested an unknown Google-change assessment tool");
-  }
-  const args = privateGmailAttachmentArguments.parse(JSON.parse(rawArguments));
-  const source = gmailSources.get(args.sourceId);
-  const reference = source?.attachments.find((attachment) => attachment.attachmentId === args.attachmentId);
-  if (!source || !reference) {
-    throw unsafeRead("OpenAI requested an attachment that Google change evidence did not contain");
-  }
-  return readVerifiedGmailAttachment(connectionId, source, reference, reads, signal);
-}
-
 async function readVerifiedGmailAttachment(
   connectionId: string,
   source: FlorencePrivateGmailSource,
   reference: FlorenceGmailAttachmentReference,
   reads: FlorenceGoogleChangesReadTools,
   signal?: AbortSignal,
-): Promise<ResponseFunctionCallOutputItemList> {
+): Promise<{
+  readonly metadata: z.infer<typeof attachmentCapabilityOutputSchema>;
+  readonly content: ResponseFunctionCallOutputItemList;
+}> {
   validateAttachmentReference(reference);
   const read = await reads.readGmailAttachment({
     connectionId,
@@ -2270,23 +2571,249 @@ async function readVerifiedGmailAttachment(
     sizeBytes: read.bytes.byteLength,
   };
   if (read.mimeType === "application/pdf") {
-    return [
-      { type: "input_text", text: JSON.stringify(metadata) },
-      {
-        type: "input_file",
-        filename: read.filename,
-        file_data: Buffer.from(read.bytes).toString("base64"),
-      },
-    ];
+    return {
+      metadata,
+      content: [
+        {
+          type: "input_file",
+          filename: read.filename,
+          file_data: Buffer.from(read.bytes).toString("base64"),
+        },
+      ],
+    };
   }
-  return [
-    { type: "input_text", text: JSON.stringify(metadata) },
-    {
-      type: "input_image",
-      detail: "auto",
-      image_url: `data:${read.mimeType};base64,${Buffer.from(read.bytes).toString("base64")}`,
-    },
-  ];
+  return {
+    metadata,
+    content: [
+      {
+        type: "input_image",
+        detail: "auto",
+        image_url: `data:${read.mimeType};base64,${Buffer.from(read.bytes).toString("base64")}`,
+      },
+    ],
+  };
+}
+
+function functionTools(snapshot: CapabilityCatalogSnapshot): FunctionTool[] {
+  return snapshot.tools.map(
+    (tool) =>
+      ({
+        type: "function",
+        name: tool.name,
+        description: tool.description,
+        strict: true,
+        parameters: tool.parameters,
+      }) as FunctionTool,
+  );
+}
+
+function rawCapabilityCalls(
+  calls: readonly { readonly call_id: string; readonly name: string; readonly arguments: string }[],
+) {
+  return calls.map((call) => ({
+    callId: call.call_id,
+    name: call.name,
+    argumentsJson: call.arguments,
+  }));
+}
+
+function responseCompletion(response: {
+  readonly status?: unknown;
+  readonly output: readonly { readonly type: string; readonly status?: unknown }[];
+}): "complete" | "truncated" {
+  return response.status === "incomplete" ||
+    response.output.some(
+      (item) => item.type === "function_call" && item.status !== undefined && item.status !== "completed",
+    )
+    ? "truncated"
+    : "complete";
+}
+
+function terminalFunctionOutputs(
+  terminals: readonly CapabilityTerminalEnvelope[],
+  artifacts?: Map<string, ResponseFunctionCallOutputItemList>,
+): ResponseInputItem[] {
+  return terminals.map((terminal) => {
+    const artifact = terminal.outcome === "succeeded" ? artifacts?.get(terminal.callId) : undefined;
+    artifacts?.delete(terminal.callId);
+    return {
+      type: "function_call_output" as const,
+      call_id: terminal.callId,
+      output: artifact
+        ? [{ type: "input_text" as const, text: terminal.modelOutput }, ...artifact]
+        : terminal.modelOutput,
+    };
+  });
+}
+
+function settleForegroundCapabilityResults(
+  terminals: readonly CapabilityTerminalEnvelope[],
+  context: ForegroundCapabilityContext,
+): void {
+  for (const terminal of terminals) {
+    const settle = context.settlements.get(terminal.callId);
+    context.settlements.delete(terminal.callId);
+    if (terminal.outcome === "succeeded") settle?.();
+  }
+}
+
+function foregroundTurnCapabilitySource(input: FlorenceReasonerInput): CapabilitySource {
+  return {
+    sourceId: input.currentMessage.sourceId,
+    kind: "turn",
+    ownerId: input.audience === "private" ? input.currentAdultId : null,
+    visibility: input.audience === "private" ? "adult_private" : "household",
+    provider: "linq",
+    label: "Current parent message",
+    observedAt: input.currentMessage.occurredAt,
+  };
+}
+
+function privateReviewCapabilitySource(adultId: string, observedAt: string): CapabilitySource {
+  const digest = createHash("sha256").update(`${adultId}\0${observedAt}`).digest("hex");
+  return {
+    sourceId: `private-google-review:${digest}`,
+    kind: "computed",
+    ownerId: adultId,
+    visibility: "adult_private",
+    provider: "florence",
+    label: "Private Google review",
+    observedAt,
+  };
+}
+
+function florenceCapabilitySource(source: FlorenceSource, input: FlorenceReasonerInput): CapabilitySource {
+  return {
+    sourceId: source.sourceId,
+    kind:
+      source.kind === "gmail"
+        ? "gmail"
+        : source.kind === "calendar"
+          ? "calendar"
+          : source.kind === "document"
+            ? "document"
+            : source.kind === "memory"
+              ? "computed"
+              : "turn",
+    ownerId: source.visibility === "adult_private" ? input.currentAdultId : null,
+    visibility: source.visibility === "adult_private" ? "adult_private" : "household",
+    provider: source.kind === "gmail" || source.kind === "calendar" ? "google" : "florence",
+    label: source.label,
+    observedAt: source.occurredAt ?? input.currentMessage.occurredAt,
+  };
+}
+
+function privateGoogleCapabilitySource(
+  source: FlorencePrivateGmailSource,
+  turnSource: CapabilitySource,
+): CapabilitySource {
+  return {
+    sourceId: source.sourceId,
+    kind: "gmail",
+    ownerId: turnSource.ownerId,
+    visibility: "adult_private",
+    provider: "google",
+    label: source.subject?.slice(0, 500) ?? "Gmail attachment",
+    observedAt: source.sentAt || turnSource.observedAt,
+  };
+}
+
+function publicCapabilitySource(url: string, observedAt: string): CapabilitySource {
+  let label = "Public web source";
+  try {
+    label = new URL(url).hostname.slice(0, 500) || label;
+  } catch {
+    // URL validation belongs to the research decision; retain a safe label here.
+  }
+  return {
+    sourceId: `public:${createHash("sha256").update(url).digest("hex")}`,
+    kind: "public",
+    ownerId: null,
+    visibility: "public",
+    provider: "web",
+    label,
+    observedAt,
+  };
+}
+
+function adapterSources(
+  sources: readonly FlorenceSource[],
+  turnSource: CapabilitySource,
+  input: FlorenceReasonerInput,
+): readonly CapabilitySource[] {
+  return [turnSource, ...sources.map((source) => florenceCapabilitySource(source, input))];
+}
+
+function accountSources(sources: readonly FlorenceSource[], context: ForegroundCapabilityContext): void {
+  if (context.input.audience === "group" && sources.some((source) => source.visibility !== "shared")) {
+    throw unsafeRead("A private source cannot enter a group turn");
+  }
+  for (const source of sources) {
+    context.knownSources.add(source.sourceId);
+    if (source.kind === "memory" && source.recordId) context.knownFacts.add(source.recordId);
+  }
+  context.reads.settleSources(sources);
+}
+
+function calendarReadIsAdmitted(input: FlorenceReasonerInput): boolean {
+  if (input.currentMessage.moveKind === "reaction") return false;
+  const connection = input.googleConnections[0];
+  if (!connection?.calendarAvailable) return false;
+  return input.audience === "private" ? connection.kind === "personal" : connection.kind === "family";
+}
+
+async function executeReadAdapter<T>(
+  operation: () => Promise<{ readonly output: T; readonly sources: readonly CapabilitySource[] }>,
+  signal: AbortSignal,
+): Promise<{ readonly output: T; readonly sources: readonly CapabilitySource[] }> {
+  try {
+    throwIfAborted(signal);
+    const result = await operation();
+    throwIfAborted(signal);
+    return result;
+  } catch (error) {
+    if (isAbortError(error) || signal.aborted) throw error;
+    if (error instanceof CapabilityAdapterError) throw error;
+    if (error instanceof FlorenceReasonerError) {
+      throw new CapabilityAdapterError(
+        error.retryable ? "transient" : "permanent",
+        error.code === "unsafe_read"
+          ? "That read is not authorized for this conversation."
+          : "The requested information could not be read safely.",
+      );
+    }
+    const providerError = providerErrorText(error);
+    if (NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN.test(providerError)) {
+      throw new CapabilityAdapterError("permanent", "The provider account cannot accept this request.");
+    }
+    if (
+      error instanceof APIConnectionError ||
+      error instanceof InternalServerError ||
+      error instanceof RateLimitError ||
+      RETRYABLE_PROVIDER_ERROR_PATTERN.test(providerError)
+    ) {
+      throw new CapabilityAdapterError("transient", "The provider is temporarily unavailable.");
+    }
+    throw new CapabilityAdapterError(
+      "invalid_response",
+      "The provider returned information Florence could not use.",
+    );
+  }
+}
+
+function privateGoogleModelInput<T extends { readonly googleConnection: { readonly connectionId: string } }>(
+  input: T,
+): Omit<T, "googleConnection"> & {
+  readonly googleConnection: Omit<T["googleConnection"], "connectionId">;
+} {
+  const { connectionId: _connectionId, ...googleConnection } = input.googleConnection;
+  return { ...input, googleConnection } as Omit<T, "googleConnection"> & {
+    readonly googleConnection: Omit<T["googleConnection"], "connectionId">;
+  };
+}
+
+function isJsonRecord(value: JsonValue): value is { readonly [key: string]: JsonValue } {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function validatePrivateGoogleBatch(
@@ -2966,89 +3493,6 @@ function bytesMatchMimeType(
   );
 }
 
-async function runReadTool(
-  name: string,
-  rawArguments: string,
-  input: FlorenceReasonerInput,
-  reads: FlorenceReadTools,
-  knownSources: Set<string>,
-  knownFacts: Set<string>,
-  calendarReads: CalendarReadCoverage[],
-  signal?: AbortSignal,
-): Promise<string> {
-  throwIfAborted(signal);
-  if (name === "read_calendar_window") {
-    const args = calendarArguments.parse(JSON.parse(rawArguments));
-    const connection = input.googleConnections.find(
-      (candidate) => candidate.connectionId === args.connectionId,
-    );
-    if (!connection) {
-      throw unsafeRead("Calendar connection is unavailable in this conversation");
-    }
-    if (
-      (input.audience === "private" && connection.kind !== "personal") ||
-      (input.audience === "group" && (connection.kind !== "family" || !connection.calendarId))
-    ) {
-      throw unsafeRead("Calendar connection has the wrong conversation scope");
-    }
-    const timeMin = Date.parse(args.timeMin);
-    const timeMax = Date.parse(args.timeMax);
-    if (timeMax <= timeMin || timeMax - timeMin > 31 * 24 * 60 * 60_000) {
-      throw unsafeRead("Calendar read window is invalid");
-    }
-    const read = calendarWindowReadSchema.parse(await reads.readCalendarWindow(args));
-    throwIfAborted(signal);
-    if (read.status === "complete") {
-      calendarReads.push({ connectionId: args.connectionId, timeMin, timeMax, events: read.events });
-    }
-    const output = JSON.stringify({
-      connectionId: args.connectionId,
-      timeMin: args.timeMin,
-      timeMax: args.timeMax,
-      ...read,
-    });
-    if (output.length > 100_000) throw unsafeRead("Calendar output exceeded the safe context limit");
-    return output;
-  }
-  let sources: readonly FlorenceSource[];
-  if (name === "search_gmail") {
-    if (input.audience !== "private") throw unsafeRead("Gmail cannot be read from a group turn");
-    const args = gmailArguments.parse(JSON.parse(rawArguments));
-    if (!input.googleConnections.some((connection) => connection.connectionId === args.connectionId)) {
-      throw unsafeRead("Gmail connection is not owned by the current adult");
-    }
-    sources = await reads.searchGmail(args);
-    throwIfAborted(signal);
-    if (sources.some((source) => source.visibility !== "adult_private" || source.kind !== "gmail")) {
-      throw unsafeRead("Gmail returned incorrectly scoped evidence");
-    }
-  } else if (name === "search_family_memory") {
-    const args = memoryArguments.parse(JSON.parse(rawArguments));
-    sources = await reads.searchFamilyMemory(args);
-    throwIfAborted(signal);
-  } else if (name === "read_source") {
-    const args = sourceArguments.parse(JSON.parse(rawArguments));
-    if (!knownSources.has(args.sourceId)) throw unsafeRead("OpenAI requested an unreferenced source");
-    const source = await reads.readSource(args);
-    throwIfAborted(signal);
-    sources = source ? [source] : [];
-  } else {
-    throw unsafeRead("OpenAI requested an unknown read tool");
-  }
-
-  const parsed = z.array(florenceSourceSchema).max(10).parse(sources);
-  if (input.audience === "group" && parsed.some((source) => source.visibility !== "shared")) {
-    throw unsafeRead("A private source cannot enter a group turn");
-  }
-  for (const source of parsed) knownSources.add(source.sourceId);
-  for (const source of parsed) {
-    if (source.kind === "memory" && source.recordId) knownFacts.add(source.recordId);
-  }
-  const output = JSON.stringify({ sources: parsed });
-  if (output.length > 100_000) throw unsafeRead("Read-tool output exceeded the safe context limit");
-  return output;
-}
-
 function validateVisibleInterests(input: FlorenceReasonerInput): void {
   const interests = input.visibleInterests ?? [];
   const interestIds = interests.map((interest) => interest.interestWorkId);
@@ -3589,14 +4033,14 @@ function validateDecision(
   }
   if (decision.calendar) {
     const familyConnections = input.googleConnections.filter(
-      (connection) => connection.kind === "family" && connection.calendarId !== null,
+      (connection) => connection.kind === "family" && connection.calendarAvailable,
     );
     if (familyConnections.length !== 1) {
       throw invalidOutput("Calendar writes require the one bound family Calendar");
     }
     const familyConnection = familyConnections[0];
     if (!familyConnection) throw invalidOutput("The family Calendar connection is unavailable");
-    const reads = calendarReads.filter((read) => read.connectionId === familyConnection.connectionId);
+    const reads = calendarReads.filter((read) => read.resourceKind === familyConnection.kind);
     const mutation = decision.calendar.mutation;
     const covers = (event: z.infer<typeof calendarEventSchema>) => {
       const { startsAt, endsAt } = calendarEventBounds(event, input.household.timeZone);
@@ -3738,11 +4182,22 @@ function continuationItems(output: readonly ResponseOutputItem[]): ResponseInput
 
 function normalizeError(error: unknown): FlorenceReasonerError {
   if (error instanceof FlorenceReasonerError) return error;
+  const providerError = providerErrorText(error);
+  if (NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN.test(providerError)) {
+    return new FlorenceReasonerError("rejected", "The model provider account cannot accept this request", {
+      cause: error,
+    });
+  }
   if (error instanceof RateLimitError) {
     return new FlorenceReasonerError("rate_limited", "OpenAI rate limit reached", { cause: error });
   }
   if (error instanceof APIConnectionError || error instanceof InternalServerError) {
     return new FlorenceReasonerError("transient", "Temporary OpenAI request failure", { cause: error });
+  }
+  if (RETRYABLE_PROVIDER_ERROR_PATTERN.test(providerError)) {
+    return new FlorenceReasonerError("transient", "Temporary model provider or transport failure", {
+      cause: error,
+    });
   }
   if (error instanceof APIError) {
     return new FlorenceReasonerError("rejected", "OpenAI rejected the Florence request", {
@@ -3755,6 +4210,16 @@ function normalizeError(error: unknown): FlorenceReasonerError {
   return new FlorenceReasonerError("rejected", "Unexpected Florence reasoning failure", {
     cause: error,
   });
+}
+
+function providerErrorText(error: unknown): string {
+  if (error instanceof Error) {
+    const details = [error.name, error.message];
+    if ("code" in error && typeof error.code === "string") details.push(error.code);
+    if ("status" in error && typeof error.status === "number") details.push(String(error.status));
+    return details.join(" ");
+  }
+  return typeof error === "string" ? error : "";
 }
 
 function configuration(message: string): FlorenceReasonerError {

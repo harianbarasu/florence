@@ -886,10 +886,10 @@ function SetupFrame({ children }: { children: React.ReactNode }) {
   );
 }
 
-function GoogleDataDisclosure() {
+function GoogleDataDisclosure({ title = "Before you connect" }: { title?: string }) {
   return (
     <aside className="google-data-disclosure" aria-label="How Florence uses Google data">
-      <strong>Before you connect</strong>
+      <strong>{title}</strong>
       <p>
         Florence will use the Google data you authorize to review Gmail and calendars, find and work with
         Drive files and Workspace documents, manage tasks and contacts, and maintain the Florence-created
@@ -1639,10 +1639,6 @@ function GoogleConnector({ view, callbackStatus }: { view: WorkspaceView; callba
   );
   const error = start.error ?? disconnect.error ?? deleteGoogleData.error;
   const isPending = start.isPending || disconnect.isPending || deleteGoogleData.isPending;
-  const needsGoogleConsent =
-    !accounts.length ||
-    accounts.some((account) => !account.historyReviewReady || !account.assistantWorkReady);
-
   async function connect() {
     try {
       const result = await start.mutateAsync();
@@ -1699,7 +1695,9 @@ function GoogleConnector({ view, callbackStatus }: { view: WorkspaceView; callba
             Contacts. Your family setup and existing calendar stay in place.
           </p>
         )}
-        {needsGoogleConsent && <GoogleDataDisclosure />}
+        <GoogleDataDisclosure
+          title={accounts.length ? "How Florence uses your Google data" : "Before you connect"}
+        />
         {error && <p className="form-error">{error.message}</p>}
       </div>
       <div className="connector-actions">
@@ -1713,26 +1711,24 @@ function GoogleConnector({ view, callbackStatus }: { view: WorkspaceView; callba
             {start.isPending ? "Opening…" : "Connect"}
           </button>
         )}
-        {accounts
-          .filter((account) => !account.historyReviewReady || !account.assistantWorkReady)
-          .map((account) => (
-            <button
-              className="button pill"
-              type="button"
-              key={`reconnect-${account.connectionId}`}
-              onClick={() => {
-                setResultNotice(null);
-                setConfirmation({
-                  kind: "reconnect",
-                  connectionId: account.connectionId,
-                  emailLabel: account.emailLabel,
-                });
-              }}
-              disabled={isPending}
-            >
-              Reconnect Google
-            </button>
-          ))}
+        {accounts.map((account) => (
+          <button
+            className="button pill"
+            type="button"
+            key={`reconnect-${account.connectionId}`}
+            onClick={() => {
+              setResultNotice(null);
+              setConfirmation({
+                kind: "reconnect",
+                connectionId: account.connectionId,
+                emailLabel: account.emailLabel,
+              });
+            }}
+            disabled={isPending}
+          >
+            Reconnect Google
+          </button>
+        ))}
         {accounts.map((account) => (
           <button
             className="text-button danger"

@@ -100,6 +100,7 @@ import {
   type LinqReactionProposal,
 } from "@florence/linq";
 import type { EnrollmentCodes, WebAccessPath } from "./enrollment.js";
+import type { FlorenceFlightsClient } from "./flights.js";
 import type { FlorenceMapsClient } from "./maps.js";
 import {
   type FlorenceBoundedPrivateGoogleEvidence,
@@ -117,6 +118,7 @@ import {
   type FlorenceSource,
   type FlorenceVoiceNoteInput,
 } from "./reasoner.js";
+import type { FlorenceWeatherClient } from "./weather.js";
 
 const DEFAULT_PREFERENCES: PreferencesInput = {
   proactiveGoogleEnabled: true,
@@ -146,6 +148,8 @@ export class Florence {
   readonly #linq: LinqClient;
   readonly #google: GoogleConnection | null;
   readonly #maps: FlorenceMapsClient | null;
+  readonly #weather: FlorenceWeatherClient | null;
+  readonly #flights: FlorenceFlightsClient | null;
   readonly #reasoner: FlorenceReasoner | null;
   readonly #enrollmentCodes: EnrollmentCodes;
   readonly #imageVault: EncryptedImageVault | null;
@@ -165,6 +169,8 @@ export class Florence {
     linq: LinqClient;
     google: GoogleConnection | null;
     maps?: FlorenceMapsClient | null;
+    weather?: FlorenceWeatherClient | null;
+    flights?: FlorenceFlightsClient | null;
     reasoner: FlorenceReasoner | null;
     enrollmentCodes: EnrollmentCodes;
     imageVault: EncryptedImageVault | null;
@@ -177,6 +183,8 @@ export class Florence {
     this.#linq = input.linq;
     this.#google = input.google;
     this.#maps = input.maps ?? null;
+    this.#weather = input.weather ?? null;
+    this.#flights = input.flights ?? null;
     this.#reasoner = input.reasoner;
     this.#enrollmentCodes = input.enrollmentCodes;
     this.#imageVault = input.imageVault;
@@ -1922,11 +1930,23 @@ export class Florence {
     const enumerateConversationCalendars = async () =>
       (await readConversationCalendarCatalog()).read.calendars;
     const maps = this.#maps;
+    const weather = this.#weather;
+    const flights = this.#flights;
 
     const reads: FlorenceReadTools = {
       ...(maps
         ? {
             runMaps: (request, signal) => maps.run(request, signal),
+          }
+        : {}),
+      ...(weather
+        ? {
+            runWeather: (request, signal) => weather.run(request, signal),
+          }
+        : {}),
+      ...(flights
+        ? {
+            runFlights: (request, signal) => flights.search(request, signal),
           }
         : {}),
       settleSources: (sources) => {
@@ -4712,7 +4732,7 @@ function appendResearchSourceBubble(
   const main = bubbles.map((bubble) => ({ ...bubble }));
   if (researchUrls.length === 0) return main;
   const sourceBubble = {
-    text: researchUrls.length === 1 ? (researchUrls[0] ?? "") : `Sources:\n${researchUrls.join("\n")}`,
+    text: researchUrls.length === 1 ? (researchUrls[0] ?? "") : `Links:\n${researchUrls.join("\n")}`,
     delayMs: 0,
   };
   if (main.length < 3) return [...main, sourceBubble];

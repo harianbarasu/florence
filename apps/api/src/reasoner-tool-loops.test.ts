@@ -223,6 +223,244 @@ describe("Florence reasoner capability cutover", () => {
     });
   });
 
+  test("ordinary weather questions resolve a place and use live NWS weather with one work cue", async () => {
+    const requests: Record<string, unknown>[] = [];
+    const weatherRequests: unknown[] = [];
+    let workStarts = 0;
+    let modelTurn = 0;
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        stream: (request: Record<string, unknown>) => {
+          requests.push(request);
+          modelTurn += 1;
+          return fakeStream(
+            modelTurn === 1
+              ? {
+                  status: "completed",
+                  output_parsed: null,
+                  output: [
+                    functionCall("weather-place", "maps_search", {
+                      query: "Los Angeles, CA",
+                      limit: 1,
+                    }),
+                  ],
+                }
+              : modelTurn === 2
+                ? {
+                    status: "completed",
+                    output_parsed: null,
+                    output: [
+                      functionCall("weather-live", "weather_forecast", {
+                        coordinates: { lat: 34.0522, lon: -118.2437 },
+                        kind: "hourly",
+                        periodCount: 12,
+                      }),
+                    ],
+                  }
+                : {
+                    status: "completed",
+                    output_parsed: ordinaryDecision({
+                      bubbleText:
+                        "No rain is expected this evening in Los Angeles; it should stay mostly sunny.",
+                    }),
+                    output: [],
+                  },
+          );
+        },
+      },
+    } as never);
+    const input = foregroundInput();
+    input.currentMessage.text = "Will it rain in Los Angeles this evening?";
+    input.currentMessage.authoredText = input.currentMessage.text;
+
+    const result = await reasoner.decide(
+      input,
+      {
+        ...inertReads(),
+        async runMaps() {
+          return {
+            operation: "search" as const,
+            query: "Los Angeles, CA",
+            count: 1,
+            results: [
+              {
+                name: "Los Angeles",
+                displayName: "Los Angeles, Los Angeles County, California, United States",
+                lat: 34.0522,
+                lon: -118.2437,
+                type: "city",
+                category: "place",
+                osmType: "relation",
+                osmId: "207359",
+                importance: 0.9,
+                boundingBox: null,
+                mapsUrl: "https://www.google.com/maps/search/?api=1&query=34.0522%2C-118.2437",
+              },
+            ],
+            attribution: [
+              {
+                provider: "OpenStreetMap",
+                label: "© OpenStreetMap contributors",
+                url: "https://www.openstreetmap.org/copyright",
+              },
+            ],
+          };
+        },
+        async runWeather(request) {
+          weatherRequests.push(request);
+          return weatherResult();
+        },
+      },
+      undefined,
+      {
+        onWorkStarted() {
+          workStarts += 1;
+        },
+      },
+    );
+
+    expect(weatherRequests).toEqual([
+      {
+        coordinates: { lat: 34.0522, lon: -118.2437 },
+        kind: "hourly",
+        periodCount: 12,
+      },
+    ]);
+    expect(workStarts).toBe(1);
+    expect(result.conversation.bubbles[0]?.text).toContain("No rain is expected");
+    expect(((requests[0]?.tools as { name: string }[]) ?? []).map((tool) => tool.name)).toEqual(
+      expect.arrayContaining(["maps_search", "weather_forecast"]),
+    );
+    expect(
+      functionOutputEnvelopes(requests[2]).find((envelope) => envelope.callId === "weather-live"),
+    ).toMatchObject({
+      outcome: "succeeded",
+      output: {
+        location: { city: "Los Angeles", state: "CA" },
+        periods: [expect.objectContaining({ condition: "Mostly Sunny" })],
+      },
+    });
+  });
+
+  test("a flight identifier resolves live route and status before searching real alternatives", async () => {
+    const requests: Record<string, unknown>[] = [];
+    const flightRequests: unknown[] = [];
+    const statusUrl = "https://www.delta.com/flight-status/search?flightId=DL747";
+    const bookingUrl = "https://www.kiwi.com/deep?from=JFK&to=LAX&date=2026-08-28";
+    let workStarts = 0;
+    let modelTurn = 0;
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        stream: (request: Record<string, unknown>) => {
+          requests.push(request);
+          modelTurn += 1;
+          return fakeStream(
+            modelTurn === 1
+              ? {
+                  status: "completed",
+                  output_parsed: null,
+                  output: [functionCall("flight-status", "research_public_web", {})],
+                }
+              : modelTurn === 2
+                ? {
+                    status: "completed",
+                    output_parsed: null,
+                    output: [
+                      functionCall("flight-options", "flights_search", {
+                        origin: "JFK",
+                        destination: "LAX",
+                        departureDate: "2026-08-28",
+                        returnDate: null,
+                        adults: 1,
+                        children: 0,
+                        infants: 0,
+                        cabinClass: "economy",
+                        preferredAirlines: [],
+                        maxStops: 0,
+                        outboundDepartureHours: { from: 17, to: 23 },
+                        maxPrice: null,
+                        allowSelfTransfer: false,
+                        allowOvernightStopovers: false,
+                        allowAirportChanges: false,
+                        sort: "quality",
+                      }),
+                    ],
+                  }
+                : {
+                    status: "completed",
+                    output_parsed: ordinaryDecision({
+                      bubbleText:
+                        "DL 747 is delayed tonight from JFK to LAX. I found a direct alternative leaving at 7:00 PM for $412.",
+                      researchUrls: [statusUrl, bookingUrl],
+                    }),
+                    output: [],
+                  },
+          );
+        },
+        parse: () => ({
+          status: "completed",
+          output_parsed: {
+            outcome: "result",
+            summary:
+              "DL 747 on August 28, 2026 is delayed from JFK to LAX; scheduled 5:30 PM local departure and 8:46 PM local arrival.",
+            urls: [statusUrl],
+          },
+          output: [completedWebSearch(statusUrl)],
+        }),
+      },
+    } as never);
+    const input = foregroundInput();
+    input.currentMessage.text =
+      "My wife's flight is delayed tonight. Can you find other options? DL 747 is the original.";
+    input.currentMessage.authoredText = input.currentMessage.text;
+
+    const result = await reasoner.decide(
+      input,
+      {
+        ...inertReads(),
+        async runFlights(request) {
+          flightRequests.push(request);
+          return flightResult(bookingUrl);
+        },
+      },
+      undefined,
+      {
+        onWorkStarted() {
+          workStarts += 1;
+        },
+      },
+    );
+
+    expect(flightRequests).toEqual([
+      expect.objectContaining({
+        operation: "search",
+        origin: "JFK",
+        destination: "LAX",
+        departureDate: "2026-08-28",
+        maxStops: 0,
+        allowSelfTransfer: false,
+        allowOvernightStopovers: false,
+        allowAirportChanges: false,
+      }),
+    ]);
+    expect(result.researchUrls).toEqual([statusUrl, bookingUrl]);
+    expect(result.conversation.bubbles[0]?.text).toContain("direct alternative");
+    expect(result.conversation.bubbles[0]?.text).not.toMatch(
+      /what(?:'s| is) (?:the )?(?:origin|destination)/iu,
+    );
+    expect(workStarts).toBe(1);
+    expect(
+      functionOutputEnvelopes(requests[2]).find((envelope) => envelope.callId === "flight-options"),
+    ).toMatchObject({
+      outcome: "succeeded",
+      output: {
+        operation: "search",
+        returnedCount: 1,
+        timeBasis: "provider_local_time_at_each_airport",
+      },
+    });
+  });
+
   test("public place verification receives the map candidates selected earlier in the turn", async () => {
     let modelTurn = 0;
     const publicResearchRequests: Record<string, unknown>[] = [];
@@ -746,13 +984,13 @@ function foregroundInput(): FlorenceReasonerInput {
   };
 }
 
-function ordinaryDecision(input: { researchUrls?: string[] } = {}): FlorenceDecision {
+function ordinaryDecision(input: { bubbleText?: string; researchUrls?: string[] } = {}): FlorenceDecision {
   return {
     policy: { retain: true, schedule: true, stopMessaging: false },
     conversation: {
       replyToCurrentMessage: false,
       reaction: null,
-      bubbles: [{ text: "Done.", delayMs: 0 }],
+      bubbles: [{ text: input.bubbleText ?? "Done.", delayMs: 0 }],
     },
     facts: [],
     followUp: null,
@@ -866,6 +1104,101 @@ function completeCalendarRead() {
     totalCalendarCount: 0,
     events: [],
     totalEventCount: 0,
+  };
+}
+
+function weatherResult() {
+  return {
+    kind: "hourly" as const,
+    coordinates: { lat: 34.0522, lon: -118.2437 },
+    location: {
+      city: "Los Angeles",
+      state: "CA",
+      timeZone: "America/Los_Angeles",
+      forecastOfficeUrl: "https://api.weather.gov/offices/LOX",
+      gridId: "LOX",
+      gridX: 154,
+      gridY: 44,
+    },
+    requestedPeriodCount: 12,
+    forecastGeneratedAt: "2026-08-28T20:00:00Z",
+    forecastUpdatedAt: "2026-08-28T19:00:00Z",
+    periods: [
+      {
+        number: 1,
+        name: "This Afternoon",
+        startTime: "2026-08-28T13:00:00-07:00",
+        endTime: "2026-08-28T14:00:00-07:00",
+        isDaytime: true,
+        temperature: 82,
+        temperatureUnit: "F",
+        precipitationChancePercent: 5,
+        windSpeed: "5 mph",
+        windDirection: "SW",
+        condition: "Mostly Sunny",
+        detailedForecast: "Mostly sunny.",
+        iconUrl: null,
+      },
+    ],
+    observation: null,
+    activeAlertCount: 0,
+    alertsTruncated: false,
+    alerts: [],
+    fetchedAt: "2026-08-28T20:01:00Z",
+    attribution: {
+      provider: "National Weather Service" as const,
+      label: "Weather data from the U.S. National Weather Service" as const,
+      url: "https://www.weather.gov/",
+    },
+  };
+}
+
+function flightResult(bookingUrl: string) {
+  return {
+    operation: "search" as const,
+    query: "JFK to LAX",
+    currency: "USD",
+    passengers: { adults: 1, children: 0, infants: 0 },
+    resultsCount: 1,
+    returnedCount: 1,
+    itineraries: [
+      {
+        id: "alternative-1",
+        price: 412,
+        priceFormatted: "$412",
+        totalDurationSeconds: 21_600,
+        bookingUrl,
+        imageId: null,
+        baggage: null,
+        outbound: {
+          from: "JFK",
+          to: "LAX",
+          departureTime: "2026-08-28T19:00:00",
+          arrivalTime: "2026-08-28T22:00:00",
+          durationSeconds: 21_600,
+          stops: 0,
+          route: ["JFK", "LAX"],
+          cabinClass: "M",
+          segments: [],
+        },
+        inbound: null,
+        highlights: ["cheapest" as const, "shortest" as const, "earliest" as const],
+      },
+    ],
+    searchTimeMs: 250,
+    error: null,
+    highlights: {
+      cheapestItineraryId: "alternative-1",
+      shortestItineraryId: "alternative-1",
+      earliestItineraryId: "alternative-1",
+    },
+    timeBasis: "provider_local_time_at_each_airport" as const,
+    provider: {
+      name: "Kiwi.com" as const,
+      searchOnly: true as const,
+      bookingOccursOnProvider: true as const,
+      url: "https://www.kiwi.com/" as const,
+    },
   };
 }
 

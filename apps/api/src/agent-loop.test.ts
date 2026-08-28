@@ -101,7 +101,9 @@ describe("general agent capability lifecycle", () => {
             functionCall(
               `repeat-${modelTurns}`,
               "progress_tool",
-              modelTurns % 2 === 0 ? { limit: 10, query: "unchanged" } : { query: "unchanged", limit: 10 },
+              modelTurns % 2 === 0
+                ? { ignored: modelTurns, limit: 10, query: "unchanged" }
+                : { query: "unchanged", ignored: modelTurns, limit: 10 },
             ),
           ]) as never;
         }
@@ -114,10 +116,10 @@ describe("general agent capability lifecycle", () => {
     });
 
     expect(result).toMatchObject({ kind: "completed", turns: 5 });
-    expect(executions).toEqual(["unchanged", "unchanged", "unchanged"]);
+    expect(executions).toEqual(["unchanged", "unchanged", "unchanged", "unchanged"]);
     expect(functionOutput(requests[2], "repeat-2")).toContain("Duplicate result omitted");
     expect(functionOutput(requests[3], "repeat-3")).toContain("3 consecutive times");
-    expect(functionOutput(requests[4], "repeat-4")).toContain("was not re-executed");
+    expect(functionOutput(requests[4], "repeat-4")).toContain("4 consecutive times");
     expect(requests[4]?.tools).toEqual([]);
     expect(requests[4]?.max_tool_calls).toBeUndefined();
     expect(requests[4]?.tool_choice).toBeUndefined();
@@ -219,6 +221,7 @@ describe("general agent capability lifecycle", () => {
     });
 
     expect(read).toMatchObject({ suspendedBeforeExternal: false });
+    expect(read.results[0]?.canonicalArguments).toEqual({ operation: "read" });
     expect(executions).toEqual(["read"]);
     expect(resolvedArguments).toEqual([{ operation: "read" }]);
     expect(suspensionChecks).toBe(0);

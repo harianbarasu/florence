@@ -34,6 +34,7 @@ import type {
 const DEFAULT_EMPTY_FINAL_RETRIES = 1;
 const DUPLICATE_RESULT_STUB_MIN_CHARS = 512;
 const NO_PROGRESS_WARNING_AFTER = 3;
+const NO_PROGRESS_SYNTHESIS_AFTER = 4;
 const EMPTY_FINAL_NUDGE =
   "Your previous turn produced no final response. Continue from the available context and tool results, then provide a useful final response.";
 const NO_CAPABILITIES: CapabilityCatalogSnapshot = Object.freeze({ tools: Object.freeze([]) });
@@ -297,21 +298,6 @@ export async function runAgentLoop<TContext, const TRequest extends AgentLoopReq
 
     if (calls.length > 0) {
       emptyFinalRetries = 0;
-      const currentStreak = progressStreak;
-      const repeatedCall = repeatedNoProgressCall(calls, catalog, currentStreak);
-      if (repeatedCall && currentStreak) {
-        const reused = reusedTerminal(repeatedCall, currentStreak.terminal);
-        transcript.push(reusedToolResult(repeatedCall, currentStreak));
-        await emit({ type: "turn_end", turn: turns, response, results: [reused] });
-        const steering = await input.getSteeringInput?.();
-        if (await inject(steering, "steering", transcript, emit)) {
-          progressStreak = null;
-          synthesisOnly = false;
-        } else {
-          synthesisOnly = true;
-        }
-        continue;
-      }
       const turn: AgentLoopTurn<TContext, TParsed> = {
         turn: turns,
         transcript,
@@ -362,7 +348,7 @@ export async function runAgentLoop<TContext, const TRequest extends AgentLoopReq
         return result;
       }
       const { results } = batch;
-      progressStreak = observeProgress(calls, results, catalog, progressStreak);
+      progressStreak = observeProgress(results, progressStreak);
       annotateRepeatedResult(transcript, progressStreak);
       await emit({ type: "turn_end", turn: turns, response, results });
       const steering = await input.getSteeringInput?.();
@@ -370,6 +356,8 @@ export async function runAgentLoop<TContext, const TRequest extends AgentLoopReq
         emptyFinalRetries = 0;
         progressStreak = null;
         synthesisOnly = false;
+      } else if ((progressStreak?.count ?? 0) >= NO_PROGRESS_SYNTHESIS_AFTER) {
+        synthesisOnly = true;
       }
       continue;
     }
@@ -423,26 +411,13 @@ export async function runAgentLoop<TContext, const TRequest extends AgentLoopReq
   }
 }
 
-function repeatedNoProgressCall(
-  calls: readonly AgentLoopPlannedCall[],
-  catalog: CapabilityCatalogSnapshot,
-  streak: AgentLoopProgressStreak | null,
-): AgentLoopPlannedCall | null {
-  if (calls.length !== 1 || !streak || streak.count < NO_PROGRESS_WARNING_AFTER) return null;
-  const call = calls[0];
-  return call && isInlineCall(call, catalog) && callSignature(call) === streak.signature ? call : null;
-}
-
 function observeProgress(
-  calls: readonly AgentLoopPlannedCall[],
   results: readonly CapabilityTerminalEnvelope[],
-  catalog: CapabilityCatalogSnapshot,
   previous: AgentLoopProgressStreak | null,
 ): AgentLoopProgressStreak | null {
-  const call = calls.length === 1 ? calls[0] : undefined;
   const terminal = results.length === 1 ? results[0] : undefined;
-  if (!call || !terminal || !isInlineCall(call, catalog)) return null;
-  const signature = callSignature(call);
+  if (!terminal || terminal.canonicalArguments === null) return null;
+  const signature = terminalSignature(terminal);
   const resultDigest = terminalDigest(terminal);
   if (previous?.signature === signature && previous.resultDigest === resultDigest) {
     return { ...previous, count: previous.count + 1, terminal };
@@ -451,27 +426,13 @@ function observeProgress(
     signature,
     resultDigest,
     count: 1,
-    firstCallId: call.callId,
+    firstCallId: terminal.callId,
     terminal,
   };
 }
 
-function isInlineCall(call: AgentLoopPlannedCall, catalog: CapabilityCatalogSnapshot): boolean {
-  return catalog.tools.some(
-    (capability) => capability.name === call.name && capability.executionBoundary === "inline",
-  );
-}
-
-function callSignature(call: AgentLoopPlannedCall): string {
-  return `${call.name}\0${canonicalArguments(call.argumentsJson)}`;
-}
-
-function canonicalArguments(argumentsJson: string): string {
-  try {
-    return JSON.stringify(canonicalJsonValue(JSON.parse(argumentsJson)));
-  } catch {
-    return JSON.stringify(argumentsJson);
-  }
+function terminalSignature(terminal: CapabilityTerminalEnvelope): string {
+  return `${terminal.capabilityName}\0${JSON.stringify(canonicalJsonValue(terminal.canonicalArguments))}`;
 }
 
 function canonicalJsonValue(value: unknown): unknown {
@@ -533,30 +494,6 @@ function repeatedResultNote(streak: AgentLoopProgressStreak): string {
 
 function resultReference(streak: AgentLoopProgressStreak, note: string): string {
   return `[Duplicate result omitted. The full structured result is in tool call ${streak.firstCallId}.]\n\n${note}`;
-}
-
-function reusedTerminal(
-  call: AgentLoopPlannedCall,
-  previous: CapabilityTerminalEnvelope,
-): CapabilityTerminalEnvelope {
-  return { ...previous, callId: call.callId, sourceIndex: 0 };
-}
-
-function reusedToolResult(
-  call: AgentLoopPlannedCall,
-  streak: AgentLoopProgressStreak,
-): ResponseInputItem.FunctionCallOutput {
-  const note =
-    `[Florence loop note: this exact call was not re-executed because it already returned the same result ` +
-    `${streak.count} consecutive times. Synthesize the best answer from tool call ${streak.firstCallId}; the next turn has no tools.]`;
-  return {
-    type: "function_call_output",
-    call_id: call.callId,
-    output:
-      streak.terminal.modelOutput.length >= DUPLICATE_RESULT_STUB_MIN_CHARS
-        ? resultReference(streak, note)
-        : `${streak.terminal.modelOutput}\n\n${note}`,
-  };
 }
 
 async function executeCapabilityCalls<TContext, TParsed>(input: {

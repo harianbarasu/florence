@@ -144,6 +144,8 @@ export interface CapabilityTerminalEnvelope {
   readonly callId: string;
   readonly capabilityName: string;
   readonly sourceIndex: number;
+  /** Schema-parsed arguments used for execution; null when the lifecycle could not prepare the call. */
+  readonly canonicalArguments: JsonValue | null;
   readonly outcome: CapabilityTerminalOutcome;
   readonly errorCode: string | null;
   readonly retryable: boolean;
@@ -246,10 +248,14 @@ export class CapabilityRegistry<TContext> {
       }
     };
 
-    const terminalize = (call: NormalizedRawCall, terminal: TerminalSeed): CapabilityTerminalEnvelope => {
+    const terminalize = (
+      call: NormalizedRawCall,
+      terminal: TerminalSeed,
+      canonicalArguments: JsonValue | null = null,
+    ): CapabilityTerminalEnvelope => {
       const existing = results[call.sourceIndex];
       if (existing) return existing;
-      const envelope = buildTerminalEnvelope(call, terminal);
+      const envelope = buildTerminalEnvelope(call, terminal, canonicalArguments);
       results[call.sourceIndex] = envelope;
       return envelope;
     };
@@ -346,7 +352,7 @@ export class CapabilityRegistry<TContext> {
     const runOne = async (item: PreparedCall<TContext>): Promise<void> => {
       if (results[item.call.sourceIndex]) return;
       if (outerSignal.aborted) {
-        terminalize(item.call, cancelledBeforeStart());
+        terminalize(item.call, cancelledBeforeStart(), item.arguments);
         return;
       }
       terminalize(
@@ -356,6 +362,7 @@ export class CapabilityRegistry<TContext> {
           context: input.context,
           outerSignal,
         }),
+        item.arguments,
       );
     };
 
@@ -692,7 +699,11 @@ function parseArguments(
   }
 }
 
-function buildTerminalEnvelope(call: NormalizedRawCall, terminal: TerminalSeed): CapabilityTerminalEnvelope {
+function buildTerminalEnvelope(
+  call: NormalizedRawCall,
+  terminal: TerminalSeed,
+  canonicalArguments: JsonValue | null,
+): CapabilityTerminalEnvelope {
   const modelPayload = deepFreeze({
     outcome: terminal.outcome,
     output: terminal.output ?? null,
@@ -714,6 +725,7 @@ function buildTerminalEnvelope(call: NormalizedRawCall, terminal: TerminalSeed):
     callId: call.callId,
     capabilityName: call.name,
     sourceIndex: call.sourceIndex,
+    canonicalArguments,
     outcome: terminal.outcome,
     errorCode: terminal.errorCode,
     retryable: terminal.retryable,

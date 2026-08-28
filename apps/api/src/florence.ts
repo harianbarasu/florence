@@ -43,6 +43,7 @@ import type {
   FamilyCalendarReviewProposal,
   FamilyGroupCreationWork,
   FamilyMemberRecord,
+  FamilyWorkStateV1,
   FiniteMonitorDraft,
   FiniteMonitorUpdate,
   GoogleEvidenceDraft,
@@ -121,6 +122,11 @@ import {
   type FlorenceSource,
   type FlorenceVoiceNoteInput,
 } from "./reasoner.js";
+import type {
+  FlorenceTelephonyClient,
+  FlorenceTelephonyOperation,
+  FlorenceTelephonyResult,
+} from "./telephony.js";
 import type { FlorenceWeatherClient } from "./weather.js";
 
 const DEFAULT_PREFERENCES: PreferencesInput = {
@@ -161,6 +167,7 @@ export class Florence {
   readonly #weather: FlorenceWeatherClient | null;
   readonly #flights: FlorenceFlightsClient | null;
   readonly #browser: FlorenceBrowserClient | null;
+  readonly #telephony: FlorenceTelephonyClient | null;
   readonly #reasoner: FlorenceReasoner | null;
   readonly #enrollmentCodes: EnrollmentCodes;
   readonly #imageVault: EncryptedImageVault | null;
@@ -185,6 +192,7 @@ export class Florence {
     weather?: FlorenceWeatherClient | null;
     flights?: FlorenceFlightsClient | null;
     browser?: FlorenceBrowserClient | null;
+    telephony?: FlorenceTelephonyClient | null;
     reasoner: FlorenceReasoner | null;
     enrollmentCodes: EnrollmentCodes;
     imageVault: EncryptedImageVault | null;
@@ -201,6 +209,7 @@ export class Florence {
     this.#weather = input.weather ?? null;
     this.#flights = input.flights ?? null;
     this.#browser = input.browser ?? null;
+    this.#telephony = input.telephony ?? null;
     this.#reasoner = input.reasoner;
     this.#enrollmentCodes = input.enrollmentCodes;
     this.#imageVault = input.imageVault;
@@ -1501,14 +1510,26 @@ export class Florence {
           this.#activeFamilyWork
             .get(committedDecision.familyWork.workId)
             ?.controller.abort(new Error("The family task was cancelled"));
-          const browserSession = await this.#store.takeCancelledFamilyWorkBrowserSession(
+          const resources = await this.#store.takeCancelledFamilyWorkResources(
             committedDecision.familyWork.workId,
           );
-          if (browserSession && this.#browser) {
+          if (resources?.browserSession && this.#browser) {
             try {
-              await this.#browser.close(browserSession);
+              await this.#browser.close(resources.browserSession);
             } catch {
               // Browserbase still expires the bounded session if release is unavailable.
+            }
+          }
+          if (resources?.activePhoneCall) {
+            const stopped = await this.#stopFamilyWorkPhoneCall(
+              committedDecision.familyWork.workId,
+              resources.activePhoneCall,
+            );
+            if (stopped) {
+              await this.#store.clearCancelledFamilyWorkPhoneCall(
+                committedDecision.familyWork.workId,
+                resources.activePhoneCall,
+              );
             }
           }
         }
@@ -1641,8 +1662,10 @@ export class Florence {
     resolveCalendarEventTarget: (eventRef: string) => CalendarEventTarget | null;
   }> {
     const members = new Map(turn.household.members.map((member) => [member.id, member.displayName]));
-    const visibleSources = memorySources(turn.facts);
-    const sourceIndex = new Map(visibleSources.map((source) => [source.sourceId, source]));
+    const memorySourceCorpus = memorySources(turn.facts);
+    const searchableMemorySources = representativeMemorySources(memorySourceCorpus);
+    const visibleSources = selectVisibleMemorySources(searchableMemorySources, turnText(turn.message));
+    const sourceIndex = new Map(memorySourceCorpus.map((source) => [source.sourceId, source]));
     const googleEvidence = new Map<string, GoogleEvidenceDraft>();
     const pendingGoogleEvidence = new Map<string, GoogleEvidenceDraft>();
     const gmailAttachmentIndex = new Map<string, GmailAttachmentReference>();
@@ -2051,7 +2074,8 @@ export class Florence {
           }
         }
       },
-      searchFamilyMemory: async ({ query, limit }) => searchSources(visibleSources, query).slice(0, limit),
+      searchFamilyMemory: async ({ query, limit }) =>
+        searchSources(searchableMemorySources, query).slice(0, limit),
       listCalendars: async (): Promise<FlorenceCalendarCatalogRead> => {
         if (!this.#google || !activeGoogleConnection || !googleOwnerAdultId) {
           return {
@@ -3314,9 +3338,6 @@ export class Florence {
     }
     const findings = decisions.flatMap((decision) =>
       decision.findings.map((finding): InitialGoogleScanFinding => {
-        if (finding.familyRelevance === "adult_only") {
-          throw new Error("Adult-only Google evidence cannot become a retained finding");
-        }
         const sharing = privateCalendarSafeBackgroundSharing({
           familyRelevance: finding.familyRelevance,
           conclusion: finding.candidate,
@@ -3351,16 +3372,20 @@ export class Florence {
       }),
     );
     const facts = decisions.flatMap((decision) =>
-      decision.facts.map(
-        (fact): InitialGoogleScanFact => ({
-          ...fact,
-          observedAt: latestGoogleEvidenceTime(fact.sourceIds, evidence),
-          sourceObservations: fact.sourceIds.map((sourceId) => ({
-            sourceId,
-            observedAt: googleEvidenceTime(sourceId, evidence),
-          })),
-        }),
-      ),
+      decision.facts.flatMap((fact): InitialGoogleScanFact[] => {
+        if (fact.familyRelevance === "owner_private") return [];
+        return [
+          {
+            ...fact,
+            familyRelevance: fact.familyRelevance as InitialGoogleScanFact["familyRelevance"],
+            observedAt: latestGoogleEvidenceTime(fact.sourceIds, evidence),
+            sourceObservations: fact.sourceIds.map((sourceId) => ({
+              sourceId,
+              observedAt: googleEvidenceTime(sourceId, evidence),
+            })),
+          },
+        ];
+      }),
     );
     return {
       findings,
@@ -3398,7 +3423,17 @@ export class Florence {
     const existing = this.#activeFamilyWork.get(work.workId);
     if (existing) {
       existing.controller.abort(new Error("A newer family-task checkpoint was claimed"));
-      void existing.promise.finally(() => this.#launchFamilyWork(work));
+      void existing.promise
+        .then(async () => {
+          const state = await this.#store.readClaimedFamilyWorkState({
+            workId: work.workId,
+            generation: work.generation,
+            claimId: work.claimId,
+          });
+          if (state) this.#launchFamilyWork({ ...work, state });
+          else this.#wake();
+        })
+        .catch(() => this.#wake());
       return;
     }
     const controller = new AbortController();
@@ -3410,6 +3445,62 @@ export class Florence {
         this.#wake();
       });
     this.#activeFamilyWork.set(work.workId, { controller, promise });
+  }
+
+  async #stopFamilyWorkPhoneCall(
+    workId: string,
+    activePhoneCall: NonNullable<FamilyWorkStateV1["activePhoneCall"]>,
+  ): Promise<boolean> {
+    const telephony = this.#telephony;
+    if (!telephony || !activePhoneCall) return false;
+    const operation: FlorenceTelephonyOperation =
+      activePhoneCall.kind === "agent"
+        ? {
+            kind: "ai_call_cancel",
+            provider: "bland",
+            providerCallId: activePhoneCall.providerCallId,
+          }
+        : {
+            kind: "call_cancel",
+            provider: "twilio",
+            callSid: activePhoneCall.providerCallId,
+          };
+    try {
+      const cancellation = await telephony.run(
+        {
+          workId,
+          callId: `cancel-${activePhoneCall.providerCallId}`.slice(0, 500),
+          attempt: 1,
+          operation,
+        },
+        new AbortController().signal,
+      );
+      if (cancellation.kind === "completed" || cancellation.kind === "failed") return true;
+      const statusOperation: FlorenceTelephonyOperation =
+        activePhoneCall.kind === "agent"
+          ? {
+              kind: "ai_call_status",
+              provider: "bland",
+              providerCallId: activePhoneCall.providerCallId,
+            }
+          : {
+              kind: "call_status",
+              provider: "twilio",
+              callSid: activePhoneCall.providerCallId,
+            };
+      const status = await telephony.run(
+        {
+          workId,
+          callId: `status-${activePhoneCall.providerCallId}`.slice(0, 500),
+          attempt: 1,
+          operation: statusOperation,
+        },
+        new AbortController().signal,
+      );
+      return status.kind === "completed" || status.kind === "failed";
+    } catch {
+      return false;
+    }
   }
 
   async #executeFamilyWork(
@@ -3432,11 +3523,21 @@ export class Florence {
       });
       return;
     }
-    const familyWorkOwnerAdultId = work.ownerAdultId;
-    const browser =
-      this.#browser && work.visibility === "private" && familyWorkOwnerAdultId ? this.#browser : null;
+    const familyWorkExecutionAdultId = work.ownerAdultId ?? work.initiatingAdultId;
+    const familyWorkGoogleAdultId = familyWorkExecutionAdultId;
+    const browser = this.#browser && familyWorkExecutionAdultId ? this.#browser : null;
+    const familyWorkOriginImages = [
+      ...(work.origin.replyTarget ? [work.origin.replyTarget] : []),
+      ...work.origin.supersededMessages,
+      work.origin.message,
+    ]
+      .flatMap((message) => message.images.map((image) => ({ ...image, sourceId: message.sourceId })))
+      .slice(-10);
+    const familyWorkOriginDocuments = work.origin.currentDocuments.slice(-3);
     const claimedBrowserSession = work.state.browserSession;
     let browserSession = claimedBrowserSession;
+    let uncheckpointedPhoneCall: FamilyWorkStateV1["activePhoneCall"] = null;
+    let uncheckpointedTextMessage: FamilyWorkStateV1["activeTextMessage"] = null;
     const closeBrowserSession = async (session: NonNullable<typeof browserSession>): Promise<void> => {
       if (!browser) return;
       try {
@@ -3450,19 +3551,65 @@ export class Florence {
         await closeBrowserSession(browserSession);
       }
     };
+    const stopUncheckpointedPhoneCall = async (retainForCancellation: boolean): Promise<void> => {
+      const activePhoneCall = uncheckpointedPhoneCall;
+      if (!activePhoneCall) return;
+      if (retainForCancellation) {
+        const retained = await this.#store.retainCancelledFamilyWorkPhoneCall(
+          work.workId,
+          activePhoneCall,
+          this.#now().toISOString(),
+        );
+        if (!retained) return;
+      }
+      const stopped = await this.#stopFamilyWorkPhoneCall(work.workId, activePhoneCall);
+      if (stopped && retainForCancellation) {
+        await this.#store.clearCancelledFamilyWorkPhoneCall(work.workId, activePhoneCall);
+      }
+      if (stopped) uncheckpointedPhoneCall = null;
+    };
+    const adoptOrStopUncheckpointedPhoneCall = async (): Promise<void> => {
+      const activePhoneCall = uncheckpointedPhoneCall;
+      if (!activePhoneCall) return;
+      try {
+        const adopted = await this.#store.adoptFamilyWorkPhoneCall(
+          work.workId,
+          activePhoneCall,
+          this.#now().toISOString(),
+        );
+        if (adopted) {
+          uncheckpointedPhoneCall = null;
+          return;
+        }
+      } catch {
+        // If the latest task state cannot adopt the provider ID, stop the call below.
+      }
+      await stopUncheckpointedPhoneCall(false);
+    };
+    const adoptUncheckpointedTextMessage = async (): Promise<void> => {
+      const activeTextMessage = uncheckpointedTextMessage;
+      if (!activeTextMessage) return;
+      try {
+        const adopted = await this.#store.adoptFamilyWorkTextMessage(work.workId, activeTextMessage);
+        if (adopted) uncheckpointedTextMessage = null;
+      } catch {
+        // Twilio does not expose a supported cancel operation for an immediate SMS.
+        // Keep the durable task retryable; its exact create request will reconcile by provider log.
+      }
+    };
     try {
       const maps = this.#maps;
       const publicPages = this.#publicPages;
       const weather = this.#weather;
       const flights = this.#flights;
+      const telephony = this.#telephony;
       const google = this.#google;
-      const familyWorkGoogleConnections =
-        google && work.visibility === "private" && familyWorkOwnerAdultId
-          ? await google.status({
-              householdId: work.household.householdId,
-              ownerAdultId: familyWorkOwnerAdultId,
-            })
-          : [];
+      const familyWorkGoogleConnections = google
+        ? await google.status({
+            householdId: work.household.householdId,
+            ownerAdultId: familyWorkGoogleAdultId,
+          })
+        : [];
       const familyWorkCalendarConnection = familyWorkGoogleConnections.find(
         (connection) => connection.status === "active",
       );
@@ -3471,13 +3618,12 @@ export class Florence {
           connection.status === "active" &&
           GOOGLE_WORKSPACE_ACTION_SCOPES.every((scope) => connection.grantedScopes.includes(scope)),
       );
-      const familyWorkHousehold =
-        familyWorkCalendarConnection && familyWorkOwnerAdultId
-          ? await this.#store.readHousehold({
-              householdId: work.household.householdId,
-              viewerAdultId: familyWorkOwnerAdultId,
-            })
-          : null;
+      const familyWorkHousehold = familyWorkCalendarConnection
+        ? await this.#store.readHousehold({
+            householdId: work.household.householdId,
+            viewerAdultId: familyWorkGoogleAdultId,
+          })
+        : null;
       const familyWorkCalendarRef = (calendarId: string): string => {
         if (!familyWorkCalendarConnection) throw new Error("Google Calendar is unavailable");
         return `calendar_${sha256(
@@ -3485,12 +3631,12 @@ export class Florence {
         ).slice(0, 32)}`;
       };
       const listFamilyWorkCalendars = async (): Promise<FlorenceCalendarCatalogRead> => {
-        if (!google || !familyWorkCalendarConnection || !familyWorkOwnerAdultId) {
+        if (!google || !familyWorkCalendarConnection) {
           return { status: "unavailable", calendars: [], totalCalendarCount: 0 };
         }
         const read = await google.readPersonalCalendarCatalog({
           householdId: work.household.householdId,
-          ownerAdultId: familyWorkOwnerAdultId,
+          ownerAdultId: familyWorkGoogleAdultId,
           connectionId: familyWorkCalendarConnection.connectionId,
           excludedFamilyCalendarId: familyWorkHousehold?.familyCalendarId ?? null,
         });
@@ -3514,7 +3660,7 @@ export class Florence {
         scope: "all" | "primary" | "selected";
         calendarRefs: readonly string[];
       }): Promise<FlorenceCalendarWindowRead> => {
-        if (!google || !familyWorkCalendarConnection || !familyWorkOwnerAdultId) {
+        if (!google || !familyWorkCalendarConnection) {
           return {
             status: "unavailable",
             calendars: [],
@@ -3527,7 +3673,7 @@ export class Florence {
         if (input.scope === "selected") {
           const catalog = await google.readPersonalCalendarCatalog({
             householdId: work.household.householdId,
-            ownerAdultId: familyWorkOwnerAdultId,
+            ownerAdultId: familyWorkGoogleAdultId,
             connectionId: familyWorkCalendarConnection.connectionId,
             excludedFamilyCalendarId: familyWorkHousehold?.familyCalendarId ?? null,
           });
@@ -3554,7 +3700,7 @@ export class Florence {
         } else if (input.scope === "primary") {
           const catalog = await google.readPersonalCalendarCatalog({
             householdId: work.household.householdId,
-            ownerAdultId: familyWorkOwnerAdultId,
+            ownerAdultId: familyWorkGoogleAdultId,
             connectionId: familyWorkCalendarConnection.connectionId,
             excludedFamilyCalendarId: familyWorkHousehold?.familyCalendarId ?? null,
           });
@@ -3572,7 +3718,7 @@ export class Florence {
         }
         const read = await google.readPersonalCalendarWindow({
           householdId: work.household.householdId,
-          ownerAdultId: familyWorkOwnerAdultId,
+          ownerAdultId: familyWorkGoogleAdultId,
           connectionId: familyWorkCalendarConnection.connectionId,
           excludedFamilyCalendarId: familyWorkHousehold?.familyCalendarId ?? null,
           timeMin: input.timeMin,
@@ -3636,6 +3782,8 @@ export class Florence {
           objective: work.objective,
           visibility: work.visibility,
           ownerAdultId: work.ownerAdultId,
+          initiatingAdultId: work.initiatingAdultId,
+          origin: work.origin,
           household: work.household,
           state: work.state,
           currentTime: this.#now().toISOString(),
@@ -3647,7 +3795,60 @@ export class Florence {
           ...(maps ? { runMaps: (request, taskSignal) => maps.run(request, taskSignal) } : {}),
           ...(weather ? { runWeather: (request, taskSignal) => weather.run(request, taskSignal) } : {}),
           ...(flights ? { runFlights: (request, taskSignal) => flights.search(request, taskSignal) } : {}),
-          ...(browser && familyWorkOwnerAdultId
+          ...(telephony
+            ? {
+                telephonyProviders: telephony.configuredProviders,
+                runTelephony: (operation: FlorenceTelephonyOperation, taskSignal?: AbortSignal) => {
+                  const pendingCall = work.state.pendingCall;
+                  if (
+                    !pendingCall ||
+                    !["phone_agent_call", "sms_work", "phone_announcement"].includes(pendingCall.name)
+                  ) {
+                    throw new Error("Durable phone work lost its pending call metadata");
+                  }
+                  return telephony
+                    .run(
+                      {
+                        workId: work.workId,
+                        callId: pendingCall.callId,
+                        attempt: pendingCall.attempt,
+                        operation,
+                      },
+                      operation.kind === "ai_call_start" ? undefined : taskSignal,
+                    )
+                    .then((result: FlorenceTelephonyResult) => {
+                      if (
+                        (operation.kind === "ai_call_start" || operation.kind === "call_start") &&
+                        result.providerId &&
+                        (result.kind === "accepted" ||
+                          result.kind === "progress" ||
+                          result.kind === "uncertain_effect")
+                      ) {
+                        uncheckpointedPhoneCall = {
+                          provider: result.provider,
+                          kind: operation.kind === "ai_call_start" ? "agent" : "announcement",
+                          providerCallId: result.providerId,
+                        };
+                      }
+                      if (
+                        (operation.kind === "sms_send" || operation.kind === "sms_status") &&
+                        result.provider === "twilio" &&
+                        result.providerId &&
+                        (result.kind === "accepted" ||
+                          result.kind === "progress" ||
+                          result.kind === "uncertain_effect")
+                      ) {
+                        uncheckpointedTextMessage = {
+                          provider: "twilio",
+                          messageSid: result.providerId,
+                        };
+                      }
+                      return result;
+                    });
+                },
+              }
+            : {}),
+          ...(browser && familyWorkExecutionAdultId
             ? {
                 runBrowser: async (operation: FlorenceBrowserOperation, taskSignal?: AbortSignal) => {
                   const pendingCall = work.state.pendingCall;
@@ -3657,7 +3858,7 @@ export class Florence {
                   const result = await browser.run(
                     {
                       workId: work.workId,
-                      ownerAdultId: familyWorkOwnerAdultId,
+                      ownerAdultId: familyWorkExecutionAdultId,
                       callId: pendingCall.callId,
                       attempt: pendingCall.attempt,
                       session: browserSession,
@@ -3670,19 +3871,53 @@ export class Florence {
                 },
               }
             : {}),
-          ...(familyWorkCalendarConnection && familyWorkOwnerAdultId
+          ...(familyWorkCalendarConnection
             ? {
                 listCalendars: listFamilyWorkCalendars,
                 readCalendarWindow: readFamilyWorkCalendarWindow,
               }
             : {}),
-          ...(google && familyWorkWorkspaceConnection && familyWorkOwnerAdultId
+          readCurrentImage: async ({ assetId, mimeType }) => {
+            const image = familyWorkOriginImages.find(
+              (candidate) => candidate.assetId === assetId && candidate.mimeType === mimeType,
+            );
+            if (!image) throw new Error("The image is not attached to the durable task request");
+            if (!this.#imageVault) throw new Error("Florence image reading is not configured");
+            return this.#imageVault.read({
+              householdId: work.household.householdId,
+              signalId: image.sourceId,
+              image: { assetId, mimeType },
+            });
+          },
+          readCurrentPdf: async ({ documentId, filename, mimeType, contentDigest }) => {
+            const document = familyWorkOriginDocuments.find(
+              (candidate) =>
+                candidate.id === documentId &&
+                candidate.filename === filename &&
+                candidate.mimeType === mimeType &&
+                candidate.contentDigest === contentDigest,
+            );
+            if (!document) throw new Error("The PDF is not attached to the durable task request");
+            if (!this.#imageVault) throw new Error("Florence PDF reading is not configured");
+            return this.#imageVault.openPdf({
+              documentId: document.id,
+              householdId: work.household.householdId,
+              signalId: document.parentSourceId,
+              filename: document.filename,
+              mimeType: document.mimeType,
+              contentDigest: document.contentDigest,
+              contentEnvelope: document.contentEnvelope,
+              discardAfter: document.discardAfter,
+              now: this.#now(),
+            });
+          },
+          ...(google && familyWorkWorkspaceConnection
             ? {
                 runGoogleWorkspace: (operation: GoogleWorkspaceOperation, taskSignal?: AbortSignal) =>
                   google.runWorkspace(
                     {
                       householdId: work.household.householdId,
-                      ownerAdultId: familyWorkOwnerAdultId,
+                      ownerAdultId: familyWorkGoogleAdultId,
                       connectionId: familyWorkWorkspaceConnection.connectionId,
                       operation,
                     },
@@ -3704,11 +3939,16 @@ export class Florence {
           result: {
             type: "continue",
             state: { ...step.state, browserSession },
-            nextCheckAt: settledAt,
+            nextCheckAt: later(new Date(settledAt), step.nextCheckDelayMs),
             ...(step.progressText ? { progressText: step.progressText } : {}),
           },
         });
-        if (settlement === "stale") await closeUncheckpointedBrowserSession();
+        if (settlement === "stale") {
+          await closeUncheckpointedBrowserSession();
+          if (familyWorkWasExplicitlyCancelled(signal)) await stopUncheckpointedPhoneCall(true);
+          else await adoptOrStopUncheckpointedPhoneCall();
+          await adoptUncheckpointedTextMessage();
+        }
       } else if (step.kind === "waiting") {
         const settlement = await this.#store.settleFamilyWorkClaim({
           workId: work.workId,
@@ -3721,9 +3961,37 @@ export class Florence {
             question: step.question,
           },
         });
-        if (settlement === "stale") await closeUncheckpointedBrowserSession();
+        if (settlement === "stale") {
+          await closeUncheckpointedBrowserSession();
+          await adoptOrStopUncheckpointedPhoneCall();
+          await adoptUncheckpointedTextMessage();
+        }
       } else {
         const terminalBrowserSession = browserSession;
+        const terminalPhoneCall = step.state.activePhoneCall;
+        if (terminalPhoneCall) {
+          const stopped = await this.#stopFamilyWorkPhoneCall(work.workId, terminalPhoneCall);
+          if (!stopped) {
+            await this.#store.settleFamilyWorkClaim({
+              workId: work.workId,
+              generation: work.generation,
+              claimId: work.claimId,
+              settledAt,
+              result: {
+                type: "retry",
+                state: {
+                  ...work.state,
+                  claim: null,
+                  activePhoneCall: terminalPhoneCall,
+                  browserSession,
+                },
+                retryAt: later(new Date(settledAt), 5_000),
+                error: "Florence is still stopping the active provider call before finishing this task",
+              },
+            });
+            return;
+          }
+        }
         const settlement = await this.#store.settleFamilyWorkClaim({
           workId: work.workId,
           generation: work.generation,
@@ -3731,7 +3999,7 @@ export class Florence {
           settledAt,
           result: {
             type: "terminal",
-            state: { ...step.state, browserSession: null },
+            state: { ...step.state, browserSession: null, activePhoneCall: null },
             terminalText: step.text,
           },
         });
@@ -3739,6 +4007,8 @@ export class Florence {
           await closeBrowserSession(terminalBrowserSession);
         } else if (settlement === "stale") {
           await closeUncheckpointedBrowserSession();
+          await adoptOrStopUncheckpointedPhoneCall();
+          await adoptUncheckpointedTextMessage();
           if (familyWorkWasExplicitlyCancelled(signal) && terminalBrowserSession) {
             await closeBrowserSession(terminalBrowserSession);
           }
@@ -3748,6 +4018,8 @@ export class Florence {
       if (signal.aborted) {
         const cancelled = familyWorkWasExplicitlyCancelled(signal);
         if (cancelled && browserSession) await closeBrowserSession(browserSession);
+        if (cancelled) await stopUncheckpointedPhoneCall(true);
+        if (cancelled) await adoptUncheckpointedTextMessage();
         const interruptedAt = this.#now();
         const settlement = await this.#store.settleFamilyWorkClaim({
           workId: work.workId,
@@ -3759,13 +4031,21 @@ export class Florence {
             state: {
               ...work.state,
               claim: null,
+              activePhoneCall: cancelled
+                ? work.state.activePhoneCall
+                : (uncheckpointedPhoneCall ?? work.state.activePhoneCall),
+              activeTextMessage: uncheckpointedTextMessage ?? work.state.activeTextMessage,
               browserSession: cancelled ? null : browserSession,
             },
             retryAt: later(interruptedAt, 1),
             error: "The task step was interrupted before its checkpoint and will resume",
           },
         });
-        if (settlement === "stale") await closeUncheckpointedBrowserSession();
+        if (settlement === "stale") {
+          await closeUncheckpointedBrowserSession();
+          if (!cancelled) await adoptOrStopUncheckpointedPhoneCall();
+          await adoptUncheckpointedTextMessage();
+        }
         return;
       }
       const settlement = await this.#store.settleFamilyWorkClaim({
@@ -3775,16 +4055,40 @@ export class Florence {
         settledAt: this.#now().toISOString(),
         result: {
           type: "retry",
-          state: { ...work.state, claim: null, browserSession },
+          state: {
+            ...work.state,
+            claim: null,
+            activePhoneCall: uncheckpointedPhoneCall ?? work.state.activePhoneCall,
+            activeTextMessage: uncheckpointedTextMessage ?? work.state.activeTextMessage,
+            browserSession,
+          },
           retryAt: later(this.#now(), RETRY_MS),
           error: errorText(error),
         },
       });
-      if (settlement === "stale") await closeUncheckpointedBrowserSession();
+      if (settlement === "stale") {
+        await closeUncheckpointedBrowserSession();
+        await adoptOrStopUncheckpointedPhoneCall();
+        await adoptUncheckpointedTextMessage();
+      }
     }
   }
 
   async #executeProactiveWork(work: Exclude<DueProactiveWork, { kind: "family_task" }>): Promise<void> {
+    if (work.kind === "cancelled_family_task") {
+      const stopped = await this.#stopFamilyWorkPhoneCall(work.workId, work.activePhoneCall);
+      if (stopped) {
+        await this.#store.clearCancelledFamilyWorkPhoneCall(work.workId, work.activePhoneCall);
+      } else {
+        await this.#store.retryCancelledFamilyWorkPhoneCall(
+          work.workId,
+          work.activePhoneCall,
+          later(this.#now(), RETRY_MS),
+          "Florence is still stopping the cancelled task's provider call",
+        );
+      }
+      return;
+    }
     if (work.kind === "reminder") {
       await this.#store.fireDueReminder({
         workId: work.workId,
@@ -4423,7 +4727,7 @@ export class Florence {
           finding.monitor !== null &&
           finding.monitor.operation !== "create" &&
           activeMonitorIds.has(finding.monitor.monitorId);
-        return finding.familyRelevance !== "adult_only" || existingMonitorChange;
+        return finding.familyRelevance !== "owner_private" || finding.materialChange || existingMonitorChange;
       });
       const storeFindings = retainedFindings.map((finding) => {
         const sharing = privateCalendarSafeBackgroundSharing({
@@ -4441,7 +4745,7 @@ export class Florence {
           familyCalendar: sharing.familyCalendar,
         };
       });
-      const retainedFacts = decision.facts.filter((fact) => fact.familyRelevance !== "adult_only");
+      const retainedFacts = decision.facts.filter((fact) => fact.familyRelevance !== "owner_private");
       let deliveries = storeFindings
         .filter(
           (finding) =>
@@ -5121,6 +5425,53 @@ function memorySources(facts: readonly FactRecord[]): FlorenceSource[] {
   });
 }
 
+const VISIBLE_MEMORY_SOURCE_LIMIT = 50;
+
+function representativeMemorySources(sources: readonly FlorenceSource[]): FlorenceSource[] {
+  const byFact = new Map<string, FlorenceSource>();
+  for (const source of sources) {
+    const key = source.recordId ?? source.sourceId;
+    const existing = byFact.get(key);
+    if (
+      !existing ||
+      (source.occurredAt ?? "") > (existing.occurredAt ?? "") ||
+      (source.occurredAt === existing.occurredAt && source.sourceId > existing.sourceId)
+    ) {
+      byFact.set(key, source);
+    }
+  }
+  return [...byFact.values()];
+}
+
+function selectVisibleMemorySources(
+  sources: readonly FlorenceSource[],
+  currentMessage: string,
+): FlorenceSource[] {
+  const queryTerms = new Set(
+    (currentMessage.toLocaleLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []).filter((term) => term.length >= 3),
+  );
+  const relevance = (source: FlorenceSource): number => {
+    const sourceTerms = new Set(
+      (`${source.label}\n${source.text}`.toLocaleLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []).filter(
+        (term) => term.length >= 3,
+      ),
+    );
+    let score = 0;
+    for (const term of queryTerms) {
+      if (sourceTerms.has(term)) score += 1;
+    }
+    return score;
+  };
+  return [...sources]
+    .sort(
+      (left, right) =>
+        relevance(right) - relevance(left) ||
+        (right.occurredAt ?? "").localeCompare(left.occurredAt ?? "") ||
+        right.sourceId.localeCompare(left.sourceId),
+    )
+    .slice(0, VISIBLE_MEMORY_SOURCE_LIMIT);
+}
+
 function enforcePolicy(decision: FlorenceDecision, announceRestrictions: boolean): FlorenceDecision {
   if (decision.policy.stopMessaging) {
     return {
@@ -5168,7 +5519,7 @@ function enforcePolicy(decision: FlorenceDecision, announceRestrictions: boolean
     facts: retain ? decision.facts : decision.facts.filter((fact) => fact.operation === "forget"),
     followUp: schedule ? decision.followUp : null,
     reminder,
-    familyWork: schedule ? decision.familyWork : null,
+    familyWork: decision.familyWork,
     docketCompletions: decision.docketCompletions,
     interest,
     calendar,
@@ -5412,13 +5763,13 @@ function decisionCommit(
     if (
       turn.authority.audience !== "private" ||
       turn.message.moveKind === "reaction" ||
-      !turn.message.authoredText?.trim() ||
+      !hasVerifiedInstruction(turn.message) ||
       householdUpdate.sourceIds.length !== 1 ||
       householdUpdate.sourceIds[0] !== turn.message.sourceId
     ) {
       throw new FlorenceReasonerError(
         "invalid_output",
-        "A household update requires only the current adult's typed private Message",
+        "A household update requires only the current adult's verified private instruction",
       );
     }
   }
@@ -5484,10 +5835,10 @@ function calendarCommit(
       "A Calendar decision must cite the current adult message",
     );
   }
-  if (!turn.message.authoredText?.trim()) {
+  if (!hasVerifiedInstruction(turn.message)) {
     throw new FlorenceReasonerError(
       "invalid_output",
-      "A Calendar decision requires the current parent's authored instruction",
+      "A Calendar decision requires the current parent's verified instruction",
     );
   }
   if (!turn.household.familyCalendarId) {
@@ -6185,19 +6536,16 @@ function turnText(turn: InboundTurn["message"] | InboundTurn["recentMessages"][n
   return "Shared a family attachment.";
 }
 
+function hasVerifiedInstruction(turn: InboundTurn["message"]): boolean {
+  return Boolean(turn.authoredText?.trim() || (turn.voiceTranscriptPresent && turn.text?.trim()));
+}
+
 function redactWebAccessToken(value: string): string {
   return value.replace(/wa1\.[A-Za-z0-9_-]+/gu, "[secure web link]");
 }
 
 function modelSafeGmailText(value: string): string {
-  return redactWebAccessToken(value)
-    .replace(/https?:\/\/[^\s<>"']+/giu, "[link removed]")
-    .replace(/\b(?:\d[\s-]?){6,8}\b/gu, "[code removed]")
-    .replace(/\b[A-Za-z0-9][A-Za-z0-9._~+/=-]{23,}\b/gu, "[secret removed]")
-    .replace(
-      /\b((?:password|passcode|one[- ]time code|verification code|security code|otp)\b\s*(?:is|:|=|-)\s*)\S+/giu,
-      "$1[secret removed]",
-    );
+  return redactWebAccessToken(value);
 }
 
 function approvalReplyTargetsPrompt(
@@ -6426,13 +6774,16 @@ function privateCalendarSafeBackgroundSharing<
   adultFirstName: string;
   timeZone: string;
 }): { conclusion: TConclusion | null; familyCalendar: FamilyCalendarReviewProposal | null } {
+  if (input.familyRelevance === "owner_private") {
+    return { conclusion: null, familyCalendar: null };
+  }
   const familyCalendar = input.familyCalendar;
   const personalCalendarSourceId = familyCalendar?.sourceIds[0];
   const personalCalendarSource = personalCalendarSourceId
     ? input.googleEvidence.get(personalCalendarSourceId)
     : null;
   if (
-    input.familyRelevance !== "adult_only" &&
+    input.familyRelevance !== "owner_private" &&
     input.conclusion?.category === "family_date" &&
     familyCalendar !== null &&
     familyCalendar.sourceIds.length === 1 &&

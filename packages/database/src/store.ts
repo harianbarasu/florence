@@ -232,6 +232,13 @@ export type CurrentMessageDocument = {
   discardAfter: string;
 };
 
+export type FamilyWorkOriginContext = {
+  message: ConversationTurn & { speaker: string };
+  supersededMessages: readonly (ConversationTurn & { speaker: string })[];
+  replyTarget: ConversationTurn | null;
+  currentDocuments: readonly CurrentMessageDocument[];
+};
+
 export type GoogleConnectionStatus = "pending" | "active" | "disconnected";
 export type GoogleConnectionView = {
   connectionId: string;
@@ -334,7 +341,7 @@ export type FamilyRelevance =
   | "child_care_school_or_activity"
   | "household_logistics"
   | "enrolled_adult_coordination"
-  | "adult_only";
+  | "owner_private";
 
 export type GoogleStableFactContext = {
   slot: string;
@@ -347,14 +354,15 @@ export type GoogleStableFactDraft = GoogleStableFactContext & {
 };
 
 export type InitialGoogleScanFinding = PrivateReviewFinding & {
-  familyRelevance: Exclude<FamilyRelevance, "adult_only">;
+  familyRelevance: FamilyRelevance;
   urgency: "now" | "soon" | "watch";
   dueAt: string | null;
   surfaceNow: boolean;
   observedAt: string;
 };
 
-export type InitialGoogleScanFact = GoogleStableFactDraft & {
+export type InitialGoogleScanFact = Omit<GoogleStableFactDraft, "familyRelevance"> & {
+  familyRelevance: Exclude<FamilyRelevance, "owner_private">;
   observedAt: string;
   /** Per-support timestamps let a replay remove the newest support and recompute the true winner. */
   sourceObservations: readonly { sourceId: string; observedAt: string }[];
@@ -590,6 +598,15 @@ export type FamilyWorkStateV1 = {
     readonly sessionId: string;
     readonly expiresAt: string;
   } | null;
+  readonly activePhoneCall: {
+    readonly provider: "bland" | "twilio";
+    readonly kind: "agent" | "announcement";
+    readonly providerCallId: string;
+  } | null;
+  readonly activeTextMessage: {
+    readonly provider: "twilio";
+    readonly messageSid: string;
+  } | null;
   readonly continuationItems: readonly JsonValue[];
   readonly pendingCall: {
     readonly callId: string;
@@ -638,11 +655,18 @@ export type SettleFamilyWorkClaimInput = {
 export type DueProactiveWork =
   | { kind: "reminder"; workId: string }
   | {
+      kind: "cancelled_family_task";
+      workId: string;
+      activePhoneCall: NonNullable<FamilyWorkStateV1["activePhoneCall"]>;
+    }
+  | {
       kind: "family_task";
       workId: string;
       household: SharedFamilyProfile;
       visibility: Visibility;
       ownerAdultId: string | null;
+      initiatingAdultId: string;
+      origin: FamilyWorkOriginContext;
       objective: string;
       state: FamilyWorkStateV1;
       claimId: string;
@@ -2808,6 +2832,30 @@ export class PostgresFlorenceStore {
           )
       `;
 
+      const [cancelledFamilyTask] = await sql<ProactiveWorkRow[]>`
+        select * from proactive_work
+        where kind='family_task' and status='cancelled' and next_check_at<=${now}
+          and task_state->'activePhoneCall' is not null
+          and task_state->'activePhoneCall' <> 'null'::jsonb
+        order by next_check_at,id
+        limit 1 for update skip locked
+      `;
+      if (cancelledFamilyTask) {
+        const state = familyWorkState(cancelledFamilyTask.task_state);
+        if (!state.activePhoneCall) {
+          throw new FlorenceStoreConflict("Cancelled family work lost its active phone call");
+        }
+        await sql`
+          update proactive_work set next_check_at=${new Date(now.getTime() + FAMILY_WORK_CLAIM_LEASE_MS)}
+          where id=${cancelledFamilyTask.id} and kind='family_task' and status='cancelled'
+        `;
+        return {
+          kind: "cancelled_family_task",
+          workId: cancelledFamilyTask.id,
+          activePhoneCall: state.activePhoneCall,
+        };
+      }
+
       const due = await sql<ProactiveWorkRow[]>`
         select * from proactive_work where status='active' and next_check_at<=${now}
           and kind in (
@@ -2857,12 +2905,15 @@ export class PostgresFlorenceStore {
             update proactive_work set task_state=${sql.json(claimedState)},next_check_at=${leaseUntil},
               last_error=null where id=${familyTask.id}
           `;
+          const origin = await familyWorkOriginContext(sql, familyTask, now);
           return {
             kind: "family_task",
             workId: familyTask.id,
             household: await sharedFamilyProfile(sql, familyTask.household_id),
             visibility: familyTask.visibility,
             ownerAdultId: familyTask.owner_adult_id,
+            initiatingAdultId: origin.message.speaker,
+            origin,
             objective: required(familyTask.objective ?? "", "Family work objective"),
             state: claimedState,
             claimId,
@@ -3173,7 +3224,116 @@ export class PostgresFlorenceStore {
     });
   }
 
-  async takeCancelledFamilyWorkBrowserSession(workId: string): Promise<FamilyWorkStateV1["browserSession"]> {
+  async readClaimedFamilyWorkState(input: {
+    workId: string;
+    generation: number;
+    claimId: string;
+  }): Promise<FamilyWorkStateV1 | null> {
+    assertUuid(input.workId, "Family work ID");
+    assertUuid(input.claimId, "Family work claim ID");
+    familyWorkCounter(input.generation, "Family work generation");
+    const [work] = await this.#sql<ProactiveWorkRow[]>`
+      select * from proactive_work
+      where id=${input.workId} and kind='family_task' and status='active'
+        and task_state->>'generation'=${String(input.generation)}
+        and task_state->'claim'->>'claimId'=${input.claimId}
+    `;
+    return work ? familyWorkState(work.task_state) : null;
+  }
+
+  async adoptFamilyWorkPhoneCall(
+    workId: string,
+    activePhoneCall: NonNullable<FamilyWorkStateV1["activePhoneCall"]>,
+    retryAtInput: string,
+  ): Promise<boolean> {
+    assertUuid(workId, "Family work ID");
+    const retryAt = instant(retryAtInput);
+    const checkedCall = familyWorkState({ ...initialFamilyWorkState(), activePhoneCall }).activePhoneCall;
+    if (!checkedCall) throw new FlorenceStoreConflict("Family work needs a phone-call handle");
+    return this.#sql.begin(async (sql) => {
+      const [work] = await sql<ProactiveWorkRow[]>`
+        select * from proactive_work
+        where id=${workId} and kind='family_task' and status in ('active','cancelled')
+        for update
+      `;
+      if (!work) return false;
+      const state = familyWorkState(work.task_state);
+      if (state.activePhoneCall) {
+        const sameCall = sameFamilyWorkPhoneCall(state.activePhoneCall, checkedCall);
+        const resolvesPendingCall = resolvesPendingFamilyWorkPhoneCall(state.activePhoneCall, checkedCall);
+        if (!sameCall && !resolvesPendingCall) return false;
+        const nextState = resolvesPendingCall
+          ? familyWorkState({ ...state, activePhoneCall: checkedCall })
+          : state;
+        if (work.status === "cancelled") {
+          await sql`
+            update proactive_work set task_state=${sql.json(nextState)},next_check_at=${retryAt}
+            where id=${work.id} and kind='family_task' and status='cancelled'
+          `;
+        } else if (resolvesPendingCall) {
+          await sql`
+            update proactive_work set task_state=${sql.json(nextState)}
+            where id=${work.id} and kind='family_task' and status='active'
+          `;
+        }
+        return true;
+      }
+      const nextState = familyWorkState({ ...state, activePhoneCall: checkedCall });
+      if (work.status === "cancelled") {
+        await sql`
+          update proactive_work set task_state=${sql.json(nextState)},next_check_at=${retryAt}
+          where id=${work.id} and kind='family_task' and status='cancelled'
+        `;
+      } else {
+        await sql`
+          update proactive_work set task_state=${sql.json(nextState)}
+          where id=${work.id} and kind='family_task' and status='active'
+        `;
+      }
+      return true;
+    });
+  }
+
+  async adoptFamilyWorkTextMessage(
+    workId: string,
+    activeTextMessage: NonNullable<FamilyWorkStateV1["activeTextMessage"]>,
+  ): Promise<boolean> {
+    assertUuid(workId, "Family work ID");
+    const checkedMessage = familyWorkState({
+      ...initialFamilyWorkState(),
+      activeTextMessage,
+    }).activeTextMessage;
+    if (!checkedMessage) throw new FlorenceStoreConflict("Family work needs a text-message handle");
+    return this.#sql.begin(async (sql) => {
+      const [work] = await sql<ProactiveWorkRow[]>`
+        select * from proactive_work
+        where id=${workId} and kind='family_task' and status in ('active','cancelled')
+        for update
+      `;
+      if (!work) return false;
+      const state = familyWorkState(work.task_state);
+      if (state.activeTextMessage) {
+        const sameMessage = sameFamilyWorkTextMessage(state.activeTextMessage, checkedMessage);
+        const resolvesPendingMessage = resolvesPendingTwilioFamilyWorkTextMessage(
+          state.activeTextMessage,
+          checkedMessage,
+        );
+        if (!sameMessage && !resolvesPendingMessage) return false;
+        if (!resolvesPendingMessage) return true;
+      }
+      const nextState = familyWorkState({ ...state, activeTextMessage: checkedMessage });
+      await sql`
+        update proactive_work set task_state=${sql.json(nextState)}
+        where id=${work.id} and kind='family_task' and status in ('active','cancelled')
+      `;
+      return true;
+    });
+  }
+
+  async takeCancelledFamilyWorkResources(workId: string): Promise<{
+    browserSession: FamilyWorkStateV1["browserSession"];
+    activePhoneCall: FamilyWorkStateV1["activePhoneCall"];
+  } | null> {
     assertUuid(workId, "Family work ID");
     return this.#sql.begin(async (sql) => {
       const [work] = await sql<ProactiveWorkRow[]>`
@@ -3184,13 +3344,104 @@ export class PostgresFlorenceStore {
       if (!work) return null;
       const state = familyWorkState(work.task_state);
       const browserSession = state.browserSession;
-      if (!browserSession) return null;
-      const nextState = familyWorkState({ ...state, browserSession: null });
+      const activePhoneCall = state.activePhoneCall;
+      if (!browserSession && !activePhoneCall) return null;
+      if (browserSession) {
+        const nextState = familyWorkState({ ...state, browserSession: null });
+        await sql`
+          update proactive_work set task_state=${sql.json(nextState)}
+          where id=${work.id} and kind='family_task' and status='cancelled'
+        `;
+      }
+      return { browserSession, activePhoneCall };
+    });
+  }
+
+  async retainCancelledFamilyWorkPhoneCall(
+    workId: string,
+    activePhoneCall: NonNullable<FamilyWorkStateV1["activePhoneCall"]>,
+    retryAtInput = new Date().toISOString(),
+  ): Promise<boolean> {
+    assertUuid(workId, "Family work ID");
+    const retryAt = instant(retryAtInput);
+    const checkedCall = familyWorkState({ ...initialFamilyWorkState(), activePhoneCall }).activePhoneCall;
+    if (!checkedCall) throw new FlorenceStoreConflict("Cancelled family work needs a phone-call handle");
+    return this.#sql.begin(async (sql) => {
+      const [work] = await sql<ProactiveWorkRow[]>`
+        select * from proactive_work
+        where id=${workId} and kind='family_task' and status='cancelled'
+        for update
+      `;
+      if (!work) return false;
+      const state = familyWorkState(work.task_state);
+      if (state.activePhoneCall) {
+        if (!sameFamilyWorkPhoneCall(state.activePhoneCall, checkedCall)) {
+          throw new FlorenceStoreConflict("Cancelled family work already tracks another phone call");
+        }
+        await sql`
+          update proactive_work set next_check_at=${retryAt}
+          where id=${work.id} and kind='family_task' and status='cancelled'
+        `;
+        return true;
+      }
+      const nextState = familyWorkState({ ...state, activePhoneCall: checkedCall });
       await sql`
-        update proactive_work set task_state=${sql.json(nextState)}
+        update proactive_work set task_state=${sql.json(nextState)},next_check_at=${retryAt}
         where id=${work.id} and kind='family_task' and status='cancelled'
       `;
-      return browserSession;
+      return true;
+    });
+  }
+
+  async retryCancelledFamilyWorkPhoneCall(
+    workId: string,
+    expected: NonNullable<FamilyWorkStateV1["activePhoneCall"]>,
+    retryAtInput: string,
+    errorInput: string,
+  ): Promise<boolean> {
+    assertUuid(workId, "Family work ID");
+    const retryAt = instant(retryAtInput);
+    const error = bounded(required(errorInput, "Cancelled family work phone retry"), 2_000);
+    return this.#sql.begin(async (sql) => {
+      const [work] = await sql<ProactiveWorkRow[]>`
+        select * from proactive_work
+        where id=${workId} and kind='family_task' and status='cancelled'
+        for update
+      `;
+      if (!work) return false;
+      const state = familyWorkState(work.task_state);
+      if (!state.activePhoneCall || !sameFamilyWorkPhoneCall(state.activePhoneCall, expected)) return false;
+      await sql`
+        update proactive_work set next_check_at=${retryAt},last_error=${error}
+        where id=${work.id} and kind='family_task' and status='cancelled'
+      `;
+      return true;
+    });
+  }
+
+  async clearCancelledFamilyWorkPhoneCall(
+    workId: string,
+    expected: NonNullable<FamilyWorkStateV1["activePhoneCall"]>,
+  ): Promise<boolean> {
+    assertUuid(workId, "Family work ID");
+    return this.#sql.begin(async (sql) => {
+      const [work] = await sql<ProactiveWorkRow[]>`
+        select * from proactive_work
+        where id=${workId} and kind='family_task' and status='cancelled'
+        for update
+      `;
+      if (!work) return false;
+      const state = familyWorkState(work.task_state);
+      const active = state.activePhoneCall;
+      if (!active || !sameFamilyWorkPhoneCall(active, expected)) {
+        return false;
+      }
+      const nextState = familyWorkState({ ...state, activePhoneCall: null });
+      await sql`
+        update proactive_work set task_state=${sql.json(nextState)},next_check_at=null,last_error=null
+        where id=${work.id} and kind='family_task' and status='cancelled'
+      `;
+      return true;
     });
   }
 
@@ -7408,7 +7659,8 @@ export class PostgresFlorenceStore {
             await terminalizeUnsentFamilyWorkOutbounds(sql, work.id, "cancellation");
             await sql`
               update proactive_work set task_state=${sql.json(nextState)},status='cancelled',
-                next_check_at=null,current_conclusion='Cancelled.',last_error=null where id=${work.id}
+                next_check_at=${state.activePhoneCall ? handledAt : null},
+                current_conclusion='Cancelled.',last_error=null where id=${work.id}
             `;
           }
         }
@@ -10741,7 +10993,7 @@ function googleStableFacts(input: readonly GoogleStableFactDraft[]): GoogleStabl
       throw new FlorenceStoreConflict("A Google fact statement is too long");
     }
     if (!isHouseholdFactRelevance(fact.familyRelevance)) {
-      throw new FlorenceStoreUnauthorized("Adult-only Google evidence cannot become stable memory");
+      throw new FlorenceStoreUnauthorized("Owner-private Google evidence cannot become stable memory");
     }
     const sourceIds = unique(fact.sourceIds);
     if (sourceIds.length < 1 || sourceIds.length > 10) {
@@ -10788,7 +11040,13 @@ function exactReviewedGoogleSources(input: {
   return dispositions;
 }
 
-function isHouseholdFactRelevance(value: FamilyRelevance): value is Exclude<FamilyRelevance, "adult_only"> {
+function isFamilyRelevance(value: unknown): value is FamilyRelevance {
+  return value === "owner_private" || isHouseholdFactRelevance(value as FamilyRelevance);
+}
+
+function isHouseholdFactRelevance(
+  value: FamilyRelevance,
+): value is Exclude<FamilyRelevance, "owner_private"> {
   return (
     value === "child_care_school_or_activity" ||
     value === "household_logistics" ||
@@ -13598,7 +13856,190 @@ function reminderText(action: string): string {
   return `Reminder: ${normalized}${/[.!?]$/u.test(normalized) ? "" : "."}`;
 }
 
+type FamilyWorkOriginMessageRow = {
+  source_id: string;
+  channel_id: string;
+  sender_adult_id: string | null;
+  direction: "inbound" | "outbound";
+  move_kind: "message" | "reply" | "reaction";
+  text: string | null;
+  reaction: string | null;
+  images: JsonValue;
+  reply_to_source_id: string | null;
+  metadata: JsonValue;
+  occurred_at: Date;
+};
+
+async function familyWorkOriginContext(
+  sql: postgres.TransactionSql,
+  work: ProactiveWorkRow,
+  now: Date,
+): Promise<FamilyWorkOriginContext> {
+  const [message] = await sql<FamilyWorkOriginMessageRow[]>`
+    select message.source_id,message.channel_id,message.sender_adult_id,message.direction,
+      message.move_kind,message.text,message.reaction,message.images,message.reply_to_source_id,
+      source.metadata,source.occurred_at
+    from proactive_work_sources work_source
+    join sources source on source.id=work_source.source_id
+    join messages message on message.source_id=source.id
+    where work_source.work_id=${work.id} and source.household_id=${work.household_id}
+      and source.kind='linq_message' and source.visibility=${work.visibility}
+      and source.owner_adult_id is not distinct from ${work.owner_adult_id}
+      and message.direction='inbound' and message.sender_adult_id is not null
+    order by source.occurred_at,source.id
+    limit 1
+  `;
+  if (!message?.sender_adult_id || message.direction !== "inbound") {
+    throw new FlorenceStoreConflict("Family work has no initiating parent message");
+  }
+
+  const superseded = await sql<(FamilyWorkOriginMessageRow & { depth: number })[]>`
+    with recursive superseded as (
+      select prior_message.source_id,prior_message.channel_id,prior_message.sender_adult_id,
+        prior_message.direction,prior_message.move_kind,prior_message.text,prior_message.reaction,
+        prior_message.images,prior_message.reply_to_source_id,prior_source.metadata,
+        prior_source.occurred_at,1 as depth,array[current_source.id,prior_source.id] as path
+      from sources current_source
+      join sources prior_source
+        on prior_source.id::text=current_source.metadata->>'supersedesSourceId'
+      join messages prior_message on prior_message.source_id=prior_source.id
+      where current_source.id=${message.source_id} and prior_message.channel_id=${message.channel_id}
+        and prior_message.direction='inbound' and prior_source.household_id=${work.household_id}
+        and prior_source.visibility=${work.visibility}
+        and prior_source.owner_adult_id is not distinct from ${work.owner_adult_id}
+      union all
+      select prior_message.source_id,prior_message.channel_id,prior_message.sender_adult_id,
+        prior_message.direction,prior_message.move_kind,prior_message.text,prior_message.reaction,
+        prior_message.images,prior_message.reply_to_source_id,prior_source.metadata,
+        prior_source.occurred_at,superseded.depth+1,superseded.path||prior_source.id
+      from superseded
+      join sources prior_source on prior_source.id::text=superseded.metadata->>'supersedesSourceId'
+      join messages prior_message on prior_message.source_id=prior_source.id
+      where prior_message.channel_id=${message.channel_id} and prior_message.direction='inbound'
+        and prior_source.household_id=${work.household_id}
+        and prior_source.visibility=${work.visibility}
+        and prior_source.owner_adult_id is not distinct from ${work.owner_adult_id}
+        and not prior_source.id=any(superseded.path) and superseded.depth<100
+    )
+    select source_id,channel_id,sender_adult_id,direction,move_kind,text,reaction,images,
+      reply_to_source_id,metadata,occurred_at,depth
+    from superseded order by depth desc,occurred_at,source_id
+  `;
+  if (superseded.some((prior) => !prior.sender_adult_id || prior.direction !== "inbound")) {
+    throw new FlorenceStoreConflict("Family work has an invalid initiating edit chain");
+  }
+
+  const activeSourceIds = [...superseded.map((prior) => prior.source_id), message.source_id];
+  const messageDocuments = await sql<
+    {
+      id: string;
+      parent_source_id: string;
+      filename: string;
+      mime_type: string;
+      content_digest: string;
+      content_envelope: Uint8Array;
+      discard_after: Date;
+    }[]
+  >`
+    select source.id,source.parent_source_id,document.filename,document.mime_type,
+      document.content_digest,document.content_envelope,document.discard_after
+    from sources source
+    join sources parent on parent.id=source.parent_source_id
+    join documents document on document.source_id=source.id
+    where source.household_id=${work.household_id}
+      and source.parent_source_id in ${sql(activeSourceIds)}
+      and source.visibility=parent.visibility
+      and source.owner_adult_id is not distinct from parent.owner_adult_id
+      and source.visibility=${work.visibility}
+      and source.owner_adult_id is not distinct from ${work.owner_adult_id}
+      and source.kind='document' and document.mime_type='application/pdf'
+      and document.retained=false and document.content_envelope is not null
+      and document.discard_after>${now}
+    order by parent.occurred_at,source.id
+  `;
+  const [replyTarget] = message.reply_to_source_id
+    ? await sql<FamilyWorkOriginMessageRow[]>`
+        select reply.source_id,reply.channel_id,reply.sender_adult_id,reply.direction,
+          reply.move_kind,reply.text,reply.reaction,reply.images,reply.reply_to_source_id,
+          source.metadata,source.occurred_at
+        from messages reply join sources source on source.id=reply.source_id
+        where reply.source_id=${message.reply_to_source_id} and reply.channel_id=${message.channel_id}
+          and source.household_id=${work.household_id}
+          and source.visibility=${work.visibility}
+          and source.owner_adult_id is not distinct from ${work.owner_adult_id}
+        limit 1
+      `
+    : [];
+  const replyDocuments = replyTarget
+    ? await sql<
+        {
+          id: string;
+          parent_source_id: string;
+          filename: string;
+          mime_type: string;
+          content_digest: string;
+          content_envelope: Uint8Array;
+          discard_after: Date;
+        }[]
+      >`
+        select source.id,source.parent_source_id,document.filename,document.mime_type,
+          document.content_digest,document.content_envelope,document.discard_after
+        from sources source
+        join sources parent on parent.id=source.parent_source_id
+        join documents document on document.source_id=source.id
+        where source.household_id=${work.household_id}
+          and source.parent_source_id=${replyTarget.source_id}
+          and parent.visibility=${work.visibility}
+          and parent.owner_adult_id is not distinct from ${work.owner_adult_id}
+          and source.visibility=parent.visibility
+          and source.owner_adult_id is not distinct from parent.owner_adult_id
+          and source.kind='document' and document.mime_type='application/pdf'
+          and document.retained=false and document.content_envelope is not null
+          and document.discard_after>${now}
+        order by source.id
+      `
+    : [];
+  const documents = [...messageDocuments, ...replyDocuments];
+
+  const turn = (row: FamilyWorkOriginMessageRow, speaker: string): ConversationTurn => ({
+    sourceId: row.source_id,
+    speaker,
+    moveKind: row.move_kind,
+    text: row.text,
+    ...conversationAuthorship(row.metadata),
+    reaction: row.reaction,
+    images: imageReferences(row.images),
+    replyToSourceId: row.reply_to_source_id,
+    occurredAt: row.occurred_at.toISOString(),
+  });
+  return {
+    message: turn(message, message.sender_adult_id) as ConversationTurn & { speaker: string },
+    supersededMessages: superseded.map(
+      (prior) => turn(prior, prior.sender_adult_id as string) as ConversationTurn & { speaker: string },
+    ),
+    replyTarget: replyTarget
+      ? turn(
+          replyTarget,
+          replyTarget.direction === "outbound"
+            ? "florence"
+            : required(replyTarget.sender_adult_id ?? "", "Reply sender"),
+        )
+      : null,
+    currentDocuments: documents.map((document) => ({
+      id: document.id,
+      parentSourceId: document.parent_source_id,
+      filename: document.filename,
+      mimeType: pdfMimeType(document.mime_type),
+      contentDigest: document.content_digest,
+      contentEnvelope: document.content_envelope,
+      discardAfter: document.discard_after.toISOString(),
+    })),
+  };
+}
+
 const FAMILY_WORK_STATE_KEYS = [
+  "activePhoneCall",
+  "activeTextMessage",
   "browserSession",
   "claim",
   "continuationItems",
@@ -13620,6 +14061,8 @@ function initialFamilyWorkState(): FamilyWorkStateV1 {
     generation: 0,
     phase: "ready",
     claim: null,
+    activePhoneCall: null,
+    activeTextMessage: null,
     browserSession: null,
     continuationItems: [],
     pendingCall: null,
@@ -13645,6 +14088,8 @@ function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWor
     throw new FlorenceStoreConflict("Stored family work state is invalid");
   }
   const state = canonical;
+  if (state.activePhoneCall === undefined) state.activePhoneCall = null;
+  if (state.activeTextMessage === undefined) state.activeTextMessage = null;
   if (state.browserSession === undefined) state.browserSession = null;
   assertExactJsonKeys(state, FAMILY_WORK_STATE_KEYS, "Family work state");
   if (state.kind !== "family_work_v1" || state.version !== 1) {
@@ -13691,6 +14136,53 @@ function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWor
         "Family work browser session ID",
       ),
       expiresAt: instant(expiresAt).toISOString(),
+    };
+  }
+
+  let activePhoneCall: FamilyWorkStateV1["activePhoneCall"] = null;
+  if (state.activePhoneCall !== null) {
+    const storedPhoneCall = strictJsonRecord(state.activePhoneCall, "Family work active phone call");
+    assertExactJsonKeys(
+      storedPhoneCall,
+      ["kind", "provider", "providerCallId"],
+      "Family work active phone call",
+    );
+    const provider = storedPhoneCall.provider;
+    if (provider !== "bland" && provider !== "twilio") {
+      throw new FlorenceStoreConflict("Family work phone provider is invalid");
+    }
+    const kind = storedPhoneCall.kind;
+    if (kind !== "agent" && kind !== "announcement") {
+      throw new FlorenceStoreConflict("Family work phone-call kind is invalid");
+    }
+    if ((kind === "agent") !== (provider === "bland")) {
+      throw new FlorenceStoreConflict("Family work phone provider does not match the call kind");
+    }
+    activePhoneCall = {
+      provider,
+      kind,
+      providerCallId: limitedRequiredString(
+        requiredStringField(storedPhoneCall, "providerCallId", "Family work provider call ID"),
+        300,
+        "Family work provider call ID",
+      ),
+    };
+  }
+
+  let activeTextMessage: FamilyWorkStateV1["activeTextMessage"] = null;
+  if (state.activeTextMessage !== null) {
+    const storedTextMessage = strictJsonRecord(state.activeTextMessage, "Family work active text message");
+    assertExactJsonKeys(storedTextMessage, ["messageSid", "provider"], "Family work active text message");
+    if (storedTextMessage.provider !== "twilio") {
+      throw new FlorenceStoreConflict("Family work text-message provider is invalid");
+    }
+    activeTextMessage = {
+      provider: "twilio",
+      messageSid: limitedRequiredString(
+        requiredStringField(storedTextMessage, "messageSid", "Family work Twilio message SID"),
+        300,
+        "Family work Twilio message SID",
+      ),
     };
   }
 
@@ -13806,6 +14298,8 @@ function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWor
     generation,
     phase,
     claim,
+    activePhoneCall,
+    activeTextMessage,
     browserSession,
     continuationItems: [...continuationItems],
     pendingCall,
@@ -13821,6 +14315,54 @@ function familyWorkCounter(value: unknown, name: string): number {
     throw new FlorenceStoreConflict(`${name} is invalid`);
   }
   return value as number;
+}
+
+function sameFamilyWorkPhoneCall(
+  left: NonNullable<FamilyWorkStateV1["activePhoneCall"]>,
+  right: NonNullable<FamilyWorkStateV1["activePhoneCall"]>,
+): boolean {
+  return (
+    left.provider === right.provider &&
+    left.kind === right.kind &&
+    left.providerCallId === right.providerCallId
+  );
+}
+
+function resolvesPendingFamilyWorkPhoneCall(
+  current: NonNullable<FamilyWorkStateV1["activePhoneCall"]>,
+  resolved: NonNullable<FamilyWorkStateV1["activePhoneCall"]>,
+): boolean {
+  return (
+    resolved.provider === current.provider &&
+    resolved.kind === current.kind &&
+    ((current.provider === "bland" &&
+      current.kind === "agent" &&
+      current.providerCallId.startsWith("pending_bland_") &&
+      !resolved.providerCallId.startsWith("pending_bland_")) ||
+      (current.provider === "twilio" &&
+        current.kind === "announcement" &&
+        current.providerCallId.startsWith("pending_twilio_call_") &&
+        !resolved.providerCallId.startsWith("pending_twilio_call_")))
+  );
+}
+
+function sameFamilyWorkTextMessage(
+  left: NonNullable<FamilyWorkStateV1["activeTextMessage"]>,
+  right: NonNullable<FamilyWorkStateV1["activeTextMessage"]>,
+): boolean {
+  return left.provider === right.provider && left.messageSid === right.messageSid;
+}
+
+function resolvesPendingTwilioFamilyWorkTextMessage(
+  current: NonNullable<FamilyWorkStateV1["activeTextMessage"]>,
+  resolved: NonNullable<FamilyWorkStateV1["activeTextMessage"]>,
+): boolean {
+  return (
+    current.provider === "twilio" &&
+    current.messageSid.startsWith("pending_twilio_sms_") &&
+    resolved.provider === current.provider &&
+    resolved.messageSid !== current.messageSid
+  );
 }
 
 function familyWorkContinuationWithoutPendingCall(state: FamilyWorkStateV1): readonly JsonValue[] {
@@ -14773,10 +15315,9 @@ function initialGoogleScanCalendarTarget(value: JsonValue): InitialGoogleScanCal
 function initialGoogleScanFinding(value: JsonValue): InitialGoogleScanFinding {
   const finding = jsonRecord(value);
   const familyRelevance = finding.familyRelevance;
-  if (!isHouseholdFactRelevance(familyRelevance as FamilyRelevance)) {
+  if (!isFamilyRelevance(familyRelevance)) {
     throw new FlorenceStoreConflict("Initial Google scan finding relevance is invalid");
   }
-  const retainedFamilyRelevance = familyRelevance as Exclude<FamilyRelevance, "adult_only">;
   const sourceIds = scanSourceIds(finding.sourceIds, "Initial Google scan finding");
   if (typeof finding.surfaceNow !== "boolean") {
     throw new FlorenceStoreConflict("Initial Google scan surface state is invalid");
@@ -14816,6 +15357,9 @@ function initialGoogleScanFinding(value: JsonValue): InitialGoogleScanFinding {
     finding.familyCalendar === undefined || finding.familyCalendar === null
       ? null
       : (finding.familyCalendar as unknown as FamilyCalendarReviewProposal);
+  if (familyRelevance === "owner_private" && (householdCandidate !== null || familyCalendar !== null)) {
+    throw new FlorenceStoreConflict("An owner-private Google finding cannot create household output");
+  }
   return {
     privateSummary: requiredStringField(finding, "privateSummary", "Initial Google scan finding summary"),
     ...(finding.actionAnchorDigest === undefined || finding.actionAnchorDigest === null
@@ -14835,7 +15379,7 @@ function initialGoogleScanFinding(value: JsonValue): InitialGoogleScanFinding {
     householdCandidate,
     monitor,
     familyCalendar,
-    familyRelevance: retainedFamilyRelevance,
+    familyRelevance,
     urgency: briefingUrgency(finding.urgency),
     dueAt:
       finding.dueAt === null
@@ -14854,7 +15398,7 @@ function initialGoogleScanFact(value: JsonValue): InitialGoogleScanFact {
   if (!isHouseholdFactRelevance(familyRelevance as FamilyRelevance)) {
     throw new FlorenceStoreConflict("Initial Google scan fact relevance is invalid");
   }
-  const retainedFamilyRelevance = familyRelevance as Exclude<FamilyRelevance, "adult_only">;
+  const retainedFamilyRelevance = familyRelevance as Exclude<FamilyRelevance, "owner_private">;
   const sourceIds = scanSourceIds(fact.sourceIds, "Initial Google scan fact");
   const observedAt = instant(
     requiredStringField(fact, "observedAt", "Initial Google scan fact observation"),
@@ -15716,7 +16260,7 @@ async function insertInboundReaction(
 }
 
 export function isCarrierMessagesOptOut(text: string | null | undefined): boolean {
-  return /^(?:STOP|UNSUBSCRIBE|QUIT|END|CANCEL)$/i.test(text?.trim() ?? "");
+  return /^(?:STOP|UNSUBSCRIBE|QUIT|END)$/i.test(text?.trim() ?? "");
 }
 
 async function insertOutbound(sql: postgres.TransactionSql, input: OutboundInsert): Promise<void> {

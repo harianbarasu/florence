@@ -65,6 +65,16 @@ Optional browser provider:
 | `BROWSERBASE_API_KEY` | Enables Florence's authenticated browser work when non-empty; omit to start without browser tooling |
 | `BROWSERBASE_PROJECT_ID` | Optional Browserbase project ID used when creating and releasing sessions |
 
+Optional phone providers:
+
+| Variable | Contract |
+| --- | --- |
+| `BLAND_API_KEY` | Enables conversational outbound task calls when non-empty |
+| `BLAND_DEFAULT_VOICE` | Optional Bland voice ID; defaults to `mason` |
+| `TWILIO_ACCOUNT_SID` | Enables SMS/MMS, inbox polling, and one-way calls when all three Twilio values are present |
+| `TWILIO_AUTH_TOKEN` | Twilio account credential |
+| `TWILIO_PHONE_NUMBER` | Florence's exact E.164 Twilio sender/caller number |
+
 Optional bounded settings:
 
 - `FLORENCE_MODEL_TIMEOUT_MS=30000`
@@ -82,11 +92,13 @@ Register exactly:
 
 The Linq API key and webhook signing secret are different credentials. Florence verifies the raw webhook signature, pins the payload version, re-reads the live chat, and requires iMessage plus the exact current participant set before retaining content.
 
-Google currently uses `openid`, `email`, `gmail.readonly`,
-`calendar.events.owned`, `calendar.app.created`, `calendar.acls`, and
-`calendar.calendarlist`. Gmail remains private to its owning adult. Calendar
-writes require a current exact instruction or approval and provider readback
-before Florence confirms the change.
+Google currently uses `openid`, `email`, `gmail.modify`, `drive`, `tasks`,
+`contacts`, `calendar.events.owned`, `calendar.events.readonly`,
+`calendar.app.created`, `calendar.acls`, and `calendar.calendarlist`.
+Ordinary Gmail conversation remains private to its owning adult; explicit durable
+work started in the family group uses the initiating parent's Google connection.
+Calendar writes require a current exact instruction or approval and provider
+readback before Florence confirms the change.
 
 ## Build gates
 

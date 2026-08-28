@@ -45,7 +45,7 @@ Evidence labels in this note mean:
 | Arrange an airport ride and book a handyman | Product claim on the [product page](https://instinct.co/) | Tasks are framed as completed real-world outcomes, including third-party coordination | Provider coverage, confirmation flow, payment handling, or success rate |
 | Plan road trips and a wedding; buy groceries and concert tickets; cancel subscriptions | Founder-reported early use in the [launch post](https://x.com/noahrshinn/status/2092691344456351744) | The intended breadth includes travel, planning, commerce, recurring-account chores, and multi-step projects | Exact workflows, number of successful users, human intervention, or repeatability |
 | Think, plan, and act to complete everyday tasks | Published contract in the [Privacy Policy](https://instinct.co/privacy-policy) | The service contract is action-oriented, not answer-only | Internal planner, model, scheduler, retry behavior, or task-state representation |
-| Access and take actions across connected services | Published contract in the [Terms, Connected services and Actions](https://instinct.co/terms) | A generalized connector/action model exists; actions may include purchases and third-party commitments | The available connector catalog, per-connector operations, or default confirmation policy |
+| Access and take actions across connected services | Published contract in the [Terms, Connected services and Actions](https://instinct.co/terms) | Instinct is intended to finish work across services, including purchases and third-party commitments | The available services, operation depth, mechanism, or completion reliability |
 | Use Gmail, Calendar, Drive, Docs, Sheets, Slides, and Tasks | Published contract in the [Privacy Policy, Google Workspace](https://instinct.co/privacy-policy) | Instinct's named Google surface is the full productivity suite, not just inbox and calendar | Editing depth, search quality, or whether every action is enabled |
 | Book rides or medical appointments using account credentials, payments, or relevant personal context | Published contract in the [Privacy Policy](https://instinct.co/privacy-policy) | The product is designed for authenticated and transactional workflows | Merchant/provider coverage, approval UX, or actual booking reliability |
 | Send status updates through push, local, text, picture, alert, or email messages | Published contract in the [Terms, Use of the app](https://instinct.co/terms) | The product has multiple outbound delivery surfaces suitable for status and completion | Which channels the assistant itself uses for task progress or the cadence of updates |
@@ -165,7 +165,7 @@ The Florence baseline at this research date already includes Messages participat
 2. location-aware errands and pickups;
 3. commerce, tickets, groceries, subscriptions, and account workflows;
 4. healthcare/admin forms and portals; and
-5. an extensible connector catalog for personal services.
+5. concrete personal-service workflows for the next household jobs Florence needs to finish.
 
 ## Competitive acceptance scenarios
 

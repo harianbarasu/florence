@@ -7,6 +7,7 @@ import {
 
 export type {
   GoogleWorkspaceJsonValue,
+  GoogleWorkspaceMailAttachment,
   GoogleWorkspaceOperation,
   GoogleWorkspaceResult,
 } from "./workspace.js";

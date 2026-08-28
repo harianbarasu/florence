@@ -30,6 +30,7 @@ import {
 } from "@florence/linq";
 import { describe, expect, onTestFinished, test } from "vitest";
 import { buildApp, createSessionCallerResolver } from "./app.js";
+import type { FlorenceBrowserClient } from "./browser.js";
 import { EnrollmentCodes } from "./enrollment.js";
 import { Florence } from "./florence.js";
 import { createLinqIngress } from "./linq-ingress.js";
@@ -466,6 +467,8 @@ release("Durable family work store", () => {
       generation: 0,
       phase: "ready",
       claim: null,
+      activePhoneCall: null,
+      activeTextMessage: null,
       browserSession: null,
       continuationItems: [],
       pendingCall: null,
@@ -478,10 +481,29 @@ release("Durable family work store", () => {
       sessionId: "browserbase-cancelled-session",
       expiresAt: at(3_600_000),
     } as const;
+    const cancelledPhoneCall = {
+      provider: "bland",
+      kind: "agent",
+      providerCallId: "bland-cancelled-call",
+    } as const;
+    const pendingCancelledPhoneCall = {
+      ...cancelledPhoneCall,
+      providerCallId: `pending_bland_${"a".repeat(64)}_KzE1NTU1MjEyMTI`,
+    } as const;
+    const pendingCancelledTwilioCall = {
+      provider: "twilio",
+      kind: "announcement",
+      providerCallId: `pending_twilio_call_${base.toString(36)}_${"b".repeat(64)}_KzE1NTU1MjEyMTI`,
+    } as const;
+    const resolvedCancelledTwilioCall = {
+      ...pendingCancelledTwilioCall,
+      providerCallId: "CA-resolved-cancelled-call",
+    } as const;
     const cancelledBrowserState = {
       ...initialState,
       generation: 1,
       phase: "terminal",
+      activePhoneCall: cancelledPhoneCall,
       browserSession: cancelledBrowserSession,
       progressRevision: 1,
       terminal: { outcome: "cancelled", text: "Cancelled." },
@@ -532,6 +554,93 @@ release("Durable family work store", () => {
         ${sqlLiteral(JSON.stringify(initialState))}::jsonb,'active',
         ${sqlLiteral(at(-1_000))},${sqlLiteral(at(-9_000))}
       );
+      insert into sources (
+        id,household_id,kind,visibility,owner_adult_id,external_key,label,metadata,occurred_at
+      ) values (
+        '10000000-0000-4000-8000-000000000007',
+        '10000000-0000-4000-8000-000000000001','linq_message','private',
+        '10000000-0000-4000-8000-000000000002','family-work-request','Family work request',
+        ${sqlLiteral(
+          JSON.stringify({
+            authoredText: "Please use this revised request.",
+            voiceTranscriptPresent: true,
+            supersedesSourceId: "10000000-0000-4000-8000-000000000009",
+          }),
+        )}::jsonb,${sqlLiteral(at(-9_500))}
+      ),(
+        '10000000-0000-4000-8000-000000000009',
+        '10000000-0000-4000-8000-000000000001','linq_message','private',
+        '10000000-0000-4000-8000-000000000002','family-work-request-original',
+        'Original family work request',
+        '{"authoredText":"Prepare the original camp form.","voiceTranscriptPresent":false}'::jsonb,
+        ${sqlLiteral(at(-9_700))}
+      ),(
+        '10000000-0000-4000-8000-000000000010',
+        '10000000-0000-4000-8000-000000000001','linq_message','private',
+        '10000000-0000-4000-8000-000000000002','family-work-reply-target',
+        'Florence question',
+        '{"authoredText":"Which camp form should I use?","voiceTranscriptPresent":false}'::jsonb,
+        ${sqlLiteral(at(-9_600))}
+      );
+      insert into messages (
+        source_id,channel_id,direction,sender_adult_id,move_kind,text,provider_event_id,
+        provider_message_id,reply_to_source_id,turn_id,turn_part,status,images,idempotency_key,
+        sent_at
+      ) values (
+        '10000000-0000-4000-8000-000000000009',
+        '10000000-0000-4000-8000-000000000004','inbound',
+        '10000000-0000-4000-8000-000000000002','message','Prepare the original camp form.',
+        'family-work-original-event','family-work-original-message',null,
+        '10000000-0000-4000-8000-000000000013',0,'handled','[]'::jsonb,null,null
+      ),(
+        '10000000-0000-4000-8000-000000000010',
+        '10000000-0000-4000-8000-000000000004','outbound',null,'message',
+        'Which camp form should I use?',null,'family-work-reply-target-message',null,
+        '10000000-0000-4000-8000-000000000014',0,'sent',
+        '[{"assetId":"10000000-0000-4000-8000-000000000016","mimeType":"image/png"}]'::jsonb,
+        'family-work-reply-target-idempotency',${sqlLiteral(at(-9_600))}
+      ),(
+        '10000000-0000-4000-8000-000000000007',
+        '10000000-0000-4000-8000-000000000004','inbound',
+        '10000000-0000-4000-8000-000000000002','reply',
+        E'Please use this revised request.\nVoice transcript: The blue form is the right one.',
+        'family-work-event','family-work-message','10000000-0000-4000-8000-000000000010',
+        '10000000-0000-4000-8000-000000000008',0,'handled',
+        '[{"assetId":"10000000-0000-4000-8000-000000000012","mimeType":"image/jpeg"}]'::jsonb,
+        null,null
+      );
+      insert into sources (
+        id,household_id,kind,visibility,owner_adult_id,external_key,parent_source_id,label,
+        occurred_at
+      ) values (
+        '10000000-0000-4000-8000-000000000011',
+        '10000000-0000-4000-8000-000000000001','document','private',
+        '10000000-0000-4000-8000-000000000002','family-work-pdf',
+        '10000000-0000-4000-8000-000000000007','revised-camp-form.pdf',
+        ${sqlLiteral(at(-9_500))}
+      ),(
+        '10000000-0000-4000-8000-000000000015',
+        '10000000-0000-4000-8000-000000000001','document','private',
+        '10000000-0000-4000-8000-000000000002','family-work-reply-pdf',
+        '10000000-0000-4000-8000-000000000010','original-camp-form.pdf',
+        ${sqlLiteral(at(-9_600))}
+      );
+      insert into documents (
+        source_id,saved_by_adult_id,filename,mime_type,content_digest,retained,
+        content_envelope,discard_after
+      ) values (
+        '10000000-0000-4000-8000-000000000011',
+        '10000000-0000-4000-8000-000000000002','revised-camp-form.pdf','application/pdf',
+        '${"a".repeat(64)}',false,decode('010203','hex'),${sqlLiteral(at(86_400_000))}
+      ),(
+        '10000000-0000-4000-8000-000000000015',
+        '10000000-0000-4000-8000-000000000002','original-camp-form.pdf','application/pdf',
+        '${"b".repeat(64)}',false,decode('040506','hex'),${sqlLiteral(at(86_400_000))}
+      );
+      insert into proactive_work_sources (work_id,source_id) values (
+        '10000000-0000-4000-8000-000000000003',
+        '10000000-0000-4000-8000-000000000007'
+      );
       insert into proactive_work (
         id,household_id,kind,visibility,owner_adult_id,objective,current_conclusion,
         task_state,status,next_check_at,created_at
@@ -562,12 +671,77 @@ release("Durable family work store", () => {
       await rm(directory, { recursive: true, force: true });
     });
 
-    expect(await store.takeCancelledFamilyWorkBrowserSession("10000000-0000-4000-8000-000000000006")).toEqual(
-      cancelledBrowserSession,
-    );
+    expect(await store.takeCancelledFamilyWorkResources("10000000-0000-4000-8000-000000000006")).toEqual({
+      browserSession: cancelledBrowserSession,
+      activePhoneCall: cancelledPhoneCall,
+    });
+    expect(await store.takeCancelledFamilyWorkResources("10000000-0000-4000-8000-000000000006")).toEqual({
+      browserSession: null,
+      activePhoneCall: cancelledPhoneCall,
+    });
     expect(
-      await store.takeCancelledFamilyWorkBrowserSession("10000000-0000-4000-8000-000000000006"),
-    ).toBeNull();
+      await store.clearCancelledFamilyWorkPhoneCall(
+        "10000000-0000-4000-8000-000000000006",
+        cancelledPhoneCall,
+      ),
+    ).toBe(true);
+    expect(
+      await store.retainCancelledFamilyWorkPhoneCall(
+        "10000000-0000-4000-8000-000000000006",
+        pendingCancelledTwilioCall,
+        at(2),
+      ),
+    ).toBe(true);
+    expect(
+      await store.adoptFamilyWorkPhoneCall(
+        "10000000-0000-4000-8000-000000000006",
+        resolvedCancelledTwilioCall,
+        at(2),
+      ),
+    ).toBe(true);
+    expect(await store.takeCancelledFamilyWorkResources("10000000-0000-4000-8000-000000000006")).toEqual({
+      browserSession: null,
+      activePhoneCall: resolvedCancelledTwilioCall,
+    });
+    expect(await store.takeCancelledFamilyWorkResources("10000000-0000-4000-8000-000000000006")).toBeNull();
+    expect(
+      await store.retainCancelledFamilyWorkPhoneCall(
+        "10000000-0000-4000-8000-000000000006",
+        pendingCancelledPhoneCall,
+        at(0),
+      ),
+    ).toBe(true);
+    expect(
+      await store.adoptFamilyWorkPhoneCall("10000000-0000-4000-8000-000000000006", cancelledPhoneCall, at(0)),
+    ).toBe(true);
+    expect(await store.takeCancelledFamilyWorkResources("10000000-0000-4000-8000-000000000006")).toEqual({
+      browserSession: null,
+      activePhoneCall: cancelledPhoneCall,
+    });
+    expect(await store.readNextDueProactiveWork(at(0))).toEqual({
+      kind: "cancelled_family_task",
+      workId: "10000000-0000-4000-8000-000000000006",
+      activePhoneCall: cancelledPhoneCall,
+    });
+    expect(
+      await store.retryCancelledFamilyWorkPhoneCall(
+        "10000000-0000-4000-8000-000000000006",
+        cancelledPhoneCall,
+        at(1),
+        "The provider call is still stopping",
+      ),
+    ).toBe(true);
+    expect(await store.readNextDueProactiveWork(at(1))).toEqual({
+      kind: "cancelled_family_task",
+      workId: "10000000-0000-4000-8000-000000000006",
+      activePhoneCall: cancelledPhoneCall,
+    });
+    expect(
+      await store.clearCancelledFamilyWorkPhoneCall(
+        "10000000-0000-4000-8000-000000000006",
+        cancelledPhoneCall,
+      ),
+    ).toBe(true);
 
     const reminder = await store.readNextDueProactiveWork(at(0));
     expect(reminder).toEqual({ kind: "reminder", workId: "10000000-0000-4000-8000-000000000005" });
@@ -585,6 +759,55 @@ release("Durable family work store", () => {
 
     const first = await store.readNextDueProactiveWork(at(2));
     if (first?.kind !== "family_task") throw new Error("Family work was not claimed");
+    expect(first.initiatingAdultId).toBe("10000000-0000-4000-8000-000000000002");
+    expect(first.origin).toMatchObject({
+      message: {
+        sourceId: "10000000-0000-4000-8000-000000000007",
+        moveKind: "reply",
+        authoredText: "Please use this revised request.",
+        voiceTranscriptPresent: true,
+        replyToSourceId: "10000000-0000-4000-8000-000000000010",
+        images: [
+          {
+            assetId: "10000000-0000-4000-8000-000000000012",
+            mimeType: "image/jpeg",
+          },
+        ],
+      },
+      supersededMessages: [
+        expect.objectContaining({
+          sourceId: "10000000-0000-4000-8000-000000000009",
+          text: "Prepare the original camp form.",
+        }),
+      ],
+      replyTarget: expect.objectContaining({
+        sourceId: "10000000-0000-4000-8000-000000000010",
+        speaker: "florence",
+        text: "Which camp form should I use?",
+        images: [
+          {
+            assetId: "10000000-0000-4000-8000-000000000016",
+            mimeType: "image/png",
+          },
+        ],
+      }),
+      currentDocuments: [
+        expect.objectContaining({
+          id: "10000000-0000-4000-8000-000000000011",
+          parentSourceId: "10000000-0000-4000-8000-000000000007",
+          filename: "revised-camp-form.pdf",
+          contentDigest: "a".repeat(64),
+        }),
+        expect.objectContaining({
+          id: "10000000-0000-4000-8000-000000000015",
+          parentSourceId: "10000000-0000-4000-8000-000000000010",
+          filename: "original-camp-form.pdf",
+          contentDigest: "b".repeat(64),
+        }),
+      ],
+    });
+    expect(first.origin.currentDocuments[0]?.contentEnvelope).toEqual(Uint8Array.from([1, 2, 3]));
+    expect(first.origin.currentDocuments[1]?.contentEnvelope).toEqual(Uint8Array.from([4, 5, 6]));
     const plannedState = {
       ...first.state,
       phase: "tool_pending" as const,
@@ -1973,6 +2196,113 @@ release("Florence parent journeys", () => {
     );
   }, 20_000);
 
+  test("runs authenticated browser work from the initiating parent in the family thread", async () => {
+    const browserRuns: Parameters<FlorenceBrowserClient["run"]>[0][] = [];
+    const closedSessions: Parameters<FlorenceBrowserClient["close"]>[0][] = [];
+    const browser: FlorenceBrowserClient = {
+      run: async (input) => {
+        browserRuns.push(input);
+        return {
+          session: {
+            sessionId: "browserbase-family-session",
+            expiresAt: "2026-08-27T21:00:00.000Z",
+          },
+          observation: {
+            kind: "page",
+            reason: null,
+            url: "https://camp.example/register",
+            title: "Camp registration",
+            snapshot: "Registration form",
+            refCount: 0,
+            truncated: false,
+          },
+        };
+      },
+      close: async (session) => {
+        closedSessions.push(session);
+      },
+      closeAll: async () => undefined,
+    };
+    const harness = await createHarness(
+      async (input) =>
+        input.currentMessage.text === "Open the camp registration for us."
+          ? decision({
+              familyWork: {
+                operation: "create",
+                workId: null,
+                objective: "Open the camp registration form.",
+                instruction: null,
+              },
+            })
+          : decision(),
+      {
+        browser,
+        continueFamilyWork: async (input, reads) => {
+          if (input.state.phase === "ready") {
+            expect(input.origin.message).toMatchObject({
+              speaker: expect.any(String),
+              text: "Open the camp registration for us.",
+              authoredText: "Open the camp registration for us.",
+              voiceTranscriptPresent: false,
+            });
+            return {
+              kind: "continue",
+              state: {
+                ...input.state,
+                phase: "tool_pending",
+                claim: null,
+                pendingCall: {
+                  callId: "open-camp-registration",
+                  name: "browser_work",
+                  argumentsJson: JSON.stringify({
+                    operation: "navigate",
+                    url: "https://camp.example/register",
+                  }),
+                  attempt: 0,
+                },
+              },
+              progressText: null,
+              nextCheckDelayMs: 0,
+            };
+          }
+          if (!reads.runBrowser)
+            throw new Error("The family task did not receive authenticated browser work");
+          const observation = await reads.runBrowser({
+            kind: "navigate",
+            url: "https://camp.example/register",
+          });
+          expect(observation.title).toBe("Camp registration");
+          const terminalText = "I opened the camp registration form.";
+          return {
+            kind: "terminal",
+            state: {
+              ...input.state,
+              phase: "terminal",
+              claim: null,
+              pendingCall: null,
+              terminal: { outcome: "succeeded", text: terminalText },
+            },
+            outcome: "succeeded",
+            text: terminalText,
+          };
+        },
+      },
+    );
+    await harness.readyHousehold();
+
+    await harness.accept("group", "group-browser-work", "Open the camp registration for us.", "partner");
+    await harness.drain();
+    harness.state.now += 1_001;
+    await harness.drain();
+
+    expect(browserRuns).toHaveLength(1);
+    expect(browserRuns[0]).toMatchObject({
+      ownerAdultId: harness.partnerAdultId,
+      operation: { kind: "navigate", url: "https://camp.example/register" },
+    });
+    expect(closedSessions).toEqual([expect.objectContaining({ sessionId: "browserbase-family-session" })]);
+  }, 20_000);
+
   test("gets ahead from both parents’ context, native inputs, a monitor, and the read-only calendar", async () => {
     let nativeInputWasRead = false;
     let ordinaryUnusedSourceId: string | null = null;
@@ -2281,10 +2611,10 @@ release("Florence parent journeys", () => {
     );
     if (!founderModelReview) throw new Error("The founder's model-safe Gmail batch is missing");
     const founderModelReviewJson = JSON.stringify(founderModelReview);
-    expect(founderModelReviewJson).toContain("[code removed]");
-    expect(founderModelReviewJson).toContain("[link removed]");
-    expect(founderModelReviewJson).not.toContain("123456");
-    expect(founderModelReviewJson).not.toContain("example.test/reset");
+    expect(founderModelReviewJson).toContain("Code 123456");
+    expect(founderModelReviewJson).toContain(
+      "https://example.test/reset?token=fake-only-token-value-1234567890",
+    );
     const founderBaselineReads = harness.state.baselinePageReads.filter(
       (read) => read.ownerAdultId === harness.founderAdultId && read.connectionId === FOUNDER_GOOGLE,
     );
@@ -2681,6 +3011,7 @@ release("Florence parent journeys", () => {
     harness.state.unrelatedAccountEmailPending = true;
     harness.state.now += 2 * 60_000;
     await harness.drain();
+    const unrelatedAccountMessages = harness.linq.messages.slice(messagesBeforeUnrelatedAccountEmail);
     expect(
       harness.state.googleAssessments.some((assessment) =>
         assessment.evidence.gmail.sources.some(
@@ -2688,26 +3019,38 @@ release("Florence parent journeys", () => {
         ),
       ),
     ).toBe(true);
-    expect(harness.linq.messages).toHaveLength(messagesBeforeUnrelatedAccountEmail);
-    expect(harness.linq.messages.some((message) => message.text === UNRELATED_ACCOUNT_EMAIL_ALERT)).toBe(
-      false,
-    );
+    expect(unrelatedAccountMessages).toEqual([
+      expect.objectContaining({
+        providerConversationId: PRIVATE_FOUNDER,
+        text: UNRELATED_ACCOUNT_EMAIL_ALERT,
+      }),
+    ]);
+    expect(
+      harness.linq.messages.some(
+        (message) =>
+          message.providerConversationId === FAMILY_GROUP && message.text === UNRELATED_ACCOUNT_EMAIL_ALERT,
+      ),
+    ).toBe(false);
     await harness.assertDatabase(
-      "An unrelated adult account email source was retained",
-      `not exists (
+      "An actionable owner-private account email was not retained for its owner",
+      `exists (
         select 1 from sources
-        where kind='gmail' and metadata->>'messageId'='gmail-unrelated-retail-account-alert'
+        where kind='gmail' and visibility='private'
+          and owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid
+          and metadata->>'messageId'='gmail-unrelated-retail-account-alert'
       )`,
     );
     await harness.assertDatabase(
-      "An unrelated adult account email became a monitor",
-      `not exists (
+      "An actionable owner-private account email did not create its private monitor",
+      `exists (
         select 1 from proactive_work
-        where kind='finite_monitor' and objective=${sqlLiteral(UNRELATED_ACCOUNT_MONITOR_OBJECTIVE)}
+        where kind='finite_monitor' and visibility='private'
+          and owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid
+          and objective=${sqlLiteral(UNRELATED_ACCOUNT_MONITOR_OBJECTIVE)}
       )`,
     );
     await harness.assertDatabase(
-      "An unrelated adult account email became a fact",
+      "An owner-private account email became a shared Vault fact",
       `not exists (select 1 from facts where slot=${sqlLiteral(UNRELATED_ACCOUNT_FACT_SLOT)})`,
     );
     await harness.assertDatabase(
@@ -2902,7 +3245,12 @@ release("Florence parent journeys", () => {
       ]),
     );
 
-    await harness.accept("group", "soccer-interest", INTEREST_REQUEST, "partner");
+    const voicedInterest = await harness.florence.acceptInbound({
+      ...harness.inbound("group", "soccer-interest", INTEREST_REQUEST, "partner"),
+      authoredText: null,
+      voiceTranscriptPresent: true,
+    });
+    expect(voicedInterest).not.toBeNull();
     await harness.drain();
     const interests = (
       await harness.florence.workspaceForAdult(harness.founderAdultId)
@@ -3841,16 +4189,18 @@ release("Florence parent journeys", () => {
     expect(
       initialBoundaryHarness.linq.messages.some(
         (message) =>
-          message.text === UNRELATED_ACCOUNT_EMAIL_ALERT ||
-          message.text.includes("retail account password changed"),
+          message.providerConversationId === PRIVATE_FOUNDER &&
+          message.text.includes(UNRELATED_ACCOUNT_EMAIL_ALERT),
       ),
-    ).toBe(false);
+    ).toBe(true);
     expect(
       initialBoundaryHarness.linq.messages.some(
         (message) =>
-          message.providerConversationId === PRIVATE_FOUNDER && message.text === PRIVATE_INITIAL_ALL_CLEAR,
+          message.providerConversationId === FAMILY_GROUP &&
+          (message.text === UNRELATED_ACCOUNT_EMAIL_ALERT ||
+            message.text.includes("retail account password changed")),
       ),
-    ).toBe(true);
+    ).toBe(false);
     const initialBoundaryWorkspace = await initialBoundaryHarness.florence.workspaceForAdult(
       initialBoundaryHarness.founderAdultId,
     );
@@ -3861,17 +4211,21 @@ release("Florence parent journeys", () => {
       initialBoundaryWorkspace.vault?.watches.some(
         (watch) => watch.objective === UNRELATED_ACCOUNT_MONITOR_OBJECTIVE,
       ),
-    ).toBe(false);
+    ).toBe(true);
     await initialBoundaryHarness.assertDatabase(
-      "An adult-only initial Google finding crossed Florence's family relevance boundary",
-      `not exists (
+      "An actionable owner-private initial Google finding was not retained privately",
+      `exists (
         select 1 from sources
-        where kind='gmail' and metadata->>'messageId'='gmail-initial-unrelated-retail-account-alert'
+        where kind='gmail' and visibility='private'
+          and owner_adult_id=${sqlLiteral(initialBoundaryHarness.founderAdultId)}::uuid
+          and metadata->>'messageId'='gmail-initial-unrelated-retail-account-alert'
       ) and not exists (
         select 1 from facts where slot=${sqlLiteral(UNRELATED_ACCOUNT_FACT_SLOT)}
-      ) and not exists (
+      ) and exists (
         select 1 from proactive_work
-        where kind='finite_monitor' and objective=${sqlLiteral(UNRELATED_ACCOUNT_MONITOR_OBJECTIVE)}
+        where kind='finite_monitor' and visibility='private'
+          and owner_adult_id=${sqlLiteral(initialBoundaryHarness.founderAdultId)}::uuid
+          and objective=${sqlLiteral(UNRELATED_ACCOUNT_MONITOR_OBJECTIVE)}
       )`,
     );
 
@@ -3892,7 +4246,7 @@ release("Florence parent journeys", () => {
       ),
     ).toBe(true);
     await initialFactOnlyBoundaryHarness.assertDatabase(
-      "An adult-only fact-only initial review crossed Florence's family relevance boundary",
+      "An owner-private fact-only initial review crossed Florence's family relevance boundary",
       `not exists (
         select 1 from sources
         where kind='gmail' and metadata->>'messageId'='gmail-initial-unrelated-retail-account-alert'
@@ -4399,7 +4753,12 @@ release("Florence parent journeys", () => {
     expect(privateFact).toMatchObject({ visibility: "private" });
     expect(partnerPrivate.vault?.facts.some((fact) => fact.id === privateFact?.id)).toBe(false);
 
-    await harness.accept("private", "private-household-update", "Tell Alex that pickup is at 3:15.");
+    const voicedHouseholdUpdate = await harness.florence.acceptInbound({
+      ...harness.inbound("private", "private-household-update", "Tell Alex that pickup is at 3:15."),
+      authoredText: null,
+      voiceTranscriptPresent: true,
+    });
+    expect(voicedHouseholdUpdate).not.toBeNull();
     await harness.drain();
     expect(
       harness.linq.messages.filter(
@@ -4445,7 +4804,12 @@ release("Florence parent journeys", () => {
     expect(shared.vault?.facts.some((fact) => fact.id === pickupFactId)).toBe(false);
 
     harness.state.uncertainCalendarCreateTitle = PICKUP_EVENT.title;
-    await harness.accept("group", "calendar-create", "Add Maya pickup to the family calendar.");
+    const voicedCalendarCreate = await harness.florence.acceptInbound({
+      ...harness.inbound("group", "calendar-create", "Add Maya pickup to the family calendar."),
+      authoredText: null,
+      voiceTranscriptPresent: true,
+    });
+    expect(voicedCalendarCreate).not.toBeNull();
     await harness.drain();
     const uncertainCreateAttempts = () =>
       harness.state.calendarExecutions.filter(
@@ -5301,7 +5665,12 @@ function expectFreshLinqIncarnation(
 
 async function createHarness(
   reason: Reason = async () => decision(),
-  options: { now?: number; linqLedger?: FakeLinqLedger } = {},
+  options: {
+    now?: number;
+    linqLedger?: FakeLinqLedger;
+    browser?: FlorenceBrowserClient;
+    continueFamilyWork?: FlorenceReasoner["continueFamilyWork"];
+  } = {},
 ): Promise<Harness> {
   if (!TEST_DATABASE_URL) throw new Error("TEST_DATABASE_URL is required");
   const directory = await mkdtemp(join(tmpdir(), "florence-parent-journeys-"));
@@ -5383,12 +5752,13 @@ async function createHarness(
     encryptionKey: new Uint8Array(32).fill(7),
   });
   const enrollmentCodes = new EnrollmentCodes(ENROLLMENT_SECRET);
-  const reasoner = createReasoner(reason, state);
+  const reasoner = createReasoner(reason, state, options.continueFamilyWork);
   const google = createGoogle(store, state);
   const florence = new Florence({
     store,
     linq: linq as unknown as LinqClient,
     google,
+    ...(options.browser ? { browser: options.browser } : {}),
     reasoner,
     enrollmentCodes,
     imageVault: vault,
@@ -5408,9 +5778,14 @@ async function createHarness(
   return harness;
 }
 
-function createReasoner(reason: Reason, state: HarnessState): FlorenceReasoner {
+function createReasoner(
+  reason: Reason,
+  state: HarnessState,
+  continueFamilyWork?: FlorenceReasoner["continueFamilyWork"],
+): FlorenceReasoner {
   return {
     decide: reason,
+    ...(continueFamilyWork ? { continueFamilyWork } : {}),
     transcribeVoiceNote: async (input: Parameters<FlorenceReasoner["transcribeVoiceNote"]>[0]) => {
       state.voiceTranscriptions += 1;
       expect(input).toMatchObject({ filename: "teacher-note.wav", mimeType: "audio/wav" });
@@ -5563,6 +5938,33 @@ function createReasoner(reason: Reason, state: HarnessState): FlorenceReasoner {
       }
       const source = eligibleGmail[0];
       if (!source) {
+        const ownerPrivateSource = unrelated[0];
+        if (founder && state.initialUnrelatedAccountReview && ownerPrivateSource) {
+          return {
+            findings: [
+              {
+                privateSummary: UNRELATED_ACCOUNT_EMAIL_ALERT,
+                actionAnchor: "password changed",
+                familyRelevance: "owner_private" as const,
+                sourceIds: [ownerPrivateSource.sourceId],
+                urgency: "now" as const,
+                dueAt: null,
+                surfaceNow: true,
+                candidate: null,
+                monitor: {
+                  objective: UNRELATED_ACCOUNT_MONITOR_OBJECTIVE,
+                  currentConclusion: "The account change needs the adult’s verification.",
+                  endCondition: "The adult confirms the change or secures the account.",
+                  nextCheck: new Date(Date.parse(input.currentTime) + 24 * 60 * 60_000).toISOString(),
+                  why: "The account alert asks for verification.",
+                },
+                familyCalendar: null,
+              },
+            ],
+            facts: [],
+            dismissedSourceIds: [...unrelated.slice(1), ...calendar].map((candidate) => candidate.sourceId),
+          };
+        }
         return {
           findings: [],
           facts: [],
@@ -5906,7 +6308,7 @@ function createReasoner(reason: Reason, state: HarnessState): FlorenceReasoner {
                     {
                       privateDetail: UNRELATED_ACCOUNT_EMAIL_ALERT,
                       actionAnchor: "password changed",
-                      familyRelevance: "adult_only" as const,
+                      familyRelevance: "owner_private" as const,
                       householdConclusion: null,
                       sourceIds: [unrelatedAccountSource.sourceId],
                       urgency: "now" as const,
@@ -5990,7 +6392,7 @@ function createReasoner(reason: Reason, state: HarnessState): FlorenceReasoner {
               {
                 slot: UNRELATED_ACCOUNT_FACT_SLOT,
                 statement: UNRELATED_ACCOUNT_FACT,
-                familyRelevance: "adult_only" as const,
+                familyRelevance: "owner_private" as const,
                 sourceIds: [unrelatedAccountSource.sourceId],
               },
             ]
@@ -6375,8 +6777,8 @@ function createGoogle(store: PostgresFlorenceStore, state: HarnessState): Google
               subject: UNRELATED_ACCOUNT_EMAIL_SUBJECT,
               text:
                 index === 0
-                  ? "Archived adult-only account notice. Code 123456. https://example.test/reset?token=fake-only-token-value-1234567890"
-                  : "Archived adult-only account notice.",
+                  ? "Archived owner-private account notice. Code 123456. https://example.test/reset?token=fake-only-token-value-1234567890"
+                  : "Archived owner-private account notice.",
               attachments: [],
             })),
           };

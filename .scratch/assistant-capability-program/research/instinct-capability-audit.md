@@ -117,10 +117,8 @@ The following is therefore a proposed Florence product SLO, not an observed comp
 ### P1 — platform breadth after the work loop is reliable
 
 1. Plain-language one-shot and recurring automations/monitors with reusable family recipes. [Poke recipe docs](https://poke.com/docs/creating-recipes)
-2. Curated extensibility through a task-appropriate tool protocol, with tools discovered by capability rather than prompt keywords. [Poke MCP docs](https://poke.com/docs/mcp-servers)
-3. Event/webhook ingress so schools, travel services, home systems, and other apps can delegate work into the same Florence thread. [Poke API](https://poke.com/docs/api)
-4. Phone/computer operation or human handoff for reservations, calls, orders, rides, and businesses without APIs. [Instinct](https://instinct.co/) · [Poke Human FAQ](https://poke.com/faq#poke-human)
-5. Voice calls and richer ambient inputs (screen/audio/location) where they directly improve household assistance. [Instinct](https://instinct.co/)
+2. Phone/computer operation or human handoff for reservations, calls, orders, rides, and businesses without APIs. [Instinct](https://instinct.co/) · [Poke Human FAQ](https://poke.com/faq#poke-human)
+3. Voice calls and richer ambient inputs (screen/audio/location) where they directly improve household assistance. [Instinct](https://instinct.co/)
 
 ## What can actually be taken from Poke's public code
 

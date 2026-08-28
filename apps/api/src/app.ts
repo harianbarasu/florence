@@ -33,6 +33,7 @@ import { createLinqIngress, type LinqIngress, LinqIngressError } from "./linq-in
 import { OpenStreetMapsClient } from "./maps.js";
 import { PublicPageReader } from "./public-page.js";
 import { createFlorenceReasonerFromEnv } from "./reasoner.js";
+import { ProviderTelephonyClient } from "./telephony.js";
 import { NwsWeatherClient } from "./weather.js";
 
 export type AdultCaller = { adultId: string };
@@ -87,6 +88,34 @@ export function createDefaultDependencies(env: NodeJS.ProcessEnv = process.env):
         ...(browserbaseProjectId ? { projectId: browserbaseProjectId } : {}),
       })
     : null;
+  const blandApiKey = env.BLAND_API_KEY?.trim();
+  const twilioConfigured = [env.TWILIO_ACCOUNT_SID, env.TWILIO_AUTH_TOKEN, env.TWILIO_PHONE_NUMBER].some(
+    (value) => Boolean(value?.trim()),
+  );
+  const telephony =
+    blandApiKey || twilioConfigured
+      ? new ProviderTelephonyClient({
+          ...(blandApiKey
+            ? {
+                bland: {
+                  apiKey: blandApiKey,
+                  ...(env.BLAND_DEFAULT_VOICE?.trim()
+                    ? { defaultVoice: env.BLAND_DEFAULT_VOICE.trim() }
+                    : {}),
+                },
+              }
+            : {}),
+          ...(twilioConfigured
+            ? {
+                twilio: {
+                  accountSid: requiredEnv(env, "TWILIO_ACCOUNT_SID"),
+                  authToken: requiredEnv(env, "TWILIO_AUTH_TOKEN"),
+                  phoneNumber: requiredEnv(env, "TWILIO_PHONE_NUMBER"),
+                },
+              }
+            : {}),
+        })
+      : null;
   const florence = new Florence({
     store,
     linq,
@@ -96,6 +125,7 @@ export function createDefaultDependencies(env: NodeJS.ProcessEnv = process.env):
     weather: new NwsWeatherClient(),
     flights: new KiwiFlightSearchClient(),
     browser,
+    telephony,
     reasoner: createFlorenceReasonerFromEnv(env),
     enrollmentCodes,
     imageVault,

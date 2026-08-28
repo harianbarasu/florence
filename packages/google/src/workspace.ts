@@ -7,8 +7,10 @@ import { createHash } from "node:crypto";
  * Hermes Agent Google Workspace skill at commit
  * 6dcebea7fc5d0cc4f621eeaddf52b7d877a5f882, especially its MIME/reply handling,
  * Drive field projections and native-file semantics, People projection, Sheets
- * USER_ENTERED/INSERT_ROWS writes, and Docs text/index handling. Florence keeps
- * those useful contracts while adding bounded pagination and replay reconciliation.
+ * USER_ENTERED/INSERT_ROWS writes, and Docs text/index handling. Draft, forward,
+ * multipart/attachment composition, and provider readback follow the same pinned
+ * source's Himalaya composition and inbox-triage practices. Florence keeps those
+ * useful contracts while adding bounded pagination and replay reconciliation.
  */
 
 const GMAIL_API = "https://gmail.googleapis.com/gmail/v1/users/me";
@@ -21,6 +23,11 @@ const TASKS_API = "https://tasks.googleapis.com/tasks/v1";
 const REQUEST_TIMEOUT_MS = 20_000;
 const MAX_PAGES = 20;
 const MAX_BODY_CHARACTERS = 500_000;
+const MAX_GMAIL_DRAFT_ATTACHMENTS = 20;
+const MAX_GMAIL_DRAFT_ATTACHMENT_BYTES = 20 * 1024 * 1024;
+const MAX_GMAIL_DRAFT_TOTAL_ATTACHMENT_BYTES = 24 * 1024 * 1024;
+const MAX_GMAIL_DRAFT_MESSAGE_RESULT_BYTES = 140_000;
+const MAX_DRIVE_NATIVE_EXPORT_BYTES = 10 * 1024 * 1024;
 
 export type GoogleSheetScalar = string | number | boolean | null;
 
@@ -29,6 +36,17 @@ export type GoogleContactSource = Readonly<{
   id: string;
   etag: string;
 }>;
+
+export type GoogleWorkspaceMailAttachment =
+  | Readonly<{
+      source: "gmail";
+      messageId: string;
+      attachmentId: string;
+    }>
+  | Readonly<{
+      source: "drive";
+      fileId: string;
+    }>;
 
 export type GoogleWorkspaceOperation =
   | Readonly<{ operation: "gmail_get"; messageId: string }>
@@ -50,6 +68,47 @@ export type GoogleWorkspaceOperation =
       body: string;
       bodyFormat: "plain" | "html";
       idempotencyKey: string;
+    }>
+  | Readonly<{
+      operation: "gmail_draft_create";
+      mode: "new";
+      to: readonly string[];
+      cc: readonly string[];
+      bcc: readonly string[];
+      subject: string;
+      body: string;
+      bodyFormat: "plain" | "html";
+      attachments: readonly GoogleWorkspaceMailAttachment[];
+      idempotencyKey: string;
+    }>
+  | Readonly<{
+      operation: "gmail_draft_create";
+      mode: "reply";
+      messageId: string;
+      body: string;
+      bodyFormat: "plain" | "html";
+      attachments: readonly GoogleWorkspaceMailAttachment[];
+      idempotencyKey: string;
+    }>
+  | Readonly<{
+      operation: "gmail_draft_create";
+      mode: "forward";
+      messageId: string;
+      to: readonly string[];
+      cc: readonly string[];
+      bcc: readonly string[];
+      body: string;
+      bodyFormat: "plain" | "html";
+      includeSourceAttachments: boolean;
+      attachments: readonly GoogleWorkspaceMailAttachment[];
+      idempotencyKey: string;
+    }>
+  | Readonly<{ operation: "gmail_draft_get"; draftId: string }>
+  | Readonly<{
+      operation: "gmail_draft_send";
+      draftId: string;
+      /** The exact messageHeaderId returned by gmail_draft_create for this draft. */
+      messageHeaderId: string;
     }>
   | Readonly<{ operation: "gmail_labels" }>
   | Readonly<{
@@ -217,6 +276,12 @@ export async function executeGoogleWorkspaceOperation(input: {
       return envelope(operation.operation, await gmailSend(context, operation));
     case "gmail_reply":
       return envelope(operation.operation, await gmailReply(context, operation));
+    case "gmail_draft_create":
+      return envelope(operation.operation, await gmailDraftCreate(context, operation));
+    case "gmail_draft_get":
+      return envelope(operation.operation, await gmailDraftGet(context, operation.draftId));
+    case "gmail_draft_send":
+      return envelope(operation.operation, await gmailDraftSend(context, operation));
     case "gmail_labels":
       return envelope(operation.operation, await gmailLabels(context));
     case "gmail_modify":
@@ -421,6 +486,538 @@ async function gmailReply(
   return sentResult("sent", response);
 }
 
+type GmailDraftCreateOperation = Extract<GoogleWorkspaceOperation, { operation: "gmail_draft_create" }>;
+
+type MailAttachmentContent = Readonly<{
+  filename: string;
+  mimeType: string;
+  bytes: Buffer;
+}>;
+
+type GmailSourceMessage = Readonly<{
+  message: JsonRecord;
+  payload: JsonRecord;
+  headers: Map<string, string>;
+  body: ReturnType<typeof extractGmailBody>;
+}>;
+
+async function gmailDraftCreate(
+  context: ExecutionContext,
+  operation: GmailDraftCreateOperation,
+): Promise<{ readonly [key: string]: GoogleWorkspaceJsonValue }> {
+  const actionKey = stableActionKey(operation.idempotencyKey);
+  const messageHeaderId = deterministicMessageId(actionKey);
+  const sent = await findSentMessage(context, messageHeaderId);
+  if (sent !== null) {
+    return {
+      status: "already_sent",
+      draftId: null,
+      messageHeaderId,
+      messageId: stringField(sent, "id"),
+      threadId: optionalString(sent.threadId),
+    };
+  }
+  const existing = await findDraftByMessageHeaderId(context, messageHeaderId);
+  if (existing !== null) {
+    const draft = await readGmailDraft(context, stringField(existing, "id"));
+    assertGmailMessageHeaderId(draft.message, messageHeaderId, "draft");
+    return draftResult("already_done", draft.draftId, draft.message, messageHeaderId);
+  }
+
+  const sourceCache = new Map<string, GmailSourceMessage>();
+  const composed = await composeGmailDraft(context, operation, sourceCache);
+  const attachments = await resolveMailAttachments(context, composed.attachmentSources, sourceCache);
+  const raw = createMimeMessage({
+    to: composed.to,
+    cc: composed.cc,
+    bcc: composed.bcc,
+    subject: composed.subject,
+    body: composed.body,
+    bodyFormat: operation.bodyFormat,
+    messageHeaderId,
+    ...(composed.inReplyTo === null ? {} : { inReplyTo: composed.inReplyTo }),
+    ...(composed.references === null ? {} : { references: composed.references }),
+    attachments,
+  });
+  const response = await googleJson(context, "Gmail", `${GMAIL_API}/drafts`, {
+    method: "POST",
+    body: JSON.stringify({
+      message: {
+        raw,
+        ...(composed.threadId === null ? {} : { threadId: composed.threadId }),
+      },
+    }),
+  });
+  const draftId = identifier(stringField(response, "id"), "Gmail draft ID");
+  const draft = await readGmailDraft(context, draftId);
+  assertGmailMessageHeaderId(draft.message, messageHeaderId, "draft");
+  return draftResult("created", draft.draftId, draft.message, messageHeaderId);
+}
+
+async function gmailDraftGet(
+  context: ExecutionContext,
+  draftIdInput: string,
+): Promise<{ readonly [key: string]: GoogleWorkspaceJsonValue }> {
+  const draft = await readGmailDraft(context, draftIdInput);
+  return {
+    draftId: draft.draftId,
+    message: compactGmailDraftMessage(draft.message),
+  };
+}
+
+async function gmailDraftSend(
+  context: ExecutionContext,
+  operation: Extract<GoogleWorkspaceOperation, { operation: "gmail_draft_send" }>,
+): Promise<{ readonly [key: string]: GoogleWorkspaceJsonValue }> {
+  const draftId = identifier(operation.draftId, "Gmail draft ID");
+  const messageHeaderId = florenceMessageHeaderId(operation.messageHeaderId);
+  let draft: Awaited<ReturnType<typeof readGmailDraft>>;
+  try {
+    draft = await readGmailDraft(context, draftId);
+  } catch (error) {
+    if (error instanceof GoogleWorkspaceError && error.status === 404) {
+      // Gmail deletes a draft when it sends it, so only the absent-draft retry path
+      // may reconcile from Sent without first reading the provider draft.
+      const sent = await findSentMessage(context, messageHeaderId);
+      if (sent !== null) {
+        return {
+          ...sentResult("already_done", sent),
+          draftId,
+          messageHeaderId,
+        };
+      }
+      throw new GoogleWorkspaceError(
+        "Gmail draft no longer exists and no matching sent message was found",
+        "reconciliation_failed",
+        { service: "Gmail", cause: error },
+      );
+    }
+    throw error;
+  }
+  assertGmailMessageHeaderId(draft.message, messageHeaderId, "draft");
+  const sent = await findSentMessage(context, messageHeaderId);
+  if (sent !== null) {
+    return {
+      ...sentResult("already_done", sent),
+      draftId,
+      messageHeaderId,
+    };
+  }
+  const response = await googleJson(context, "Gmail", `${GMAIL_API}/drafts/send`, {
+    method: "POST",
+    body: JSON.stringify({ id: draftId }),
+  });
+  assertGmailMessageHeaderId(
+    await googleJson(
+      context,
+      "Gmail",
+      `${GMAIL_API}/messages/${encodeURIComponent(stringField(response, "id"))}?format=metadata&metadataHeaders=Message-ID`,
+    ),
+    messageHeaderId,
+    "sent message",
+  );
+  return {
+    ...sentResult("sent", response),
+    draftId,
+    messageHeaderId,
+  };
+}
+
+async function composeGmailDraft(
+  context: ExecutionContext,
+  operation: GmailDraftCreateOperation,
+  sourceCache: Map<string, GmailSourceMessage>,
+): Promise<
+  Readonly<{
+    to: readonly string[];
+    cc: readonly string[];
+    bcc: readonly string[];
+    subject: string;
+    body: string;
+    threadId: string | null;
+    inReplyTo: string | null;
+    references: string | null;
+    attachmentSources: readonly GoogleWorkspaceMailAttachment[];
+  }>
+> {
+  const body = boundedAllowEmpty(operation.body, "Gmail draft body", MAX_BODY_CHARACTERS);
+  const attachmentSources = mailAttachmentSources(operation.attachments);
+  if (operation.mode === "new") {
+    const recipients = gmailRecipients(operation.to, operation.cc, operation.bcc);
+    return {
+      ...recipients,
+      subject: headerText(operation.subject, "Gmail draft subject", 998, true),
+      body,
+      threadId: null,
+      inReplyTo: null,
+      references: null,
+      attachmentSources,
+    };
+  }
+
+  const source = await readGmailSourceMessage(context, operation.messageId, sourceCache);
+  const originalSubject = headerText(source.headers.get("subject") ?? "", "Gmail source subject", 998, true);
+  if (operation.mode === "reply") {
+    const recipient = mailboxFromHeader(
+      source.headers.get("reply-to") ?? source.headers.get("from") ?? "",
+      "Gmail reply recipient",
+    );
+    const subject = headerText(
+      /^re:/i.test(originalSubject) ? originalSubject : `Re: ${originalSubject}`,
+      "Gmail reply subject",
+      998,
+      true,
+    );
+    const inReplyTo = optionalHeaderValue(source.headers.get("message-id"), "Gmail Message-ID");
+    const priorReferences = optionalHeaderValue(source.headers.get("references"), "Gmail References");
+    return {
+      to: [recipient],
+      cc: [],
+      bcc: [],
+      subject,
+      body,
+      threadId: identifier(stringField(source.message, "threadId"), "Gmail thread ID"),
+      inReplyTo,
+      references:
+        inReplyTo === null ? null : priorReferences === null ? inReplyTo : `${priorReferences} ${inReplyTo}`,
+      attachmentSources,
+    };
+  }
+
+  const recipients = gmailRecipients(operation.to, operation.cc, operation.bcc);
+  const subject = headerText(
+    /^(?:fwd?|fw):/i.test(originalSubject) ? originalSubject : `Fwd: ${originalSubject}`,
+    "Gmail forward subject",
+    998,
+    true,
+  );
+  const sourceAttachments = operation.includeSourceAttachments
+    ? gmailAttachmentReferences(source.payload).map((attachment) => ({
+        source: "gmail" as const,
+        messageId: identifier(stringField(source.message, "id"), "Gmail message ID"),
+        attachmentId: attachment.attachmentId,
+      }))
+    : [];
+  return {
+    ...recipients,
+    subject,
+    body: forwardedMessageBody(body, operation.bodyFormat, source),
+    threadId: null,
+    inReplyTo: null,
+    references: null,
+    attachmentSources: mailAttachmentSources([...attachmentSources, ...sourceAttachments]),
+  };
+}
+
+function gmailRecipients(
+  toInput: readonly string[],
+  ccInput: readonly string[],
+  bccInput: readonly string[],
+): Readonly<{ to: readonly string[]; cc: readonly string[]; bcc: readonly string[] }> {
+  const to = emailList(toInput, "Gmail To recipients", true);
+  const cc = emailList(ccInput, "Gmail Cc recipients", false);
+  const bcc = emailList(bccInput, "Gmail Bcc recipients", false);
+  if (to.length + cc.length + bcc.length > 100) invalid("Gmail has too many recipients");
+  return { to, cc, bcc };
+}
+
+function mailAttachmentSources(
+  values: readonly GoogleWorkspaceMailAttachment[],
+): readonly GoogleWorkspaceMailAttachment[] {
+  if (!Array.isArray(values) || values.length > MAX_GMAIL_DRAFT_ATTACHMENTS) {
+    invalid(`Gmail draft attachments must contain at most ${MAX_GMAIL_DRAFT_ATTACHMENTS} items`);
+  }
+  const result: GoogleWorkspaceMailAttachment[] = [];
+  const seen = new Set<string>();
+  for (const value of values) {
+    if (!isRecord(value)) invalid("Gmail draft attachment is invalid");
+    let normalized: GoogleWorkspaceMailAttachment;
+    let key: string;
+    if (value.source === "gmail") {
+      const messageId = identifier(value.messageId, "Gmail attachment message ID");
+      const attachmentId = identifier(value.attachmentId, "Gmail attachment ID");
+      normalized = { source: "gmail", messageId, attachmentId };
+      key = `gmail:${messageId}:${attachmentId}`;
+    } else if (value.source === "drive") {
+      const fileId = identifier(value.fileId, "Drive attachment file ID");
+      normalized = { source: "drive", fileId };
+      key = `drive:${fileId}`;
+    } else {
+      invalid("Gmail draft attachment source is invalid");
+    }
+    if (!seen.has(key)) {
+      seen.add(key);
+      result.push(normalized);
+    }
+  }
+  if (result.length > MAX_GMAIL_DRAFT_ATTACHMENTS) {
+    invalid(`Gmail draft attachments must contain at most ${MAX_GMAIL_DRAFT_ATTACHMENTS} items`);
+  }
+  return result;
+}
+
+async function resolveMailAttachments(
+  context: ExecutionContext,
+  sources: readonly GoogleWorkspaceMailAttachment[],
+  sourceCache: Map<string, GmailSourceMessage>,
+): Promise<readonly MailAttachmentContent[]> {
+  const attachments: MailAttachmentContent[] = [];
+  let totalBytes = 0;
+  for (const source of sources) {
+    const attachment =
+      source.source === "gmail"
+        ? await readGmailAttachmentContent(context, source, sourceCache)
+        : await readDriveAttachmentContent(context, source.fileId);
+    totalBytes += attachment.bytes.byteLength;
+    if (totalBytes > MAX_GMAIL_DRAFT_TOTAL_ATTACHMENT_BYTES) {
+      invalid(`Gmail draft attachments exceed ${MAX_GMAIL_DRAFT_TOTAL_ATTACHMENT_BYTES} total bytes`);
+    }
+    attachments.push(attachment);
+  }
+  return attachments;
+}
+
+async function readGmailSourceMessage(
+  context: ExecutionContext,
+  messageIdInput: string,
+  cache: Map<string, GmailSourceMessage>,
+): Promise<GmailSourceMessage> {
+  const messageId = identifier(messageIdInput, "Gmail message ID");
+  const cached = cache.get(messageId);
+  if (cached !== undefined) return cached;
+  const message = await googleJson(
+    context,
+    "Gmail",
+    `${GMAIL_API}/messages/${encodeURIComponent(messageId)}?format=full`,
+  );
+  const payload = recordField(message, "payload");
+  const result = {
+    message,
+    payload,
+    headers: gmailHeaders(payload),
+    body: await extractGmailBodyForForward(context, messageId, payload),
+  } as const;
+  cache.set(messageId, result);
+  return result;
+}
+
+async function readGmailAttachmentContent(
+  context: ExecutionContext,
+  source: Extract<GoogleWorkspaceMailAttachment, { source: "gmail" }>,
+  cache: Map<string, GmailSourceMessage>,
+): Promise<MailAttachmentContent> {
+  const message = await readGmailSourceMessage(context, source.messageId, cache);
+  const reference = gmailAttachmentReferences(message.payload).find(
+    (candidate) => candidate.attachmentId === source.attachmentId,
+  );
+  if (reference === undefined) {
+    throw new GoogleWorkspaceError(
+      "Gmail attachment was not found on the specified message",
+      "reconciliation_failed",
+      { service: "Gmail" },
+    );
+  }
+  const part = findGmailMimePart(message.payload, reference);
+  if (part === null) invalidResponse("Gmail attachment MIME part disappeared", "Gmail");
+  const body = recordField(part, "body");
+  let encoded: string;
+  if (reference.storage === "external") {
+    const attachment = await googleJson(
+      context,
+      "Gmail",
+      `${GMAIL_API}/messages/${encodeURIComponent(source.messageId)}/attachments/${encodeURIComponent(reference.providerAttachmentId)}`,
+    );
+    if (nonNegativeInteger(attachment.size, "Gmail attachment size", "Gmail") !== reference.sizeBytes) {
+      invalidResponse("Gmail attachment size changed before drafting", "Gmail");
+    }
+    encoded = stringField(attachment, "data");
+  } else {
+    encoded = stringField(body, "data");
+  }
+  const bytes = decodeGmailAttachment(encoded, reference.sizeBytes);
+  return {
+    filename: reference.filename,
+    mimeType: reference.mimeType,
+    bytes,
+  };
+}
+
+async function readDriveAttachmentContent(
+  context: ExecutionContext,
+  fileIdInput: string,
+): Promise<MailAttachmentContent> {
+  const fileId = identifier(fileIdInput, "Drive attachment file ID");
+  const metadata = await googleJson(
+    context,
+    "Drive",
+    `${DRIVE_API}/files/${encodeURIComponent(fileId)}?fields=id,name,mimeType,size,trashed,capabilities(canDownload)`,
+  );
+  if (metadata.trashed === true) {
+    throw new GoogleWorkspaceError("Drive attachment is in the trash", "provider_rejected", {
+      service: "Drive",
+    });
+  }
+  const capabilities = recordField(metadata, "capabilities");
+  if (capabilities.canDownload !== true) {
+    throw new GoogleWorkspaceError("Drive file cannot be downloaded", "provider_rejected", {
+      service: "Drive",
+    });
+  }
+  const name = providerAttachmentFilename(stringField(metadata, "name"), "Drive");
+  const sourceMimeType = mimeType(stringField(metadata, "mimeType"), "Drive attachment MIME type");
+  const nativeExport = driveNativeAttachmentExport(sourceMimeType, name);
+  if (nativeExport === null) {
+    const declaredSize = optionalDriveFileSize(metadata.size);
+    if (declaredSize !== null && declaredSize > MAX_GMAIL_DRAFT_ATTACHMENT_BYTES) {
+      throw new GoogleWorkspaceError(
+        `Drive attachment exceeds ${MAX_GMAIL_DRAFT_ATTACHMENT_BYTES} bytes`,
+        "provider_rejected",
+        { service: "Drive" },
+      );
+    }
+  }
+  const bytes = await googleBytes(
+    context,
+    "Drive",
+    nativeExport === null
+      ? `${DRIVE_API}/files/${encodeURIComponent(fileId)}?alt=media`
+      : `${DRIVE_API}/files/${encodeURIComponent(fileId)}/export?${new URLSearchParams({ mimeType: nativeExport.mimeType })}`,
+    nativeExport === null ? MAX_GMAIL_DRAFT_ATTACHMENT_BYTES : MAX_DRIVE_NATIVE_EXPORT_BYTES,
+  );
+  return {
+    filename: nativeExport?.filename ?? name,
+    mimeType: nativeExport?.mimeType ?? sourceMimeType,
+    bytes,
+  };
+}
+
+function driveNativeAttachmentExport(
+  sourceMimeType: string,
+  filename: string,
+): Readonly<{ mimeType: string; filename: string }> | null {
+  const nativeTypes = new Set([
+    "application/vnd.google-apps.document",
+    "application/vnd.google-apps.spreadsheet",
+    "application/vnd.google-apps.presentation",
+    "application/vnd.google-apps.drawing",
+  ]);
+  if (nativeTypes.has(sourceMimeType)) {
+    return {
+      mimeType: "application/pdf",
+      filename: replaceFilenameExtension(filename, ".pdf"),
+    };
+  }
+  if (sourceMimeType.startsWith("application/vnd.google-apps.")) {
+    throw new GoogleWorkspaceError(
+      `Drive cannot export ${sourceMimeType} as a mail attachment`,
+      "provider_rejected",
+      { service: "Drive" },
+    );
+  }
+  return null;
+}
+
+function replaceFilenameExtension(filename: string, extension: string): string {
+  const lastDot = filename.lastIndexOf(".");
+  const base = lastDot > 0 ? filename.slice(0, lastDot) : filename;
+  return providerAttachmentFilename(`${base}${extension}`, "Drive");
+}
+
+function forwardedMessageBody(
+  introduction: string,
+  format: "plain" | "html",
+  source: GmailSourceMessage,
+): string {
+  const fields = [
+    ["From", source.headers.get("from") ?? ""],
+    ["Date", source.headers.get("date") ?? ""],
+    ["Subject", source.headers.get("subject") ?? ""],
+    ["To", source.headers.get("to") ?? ""],
+    ...(source.headers.get("cc") ? [["Cc", source.headers.get("cc") ?? ""]] : []),
+  ] as const;
+  if (format === "plain") {
+    return boundedAllowEmpty(
+      `${introduction}${introduction ? "\n\n" : ""}---------- Forwarded message ---------\n${fields
+        .map(([label, value]) => `${label}: ${value}`)
+        .join("\n")}\n\n${source.body.body}`,
+      "Gmail forward body",
+      MAX_BODY_CHARACTERS,
+    );
+  }
+  const originalBody =
+    source.body.format === "html" ? source.body.body : htmlEscape(source.body.body).replace(/\r?\n/g, "<br>");
+  return boundedAllowEmpty(
+    `${introduction}${introduction ? "<br><br>" : ""}<div class="gmail_quote"><div dir="ltr" class="gmail_attr">---------- Forwarded message ---------<br>${fields
+      .map(([label, value]) => `<b>${label}:</b> ${htmlEscape(value)}<br>`)
+      .join("")}</div><br>${originalBody}</div>`,
+    "Gmail forward body",
+    MAX_BODY_CHARACTERS,
+  );
+}
+
+async function findDraftByMessageHeaderId(
+  context: ExecutionContext,
+  messageHeaderId: string,
+): Promise<JsonRecord | null> {
+  const query = new URLSearchParams({
+    q: `rfc822msgid:${messageHeaderId.replace(/^<|>$/g, "")}`,
+    maxResults: "2",
+  });
+  const response = await googleJson(context, "Gmail", `${GMAIL_API}/drafts?${query}`);
+  const drafts = recordArray(response.drafts, "Gmail drafts");
+  if (drafts.length > 1) {
+    throw new GoogleWorkspaceError(
+      "Gmail contains more than one draft for this Florence action",
+      "reconciliation_failed",
+      { service: "Gmail" },
+    );
+  }
+  return drafts[0] ?? null;
+}
+
+async function readGmailDraft(
+  context: ExecutionContext,
+  draftIdInput: string,
+): Promise<Readonly<{ draftId: string; message: JsonRecord }>> {
+  const draftId = identifier(draftIdInput, "Gmail draft ID");
+  const response = await googleJson(
+    context,
+    "Gmail",
+    `${GMAIL_API}/drafts/${encodeURIComponent(draftId)}?format=full`,
+  );
+  return {
+    draftId: identifier(stringField(response, "id"), "Gmail draft ID"),
+    message: recordField(response, "message"),
+  };
+}
+
+function assertGmailMessageHeaderId(message: JsonRecord, expected: string, label: string): void {
+  const actual = gmailHeaders(recordField(message, "payload")).get("message-id");
+  if (actual !== expected) {
+    throw new GoogleWorkspaceError(
+      `Gmail ${label} identity did not match the Florence action`,
+      "reconciliation_failed",
+      { service: "Gmail" },
+    );
+  }
+}
+
+function draftResult(
+  status: "created" | "already_done",
+  draftId: string,
+  message: JsonRecord,
+  messageHeaderId: string,
+): { readonly [key: string]: GoogleWorkspaceJsonValue } {
+  return {
+    status,
+    draftId,
+    messageId: stringField(message, "id"),
+    threadId: optionalString(message.threadId),
+    messageHeaderId,
+    message: compactGmailDraftMessage(message),
+  };
+}
+
 async function gmailLabels(
   context: ExecutionContext,
 ): Promise<{ readonly labels: GoogleWorkspaceJsonValue }> {
@@ -485,7 +1082,7 @@ function sentResult(
   };
 }
 
-function normalizeGmailMessage(message: JsonRecord): GoogleWorkspaceJsonValue {
+function normalizeGmailMessage(message: JsonRecord): { readonly [key: string]: GoogleWorkspaceJsonValue } {
   const payload = recordField(message, "payload");
   const headers = gmailHeaders(payload);
   const extracted = extractGmailBody(payload);
@@ -505,7 +1102,51 @@ function normalizeGmailMessage(message: JsonRecord): GoogleWorkspaceJsonValue {
     snippet: optionalString(message.snippet) ?? "",
     body: extracted.body,
     bodyFormat: extracted.format,
+    attachments: gmailAttachmentReferences(payload).map((attachment) => ({
+      attachmentId: attachment.attachmentId,
+      partId: attachment.partId,
+      filename: attachment.filename,
+      mimeType: attachment.mimeType,
+      sizeBytes: attachment.sizeBytes,
+    })),
   };
+}
+
+function compactGmailDraftMessage(message: JsonRecord): { readonly [key: string]: GoogleWorkspaceJsonValue } {
+  const normalized = normalizeGmailMessage(message);
+  const body = normalized.body;
+  if (typeof body !== "string") invalidResponse("Gmail draft body is invalid", "Gmail");
+  const complete = { ...normalized, bodyTruncated: false } as const;
+  if (Buffer.byteLength(JSON.stringify(complete), "utf8") <= MAX_GMAIL_DRAFT_MESSAGE_RESULT_BYTES) {
+    return complete;
+  }
+
+  const characters = [...body];
+  let lower = 0;
+  let upper = characters.length;
+  let compact: { readonly [key: string]: GoogleWorkspaceJsonValue } = {
+    ...normalized,
+    body: "",
+    bodyTruncated: true,
+  };
+  if (Buffer.byteLength(JSON.stringify(compact), "utf8") > MAX_GMAIL_DRAFT_MESSAGE_RESULT_BYTES) {
+    invalidResponse("Gmail draft metadata is too large", "Gmail");
+  }
+  while (lower <= upper) {
+    const midpoint = Math.floor((lower + upper) / 2);
+    const candidate = {
+      ...normalized,
+      body: characters.slice(0, midpoint).join(""),
+      bodyTruncated: true,
+    } as const;
+    if (Buffer.byteLength(JSON.stringify(candidate), "utf8") <= MAX_GMAIL_DRAFT_MESSAGE_RESULT_BYTES) {
+      compact = candidate;
+      lower = midpoint + 1;
+    } else {
+      upper = midpoint - 1;
+    }
+  }
+  return compact;
 }
 
 function gmailHeaders(payload: JsonRecord): Map<string, string> {
@@ -537,6 +1178,133 @@ function extractGmailBody(payload: JsonRecord): { body: string; format: "plain" 
   return chosen ?? { body: "", format: "unknown" };
 }
 
+async function extractGmailBodyForForward(
+  context: ExecutionContext,
+  messageId: string,
+  payload: JsonRecord,
+): Promise<{ body: string; format: "plain" | "html" | "unknown" }> {
+  const candidates: {
+    data: string | null;
+    attachmentId: string | null;
+    declaredSize: number;
+    format: "plain" | "html";
+  }[] = [];
+  const visit = (part: JsonRecord, depth: number): void => {
+    if (depth > 20 || candidates.length >= 100) return;
+    const mimeType = optionalString(part.mimeType)?.toLowerCase() ?? "";
+    const body = optionalRecord(part.body);
+    if (body !== null && (mimeType === "text/plain" || mimeType === "text/html")) {
+      const data = optionalString(body.data);
+      const attachmentId = optionalString(body.attachmentId);
+      if (data !== null || attachmentId !== null) {
+        candidates.push({
+          data,
+          attachmentId,
+          declaredSize: nonNegativeInteger(body.size, "Gmail message body size", "Gmail"),
+          format: mimeType === "text/plain" ? "plain" : "html",
+        });
+      }
+    }
+    for (const child of recordArray(part.parts, "Gmail MIME parts")) visit(child, depth + 1);
+  };
+  visit(payload, 0);
+  const chosen = candidates.find((candidate) => candidate.format === "plain") ?? candidates[0];
+  if (chosen === undefined) return { body: "", format: "unknown" };
+  if (chosen.data !== null) {
+    return { body: decodeBase64Url(chosen.data).slice(0, MAX_BODY_CHARACTERS), format: chosen.format };
+  }
+  if (chosen.attachmentId === null) return { body: "", format: "unknown" };
+  const attachment = await googleJson(
+    context,
+    "Gmail",
+    `${GMAIL_API}/messages/${encodeURIComponent(messageId)}/attachments/${encodeURIComponent(chosen.attachmentId)}`,
+  );
+  if (nonNegativeInteger(attachment.size, "Gmail message body size", "Gmail") !== chosen.declaredSize) {
+    invalidResponse("Gmail message body size changed before forwarding", "Gmail");
+  }
+  return {
+    body: decodeBase64Url(stringField(attachment, "data")).slice(0, MAX_BODY_CHARACTERS),
+    format: chosen.format,
+  };
+}
+
+type GmailDraftAttachmentReference = Readonly<{
+  attachmentId: string;
+  providerAttachmentId: string;
+  storage: "external" | "inline";
+  partId: string;
+  filename: string;
+  mimeType: string;
+  sizeBytes: number;
+}>;
+
+function gmailAttachmentReferences(payload: JsonRecord): readonly GmailDraftAttachmentReference[] {
+  const result: GmailDraftAttachmentReference[] = [];
+  const visit = (part: JsonRecord, depth: number): void => {
+    if (depth > 20 || result.length > MAX_GMAIL_DRAFT_ATTACHMENTS * 10) {
+      invalidResponse("Gmail message MIME structure is too deep or large", "Gmail");
+    }
+    const filenameValue = optionalString(part.filename);
+    const body = optionalRecord(part.body);
+    const partIdValue = optionalString(part.partId);
+    if (filenameValue && body !== null) {
+      const filename = providerAttachmentFilename(filenameValue, "Gmail");
+      const attachmentMimeType = mimeType(
+        optionalString(part.mimeType) ?? "application/octet-stream",
+        "Gmail attachment MIME type",
+      );
+      const sizeBytes = nonNegativeInteger(body.size, "Gmail attachment size", "Gmail");
+      const providerAttachmentId = optionalString(body.attachmentId);
+      const inlineData = optionalString(body.data);
+      if (providerAttachmentId !== null) {
+        result.push({
+          attachmentId: providerAttachmentId,
+          providerAttachmentId,
+          storage: "external",
+          partId: partIdValue ?? "",
+          filename,
+          mimeType: attachmentMimeType,
+          sizeBytes,
+        });
+      } else if (inlineData !== null && partIdValue !== null) {
+        result.push({
+          attachmentId: `inline:${partIdValue}`,
+          providerAttachmentId: "",
+          storage: "inline",
+          partId: partIdValue,
+          filename,
+          mimeType: attachmentMimeType,
+          sizeBytes,
+        });
+      }
+    }
+    for (const child of recordArray(part.parts, "Gmail MIME parts")) visit(child, depth + 1);
+  };
+  visit(payload, 0);
+  return result;
+}
+
+function findGmailMimePart(payload: JsonRecord, reference: GmailDraftAttachmentReference): JsonRecord | null {
+  let found: JsonRecord | null = null;
+  const visit = (part: JsonRecord, depth: number): void => {
+    if (found !== null || depth > 20) return;
+    const partId = optionalString(part.partId) ?? "";
+    const body = optionalRecord(part.body);
+    const attachmentId = body === null ? null : optionalString(body.attachmentId);
+    const matchesStorage =
+      reference.storage === "external"
+        ? attachmentId === reference.providerAttachmentId
+        : body !== null && optionalString(body.data) !== null;
+    if (partId === reference.partId && matchesStorage) {
+      found = part;
+      return;
+    }
+    for (const child of recordArray(part.parts, "Gmail MIME parts")) visit(child, depth + 1);
+  };
+  visit(payload, 0);
+  return found;
+}
+
 function createMimeMessage(input: {
   to: readonly string[];
   cc: readonly string[];
@@ -547,8 +1315,9 @@ function createMimeMessage(input: {
   messageHeaderId: string;
   inReplyTo?: string;
   references?: string;
+  attachments?: readonly MailAttachmentContent[];
 }): string {
-  const headers = [
+  const commonHeaders = [
     `To: ${input.to.join(", ")}`,
     ...(input.cc.length === 0 ? [] : [`Cc: ${input.cc.join(", ")}`]),
     ...(input.bcc.length === 0 ? [] : [`Bcc: ${input.bcc.join(", ")}`]),
@@ -557,15 +1326,45 @@ function createMimeMessage(input: {
     ...(input.inReplyTo === undefined ? [] : [`In-Reply-To: ${input.inReplyTo}`]),
     ...(input.references === undefined ? [] : [`References: ${input.references}`]),
     "MIME-Version: 1.0",
-    `Content-Type: text/${input.bodyFormat}; charset=UTF-8`,
-    "Content-Transfer-Encoding: base64",
   ];
-  const encodedBody =
-    Buffer.from(input.body, "utf8")
+  const attachments = input.attachments ?? [];
+  const encodedBody = foldedBase64(Buffer.from(input.body, "utf8"));
+  if (attachments.length === 0) {
+    const headers = [
+      ...commonHeaders,
+      `Content-Type: text/${input.bodyFormat}; charset=UTF-8`,
+      "Content-Transfer-Encoding: base64",
+    ];
+    return Buffer.from(`${headers.join("\r\n")}\r\n\r\n${encodedBody}\r\n`, "utf8").toString("base64url");
+  }
+
+  const boundary = `florence_${createHash("sha256").update(input.messageHeaderId, "utf8").digest("hex")}`;
+  const parts = [
+    `--${boundary}\r\nContent-Type: text/${input.bodyFormat}; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n${encodedBody}\r\n`,
+    ...attachments.map((attachment) => {
+      const filename = mimeQuotedFilename(attachment.filename);
+      return `--${boundary}\r\nContent-Type: ${attachment.mimeType}; name="${filename}"\r\nContent-Disposition: attachment; filename="${filename}"\r\nContent-Transfer-Encoding: base64\r\n\r\n${foldedBase64(attachment.bytes)}\r\n`;
+    }),
+    `--${boundary}--\r\n`,
+  ];
+  return Buffer.from(
+    `${[...commonHeaders, `Content-Type: multipart/mixed; boundary="${boundary}"`].join("\r\n")}\r\n\r\n${parts.join("")}`,
+    "utf8",
+  ).toString("base64url");
+}
+
+function foldedBase64(bytes: Buffer): string {
+  return (
+    bytes
       .toString("base64")
       .match(/.{1,76}/g)
-      ?.join("\r\n") ?? "";
-  return Buffer.from(`${headers.join("\r\n")}\r\n\r\n${encodedBody}\r\n`, "utf8").toString("base64url");
+      ?.join("\r\n") ?? ""
+  );
+}
+
+function mimeQuotedFilename(filename: string): string {
+  const encoded = encodedHeader(filename);
+  return encoded.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 }
 
 const DRIVE_FILE_FIELDS =
@@ -1934,6 +2733,80 @@ async function googleJson(
   return payload;
 }
 
+async function googleBytes(
+  context: ExecutionContext,
+  service: string,
+  url: string,
+  maximumBytes: number,
+): Promise<Buffer> {
+  const signal =
+    context.signal === undefined
+      ? AbortSignal.timeout(REQUEST_TIMEOUT_MS)
+      : AbortSignal.any([context.signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)]);
+  let response: Response;
+  try {
+    response = await context.fetch(url, {
+      headers: {
+        authorization: `Bearer ${context.accessToken}`,
+        accept: "*/*",
+      },
+      signal,
+    });
+  } catch (cause) {
+    throw new GoogleWorkspaceError(
+      googleTransportFailureMessage(context, signal, service, "request"),
+      "provider_unavailable",
+      { service, cause },
+    );
+  }
+
+  if (!response.ok) {
+    let payload: unknown = null;
+    try {
+      const text = await response.text();
+      if (text) payload = JSON.parse(text) as unknown;
+    } catch {
+      // Google occasionally returns a non-JSON intermediary error page.
+    }
+    const message = googleErrorMessage(payload) ?? `${service} rejected the request`;
+    const code: GoogleWorkspaceErrorCode =
+      response.status === 408 || response.status === 425 || response.status === 429 || response.status >= 500
+        ? "provider_unavailable"
+        : "provider_rejected";
+    throw new GoogleWorkspaceError(message, code, { service, status: response.status });
+  }
+
+  const contentLength = response.headers.get("content-length");
+  if (contentLength !== null) {
+    const parsed = Number(contentLength);
+    if (Number.isFinite(parsed) && parsed > maximumBytes) {
+      throw new GoogleWorkspaceError(
+        `${service} attachment exceeds ${maximumBytes} bytes`,
+        "provider_rejected",
+        { service },
+      );
+    }
+  }
+  let bytes: Buffer;
+  try {
+    bytes = Buffer.from(await response.arrayBuffer());
+  } catch (cause) {
+    throw new GoogleWorkspaceError(
+      googleTransportFailureMessage(context, signal, service, "response"),
+      "provider_unavailable",
+      { service, cause },
+    );
+  }
+  if (bytes.byteLength > maximumBytes) {
+    throw new GoogleWorkspaceError(
+      `${service} attachment exceeds ${maximumBytes} bytes`,
+      "provider_rejected",
+      { service },
+    );
+  }
+  return bytes;
+}
+
 function googleTransportFailureMessage(
   context: ExecutionContext,
   signal: AbortSignal,
@@ -2088,6 +2961,14 @@ function deterministicMessageId(actionKey: string): string {
   return `<florence-${actionKey}@actions.florence.invalid>`;
 }
 
+function florenceMessageHeaderId(value: unknown): string {
+  const result = headerText(value, "Gmail Florence Message-ID", 200, false);
+  if (!/^<florence-[a-f0-9]{64}@actions\.florence\.invalid>$/.test(result)) {
+    invalid("Gmail Florence Message-ID is invalid");
+  }
+  return result;
+}
+
 function encodedHeader(value: string): string {
   if (/^[\x20-\x7E]*$/.test(value)) return value;
   return `=?UTF-8?B?${Buffer.from(value, "utf8").toString("base64")}?=`;
@@ -2112,6 +2993,83 @@ function decodeBase64Url(value: string): string {
       cause,
     });
   }
+}
+
+function decodeGmailAttachment(value: string, expectedBytes: number): Buffer {
+  if (!/^[A-Za-z0-9_-]*={0,2}$/.test(value) || value.length > MAX_GMAIL_DRAFT_ATTACHMENT_BYTES * 2) {
+    invalidResponse("Gmail returned invalid attachment encoding", "Gmail");
+  }
+  let bytes: Buffer;
+  try {
+    bytes = Buffer.from(value, "base64url");
+  } catch (cause) {
+    throw new GoogleWorkspaceError("Gmail returned invalid attachment encoding", "invalid_response", {
+      service: "Gmail",
+      cause,
+    });
+  }
+  if (bytes.byteLength !== expectedBytes) {
+    invalidResponse("Gmail attachment size changed before drafting", "Gmail");
+  }
+  if (bytes.byteLength > MAX_GMAIL_DRAFT_ATTACHMENT_BYTES) {
+    throw new GoogleWorkspaceError(
+      `Gmail attachment exceeds ${MAX_GMAIL_DRAFT_ATTACHMENT_BYTES} bytes`,
+      "provider_rejected",
+      { service: "Gmail" },
+    );
+  }
+  return bytes;
+}
+
+function providerAttachmentFilename(value: string, service: string): string {
+  if (
+    !value ||
+    value.length > 240 ||
+    value.includes("\r") ||
+    value.includes("\n") ||
+    hasUnsupportedControlCharacter(value)
+  ) {
+    invalidResponse(`${service} returned an invalid attachment filename`, service);
+  }
+  return value;
+}
+
+function mimeType(value: string, label: string): string {
+  const result = value.toLowerCase();
+  if (
+    result.length > 200 ||
+    !/^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/i.test(result) ||
+    /[\r\n]/.test(result)
+  ) {
+    invalidResponse(`${label} is invalid`, label.startsWith("Drive") ? "Drive" : "Gmail");
+  }
+  return result;
+}
+
+function nonNegativeInteger(value: unknown, label: string, service: string): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+    invalidResponse(`${label} is invalid`, service);
+  }
+  return value;
+}
+
+function optionalDriveFileSize(value: unknown): number | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string" || !/^\d+$/.test(value)) {
+    invalidResponse("Drive attachment size is invalid", "Drive");
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) invalidResponse("Drive attachment size is invalid", "Drive");
+  return parsed;
+}
+
+function htmlEscape(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 function isRecord(value: unknown): value is JsonRecord {

@@ -1,5 +1,14 @@
-import { type FamilyWorkStateV1, steerFamilyWorkState } from "@florence/database";
-import { GoogleCalendarTransientError, GoogleWorkspaceError } from "@florence/google";
+import {
+  type FamilyWorkOriginContext,
+  type FamilyWorkStateV1,
+  steerFamilyWorkState,
+} from "@florence/database";
+import {
+  GoogleCalendarTransientError,
+  GoogleWorkspaceError,
+  type GoogleWorkspaceOperation,
+  type GoogleWorkspaceResult,
+} from "@florence/google";
 import { describe, expect, test } from "vitest";
 import type { FlorenceBrowserObservation, FlorenceBrowserOperation } from "./browser.js";
 import {
@@ -9,6 +18,7 @@ import {
   FlorenceReasoner,
   type FlorenceReasonerInput,
 } from "./reasoner.js";
+import type { FlorenceTelephonyOperation, FlorenceTelephonyResult } from "./telephony.js";
 
 const NOW = "2026-08-27T20:00:00.000Z";
 const PUBLIC_URL = "https://example.com/current-result";
@@ -16,7 +26,90 @@ const admittedReadAccounting = {
   settleSources() {},
 };
 
+function familyWorkOrigin(text: string, speaker = "adult-1"): FamilyWorkOriginContext {
+  return {
+    message: {
+      sourceId: `source-${speaker}`,
+      speaker,
+      moveKind: "message",
+      text,
+      authoredText: text,
+      voiceTranscriptPresent: false,
+      reaction: null,
+      images: [],
+      replyToSourceId: null,
+      occurredAt: NOW,
+    },
+    supersededMessages: [],
+    replyTarget: null,
+    currentDocuments: [],
+  };
+}
+
 describe("Florence reasoner capability cutover", () => {
+  test("ordinary parent turns cannot use a reaction as their whole response", async () => {
+    const decision = ordinaryDecision();
+    decision.conversation.reaction = "like";
+    decision.conversation.bubbles = [];
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        stream: () => fakeStream({ status: "completed", output_parsed: decision, output: [] }),
+      },
+    } as never);
+
+    await expect(reasoner.decide(foregroundInput(), inertReads())).rejects.toMatchObject({
+      code: "invalid_output",
+      message: expect.stringContaining("no bubble or application-owned outcome"),
+    });
+  });
+
+  test("a verified voice note can relay a concise derived household conclusion with a large Vault", async () => {
+    const requests: Record<string, unknown>[] = [];
+    const decision = ordinaryDecision();
+    decision.conversation.bubbles = [];
+    decision.householdUpdate = {
+      text: "School pickup is at 2:45 PM today, so Jackson should plan to leave by 2:25.",
+      sourceIds: ["turn-1"],
+    };
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        stream: (request: Record<string, unknown>) => {
+          requests.push(request);
+          return fakeStream({ status: "completed", output_parsed: decision, output: [] });
+        },
+      },
+    } as never);
+    const input = foregroundInput();
+    input.currentMessage.text =
+      "[Automatic voice-note transcript]\nTell Jackson what you worked out about pickup today.";
+    input.currentMessage.authoredText = null;
+    input.currentMessage.voiceTranscriptPresent = true;
+    input.visibleSources = Array.from({ length: 75 }, (_, index) => ({
+      sourceId: `memory-source-${index}`,
+      recordId: `memory-fact-${index}`,
+      kind: "memory" as const,
+      visibility: "adult_private" as const,
+      label: `Retained family fact ${index}`,
+      occurredAt: NOW,
+      text:
+        index === 0
+          ? "The school dismissal notice says pickup is at 2:45 PM today; normal drive time is 20 minutes."
+          : `Useful retained family detail ${index}.`,
+    }));
+
+    const result = await reasoner.decide(input, inertReads());
+
+    expect(result.householdUpdate?.text).toContain("leave by 2:25");
+    const instructions = String(requests[0]?.instructions);
+    expect(instructions).toContain("concise household-relevant conclusion");
+    expect(instructions).toContain("typed text or verified voice note");
+    expect(instructions).toContain("Never copy or dump raw Gmail");
+    expect(instructions).toContain(
+      "Return direct only when the current parent's typed text or verified voice note",
+    );
+    expect(instructions).toContain("states a stable interest in typed text or a verified voice note");
+  });
+
   test("reads parent-supplied and task-selected public pages", async () => {
     const pageUrl = "https://school.example/fall-fair";
     const selectedUrl = "https://school.example/fall-fair/faq";
@@ -144,6 +237,7 @@ describe("Florence reasoner capability cutover", () => {
 
   test("durable work reads a linked PDF at a persisted checkpoint", async () => {
     const pdfUrl = "https://school.example/forms/field-trip.pdf";
+    const modelRequests: Record<string, unknown>[] = [];
     const modelResponses = [
       {
         status: "completed",
@@ -161,7 +255,8 @@ describe("Florence reasoner capability cutover", () => {
     ];
     const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
       responses: {
-        parse() {
+        parse(request: Record<string, unknown>) {
+          modelRequests.push(request);
           const response = modelResponses.shift();
           if (!response) throw new Error("Unexpected durable PDF model turn");
           return response;
@@ -174,6 +269,8 @@ describe("Florence reasoner capability cutover", () => {
       generation: 0,
       phase: "ready",
       claim: null,
+      activePhoneCall: null,
+      activeTextMessage: null,
       browserSession: null,
       continuationItems: [],
       pendingCall: null,
@@ -182,11 +279,62 @@ describe("Florence reasoner capability cutover", () => {
       progressRevision: 0,
       terminal: null,
     };
+    const originBase = familyWorkOrigin(
+      "Use the revised field-trip form. Voice transcript: the blue form is the right one.",
+    );
+    const origin: FamilyWorkOriginContext = {
+      message: {
+        ...originBase.message,
+        authoredText: "Use the revised field-trip form.",
+        voiceTranscriptPresent: true,
+        images: [{ assetId: "field-trip-image", mimeType: "image/jpeg" }],
+      },
+      supersededMessages: [
+        {
+          ...originBase.message,
+          sourceId: "original-field-trip-request",
+          text: "Use the original field-trip form.",
+          authoredText: "Use the original field-trip form.",
+          voiceTranscriptPresent: false,
+          images: [],
+        },
+      ],
+      replyTarget: {
+        ...originBase.message,
+        sourceId: "florence-field-trip-question",
+        speaker: "florence",
+        text: "Which form should I use?",
+        authoredText: "Which form should I use?",
+        voiceTranscriptPresent: false,
+        images: [{ assetId: "reply-field-trip-image", mimeType: "image/png" }],
+      },
+      currentDocuments: [
+        {
+          id: "field-trip-pdf",
+          parentSourceId: originBase.message.sourceId,
+          filename: "revised-field-trip.pdf",
+          mimeType: "application/pdf",
+          contentDigest: "a".repeat(64),
+          contentEnvelope: Uint8Array.from([1]),
+          discardAfter: "2026-08-28T20:00:00.000Z",
+        },
+        {
+          id: "reply-field-trip-pdf",
+          parentSourceId: "florence-field-trip-question",
+          filename: "original-field-trip.pdf",
+          mimeType: "application/pdf",
+          contentDigest: "b".repeat(64),
+          contentEnvelope: Uint8Array.from([2]),
+          discardAfter: "2026-08-28T20:00:00.000Z",
+        },
+      ],
+    };
     const input = {
       workId: "family-work-pdf",
       objective: `Read ${pdfUrl} and tell me the deadline and what I need to do.`,
       visibility: "private" as const,
       ownerAdultId: "adult-1",
+      origin,
       household: {
         householdId: "household-1",
         familyLabel: "Test family",
@@ -198,25 +346,546 @@ describe("Florence reasoner capability cutover", () => {
       state,
       currentTime: NOW,
     };
-    const runPublicPage = async () => ({
-      ...publicPageResult(pdfUrl, "Field trip form", "Return by Tuesday at 3 PM. Parent signature required."),
-      kind: "pdf" as const,
-      filename: "field-trip.pdf",
-    });
+    const imageReads: string[] = [];
+    const pdfReads: string[] = [];
+    const reads = {
+      readCurrentImage: async ({
+        assetId,
+        mimeType,
+      }: {
+        assetId: string;
+        mimeType: "image/jpeg" | "image/png" | "image/webp";
+      }) => {
+        imageReads.push(assetId);
+        return { mimeType, bytes: Uint8Array.from([0xff, 0xd8, 0xff]) };
+      },
+      readCurrentPdf: async ({ documentId }: { documentId: string }) => {
+        pdfReads.push(documentId);
+        return {
+          mimeType: "application/pdf" as const,
+          bytes: Uint8Array.from([0x25, 0x50, 0x44, 0x46, 0x2d]),
+        };
+      },
+      runPublicPage: async () => ({
+        ...publicPageResult(
+          pdfUrl,
+          "Field trip form",
+          "Return by Tuesday at 3 PM. Parent signature required.",
+        ),
+        kind: "pdf" as const,
+        filename: "field-trip.pdf",
+      }),
+    };
 
-    const planned = await reasoner.continueFamilyWork(input, { runPublicPage });
+    const planned = await reasoner.continueFamilyWork(input, reads);
     if (planned.kind !== "continue") throw new Error("Durable PDF read was not planned");
     expect(planned.state).toMatchObject({ phase: "tool_pending" });
-    const read = await reasoner.continueFamilyWork({ ...input, state: planned.state }, { runPublicPage });
+    const read = await reasoner.continueFamilyWork({ ...input, state: planned.state }, reads);
     if (read.kind !== "continue") throw new Error("Durable PDF read did not settle");
     expect(JSON.stringify(read.state.continuationItems)).toContain("Parent signature required");
     expect(Buffer.byteLength(JSON.stringify(read.state))).toBeLessThan(240 * 1024);
-    const terminal = await reasoner.continueFamilyWork({ ...input, state: read.state }, { runPublicPage });
+    const terminal = await reasoner.continueFamilyWork({ ...input, state: read.state }, reads);
     expect(terminal).toMatchObject({
       kind: "terminal",
       outcome: "succeeded",
       text: expect.stringContaining("parent signature"),
     });
+    expect(imageReads).toEqual(["reply-field-trip-image", "field-trip-image"]);
+    expect(pdfReads).toEqual(["field-trip-pdf", "reply-field-trip-pdf"]);
+    expect(JSON.stringify(modelRequests[0]?.input)).toContain("Use the revised field-trip form.");
+    expect(JSON.stringify(modelRequests[0]?.input)).toContain("Use the original field-trip form.");
+    expect(JSON.stringify(modelRequests[0]?.input)).toContain("Which form should I use?");
+    expect(JSON.stringify(modelRequests[0]?.input)).toContain('"type":"input_image"');
+    expect(JSON.stringify(modelRequests[0]?.input)).toContain('"type":"input_file"');
+    expect(JSON.stringify(modelRequests[1]?.input)).not.toContain('"type":"input_image"');
+    expect(JSON.stringify(modelRequests[1]?.input)).not.toContain('"type":"input_file"');
+  });
+
+  test("durable household work calls a business and reports the transcript-backed outcome", async () => {
+    const modelResponses = [
+      {
+        status: "completed",
+        output_parsed: null,
+        output: [
+          functionCall("call-dentist", "phone_agent_call", {
+            operation: "start",
+            to: "+13105550144",
+            task: "Call the dentist, ask for a cleaning appointment for Violet on Tuesday or Wednesday after 3 PM, and do not book outside those times.",
+            providerCallId: null,
+            firstSentence: "Hi, I’m calling for the Williams family about a cleaning appointment.",
+            voice: null,
+            maxDurationMinutes: 5,
+            record: true,
+            summaryPrompt: "State whether an appointment was booked and give the exact date and time.",
+            dispositions: ["booked", "availability_found", "no_availability"],
+          }),
+        ],
+      },
+      {
+        status: "completed",
+        output_parsed: null,
+        output: [
+          functionCall("check-dentist-call", "phone_agent_call", {
+            operation: "status",
+            to: null,
+            task: null,
+            providerCallId: "bland-call-1",
+            firstSentence: null,
+            voice: null,
+            maxDurationMinutes: null,
+            record: false,
+            summaryPrompt: null,
+            dispositions: [],
+          }),
+        ],
+      },
+      {
+        status: "completed",
+        output_parsed: {
+          outcome: "succeeded",
+          text: "Violet’s cleaning is booked for Wednesday at 3:30 PM. The office confirmed it on the call.",
+        },
+        output: [],
+      },
+    ];
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        parse() {
+          const response = modelResponses.shift();
+          if (!response) throw new Error("Unexpected dentist-call model turn");
+          return response;
+        },
+      },
+    } as never);
+    const input = {
+      workId: "family-work-dentist-call",
+      objective: "Call the dentist and arrange Violet’s cleaning Tuesday or Wednesday after 3 PM.",
+      visibility: "household" as const,
+      ownerAdultId: null,
+      initiatingAdultId: "adult-jackson",
+      origin: familyWorkOrigin(
+        "Call the dentist and arrange Violet’s cleaning Tuesday or Wednesday after 3 PM.",
+        "adult-jackson",
+      ),
+      household: {
+        householdId: "household-1",
+        familyLabel: "Williams family",
+        timeZone: "America/Los_Angeles",
+        postalCode: "90045",
+        adults: [
+          { adultId: "adult-jackson", firstName: "Jackson", displayName: "Jackson Williams" },
+          { adultId: "adult-hari", firstName: "Hari", displayName: "Hari Anbarasu" },
+        ],
+        children: [
+          {
+            childId: "child-violet",
+            firstName: "Violet",
+            displayName: "Violet Williams",
+            age: 4,
+            grade: "TK",
+            school: "Wish Charter",
+            activities: [],
+          },
+        ],
+      },
+      state: {
+        kind: "family_work_v1" as const,
+        version: 1 as const,
+        generation: 0,
+        phase: "ready" as const,
+        claim: null,
+        activePhoneCall: null,
+        activeTextMessage: null,
+        browserSession: null,
+        continuationItems: [],
+        pendingCall: null,
+        steering: [],
+        publicMapResearchContext: [],
+        progressRevision: 0,
+        terminal: null,
+      },
+      currentTime: NOW,
+    };
+    const operations: FlorenceTelephonyOperation[] = [];
+    const reads = {
+      telephonyProviders: ["bland"] as const,
+      async runTelephony(operation: FlorenceTelephonyOperation): Promise<FlorenceTelephonyResult> {
+        operations.push(operation);
+        if (operation.kind === "ai_call_start") {
+          return telephonyResult({
+            kind: "accepted",
+            provider: "bland",
+            operation: operation.kind,
+            providerId: "bland-call-1",
+            providerStatus: "queued",
+          });
+        }
+        if (operation.kind === "ai_call_status") {
+          return telephonyResult({
+            kind: "completed",
+            provider: "bland",
+            operation: operation.kind,
+            providerId: "bland-call-1",
+            providerStatus: "completed",
+            summary: "Cleaning booked for Wednesday at 3:30 PM.",
+            disposition: "booked",
+            transcript: "Office: We can do Wednesday at 3:30. Florence: Please book it.",
+          });
+        }
+        throw new Error(`Unexpected telephony operation ${operation.kind}`);
+      },
+    };
+
+    const plannedCall = await reasoner.continueFamilyWork(input, reads);
+    if (plannedCall.kind !== "continue") throw new Error("Dentist call was not planned");
+    const started = await reasoner.continueFamilyWork({ ...input, state: plannedCall.state }, reads);
+    if (started.kind !== "continue") throw new Error("Dentist call did not start");
+    expect(started.progressText).toContain("placed the call");
+    expect(started.nextCheckDelayMs).toBe(5_000);
+    expect(started.state.activePhoneCall).toEqual({
+      provider: "bland",
+      kind: "agent",
+      providerCallId: "bland-call-1",
+    });
+
+    const plannedStatus = await reasoner.continueFamilyWork({ ...input, state: started.state }, reads);
+    if (plannedStatus.kind !== "continue") throw new Error("Dentist call status was not planned");
+    const completed = await reasoner.continueFamilyWork({ ...input, state: plannedStatus.state }, reads);
+    if (completed.kind !== "continue") throw new Error("Dentist call status did not settle");
+    expect(completed.nextCheckDelayMs).toBe(0);
+    expect(completed.state.activePhoneCall).toBeNull();
+    expect(JSON.stringify(completed.state.continuationItems)).toContain("Wednesday at 3:30 PM");
+
+    const terminal = await reasoner.continueFamilyWork({ ...input, state: completed.state }, reads);
+    expect(terminal).toMatchObject({
+      kind: "terminal",
+      outcome: "succeeded",
+      text: expect.stringContaining("Wednesday at 3:30 PM"),
+    });
+    expect(operations).toEqual([
+      expect.objectContaining({ kind: "ai_call_start", to: "+13105550144" }),
+      { kind: "ai_call_status", provider: "bland", providerCallId: "bland-call-1" },
+    ]);
+  });
+
+  test("waits for a Bland start confirmation after cancellation so the provider call stays tracked", async () => {
+    let resolveProvider!: (result: FlorenceTelephonyResult) => void;
+    let markProviderStarted!: () => void;
+    const providerStarted = new Promise<void>((resolve) => {
+      markProviderStarted = resolve;
+    });
+    const providerResult = new Promise<FlorenceTelephonyResult>((resolve) => {
+      resolveProvider = resolve;
+    });
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {} as never);
+    const controller = new AbortController();
+    const callArguments = {
+      operation: "start",
+      to: "+13105550144",
+      task: "Ask the dentist for an appointment.",
+      providerCallId: null,
+      firstSentence: null,
+      voice: null,
+      maxDurationMinutes: null,
+      record: true,
+      summaryPrompt: null,
+      dispositions: [],
+    };
+    const input = {
+      workId: "family-work-cancelled-call-start",
+      objective: "Call the dentist and ask for an appointment.",
+      visibility: "private" as const,
+      ownerAdultId: "adult-jackson",
+      initiatingAdultId: "adult-jackson",
+      origin: familyWorkOrigin("Call the dentist and ask for an appointment.", "adult-jackson"),
+      household: {
+        householdId: "household-1",
+        familyLabel: "Williams family",
+        timeZone: "America/Los_Angeles",
+        postalCode: "90045",
+        adults: [{ adultId: "adult-jackson", firstName: "Jackson", displayName: "Jackson Williams" }],
+        children: [],
+      },
+      state: {
+        kind: "family_work_v1" as const,
+        version: 1 as const,
+        generation: 0,
+        phase: "tool_pending" as const,
+        claim: null,
+        activePhoneCall: null,
+        activeTextMessage: null,
+        browserSession: null,
+        continuationItems: [functionCall("start-cancelled-call", "phone_agent_call", callArguments)],
+        pendingCall: {
+          callId: "start-cancelled-call",
+          name: "phone_agent_call",
+          argumentsJson: JSON.stringify(callArguments),
+          attempt: 1,
+        },
+        steering: [],
+        publicMapResearchContext: [],
+        progressRevision: 0,
+        terminal: null,
+      },
+      currentTime: NOW,
+    };
+
+    const continued = reasoner.continueFamilyWork(
+      input,
+      {
+        telephonyProviders: ["bland"],
+        runTelephony() {
+          markProviderStarted();
+          return providerResult;
+        },
+      },
+      controller.signal,
+    );
+    await providerStarted;
+    controller.abort(new Error("The parent cancelled the task"));
+    const settledBeforeProvider = await Promise.race([
+      continued.then(() => true),
+      new Promise<false>((resolve) => setTimeout(() => resolve(false), 0)),
+    ]);
+    resolveProvider(
+      telephonyResult({
+        kind: "accepted",
+        provider: "bland",
+        operation: "ai_call_start",
+        providerId: "bland-late-call-1",
+        providerStatus: "queued",
+      }),
+    );
+    const step = await continued;
+
+    expect(settledBeforeProvider).toBe(false);
+    expect(step).toMatchObject({
+      kind: "continue",
+      state: {
+        activePhoneCall: {
+          provider: "bland",
+          kind: "agent",
+          providerCallId: "bland-late-call-1",
+        },
+      },
+    });
+  });
+
+  test("replaces a pending Twilio call handle with the real call SID returned by status", async () => {
+    const pendingCallSid = `pending_twilio_call_${Date.parse(NOW).toString(36)}_${"a".repeat(64)}_KzEzMTA1NTUwMTQ0`;
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {} as never);
+    const statusArguments = {
+      operation: "status",
+      to: null,
+      message: null,
+      callSid: pendingCallSid,
+      voice: null,
+      sendDigits: null,
+      record: false,
+    };
+    const input = {
+      workId: "family-work-pending-twilio-call",
+      objective: "Announce that pickup moved to 3 PM.",
+      visibility: "private" as const,
+      ownerAdultId: "adult-jackson",
+      initiatingAdultId: "adult-jackson",
+      origin: familyWorkOrigin("Announce that pickup moved to 3 PM.", "adult-jackson"),
+      household: {
+        householdId: "household-1",
+        familyLabel: "Williams family",
+        timeZone: "America/Los_Angeles",
+        postalCode: "90045",
+        adults: [{ adultId: "adult-jackson", firstName: "Jackson", displayName: "Jackson Williams" }],
+        children: [],
+      },
+      state: {
+        kind: "family_work_v1" as const,
+        version: 1 as const,
+        generation: 0,
+        phase: "tool_pending" as const,
+        claim: null,
+        activePhoneCall: {
+          provider: "twilio" as const,
+          kind: "announcement" as const,
+          providerCallId: pendingCallSid,
+        },
+        activeTextMessage: null,
+        browserSession: null,
+        continuationItems: [functionCall("check-pending-twilio-call", "phone_announcement", statusArguments)],
+        pendingCall: {
+          callId: "check-pending-twilio-call",
+          name: "phone_announcement",
+          argumentsJson: JSON.stringify(statusArguments),
+          attempt: 1,
+        },
+        steering: [],
+        publicMapResearchContext: [],
+        progressRevision: 0,
+        terminal: null,
+      },
+      currentTime: NOW,
+    };
+
+    const step = await reasoner.continueFamilyWork(input, {
+      telephonyProviders: ["twilio"],
+      async runTelephony() {
+        return telephonyResult({
+          kind: "progress",
+          provider: "twilio",
+          operation: "call_status",
+          providerId: "CA-real-call-1",
+          providerStatus: "ringing",
+        });
+      },
+    });
+
+    expect(step).toMatchObject({
+      kind: "continue",
+      state: {
+        activePhoneCall: {
+          provider: "twilio",
+          kind: "announcement",
+          providerCallId: "CA-real-call-1",
+        },
+      },
+    });
+  });
+
+  test("durable work checkpoints a sent text until Twilio confirms delivery", async () => {
+    const modelResponses = [
+      {
+        status: "completed",
+        output_parsed: null,
+        output: [
+          functionCall("send-dentist-text", "sms_work", {
+            operation: "send",
+            to: "+13105550144",
+            from: null,
+            body: "Could you confirm Violet’s Wednesday 3:30 PM cleaning?",
+            mediaUrls: [],
+            messageSid: null,
+            limit: null,
+          }),
+        ],
+      },
+      {
+        status: "completed",
+        output_parsed: null,
+        output: [
+          functionCall("check-dentist-text", "sms_work", {
+            operation: "status",
+            to: null,
+            from: null,
+            body: null,
+            mediaUrls: [],
+            messageSid: "SM-dentist-1",
+            limit: null,
+          }),
+        ],
+      },
+      {
+        status: "completed",
+        output_parsed: {
+          outcome: "succeeded",
+          text: "The dentist’s office received the confirmation text.",
+        },
+        output: [],
+      },
+    ];
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        parse() {
+          const response = modelResponses.shift();
+          if (!response) throw new Error("Unexpected dentist-text model turn");
+          return response;
+        },
+      },
+    } as never);
+    const input = {
+      workId: "family-work-dentist-text",
+      objective: "Text the dentist and confirm Violet’s Wednesday cleaning.",
+      visibility: "private" as const,
+      ownerAdultId: "adult-jackson",
+      initiatingAdultId: "adult-jackson",
+      origin: familyWorkOrigin("Text the dentist and confirm Violet’s Wednesday cleaning.", "adult-jackson"),
+      household: {
+        householdId: "household-1",
+        familyLabel: "Williams family",
+        timeZone: "America/Los_Angeles",
+        postalCode: "90045",
+        adults: [{ adultId: "adult-jackson", firstName: "Jackson", displayName: "Jackson Williams" }],
+        children: [],
+      },
+      state: {
+        kind: "family_work_v1" as const,
+        version: 1 as const,
+        generation: 0,
+        phase: "ready" as const,
+        claim: null,
+        activePhoneCall: null,
+        activeTextMessage: null,
+        browserSession: null,
+        continuationItems: [],
+        pendingCall: null,
+        steering: [],
+        publicMapResearchContext: [],
+        progressRevision: 0,
+        terminal: null,
+      },
+      currentTime: NOW,
+    };
+    const operations: FlorenceTelephonyOperation[] = [];
+    const reads = {
+      telephonyProviders: ["twilio"] as const,
+      async runTelephony(operation: FlorenceTelephonyOperation): Promise<FlorenceTelephonyResult> {
+        operations.push(operation);
+        if (operation.kind === "sms_send") {
+          return telephonyResult({
+            kind: "accepted",
+            provider: "twilio",
+            operation: operation.kind,
+            providerId: "SM-dentist-1",
+            providerStatus: "queued",
+          });
+        }
+        if (operation.kind === "sms_status") {
+          return telephonyResult({
+            kind: "completed",
+            provider: "twilio",
+            operation: operation.kind,
+            providerId: "SM-dentist-1",
+            providerStatus: "delivered",
+          });
+        }
+        throw new Error(`Unexpected telephony operation ${operation.kind}`);
+      },
+    };
+
+    const plannedSend = await reasoner.continueFamilyWork(input, reads);
+    if (plannedSend.kind !== "continue") throw new Error("Dentist text was not planned");
+    const sent = await reasoner.continueFamilyWork({ ...input, state: plannedSend.state }, reads);
+    if (sent.kind !== "continue") throw new Error("Dentist text did not send");
+    expect(sent.state.activeTextMessage).toEqual({
+      provider: "twilio",
+      messageSid: "SM-dentist-1",
+    });
+
+    const plannedStatus = await reasoner.continueFamilyWork({ ...input, state: sent.state }, reads);
+    if (plannedStatus.kind !== "continue") throw new Error("Dentist text status was not planned");
+    const delivered = await reasoner.continueFamilyWork({ ...input, state: plannedStatus.state }, reads);
+    if (delivered.kind !== "continue") throw new Error("Dentist text status did not settle");
+    expect(delivered.state.activeTextMessage).toBeNull();
+
+    const terminal = await reasoner.continueFamilyWork({ ...input, state: delivered.state }, reads);
+    expect(terminal).toMatchObject({
+      kind: "terminal",
+      outcome: "succeeded",
+      text: expect.stringContaining("received"),
+    });
+    expect(operations).toEqual([
+      expect.objectContaining({ kind: "sms_send", to: "+13105550144" }),
+      { kind: "sms_status", provider: "twilio", messageSid: "SM-dentist-1" },
+    ]);
   });
 
   test("durable work operates a family portal, pauses for sign-in, and resumes at review", async () => {
@@ -292,6 +961,8 @@ describe("Florence reasoner capability cutover", () => {
       generation: 0,
       phase: "ready",
       claim: null,
+      activePhoneCall: null,
+      activeTextMessage: null,
       browserSession: null,
       continuationItems: [],
       pendingCall: null,
@@ -305,6 +976,7 @@ describe("Florence reasoner capability cutover", () => {
       objective: "Fill out Violet’s camp registration and get it ready for my final review.",
       visibility: "private" as const,
       ownerAdultId: "adult-1",
+      origin: familyWorkOrigin("Fill out Violet’s camp registration and get it ready for my final review."),
       household: {
         householdId: "household-1",
         familyLabel: "Test family",
@@ -453,8 +1125,19 @@ describe("Florence reasoner capability cutover", () => {
       },
     } as never);
 
+    const input = foregroundInput();
+    input.currentMessage.text = "How is traffic on that drive right now?";
+    input.currentMessage.authoredText = input.currentMessage.text;
+    input.recentMessages = [
+      {
+        sourceId: "earlier-route",
+        senderName: "Hari",
+        text: "We are driving from LAX to Wish Charter School in Los Angeles.",
+        occurredAt: "2026-08-27T19:55:00.000Z",
+      },
+    ];
     await reasoner.decide(
-      foregroundInput(),
+      input,
       {
         ...inertReads(),
         async runMaps(request) {
@@ -532,6 +1215,9 @@ describe("Florence reasoner capability cutover", () => {
         durationSeconds: 720,
       },
     });
+    expect(String(requests[0]?.instructions)).not.toContain(
+      "route endpoints are already in the parent's current typed request",
+    );
   });
 
   test("ordinary weather questions resolve a place and use live NWS weather with one work cue", async () => {
@@ -817,6 +1503,8 @@ describe("Florence reasoner capability cutover", () => {
       generation: 0,
       phase: "ready",
       claim: null,
+      activePhoneCall: null,
+      activeTextMessage: null,
       browserSession: null,
       continuationItems: [],
       pendingCall: null,
@@ -830,6 +1518,9 @@ describe("Florence reasoner capability cutover", () => {
       objective: "DL 747 is delayed tonight. Find the two best nonstop alternatives; Delta if possible.",
       visibility: "household" as const,
       ownerAdultId: null,
+      origin: familyWorkOrigin(
+        "DL 747 is delayed tonight. Find the two best nonstop alternatives; Delta if possible.",
+      ),
       household: {
         householdId: "household-1",
         familyLabel: "Test family",
@@ -1017,6 +1708,8 @@ describe("Florence reasoner capability cutover", () => {
       generation: 3,
       phase: "ready",
       claim: null,
+      activePhoneCall: null,
+      activeTextMessage: null,
       browserSession: null,
       continuationItems: [
         {
@@ -1038,6 +1731,7 @@ describe("Florence reasoner capability cutover", () => {
         objective: "Compare the useful options.",
         visibility: "household",
         ownerAdultId: null,
+        origin: familyWorkOrigin("Compare the useful options."),
         household: {
           householdId: "household-1",
           familyLabel: "Test family",
@@ -1063,7 +1757,7 @@ describe("Florence reasoner capability cutover", () => {
     });
   });
 
-  test("Workspace reads run in private conversation while writes stay in durable work", async () => {
+  test("foreground Workspace reads hand real send requests to durable work", async () => {
     const requests: Record<string, unknown>[] = [];
     const operations: unknown[] = [];
     let modelTurn = 0;
@@ -1110,16 +1804,30 @@ describe("Florence reasoner capability cutover", () => {
                 }
               : {
                   status: "completed",
-                  output_parsed: ordinaryDecision({
-                    bubbleText: "I found the enrollment form. I haven’t sent anything.",
-                  }),
+                  output_parsed: {
+                    ...ordinaryDecision({
+                      bubbleText: "I found the enrollment form. I’m sending the update now.",
+                    }),
+                    policy: { retain: true, schedule: false, stopMessaging: false },
+                    familyWork: {
+                      operation: "create",
+                      workId: null,
+                      objective:
+                        "Email the school that Violet's enrollment paperwork is complete and ask them to confirm her status is current.",
+                      instruction: null,
+                    },
+                  },
                   output: [],
                 },
           );
         },
       },
     } as never);
-    const result = await reasoner.decide(foregroundInput(), {
+    const input = foregroundInput();
+    input.currentMessage.text =
+      "Find Violet's enrollment form, then email the school that her paperwork is complete and ask them to confirm.";
+    input.currentMessage.authoredText = input.currentMessage.text;
+    const result = await reasoner.decide(input, {
       ...inertReads(),
       async runGoogleWorkspace(operation) {
         operations.push(operation);
@@ -1139,7 +1847,13 @@ describe("Florence reasoner capability cutover", () => {
     });
 
     expect(operations).toEqual([{ operation: "drive_search", query: "school enrollment form", limit: 10 }]);
-    expect(result.conversation.bubbles[0]?.text).toContain("haven’t sent anything");
+    expect(result.conversation.bubbles[0]?.text).toContain("sending the update");
+    expect(result.familyWork).toMatchObject({
+      operation: "create",
+      objective: expect.stringContaining("Email the school"),
+    });
+    expect(result.policy.schedule).toBe(false);
+    expect(String(requests[0]?.instructions)).toContain("do not turn a send request into an unsent draft");
     expect(functionOutputEnvelopes(requests[1])).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
@@ -1209,6 +1923,8 @@ describe("Florence reasoner capability cutover", () => {
       generation: 0,
       phase: "ready",
       claim: null,
+      activePhoneCall: null,
+      activeTextMessage: null,
       browserSession: null,
       continuationItems: [],
       pendingCall: null,
@@ -1222,6 +1938,9 @@ describe("Florence reasoner capability cutover", () => {
       objective: "Email the school an enrollment status update and ask them to confirm it is current.",
       visibility: "private" as const,
       ownerAdultId: "adult-1",
+      origin: familyWorkOrigin(
+        "Email the school an enrollment status update and ask them to confirm it is current.",
+      ),
       household: {
         householdId: "household-1",
         familyLabel: "Test family",
@@ -1319,6 +2038,208 @@ describe("Florence reasoner capability cutover", () => {
     });
   });
 
+  test("durable group work forwards a Gmail message with its attachment and sends the exact draft", async () => {
+    const modelResponses = [
+      {
+        status: "completed",
+        output_parsed: null,
+        output: [
+          functionCall("read-school-message", "gmail_work", {
+            operation: "gmail_get",
+            query: null,
+            limit: null,
+            messageId: "gmail-school-message",
+            to: [],
+            cc: [],
+            bcc: [],
+            subject: null,
+            body: null,
+            bodyFormat: null,
+            threadId: null,
+            addLabelIds: [],
+            removeLabelIds: [],
+          }),
+        ],
+      },
+      {
+        status: "completed",
+        output_parsed: null,
+        output: [
+          functionCall("draft-school-forward", "gmail_draft_work", {
+            operation: "create_forward",
+            messageId: "gmail-school-message",
+            draftId: null,
+            messageHeaderId: null,
+            to: ["jackson@example.com"],
+            cc: [],
+            bcc: [],
+            subject: null,
+            body: "Here is the school form Florence found.",
+            bodyFormat: "plain",
+            includeSourceAttachments: true,
+            attachments: [],
+          }),
+        ],
+      },
+      {
+        status: "completed",
+        output_parsed: null,
+        output: [
+          functionCall("send-school-forward", "gmail_draft_work", {
+            operation: "send",
+            messageId: null,
+            draftId: "gmail-draft-1",
+            messageHeaderId: "<florence-draft-1@messages.florence.local>",
+            to: [],
+            cc: [],
+            bcc: [],
+            subject: null,
+            body: null,
+            bodyFormat: null,
+            includeSourceAttachments: false,
+            attachments: [],
+          }),
+        ],
+      },
+      {
+        status: "completed",
+        output_parsed: {
+          outcome: "succeeded",
+          text: "I forwarded Jackson the school form with the original PDF attached.",
+        },
+        output: [],
+      },
+    ];
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        parse() {
+          const response = modelResponses.shift();
+          if (!response) throw new Error("Unexpected Gmail draft model turn");
+          return response;
+        },
+      },
+    } as never);
+    const input = {
+      workId: "family-work-forward-school-form",
+      objective: "Forward the school email and its form attachment to Jackson.",
+      visibility: "household" as const,
+      ownerAdultId: null,
+      initiatingAdultId: "adult-hari",
+      origin: familyWorkOrigin("Forward the school email and its form attachment to Jackson.", "adult-hari"),
+      household: {
+        householdId: "household-1",
+        familyLabel: "Test family",
+        timeZone: "America/Los_Angeles",
+        postalCode: "90045",
+        adults: [
+          { adultId: "adult-hari", firstName: "Hari", displayName: "Hari Anbarasu" },
+          { adultId: "adult-jackson", firstName: "Jackson", displayName: "Jackson Williams" },
+        ],
+        children: [],
+      },
+      state: {
+        kind: "family_work_v1" as const,
+        version: 1 as const,
+        generation: 0,
+        phase: "ready" as const,
+        claim: null,
+        activePhoneCall: null,
+        activeTextMessage: null,
+        browserSession: null,
+        continuationItems: [],
+        pendingCall: null,
+        steering: [],
+        publicMapResearchContext: [],
+        progressRevision: 0,
+        terminal: null,
+      },
+      currentTime: NOW,
+    };
+    const operations: GoogleWorkspaceOperation[] = [];
+    const runGoogleWorkspace = async (
+      operation: GoogleWorkspaceOperation,
+    ): Promise<GoogleWorkspaceResult> => {
+      operations.push(operation);
+      if (operation.operation === "gmail_get") {
+        return {
+          operation: operation.operation,
+          result: {
+            messageId: "gmail-school-message",
+            threadId: "gmail-thread-1",
+            subject: "School form",
+            body: "Please return the attached form.",
+            attachments: [
+              {
+                attachmentId: "gmail-attachment-1",
+                partId: "1",
+                filename: "school-form.pdf",
+                mimeType: "application/pdf",
+                sizeBytes: 42_000,
+              },
+            ],
+          },
+        };
+      }
+      if (operation.operation === "gmail_draft_create") {
+        return {
+          operation: operation.operation,
+          result: {
+            status: "created",
+            draftId: "gmail-draft-1",
+            messageHeaderId: "<florence-draft-1@messages.florence.local>",
+            messageId: "gmail-draft-message-1",
+            threadId: null,
+          },
+        };
+      }
+      if (operation.operation === "gmail_draft_send") {
+        return {
+          operation: operation.operation,
+          result: {
+            status: "sent",
+            draftId: operation.draftId,
+            messageHeaderId: operation.messageHeaderId,
+            messageId: "gmail-sent-message-1",
+            threadId: null,
+          },
+        };
+      }
+      throw new Error(`Unexpected Google operation ${operation.operation}`);
+    };
+
+    let state: FamilyWorkStateV1 = input.state;
+    for (let index = 0; index < 3; index += 1) {
+      const planned = await reasoner.continueFamilyWork({ ...input, state }, { runGoogleWorkspace });
+      if (planned.kind !== "continue") throw new Error("Gmail draft step was not planned");
+      const executed = await reasoner.continueFamilyWork(
+        { ...input, state: planned.state },
+        { runGoogleWorkspace },
+      );
+      if (executed.kind !== "continue") throw new Error("Gmail draft step did not execute");
+      state = executed.state;
+    }
+    const terminal = await reasoner.continueFamilyWork({ ...input, state }, { runGoogleWorkspace });
+
+    expect(operations[1]).toMatchObject({
+      operation: "gmail_draft_create",
+      mode: "forward",
+      messageId: "gmail-school-message",
+      to: ["jackson@example.com"],
+      includeSourceAttachments: true,
+      idempotencyKey: expect.stringMatching(/^[a-f0-9]{64}$/),
+    });
+    expect(operations[2]).toEqual({
+      operation: "gmail_draft_send",
+      draftId: "gmail-draft-1",
+      messageHeaderId: "<florence-draft-1@messages.florence.local>",
+    });
+    expect(terminal).toMatchObject({
+      kind: "terminal",
+      outcome: "succeeded",
+      text: expect.stringContaining("original PDF attached"),
+    });
+  });
+
   test("durable work lists Calendars and reads a selected reference across checkpoints", async () => {
     const calendarRef = "calendar-school";
     const calendarWindowArguments = {
@@ -1368,6 +2289,8 @@ describe("Florence reasoner capability cutover", () => {
       generation: 0,
       phase: "ready",
       claim: null,
+      activePhoneCall: null,
+      activeTextMessage: null,
       browserSession: null,
       continuationItems: [],
       pendingCall: null,
@@ -1381,6 +2304,7 @@ describe("Florence reasoner capability cutover", () => {
       objective: "Check the School Calendar for tomorrow's schedule.",
       visibility: "private" as const,
       ownerAdultId: "adult-1",
+      origin: familyWorkOrigin("Check the School Calendar for tomorrow's schedule."),
       household: {
         householdId: "household-1",
         familyLabel: "Test family",
@@ -1977,6 +2901,24 @@ function browserObservation(
     reason: null,
     refCount: (input.snapshot.match(/\[ref=/gu) ?? []).length,
     truncated: false,
+    ...input,
+  };
+}
+
+function telephonyResult(
+  input: Partial<FlorenceTelephonyResult> &
+    Pick<FlorenceTelephonyResult, "kind" | "provider" | "operation" | "providerId" | "providerStatus">,
+): FlorenceTelephonyResult {
+  return {
+    reason: null,
+    toPhoneNumberMasked: null,
+    answeredBy: null,
+    durationSeconds: null,
+    summary: null,
+    disposition: null,
+    transcript: null,
+    recordingUrl: null,
+    messages: [],
     ...input,
   };
 }

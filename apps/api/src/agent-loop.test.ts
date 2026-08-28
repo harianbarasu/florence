@@ -9,6 +9,7 @@ interface TestContext {
 
 const operationSchema = z.object({
   operation: z.enum(["read", "write", "denied"]),
+  sequence: z.number().int().optional(),
 });
 
 function operationOf(value: JsonValue | undefined): string | undefined {
@@ -60,7 +61,10 @@ describe("general agent capability lifecycle", () => {
         modelTurns += 1;
         if (modelTurns <= 13) {
           return response([
-            functionCall(`read-${modelTurns}`, "household_tool", { operation: "read" }),
+            functionCall(`read-${modelTurns}`, "household_tool", {
+              operation: "read",
+              sequence: modelTurns,
+            }),
           ]) as never;
         }
         return response([], { text: "I finished the complete multi-source review." }) as never;
@@ -73,6 +77,112 @@ describe("general agent capability lifecycle", () => {
 
     expect(result).toMatchObject({ kind: "completed", turns: 14 });
     expect(executions).toEqual(Array.from({ length: 13 }, () => "read"));
+  });
+
+  test("reuses demonstrated no-progress results and makes the model synthesize without tools", async () => {
+    const executions: string[] = [];
+    const registry = progressRegistry(executions, ["same".repeat(180)]);
+    const requests: Array<{
+      readonly input?: unknown;
+      readonly tools?: unknown;
+      readonly max_tool_calls?: unknown;
+      readonly tool_choice?: unknown;
+    }> = [];
+    let modelTurns = 0;
+
+    const result = await runAgentLoop({
+      client: {} as never,
+      request: { model: "test-model", max_tool_calls: 4, tool_choice: "required" },
+      modelCall: (request) => {
+        requests.push(request);
+        modelTurns += 1;
+        if (modelTurns <= 4) {
+          return response([
+            functionCall(
+              `repeat-${modelTurns}`,
+              "progress_tool",
+              modelTurns % 2 === 0 ? { limit: 10, query: "unchanged" } : { query: "unchanged", limit: 10 },
+            ),
+          ]) as never;
+        }
+        return response([], { answer: "I used the result already available." }) as never;
+      },
+      transcript: [],
+      registry,
+      getCapabilityContext: () => ({ allowWrites: false }),
+      parallelToolCalls: false,
+    });
+
+    expect(result).toMatchObject({ kind: "completed", turns: 5 });
+    expect(executions).toEqual(["unchanged", "unchanged", "unchanged"]);
+    expect(functionOutput(requests[2], "repeat-2")).toContain("Duplicate result omitted");
+    expect(functionOutput(requests[3], "repeat-3")).toContain("3 consecutive times");
+    expect(functionOutput(requests[4], "repeat-4")).toContain("was not re-executed");
+    expect(requests[4]?.tools).toEqual([]);
+    expect(requests[4]?.max_tool_calls).toBeUndefined();
+    expect(requests[4]?.tool_choice).toBeUndefined();
+  });
+
+  test("resets exact-call no-progress tracking when the terminal result changes", async () => {
+    const executions: string[] = [];
+    const registry = progressRegistry(executions, ["first", "first", "second", "second", "third"]);
+    const requests: Array<{ readonly tools?: unknown }> = [];
+    let modelTurns = 0;
+
+    const result = await runAgentLoop({
+      client: {} as never,
+      request: { model: "test-model" },
+      modelCall: (request) => {
+        requests.push(request);
+        modelTurns += 1;
+        if (modelTurns <= 5) {
+          return response([
+            functionCall(`changing-${modelTurns}`, "progress_tool", { query: "same-call" }),
+          ]) as never;
+        }
+        return response([], { answer: "The changing result is complete." }) as never;
+      },
+      transcript: [],
+      registry,
+      getCapabilityContext: () => ({ allowWrites: false }),
+      parallelToolCalls: false,
+    });
+
+    expect(result).toMatchObject({ kind: "completed", turns: 6 });
+    expect(executions).toEqual(Array.from({ length: 5 }, () => "same-call"));
+    expect(requests.every((request) => Array.isArray(request.tools) && request.tools.length === 1)).toBe(
+      true,
+    );
+  });
+
+  test("keeps repeated external calls behind the durable suspension seam", async () => {
+    const executions: string[] = [];
+    const registry = testRegistry(executions, []);
+    let modelTurns = 0;
+    let suspensionChecks = 0;
+
+    const result = await runAgentLoop({
+      client: {} as never,
+      request: { model: "test-model" },
+      modelCall: () => {
+        modelTurns += 1;
+        return response([
+          functionCall(`external-${modelTurns}`, "household_tool", { operation: "write" }),
+        ]) as never;
+      },
+      transcript: [],
+      registry,
+      getCapabilityContext: () => ({ allowWrites: true }),
+      parallelToolCalls: false,
+      suspendBeforeToolExecution: () => {
+        suspensionChecks += 1;
+        return suspensionChecks === 4 ? { value: "checkpoint" } : undefined;
+      },
+    });
+
+    expect(result).toMatchObject({ kind: "suspended", turns: 4, suspension: "checkpoint" });
+    expect(suspensionChecks).toBe(4);
+    expect(executions).toEqual(["write", "write", "write"]);
   });
 
   test("derives a truthful model contract and resolves boundaries from canonical arguments", async () => {
@@ -245,9 +355,38 @@ function modelSchema(operations: readonly string[]): JsonValue {
     additionalProperties: false,
     properties: {
       operation: { type: "string", enum: operations },
+      sequence: { type: "integer" },
     },
     required: ["operation"],
   };
+}
+
+function progressRegistry(executions: string[], values: readonly string[]) {
+  let execution = 0;
+  return new CapabilityRegistry<TestContext>([
+    defineCapability({
+      name: "progress_tool",
+      description: "Read changing progress.",
+      modelSchema: {
+        type: "object",
+        additionalProperties: false,
+        properties: { query: { type: "string" }, limit: { type: "integer" } },
+        required: ["query"],
+      },
+      inputSchema: z.object({ query: z.string(), limit: z.number().int().optional() }),
+      outputSchema: z.object({ value: z.string() }),
+      executionMode: "sequential",
+      executionBoundary: "inline",
+      timeoutMs: 1_000,
+      maxOutputBytes: 4_096,
+      async execute({ arguments: args }) {
+        executions.push(args.query);
+        const value = values[Math.min(execution, values.length - 1)] ?? "";
+        execution += 1;
+        return { output: { value } };
+      },
+    }),
+  ]);
 }
 
 function functionCall(
@@ -289,4 +428,13 @@ function toolErrors(request: { readonly input?: unknown } | undefined): string[]
       };
       return envelope.error?.code ?? "";
     });
+}
+
+function functionOutput(request: { readonly input?: unknown } | undefined, callId: string): string {
+  const input =
+    (request?.input as Array<{ type?: string; call_id?: string; output?: unknown }> | undefined) ?? [];
+  const output = input.find(
+    (item) => item.type === "function_call_output" && item.call_id === callId,
+  )?.output;
+  return typeof output === "string" ? output : "";
 }

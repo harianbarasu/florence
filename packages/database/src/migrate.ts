@@ -7,7 +7,16 @@ export const baselineFile = fileURLToPath(new URL("../sql/001_florence.sql", imp
 const remindersFile = fileURLToPath(new URL("../sql/002_reminders.sql", import.meta.url));
 const familyWorkFile = fileURLToPath(new URL("../sql/003_family_work.sql", import.meta.url));
 const docketCompletionFile = fileURLToPath(new URL("../sql/004_docket_completion.sql", import.meta.url));
-export const migrationFiles = [baselineFile, remindersFile, familyWorkFile, docketCompletionFile] as const;
+const docketCalendarCompatibilityFile = fileURLToPath(
+  new URL("../sql/005_docket_calendar_compatibility.sql", import.meta.url),
+);
+export const migrationFiles = [
+  baselineFile,
+  remindersFile,
+  familyWorkFile,
+  docketCompletionFile,
+  docketCalendarCompatibilityFile,
+] as const;
 
 export async function migrateDatabase(connectionString: string, sqlFile?: string): Promise<void> {
   const client = postgres(connectionString, { max: 1 });

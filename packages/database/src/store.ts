@@ -1383,6 +1383,8 @@ type CalendarActionAuthorityRow = {
   basis_source_id: string | null;
   approval_source_id: string | null;
   approval_prompt_source_id: string | null;
+  google_action_key: string | null;
+  legacy_google_review_basis: boolean;
   payload: JsonValue;
   provider_event_id: string | null;
   provider_etag: string | null;
@@ -6766,6 +6768,18 @@ export class PostgresFlorenceStore {
 
   async commitTurn(input: CommitTurnInput): Promise<CommitTurnResult> {
     const handledAt = instant(input.handledAt);
+    const completeDocketCandidateIds = input.completeDocketCandidateIds ?? [];
+    if (
+      completeDocketCandidateIds.length > 20 ||
+      new Set(completeDocketCandidateIds).size !== completeDocketCandidateIds.length
+    ) {
+      throw new FlorenceStoreConflict(
+        "A conversation cannot complete repeated or excessive household docket items",
+      );
+    }
+    for (const candidateId of completeDocketCandidateIds) {
+      assertUuid(candidateId, "Household docket candidate ID");
+    }
     return this.#sql.begin(async (sql) => {
       const [turn] = await sql<
         {
@@ -6853,6 +6867,11 @@ export class PostgresFlorenceStore {
       }
       if (turn.audience !== "private" && input.partnerInvitationApproval !== undefined) {
         throw new FlorenceStoreUnauthorized("Partner invitations require a private adult thread");
+      }
+      if (completeDocketCandidateIds.length > 0) {
+        // A Google poll takes its work row before reconciling sources, monitors, Calendar actions,
+        // and the review. Take that same leading lock before this turn mutates Google-backed state.
+        await lockHouseholdGooglePolls(sql, turn.household_id);
       }
 
       let householdUpdateGroup: (ChannelRow & FamilyGroupAuthorityRow) | null = null;
@@ -7572,18 +7591,6 @@ export class PostgresFlorenceStore {
         }
       }
 
-      const completeDocketCandidateIds = input.completeDocketCandidateIds ?? [];
-      if (
-        completeDocketCandidateIds.length > 20 ||
-        new Set(completeDocketCandidateIds).size !== completeDocketCandidateIds.length
-      ) {
-        throw new FlorenceStoreConflict(
-          "A conversation cannot complete repeated or excessive household docket items",
-        );
-      }
-      for (const candidateId of completeDocketCandidateIds) {
-        assertUuid(candidateId, "Household docket candidate ID");
-      }
       if (completeDocketCandidateIds.length > 0) {
         await completeHouseholdDocketCandidates(sql, {
           householdId: turn.household_id,
@@ -8207,18 +8214,35 @@ export class PostgresFlorenceStore {
     return this.#sql.begin(async (sql) => {
       const [row] = await sql<CalendarActionAuthorityRow[]>`
         select a.id,a.status,a.household_id,a.basis_source_id,a.approval_source_id,
-               a.approval_prompt_source_id,a.payload,a.provider_event_id,a.provider_etag,
+               a.approval_prompt_source_id,a.google_action_key,
+               coalesce(basis.kind in ('gmail','calendar') and basis.visibility='private',false)
+                 as legacy_google_review_basis,
+               a.payload,a.provider_event_id,a.provider_etag,
                a.committed_at,a.retry_at,message.channel_id,message.direction,
                message.sender_adult_id,c.audience as channel_audience,c.provider_conversation_id,
                c.adult_one_id,c.identity_one_digest,c.adult_two_id,c.identity_two_digest,
                c.authority_digest,c.bound_at,c.revoked_at,c.stopped_at
         from calendar_actions a left join messages message on message.source_id=a.approval_source_id
         left join linq_channels c on c.id=message.channel_id
+        left join sources basis on basis.id=a.basis_source_id
         where a.status='pending' and a.retry_at<=${dueAt}
         order by a.retry_at,a.created_at,a.id limit 1
         for update of a skip locked
       `;
       if (!row) return null;
+      const retireAction = row.google_action_key
+        ? (await readResolvedGoogleActionKeys(sql, row.household_id)).has(row.google_action_key)
+        : row.legacy_google_review_basis && row.approval_source_id === null;
+      if (retireAction) {
+        // Tagged work already handled by the family must never be reclaimed after a provider
+        // failure. Untagged, unapproved private-Google actions predate stable docket identity, so
+        // retire them and let the next authoritative review recreate anything still relevant.
+        await sql`
+          delete from calendar_actions
+          where id=${row.id} and status='pending' and retry_at<=${dueAt}
+        `;
+        return null;
+      }
       const familyCalendarAuthority = await readFamilyCalendarAuthority(sql, row.household_id);
       const mutation = familyCalendarMutation(row.payload);
       let personalCalendarOwnerApproved = false;
@@ -9959,7 +9983,10 @@ async function readCalendarActionAuthority(
 ): Promise<CalendarActionAuthorityRow | undefined> {
   const [row] = await sql<CalendarActionAuthorityRow[]>`
     select a.id,a.status,a.household_id,a.basis_source_id,a.approval_source_id,
-      a.approval_prompt_source_id,a.payload,a.provider_event_id,a.provider_etag,a.committed_at,a.retry_at,
+      a.approval_prompt_source_id,a.google_action_key,
+      coalesce(basis.kind in ('gmail','calendar') and basis.visibility='private',false)
+        as legacy_google_review_basis,
+      a.payload,a.provider_event_id,a.provider_etag,a.committed_at,a.retry_at,
       approval.channel_id,approval.direction,approval.sender_adult_id,
       channel.audience as channel_audience,channel.provider_conversation_id,channel.adult_one_id,
       channel.identity_one_digest,channel.adult_two_id,channel.identity_two_digest,
@@ -9967,6 +9994,7 @@ async function readCalendarActionAuthority(
     from calendar_actions a
     left join messages approval on approval.source_id=a.approval_source_id
     left join linq_channels channel on channel.id=approval.channel_id
+    left join sources basis on basis.id=a.basis_source_id
     where a.id=${actionId} for update of a
   `;
   return row;
@@ -14052,6 +14080,28 @@ type StoredBriefingCandidateGroup = {
   ownerAdultIds: readonly string[];
 };
 
+async function lockHouseholdGooglePolls(sql: postgres.TransactionSql, householdId: string): Promise<void> {
+  await sql`
+    select id from proactive_work
+    where household_id=${householdId}
+      and kind in ('personal_google_poll','family_calendar_poll')
+      and status in ('active','paused')
+    order by id for update
+  `;
+}
+
+async function lockHouseholdDocketMonitors(
+  sql: postgres.TransactionSql,
+  householdId: string,
+): Promise<readonly { id: string; last_error: string | null }[]> {
+  return sql<{ id: string; last_error: string | null }[]>`
+    select id,last_error from proactive_work
+    where household_id=${householdId} and kind='finite_monitor'
+      and status in ('active','paused')
+    order by id for update
+  `;
+}
+
 async function completeHouseholdDocketCandidates(
   sql: postgres.TransactionSql,
   input: {
@@ -14066,6 +14116,8 @@ async function completeHouseholdDocketCandidates(
     select time_zone from households where id=${input.householdId} for share
   `;
   if (!household) throw new FlorenceStoreConflict("The household docket no longer exists");
+  await lockHouseholdGooglePolls(sql, input.householdId);
+  const linkedMonitors = await lockHouseholdDocketMonitors(sql, input.householdId);
   const reviews = await sql<(ProactiveWorkRow & { private_conflict_busy_sharing_enabled: boolean })[]>`
     select work.*,
       coalesce(person.preferences->'privateConflictBusySharingEnabled'='true'::jsonb,false)
@@ -14139,14 +14191,6 @@ async function completeHouseholdDocketCandidates(
       completedGoogleActionKeys: durableCompletedActionKeys,
     })}
     where id=${input.basisSourceId} and household_id=${input.householdId}
-  `;
-  const linkedMonitors = await sql<{ id: string; last_error: string | null }[]>`
-    select id,last_error from proactive_work
-    where household_id=${input.householdId} and kind='finite_monitor'
-      and status in ('active','paused')
-      and left(coalesce(last_error,''),${GOOGLE_ACTION_WORK_MARKER_PREFIX.length})=
-        ${GOOGLE_ACTION_WORK_MARKER_PREFIX}
-    order by id for update
   `;
   const completedMonitorIds = linkedMonitors.flatMap((monitor) => {
     const actionKey = googleActionKeyFromWorkMarker(monitor.last_error);

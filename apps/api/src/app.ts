@@ -30,6 +30,7 @@ import { KiwiFlightSearchClient } from "./flights.js";
 import { Florence } from "./florence.js";
 import { createLinqIngress, type LinqIngress, LinqIngressError } from "./linq-ingress.js";
 import { OpenStreetMapsClient } from "./maps.js";
+import { PublicPageReader } from "./public-page.js";
 import { createFlorenceReasonerFromEnv } from "./reasoner.js";
 import { NwsWeatherClient } from "./weather.js";
 
@@ -78,6 +79,7 @@ export function createDefaultDependencies(env: NodeJS.ProcessEnv = process.env):
     linq,
     google,
     maps: new OpenStreetMapsClient(),
+    publicPages: new PublicPageReader(),
     weather: new NwsWeatherClient(),
     flights: new KiwiFlightSearchClient(),
     reasoner: createFlorenceReasonerFromEnv(env),

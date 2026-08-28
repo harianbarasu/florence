@@ -113,6 +113,199 @@ describe("Florence reasoner capability cutover", () => {
     }
   });
 
+  test("reads a parent-supplied page and refuses an unrelated model-invented URL", async () => {
+    const pageUrl = "https://school.example/fall-fair";
+    const requests: Record<string, unknown>[] = [];
+    const pageReads: unknown[] = [];
+    let modelTurn = 0;
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        stream: (request: Record<string, unknown>) => {
+          requests.push(request);
+          modelTurn += 1;
+          return fakeStream(
+            modelTurn === 1
+              ? {
+                  status: "completed",
+                  output_parsed: null,
+                  output: [
+                    functionCall("parent-page", "read_public_page", { url: pageUrl }),
+                    functionCall("invented-page", "read_public_page", {
+                      url: "https://unseen.example/private-plan",
+                    }),
+                  ],
+                }
+              : {
+                  status: "completed",
+                  output_parsed: ordinaryDecision({
+                    bubbleText: "The fall-fair RSVP closes September 6 at 5 PM.",
+                    researchUrls: [pageUrl],
+                  }),
+                  output: [],
+                },
+          );
+        },
+      },
+    } as never);
+    const input = foregroundInput();
+    input.currentMessage.text = `Read ${pageUrl} — when is the RSVP due?`;
+    input.currentMessage.authoredText = input.currentMessage.text;
+
+    const result = await reasoner.decide(input, {
+      ...inertReads(),
+      async runPublicPage(request) {
+        pageReads.push(request);
+        return publicPageResult(pageUrl, "Fall Fair", "RSVP closes September 6 at 5 PM.");
+      },
+    });
+
+    expect(pageReads).toEqual([{ url: pageUrl, charLimit: 15_000 }]);
+    expect(result.conversation.bubbles[0]?.text).toContain("September 6 at 5 PM");
+    expect(result.researchUrls).toEqual([pageUrl]);
+    const envelopes = functionOutputEnvelopes(requests[1]);
+    expect(envelopes.find((envelope) => envelope.callId === "parent-page")).toMatchObject({
+      outcome: "succeeded",
+      output: { title: "Fall Fair", text: expect.stringContaining("September 6") },
+    });
+    expect(envelopes.find((envelope) => envelope.callId === "invented-page")).toMatchObject({
+      outcome: "protocol_rejected",
+      error: { code: "not_admitted" },
+    });
+  });
+
+  test("follows a verified search result and reads the page before answering", async () => {
+    const searchUrl = "https://school.example/field-trip";
+    const requests: Record<string, unknown>[] = [];
+    let modelTurn = 0;
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        stream: (request: Record<string, unknown>) => {
+          requests.push(request);
+          modelTurn += 1;
+          return fakeStream(
+            modelTurn === 1
+              ? {
+                  status: "completed",
+                  output_parsed: null,
+                  output: [functionCall("find-trip", "research_public_web", {})],
+                }
+              : modelTurn === 2
+                ? {
+                    status: "completed",
+                    output_parsed: null,
+                    output: [functionCall("open-trip", "read_public_page", { url: searchUrl })],
+                  }
+                : {
+                    status: "completed",
+                    output_parsed: ordinaryDecision({
+                      bubbleText: "The permission form is due Tuesday at 3 PM.",
+                      researchUrls: [searchUrl],
+                    }),
+                    output: [],
+                  },
+          );
+        },
+        parse: () => ({
+          status: "completed",
+          output_parsed: {
+            outcome: "result",
+            summary: "The school posted a field-trip page.",
+            urls: [searchUrl],
+          },
+          output: [completedWebSearch(searchUrl)],
+        }),
+      },
+    } as never);
+
+    const result = await reasoner.decide(foregroundInput(), {
+      ...inertReads(),
+      async runPublicPage(request) {
+        expect(request.url).toBe(searchUrl);
+        return publicPageResult(searchUrl, "Field trip", "Permission form due Tuesday at 3 PM.");
+      },
+    });
+
+    expect(result.conversation.bubbles[0]?.text).toContain("Tuesday at 3 PM");
+    expect(JSON.stringify(requests[2]?.input)).toContain("Permission form due Tuesday at 3 PM");
+    expect(result.researchUrls).toEqual([searchUrl]);
+  });
+
+  test("durable work reads a linked PDF at a persisted checkpoint", async () => {
+    const pdfUrl = "https://school.example/forms/field-trip.pdf";
+    const modelResponses = [
+      {
+        status: "completed",
+        output_parsed: null,
+        output: [functionCall("read-field-trip-pdf", "read_public_page", { url: pdfUrl })],
+      },
+      {
+        status: "completed",
+        output_parsed: {
+          outcome: "succeeded",
+          text: "The field-trip form is due Tuesday at 3 PM and needs a parent signature.",
+        },
+        output: [],
+      },
+    ];
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        parse() {
+          const response = modelResponses.shift();
+          if (!response) throw new Error("Unexpected durable PDF model turn");
+          return response;
+        },
+      },
+    } as never);
+    const state: FamilyWorkStateV1 = {
+      kind: "family_work_v1",
+      version: 1,
+      generation: 0,
+      phase: "ready",
+      claim: null,
+      continuationItems: [],
+      pendingCall: null,
+      steering: [],
+      publicMapResearchContext: [],
+      progressRevision: 0,
+      terminal: null,
+    };
+    const input = {
+      workId: "family-work-pdf",
+      objective: `Read ${pdfUrl} and tell me the deadline and what I need to do.`,
+      visibility: "private" as const,
+      ownerAdultId: "adult-1",
+      household: {
+        householdId: "household-1",
+        familyLabel: "Test family",
+        timeZone: "America/Los_Angeles",
+        postalCode: "90045",
+        adults: [{ adultId: "adult-1", firstName: "Hari", displayName: "Hari Anbarasu" }],
+        children: [],
+      },
+      state,
+      currentTime: NOW,
+    };
+    const runPublicPage = async () => ({
+      ...publicPageResult(pdfUrl, "Field trip form", "Return by Tuesday at 3 PM. Parent signature required."),
+      kind: "pdf" as const,
+      filename: "field-trip.pdf",
+    });
+
+    const planned = await reasoner.continueFamilyWork(input, { runPublicPage });
+    if (planned.kind !== "continue") throw new Error("Durable PDF read was not planned");
+    expect(planned.state).toMatchObject({ phase: "tool_pending" });
+    const read = await reasoner.continueFamilyWork({ ...input, state: planned.state }, { runPublicPage });
+    if (read.kind !== "continue") throw new Error("Durable PDF read did not settle");
+    expect(JSON.stringify(read.state.continuationItems)).toContain("Parent signature required");
+    expect(Buffer.byteLength(JSON.stringify(read.state))).toBeLessThan(240 * 1024);
+    const terminal = await reasoner.continueFamilyWork({ ...input, state: read.state }, { runPublicPage });
+    expect(terminal).toMatchObject({
+      kind: "terminal",
+      outcome: "succeeded",
+      text: expect.stringContaining("parent signature"),
+    });
+  });
+
   test("ordinary route questions use the dedicated maps tools and start visible work once", async () => {
     const requests: Record<string, unknown>[] = [];
     const mapRequests: unknown[] = [];
@@ -1389,6 +1582,22 @@ function completeCalendarRead() {
     totalCalendarCount: 0,
     events: [],
     totalEventCount: 0,
+  };
+}
+
+function publicPageResult(url: string, title: string, text: string) {
+  return {
+    requestedUrl: url,
+    finalUrl: url,
+    kind: "html" as const,
+    title,
+    filename: null,
+    text,
+    truncated: false,
+    totalCleanCharacters: text.length,
+    totalCleanBytes: Buffer.byteLength(text),
+    responseBytes: Buffer.byteLength(text),
+    fetchedAt: NOW,
   };
 }
 

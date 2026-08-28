@@ -49,6 +49,7 @@ Each ticket must name the family behavior it unlocks. Existing household boundar
 - [Add live weather and flight disruption help](issues/08-port-maps-weather-and-travel.md) — NOAA/NWS forecasts, observations, and alerts plus Hermes-derived live Kiwi alternatives now turn ordinary weather and flight-number disruption messages into work without a new provider framework.
 - [Port complete reminder control](issues/09-port-complete-reminder-control.md) — durable private and household reminders now support ordinary-language create/list/change/pause/resume/run/cancel and local-time recurrence through the existing due-work/outbox path.
 - [Keep multi-step family work going](issues/10-port-durable-family-work.md) — one Pi/Hermes-adapted PostgreSQL checkpoint loop now acknowledges, resumes, steers, cancels, reports progress, rejects stale workers, and delivers one receipt-confirmed result without a second runtime or progress framework.
+- [Read linked public pages and PDFs](issues/06-port-safe-public-page-reading.md) — one Hermes-adapted concrete reader now follows parent or research links, extracts HTML and PDFs locally, and works in foreground or durable tasks without a browser runtime, provider framework, or generic safety subsystem.
 
 ## Fog
 

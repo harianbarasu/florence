@@ -102,6 +102,7 @@ import {
 import type { EnrollmentCodes, WebAccessPath } from "./enrollment.js";
 import type { FlorenceFlightsClient } from "./flights.js";
 import type { FlorenceMapsClient } from "./maps.js";
+import type { FlorencePublicPageClient } from "./public-page.js";
 import {
   type FlorenceBoundedPrivateGoogleEvidence,
   type FlorenceCalendarCatalogRead,
@@ -148,6 +149,7 @@ export class Florence {
   readonly #linq: LinqClient;
   readonly #google: GoogleConnection | null;
   readonly #maps: FlorenceMapsClient | null;
+  readonly #publicPages: FlorencePublicPageClient | null;
   readonly #weather: FlorenceWeatherClient | null;
   readonly #flights: FlorenceFlightsClient | null;
   readonly #reasoner: FlorenceReasoner | null;
@@ -170,6 +172,7 @@ export class Florence {
     linq: LinqClient;
     google: GoogleConnection | null;
     maps?: FlorenceMapsClient | null;
+    publicPages?: FlorencePublicPageClient | null;
     weather?: FlorenceWeatherClient | null;
     flights?: FlorenceFlightsClient | null;
     reasoner: FlorenceReasoner | null;
@@ -184,6 +187,7 @@ export class Florence {
     this.#linq = input.linq;
     this.#google = input.google;
     this.#maps = input.maps ?? null;
+    this.#publicPages = input.publicPages ?? null;
     this.#weather = input.weather ?? null;
     this.#flights = input.flights ?? null;
     this.#reasoner = input.reasoner;
@@ -1967,10 +1971,16 @@ export class Florence {
     const enumerateConversationCalendars = async () =>
       (await readConversationCalendarCatalog()).read.calendars;
     const maps = this.#maps;
+    const publicPages = this.#publicPages;
     const weather = this.#weather;
     const flights = this.#flights;
 
     const reads: FlorenceReadTools = {
+      ...(publicPages
+        ? {
+            runPublicPage: (request, signal) => publicPages.run(request, signal),
+          }
+        : {}),
       ...(maps
         ? {
             runMaps: (request, signal) => maps.run(request, signal),
@@ -3376,6 +3386,7 @@ export class Florence {
     }
     try {
       const maps = this.#maps;
+      const publicPages = this.#publicPages;
       const weather = this.#weather;
       const flights = this.#flights;
       const step = await reasoner.continueFamilyWork(
@@ -3389,6 +3400,9 @@ export class Florence {
           currentTime: this.#now().toISOString(),
         },
         {
+          ...(publicPages
+            ? { runPublicPage: (request, taskSignal) => publicPages.run(request, taskSignal) }
+            : {}),
           ...(maps ? { runMaps: (request, taskSignal) => maps.run(request, taskSignal) } : {}),
           ...(weather ? { runWeather: (request, taskSignal) => weather.run(request, taskSignal) } : {}),
           ...(flights ? { runFlights: (request, taskSignal) => flights.search(request, taskSignal) } : {}),

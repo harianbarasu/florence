@@ -51,6 +51,13 @@ import {
   mapTimezoneRequestSchema,
 } from "./maps.js";
 import {
+  type FlorencePublicPageRequest,
+  type FlorencePublicPageResult,
+  PublicPageError,
+  publicPageRequestSchema,
+  publicPageResultSchema,
+} from "./public-page.js";
+import {
   type FlorenceWeatherRequest,
   type FlorenceWeatherResult,
   WeatherProviderError,
@@ -1326,7 +1333,10 @@ export type FlorenceFamilyWorkInput = Readonly<{
   currentTime: string;
 }>;
 
-export type FlorenceFamilyWorkReadTools = Pick<FlorenceReadTools, "runMaps" | "runWeather" | "runFlights">;
+export type FlorenceFamilyWorkReadTools = Pick<
+  FlorenceReadTools,
+  "runMaps" | "runWeather" | "runFlights" | "runPublicPage"
+>;
 
 export type FlorenceFamilyWorkStep =
   | Readonly<{
@@ -1418,6 +1428,7 @@ type PrivateGoogleSource = FlorencePrivateGmailSource | FlorencePrivateCalendarE
 
 export interface FlorenceReadTools {
   settleSources(sources: readonly FlorenceSource[]): void;
+  runPublicPage?(request: FlorencePublicPageRequest, signal?: AbortSignal): Promise<FlorencePublicPageResult>;
   runMaps?(request: FlorenceMapsRequest, signal?: AbortSignal): Promise<FlorenceMapsResult>;
   runWeather?(request: FlorenceWeatherRequest, signal?: AbortSignal): Promise<FlorenceWeatherResult>;
   runFlights?(
@@ -1521,7 +1532,7 @@ Use currentMessage.replyTo as the exact message the parent replied to when it is
 
 For a parent document or photo, use judgment before extraction. Lead with the one or two deadlines, conflicts, or decisions that deserve attention; do not dump every date or detail. Distinguish action-needed items, useful dates, stable logistics that may matter later, and one-offs that should remain temporary. When a Calendar connection is available, read it around every useful date before describing availability or a conflict—the adult's personal Calendar in private, or the family Calendar in the group. Mention only meaningful conflicts or uncertainty, never an unrelated event dump. Ask at most one blocking question across the whole turn.
 
-The isolated research_public_web tool is available for ordinary parent turns. Use it when the request depends on current or public facts, resolving an identifier, comparing options, checking status, or reading a public page. It receives only the parent's sanitized current typed request plus public place candidates returned by a maps tool earlier in this turn; never try to pass private context to it. Search before asking for context the public web can recover; ask at most one focused question only for a consequential constraint that remains genuinely missing after the useful lookup. A flight number is one example of a public identifier, not a special intent. Do the lookup in this turn and report the result or an honest blocker. Never say you will look, prioritize, research, check, or follow up later unless this decision actually creates durable follow-up or familyWork.
+The isolated research_public_web tool is available for ordinary parent turns. Use it when the request depends on current or public facts, resolving an identifier, comparing options, or checking status. The read_public_page tool opens the full clean text of an exact public HTML page or PDF already supplied in the conversation or returned by public research; use it when the parent asks you to read a link or when a search summary does not contain the needed detail. It receives no private context beyond the exact URL. Search before asking for context the public web can recover; ask at most one focused question only for a consequential constraint that remains genuinely missing after the useful lookup. A flight number is one example of a public identifier, not a special intent. Do the lookup or page read in this turn and report the result or an honest blocker. Never say you will look, prioritize, research, check, or follow up later unless this decision actually creates durable follow-up or familyWork.
 
 Dedicated maps tools are available for place search, reverse geocoding, nearby places, route distance, turn-by-turn directions, time zones, named areas, and bounding-box search. Prefer them over generic web prose when the parent asks where something is, what is nearby, how far or how long a trip is, how to get there, or what time zone a place uses. Use the household home ZIP from familyProfile for a natural “near me” request, and use a parent-supplied address, landmark, or coordinates directly. Qualify ambiguous place names with the city, state, or country already present in the conversation; if multiple materially different candidates remain, use maps_search, show the useful candidates, and ask one focused question instead of silently choosing the wrong place. For current opening hours, phone numbers, prices, or closures, call web research after the map lookup; Florence automatically gives the isolated researcher the public place candidates returned by maps. Verify traffic with web research only when the route endpoints are already in the parent's current typed request. Maps results may contain one useful tap-to-open map or directions URL that you may copy into a bubble when you did not also use public web research; after web research, omit the map URL and use researchUrls. Preserve the returned OpenStreetMap attribution when using OpenStreetMap-derived results.
 
@@ -1649,7 +1660,7 @@ const PUBLIC_REQUEST_RESEARCH_INSTRUCTIONS = `You are Florence's isolated public
 
 You receive only a parent's current typed request after the application removed known family, contact, school, home, and account details, plus an optional mapResults list of public place candidates returned earlier in this same turn. You have no household profile, names, messages, email, Calendar, memory, attachments, transcripts, or quoted text. Treat the supplied request and public mapResults as the complete public research boundary.
 
-When the request contains enough public context, use web search now. When mapResults are present, use the relevant candidate's public name, address, or official website to verify the volatile place detail the parent asked about; do not search every candidate indiscriminately. Resolve public identifiers before declaring information missing, then return a concise factual summary that directly advances the request and one to three direct HTTP(S) source URLs that web search actually returned. For a flight identifier, the summary must state the exact operating date, current status, origin and destination IATA codes, and local scheduled or estimated times when the sources establish them, so the main assistant can search alternatives without asking the parent for the route. A flight number is only one example; apply the same judgment to places, products, schedules, status, comparisons, current events, and other public facts. Do not include URLs in summary.
+When the request contains enough public context, use web search now. If it contains an exact public URL, open that page rather than relying on a search snippet. When a chosen search result contains the answer only on its page, open or find within that page before summarizing. When mapResults are present, use the relevant candidate's public name, address, or official website to verify the volatile place detail the parent asked about; do not search every candidate indiscriminately. Resolve public identifiers before declaring information missing, then return a concise factual summary that directly advances the request and one to three direct HTTP(S) source URLs that web search actually returned. For a flight identifier, the summary must state the exact operating date, current status, origin and destination IATA codes, and local scheduled or estimated times when the sources establish them, so the main assistant can search alternatives without asking the parent for the route. A flight number is only one example; apply the same judgment to places, products, schedules, status, comparisons, current events, and other public facts. Do not include URLs in summary.
 
 The application calls you only after the main model requests public research, but sanitation may leave placeholders and no useful public subject. You must still use web search at least once and must never reconstruct an omitted value. If the search does not establish a useful answer, return outcome no_result, a concise honest blocker, and no URLs. Never infer or search for a person's identity, contact details, address, account, booking, confirmation code, credentials, or private records. Never take an external action or promise later work. Output only the strict decision schema.`;
 
@@ -1657,7 +1668,7 @@ const FAMILY_WORK_INSTRUCTIONS = `You are Florence continuing one durable family
 
 This is real background work, not a chat acknowledgement. Advance the supplied objective by one useful checkpoint. You have the parent's original objective, every later steering instruction in order, prior tool calls and results, the current time, and a narrow family profile. Treat the latest steering as authoritative when it changes an earlier constraint. Do not expose task IDs, state, claims, generations, tool names, or internal process language.
 
-Use the available tools naturally. Public web research resolves current facts and identifiers; dedicated maps, route, time-zone, weather, and flight tools do the structured work they cover. A flight number is an ordinary public identifier: resolve its current operating date, route, and status before searching alternatives. Prefer a second genuinely useful source or specialized tool for a comparison, but never call tools performatively or claim an action without a returned result.
+Use the available tools naturally. Public web research resolves current facts and identifiers; read_public_page reads the full clean text of an exact HTML page or PDF from the original request or a prior public result; dedicated maps, route, time-zone, weather, and flight tools do the structured work they cover. A flight number is an ordinary public identifier: resolve its current operating date, route, and status before searching alternatives. Prefer a second genuinely useful source or specialized tool for a comparison, but never call tools performatively or claim an action without a returned result.
 
 If another read is needed, call exactly one tool and stop this checkpoint. If the accumulated evidence is enough, return a concise terminal result that leads with the useful answer and includes concrete options, times, tradeoffs, and direct URLs already present in tool results when helpful. Use outcome succeeded when the requested comparison is complete, partial when useful results exist but one named source or constraint could not be resolved, failed only when no useful result can be produced, and waiting only when one consequential parent choice remains genuinely blocking after the available reads. A waiting result must ask exactly one focused question. Never say you will keep working unless you actually call another tool in this checkpoint. Output only the strict terminal schema when you do not call a tool.`;
 
@@ -1792,6 +1803,15 @@ const PUBLIC_RESEARCH_PARAMETERS = {
   additionalProperties: false,
   properties: {},
   required: [],
+} as const;
+
+const PUBLIC_PAGE_PARAMETERS = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    url: { type: "string", minLength: 1, maxLength: 2_000 },
+  },
+  required: ["url"],
 } as const;
 
 const GMAIL_PARAMETERS = {
@@ -2043,6 +2063,7 @@ type ForegroundCapabilityContext = {
   readonly calendarReads: CalendarReadCoverage[];
   readonly publicResearchUrls: Set<string>;
   readonly publicResearchState: { used: boolean };
+  readonly allowedPublicPageUrls: Set<string>;
   readonly publicMapResearchContext: string[];
   readonly gmailSources: Map<string, FlorenceConversationalGmailSource>;
   readonly calendarRefs: Set<string>;
@@ -2137,9 +2158,68 @@ function foregroundCapabilityRegistry(): CapabilityRegistry<ForegroundCapability
           const research = await context.researchPublicRequest(signal);
           context.settlements.set(callId, () => {
             context.publicResearchState.used ||= research.outcome === "result";
-            for (const url of research.urls) context.publicResearchUrls.add(url);
+            for (const url of research.urls) {
+              context.publicResearchUrls.add(url);
+              context.allowedPublicPageUrls.add(url);
+            }
           });
           return { output: research };
+        }, signal),
+    }),
+    defineCapability({
+      name: "read_public_page",
+      description:
+        "Read the clean text of one exact public HTML page or PDF supplied by the parent or returned by a public tool.",
+      modelSchema: PUBLIC_PAGE_PARAMETERS,
+      inputSchema: publicPageRequestSchema,
+      outputSchema: publicPageResultSchema,
+      executionMode: "sequential",
+      timeoutMs: 45_000,
+      maxOutputBytes: 80_000,
+      availability: (context) => context.reads.runPublicPage !== undefined,
+      admit: ({ context, canonicalArguments }) => {
+        if (!isJsonRecord(canonicalArguments) || typeof canonicalArguments.url !== "string") return false;
+        const url = normalizedPublicPageUrl(canonicalArguments.url);
+        return (
+          url !== null &&
+          context.input.currentMessage.moveKind !== "reaction" &&
+          context.allowedPublicPageUrls.has(url)
+        );
+      },
+      execute: async ({ callId, arguments: args, context, signal }) =>
+        executeReadAdapter(async () => {
+          const runPublicPage = context.reads.runPublicPage;
+          if (!runPublicPage) throw unsafeRead("Public page reading is unavailable");
+          const requestedUrl = normalizedPublicPageUrl(args.url);
+          if (!requestedUrl || !context.allowedPublicPageUrls.has(requestedUrl)) {
+            throw unsafeRead("OpenAI requested a public page that was not supplied or discovered");
+          }
+          let page: FlorencePublicPageResult;
+          try {
+            page = publicPageResultSchema.parse(await runPublicPage(args, signal));
+          } catch (error) {
+            if (!(error instanceof PublicPageError)) throw error;
+            if (error.code === "cancelled" && signal.aborted) throw error;
+            throw new CapabilityAdapterError(
+              error.retryable
+                ? "transient"
+                : error.code === "invalid_response"
+                  ? "invalid_response"
+                  : "permanent",
+              error.safeMessage,
+            );
+          }
+          throwIfAborted(signal);
+          const finalUrl = normalizedPublicPageUrl(page.finalUrl);
+          if (!finalUrl) throw unsafeRead("Public page reading returned an invalid final URL");
+          context.settlements.set(callId, () => {
+            context.publicResearchState.used = true;
+            context.publicResearchUrls.add(requestedUrl);
+            context.publicResearchUrls.add(finalUrl);
+            context.allowedPublicPageUrls.add(requestedUrl);
+            context.allowedPublicPageUrls.add(finalUrl);
+          });
+          return { output: page };
         }, signal),
     }),
     defineCapability({
@@ -2608,6 +2688,12 @@ function familyWorkProgressText(
     return typeof summary === "string" && summary.trim()
       ? `${summary.trim()} I’m comparing the workable options now.`.slice(0, 500)
       : null;
+  }
+  if (capabilityName === "read_public_page") {
+    const title = (output as { title?: unknown }).title;
+    return typeof title === "string" && title.trim()
+      ? `I read ${title.trim()}. I’m pulling out the useful answer now.`.slice(0, 500)
+      : "I read the page. I’m pulling out the useful answer now.";
   }
   if (capabilityName === "maps_search") {
     const first = (output as { results?: readonly { displayName?: unknown }[] }).results?.[0]?.displayName;
@@ -3308,6 +3394,10 @@ export class FlorenceReasoner {
     const reads = familyWorkReads(publicReads);
     const publicMapResearchContext = [...input.state.publicMapResearchContext];
     const publicResearchUrls = new Set<string>();
+    const allowedPublicPageUrls = publicPageUrlsFromText(
+      reasonerInput.currentMessage.authoredText,
+      JSON.stringify(input.state.continuationItems),
+    );
     const capabilityContext: ForegroundCapabilityContext = {
       mode: "family_work",
       input: reasonerInput,
@@ -3317,6 +3407,7 @@ export class FlorenceReasoner {
       calendarReads: [],
       publicResearchUrls,
       publicResearchState: { used: false },
+      allowedPublicPageUrls,
       publicMapResearchContext,
       gmailSources: new Map(),
       calendarRefs: new Set(),
@@ -3519,6 +3610,11 @@ export class FlorenceReasoner {
     const calendarReads: CalendarReadCoverage[] = [];
     const publicResearchUrls = new Set<string>();
     const publicResearchState = { used: false };
+    const allowedPublicPageUrls = publicPageUrlsFromText(
+      input.currentMessage.authoredText,
+      input.currentMessage.replyTo?.text ?? null,
+      ...input.recentMessages.map((message) => message.text),
+    );
     const publicMapResearchContext: string[] = [];
     const capabilityContext: ForegroundCapabilityContext = {
       mode: "conversation",
@@ -3529,6 +3625,7 @@ export class FlorenceReasoner {
       calendarReads,
       publicResearchUrls,
       publicResearchState,
+      allowedPublicPageUrls,
       publicMapResearchContext,
       gmailSources: new Map(),
       calendarRefs: new Set(),
@@ -4600,6 +4697,35 @@ function normalizeResearchUrl(value: string): string {
     url.pathname = url.pathname.slice(0, -1);
   }
   return url.href;
+}
+
+function publicPageUrlsFromText(...values: readonly (string | null)[]): Set<string> {
+  const urls = new Set<string>();
+  for (const value of values) {
+    if (!value) continue;
+    for (const match of value.matchAll(/https?:\/\/[^\s<>"'`]+/giu)) {
+      const raw = match[0].replace(/[),.;!?\]}]+$/u, "");
+      const normalized = normalizedPublicPageUrl(raw);
+      if (normalized) urls.add(normalized);
+    }
+  }
+  return urls;
+}
+
+function normalizedPublicPageUrl(value: string): string | null {
+  try {
+    const url = new URL(value.trim());
+    if ((url.protocol !== "http:" && url.protocol !== "https:") || url.username || url.password) {
+      return null;
+    }
+    url.hash = "";
+    if (url.pathname.length > 1 && url.pathname.endsWith("/")) {
+      url.pathname = url.pathname.slice(0, -1);
+    }
+    return url.href;
+  } catch {
+    return null;
+  }
 }
 
 async function transcodeVoiceNoteToWav(

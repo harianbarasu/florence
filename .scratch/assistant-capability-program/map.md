@@ -31,6 +31,7 @@ Standing product constraints:
 <!-- Resolved tickets are indexed here by linked name and one-line gist. -->
 
 - [Make broad assistant work the product contract](issues/01-make-broad-assistant-work-the-product-contract.md) — `PLAN.md` and `AGENTS.md` now require direct Pi/Hermes reuse and authorize the complete assistant breadth under owner-scoped privacy, one durable work seam, exact consequential-action settlement, and staged real-world proof.
+- [Freeze source egress and authority](issues/02-freeze-source-egress-and-authority.md) — One policy-complete matrix now binds every admitted source and capability to conjunctive grants, positive egress, result audience, retention/deletion, consequence and all required owners, disconnect behavior, subtype-correct delivery settlement, and live authority rechecks.
 
 ## Fog
 

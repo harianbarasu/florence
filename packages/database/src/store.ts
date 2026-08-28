@@ -23,6 +23,10 @@ const FAMILY_WORK_INITIAL_DELAY_MS = 1_000;
 const FAMILY_WORK_CLAIM_LEASE_MS = 2 * 60_000;
 const MAX_FAMILY_WORK_STATE_BYTES = 256 * 1024;
 const MAX_FAMILY_WORK_COUNTER = 999_999_999;
+const CONVERSATION_HISTORY_PAGE_BYTE_BUDGET = 80_000;
+const CONVERSATION_HISTORY_FETCH_BATCH = 64;
+const CONVERSATION_HISTORY_TOKEN_VERSION = 1;
+const CONVERSATION_HISTORY_TOKEN_MAX_BYTES = 512;
 // Kept as an on-disk compatibility marker for replicas from before the reply gate stopped expiring.
 // New code only treats this timestamp as a deadline after a signed-link digest has been stored.
 const LEGACY_PARTNER_HANDSHAKE_WINDOW_MS = 24 * 60 * 60_000;
@@ -954,6 +958,73 @@ export type ConversationTurn = {
   occurredAt: string;
 };
 
+/** One exact, delivered Messages item discoverable from authorized conversation history. */
+export type ConversationHistoryMessage = Readonly<{
+  /** Opaque, channel-bound handle for an exact follow-up read. */
+  anchor: string;
+  sourceId: string;
+  conversation: "private" | "family_group";
+  senderName: string;
+  moveKind: "message" | "reply" | "reaction";
+  text: string | null;
+  reaction: string | null;
+  occurredAt: string;
+  replyToSourceId: string | null;
+  supersedesSourceId: string | null;
+  hasAttachments: boolean;
+}>;
+
+export type ConversationHistorySearchPage = Readonly<{
+  /** Newest first. */
+  messages: readonly ConversationHistoryMessage[];
+  complete: boolean;
+  nextCursor: string | null;
+}>;
+
+export type ConversationHistoryReadPage = Readonly<{
+  /** Chronological, regardless of which direction was read. */
+  messages: readonly ConversationHistoryMessage[];
+  startReached: boolean;
+  endReached: boolean;
+  olderCursor: string | null;
+  newerCursor: string | null;
+}>;
+
+export type ConversationHistorySearchInput = Readonly<{
+  authority: LinqAuthority;
+  currentSourceId: string;
+  observedAt: string;
+  query: string | null;
+  /** Inclusive message-occurrence lower bound. */
+  after: string | null;
+  /** Exclusive message-occurrence upper bound. */
+  before: string | null;
+  cursor: string | null;
+}>;
+
+export type ConversationHistoryReadInput = Readonly<{
+  authority: LinqAuthority;
+  currentSourceId: string;
+  observedAt: string;
+  anchor: string;
+  /** Null opens a balanced neighborhood; a returned cursor continues in its encoded direction. */
+  cursor: string | null;
+}>;
+
+export type ClaimedFamilyWorkConversationHistorySearchInput = ClaimedFamilyWorkReadIdentity &
+  Readonly<{
+    query: string | null;
+    after: string | null;
+    before: string | null;
+    cursor: string | null;
+  }>;
+
+export type ClaimedFamilyWorkConversationHistoryReadInput = ClaimedFamilyWorkReadIdentity &
+  Readonly<{
+    anchor: string;
+    cursor: string | null;
+  }>;
+
 export type PendingFollowUp = {
   id: string;
   objective: string;
@@ -1430,6 +1501,58 @@ type SourceRow = {
   metadata: JsonObject;
   occurred_at: Date;
 };
+
+type ConversationHistoryRow = {
+  source_id: string;
+  channel_id: string;
+  channel_audience: Audience;
+  direction: "inbound" | "outbound";
+  sender_name: string | null;
+  move_kind: "message" | "reply" | "reaction";
+  text: string | null;
+  reaction: string | null;
+  has_attachments: boolean;
+  reply_to_source_id: string | null;
+  turn_part: -1 | 0 | 1 | 2;
+  metadata: JsonValue;
+  occurred_at: Date;
+  /** Exact transcript timestamp used by stable keyset cursors. */
+  occurred_at_cursor: string;
+};
+
+type ConversationHistoryAccess = Readonly<{
+  householdId: string;
+  viewerAdultId: string;
+  channelIds: readonly string[];
+  snapshotAt: Date;
+}>;
+
+type ConversationHistoryPosition = Readonly<{
+  occurredAt: string;
+  turnPart: -1 | 0 | 1 | 2;
+  sourceId: string;
+}>;
+
+type ConversationHistoryAnchor = Readonly<{
+  householdId: string;
+  channelId: string;
+  sourceId: string;
+  snapshotAt: string;
+}>;
+
+type ConversationHistorySearchCursor = Readonly<{
+  scopeDigest: string;
+  snapshotAt: Date;
+  position: ConversationHistoryPosition;
+}>;
+
+type ConversationHistoryReadCursor = Readonly<{
+  direction: "older" | "newer";
+  scopeDigest: string;
+  anchorSourceId: string;
+  channelId: string;
+  position: ConversationHistoryPosition;
+}>;
 
 type GoogleConnectionRow = {
   id: string;
@@ -6918,6 +7041,46 @@ export class PostgresFlorenceStore {
     `;
     if (!channel) return null;
     return this.#sql.begin((sql) => insertInboundReaction(sql, channel, authority.senderAdultId, input));
+  }
+
+  async searchConversationHistory(
+    input: ConversationHistorySearchInput,
+  ): Promise<ConversationHistorySearchPage> {
+    const observedAt = instant(input.observedAt);
+    return this.#sql.begin(async (sql) => {
+      const access = await foregroundConversationHistoryAccess(sql, input, observedAt);
+      return searchConversationHistoryOn(sql, access, input);
+    });
+  }
+
+  async readConversationHistory(input: ConversationHistoryReadInput): Promise<ConversationHistoryReadPage> {
+    const observedAt = instant(input.observedAt);
+    return this.#sql.begin(async (sql) => {
+      const access = await foregroundConversationHistoryAccess(sql, input, observedAt);
+      return readConversationHistoryOn(sql, access, input);
+    });
+  }
+
+  async searchClaimedFamilyWorkConversationHistory(
+    input: ClaimedFamilyWorkConversationHistorySearchInput,
+  ): Promise<ConversationHistorySearchPage> {
+    const occurredAt = instant(input.occurredAt);
+    return this.#sql.begin(async (sql) => {
+      const context = await claimedFamilyWorkContext(sql, input, occurredAt);
+      const access = await claimedFamilyWorkConversationHistoryAccess(sql, context, occurredAt);
+      return searchConversationHistoryOn(sql, access, input);
+    });
+  }
+
+  async readClaimedFamilyWorkConversationHistory(
+    input: ClaimedFamilyWorkConversationHistoryReadInput,
+  ): Promise<ConversationHistoryReadPage> {
+    const occurredAt = instant(input.occurredAt);
+    return this.#sql.begin(async (sql) => {
+      const context = await claimedFamilyWorkContext(sql, input, occurredAt);
+      const access = await claimedFamilyWorkConversationHistoryAccess(sql, context, occurredAt);
+      return readConversationHistoryOn(sql, access, input);
+    });
   }
 
   async stageRetryCue(input: { sourceId: string; occurredAt: string }): Promise<string | null> {
@@ -14874,6 +15037,155 @@ type ClaimedFamilyWorkContext = {
   channel: ChannelRow;
 };
 
+type ForegroundConversationHistoryRow = ChannelRow & {
+  current_source_id: string;
+  current_sender_adult_id: string;
+  current_reply_to_source_id: string | null;
+  current_occurred_at: Date;
+};
+
+async function foregroundConversationHistoryAccess(
+  sql: postgres.TransactionSql,
+  input: Pick<ConversationHistorySearchInput, "authority" | "currentSourceId">,
+  observedAt: Date,
+): Promise<ConversationHistoryAccess> {
+  assertUuid(input.currentSourceId, "Current conversation source ID");
+  const [current] = await sql<ForegroundConversationHistoryRow[]>`
+    select channel.*,message.source_id as current_source_id,
+      message.sender_adult_id as current_sender_adult_id,
+      message.reply_to_source_id as current_reply_to_source_id,
+      source.occurred_at as current_occurred_at
+    from messages message
+    join sources source on source.id=message.source_id
+    join linq_channels channel on channel.id=message.channel_id
+    where message.source_id=${input.currentSourceId} and message.direction='inbound'
+      and message.status='received'
+    for share of message,source,channel
+  `;
+  if (
+    !current ||
+    current.current_source_id !== input.currentSourceId ||
+    current.current_sender_adult_id !== input.authority.senderAdultId ||
+    current.current_reply_to_source_id !== input.authority.replyToSourceId ||
+    current.id !== input.authority.channelId ||
+    current.household_id !== input.authority.householdId ||
+    current.audience !== input.authority.audience ||
+    current.provider_conversation_id !== input.authority.providerConversationId ||
+    current.authority_digest !== input.authority.authorityDigest ||
+    !sameStrings(
+      [current.adult_one_id, current.adult_two_id].filter((value): value is string => value !== null).sort(),
+      [...input.authority.adultIds].sort(),
+    ) ||
+    !sameStrings(
+      channelIdentityDigests(current),
+      [...input.authority.expectedParticipantIdentityDigests].sort(),
+    ) ||
+    input.authority.stopped ||
+    current.revoked_at !== null ||
+    current.stopped_at !== null ||
+    current.bound_at > observedAt ||
+    current.current_occurred_at > observedAt
+  ) {
+    throw new FlorenceStoreUnauthorized("Conversation history requires the exact current parent Message");
+  }
+  return conversationHistoryAccessForChannel(sql, current, input.authority.senderAdultId, observedAt);
+}
+
+async function claimedFamilyWorkConversationHistoryAccess(
+  sql: postgres.TransactionSql,
+  context: ClaimedFamilyWorkContext,
+  occurredAt: Date,
+): Promise<ConversationHistoryAccess> {
+  return conversationHistoryAccessForChannel(sql, context.channel, context.senderAdultId, occurredAt);
+}
+
+async function conversationHistoryAccessForChannel(
+  sql: postgres.TransactionSql,
+  channel: ChannelRow,
+  viewerAdultId: string,
+  observedAt: Date,
+): Promise<ConversationHistoryAccess> {
+  if (channel.revoked_at !== null || channel.stopped_at !== null || channel.bound_at > observedAt) {
+    throw new FlorenceStoreUnauthorized("The conversation is no longer active");
+  }
+
+  if (channel.audience === "private") {
+    const [adult] = await sql<
+      { id: string; identity_subject_digest: string | null; status: FamilyMemberRecord["status"] }[]
+    >`
+      select id,identity_subject_digest,status from people
+      where id=${viewerAdultId} and household_id=${channel.household_id}
+        and kind='adult' and role='steward'
+      for share
+    `;
+    if (
+      adult?.status !== "verified" ||
+      adult.identity_subject_digest === null ||
+      channel.adult_one_id !== viewerAdultId ||
+      channel.identity_one_digest !== adult.identity_subject_digest ||
+      channel.adult_two_id !== null ||
+      channel.identity_two_digest !== null ||
+      channel.authority_digest !== digestStrings([viewerAdultId, adult.identity_subject_digest])
+    ) {
+      throw new FlorenceStoreUnauthorized("The private conversation no longer belongs to this adult");
+    }
+    const group = await exactActiveFamilyGroupConversation(
+      sql,
+      channel.household_id,
+      viewerAdultId,
+      observedAt,
+    );
+    return {
+      householdId: channel.household_id,
+      viewerAdultId,
+      channelIds: group ? [channel.id, group.id] : [channel.id],
+      snapshotAt: observedAt,
+    };
+  }
+
+  const group = await exactActiveFamilyGroupConversation(
+    sql,
+    channel.household_id,
+    viewerAdultId,
+    observedAt,
+  );
+  if (!group || group.id !== channel.id) {
+    throw new FlorenceStoreUnauthorized("The family conversation is no longer current");
+  }
+  return {
+    householdId: channel.household_id,
+    viewerAdultId,
+    channelIds: [channel.id],
+    snapshotAt: observedAt,
+  };
+}
+
+async function exactActiveFamilyGroupConversation(
+  sql: postgres.TransactionSql,
+  householdId: string,
+  viewerAdultId: string,
+  observedAt: Date,
+): Promise<(ChannelRow & FamilyGroupAuthorityRow) | null> {
+  const [group] = await sql<(ChannelRow & FamilyGroupAuthorityRow)[]>`
+    select family_group.*,founder.id as founder_adult_id,
+      founder.identity_subject_digest as founder_identity_digest,
+      founder.status as founder_status,partner.id as partner_adult_id,
+      partner.identity_subject_digest as partner_identity_digest,
+      partner.status as partner_status
+    from linq_channels family_group
+    join people founder on founder.household_id=family_group.household_id
+      and founder.kind='adult' and founder.role='steward' and founder.adult_slot=1
+    join people partner on partner.household_id=family_group.household_id
+      and partner.kind='adult' and partner.role='steward' and partner.adult_slot=2
+    where family_group.household_id=${householdId} and family_group.audience='group'
+      and family_group.adult_two_id is not null and family_group.revoked_at is null
+      and family_group.stopped_at is null and family_group.bound_at<=${observedAt}
+    order by family_group.bound_at desc,family_group.id limit 1
+    for share of family_group,founder,partner
+  `;
+  return group && isExactFamilyGroupAuthority(group, group, viewerAdultId) ? group : null;
+}
+
 async function claimedFamilyWorkContext(
   sql: postgres.TransactionSql,
   input: ClaimedFamilyWorkReadIdentity,
@@ -14931,6 +15243,903 @@ async function claimedFamilyWorkContext(
     moveKind: origin.message.moveKind,
     channel,
   };
+}
+
+async function searchConversationHistoryOn(
+  sql: postgres.TransactionSql,
+  access: ConversationHistoryAccess,
+  input: Readonly<{
+    query: string | null;
+    after: string | null;
+    before: string | null;
+    cursor: string | null;
+  }>,
+): Promise<ConversationHistorySearchPage> {
+  const query = normalizedConversationHistoryQuery(input.query);
+  const after = input.after === null ? null : instant(input.after);
+  const before = input.before === null ? null : instant(input.before);
+  if (after && before && after >= before) {
+    throw new FlorenceStoreConflict("Conversation history dates are out of order");
+  }
+  const carriedCursor = input.cursor ? decodeConversationHistorySearchCursor(input.cursor) : null;
+  if (carriedCursor && carriedCursor.snapshotAt > access.snapshotAt) {
+    throw new FlorenceStoreUnauthorized("Conversation-history cursor is newer than this authorized turn");
+  }
+  const historyAccess: ConversationHistoryAccess = carriedCursor
+    ? { ...access, snapshotAt: carriedCursor.snapshotAt }
+    : access;
+  const scopeDigest = conversationHistorySearchScopeDigest(historyAccess, {
+    query,
+    after: after?.toISOString() ?? null,
+    before: before?.toISOString() ?? null,
+  });
+  if (carriedCursor && carriedCursor.scopeDigest !== scopeDigest) {
+    throw new FlorenceStoreConflict("Conversation-history cursor belongs to another search");
+  }
+  let position = carriedCursor?.position ?? null;
+  const messages: ConversationHistoryMessage[] = [];
+  let lastIncluded = position;
+
+  while (true) {
+    const rows = await fetchConversationHistorySearchRows(sql, historyAccess, {
+      query,
+      after,
+      before,
+      position,
+    });
+    if (rows.length === 0) {
+      return { messages, complete: true, nextCursor: null };
+    }
+    for (const row of rows) {
+      const message = conversationHistoryMessage(
+        historyAccess.householdId,
+        historyAccess.snapshotAt.toISOString(),
+        row,
+      );
+      const candidatePosition = conversationHistoryPosition(row);
+      const candidates = [...messages, message];
+      const candidatePage: ConversationHistorySearchPage = {
+        messages: candidates,
+        complete: false,
+        nextCursor: encodeConversationHistorySearchCursor(
+          scopeDigest,
+          historyAccess.snapshotAt,
+          candidatePosition,
+        ),
+      };
+      if (serializedConversationHistoryBytes(candidatePage) > CONVERSATION_HISTORY_PAGE_BYTE_BUDGET) {
+        if (messages.length === 0) {
+          // The byte target must never make a real message unreachable. An unusually large
+          // provider message gets its own page, and the stable keyset cursor resumes after it.
+          return {
+            messages: [message],
+            complete: false,
+            nextCursor: encodeConversationHistorySearchCursor(
+              scopeDigest,
+              historyAccess.snapshotAt,
+              candidatePosition,
+            ),
+          };
+        }
+        return {
+          messages,
+          complete: false,
+          nextCursor: encodeConversationHistorySearchCursor(
+            scopeDigest,
+            historyAccess.snapshotAt,
+            lastIncluded as ConversationHistoryPosition,
+          ),
+        };
+      }
+      messages.push(message);
+      position = candidatePosition;
+      lastIncluded = candidatePosition;
+    }
+    if (rows.length < CONVERSATION_HISTORY_FETCH_BATCH) {
+      return { messages, complete: true, nextCursor: null };
+    }
+  }
+}
+
+async function readConversationHistoryOn(
+  sql: postgres.TransactionSql,
+  access: ConversationHistoryAccess,
+  input: Readonly<{ anchor: string; cursor: string | null }>,
+): Promise<ConversationHistoryReadPage> {
+  const anchor = decodeConversationHistoryAnchor(input.anchor);
+  if (anchor.householdId !== access.householdId || !access.channelIds.includes(anchor.channelId)) {
+    throw new FlorenceStoreUnauthorized("That history anchor is not visible in this conversation");
+  }
+  const snapshotAt = instant(anchor.snapshotAt);
+  if (snapshotAt > access.snapshotAt) {
+    throw new FlorenceStoreUnauthorized("Conversation-history anchor is newer than this authorized turn");
+  }
+  const historyAccess: ConversationHistoryAccess = { ...access, snapshotAt };
+  const anchorRow = await readExactConversationHistoryRow(sql, historyAccess, anchor);
+  if (!anchorRow) {
+    throw new FlorenceStoreConflict("That conversation-history message is no longer available");
+  }
+  const scopeDigest = conversationHistoryReadScopeDigest(anchor);
+  if (input.cursor === null) {
+    return readBalancedConversationHistoryPage(sql, historyAccess, anchor, anchorRow, scopeDigest);
+  }
+  const cursor = decodeConversationHistoryReadCursor(input.cursor, scopeDigest, anchor);
+  return readDirectionalConversationHistoryPage(sql, historyAccess, anchor, cursor, scopeDigest);
+}
+
+async function readBalancedConversationHistoryPage(
+  sql: postgres.TransactionSql,
+  access: ConversationHistoryAccess,
+  anchor: ConversationHistoryAnchor,
+  anchorRow: ConversationHistoryRow,
+  scopeDigest: string,
+): Promise<ConversationHistoryReadPage> {
+  const anchorPosition = conversationHistoryPosition(anchorRow);
+  const selected: ConversationHistoryRow[] = [anchorRow];
+  let oldestPosition = anchorPosition;
+  let newestPosition = anchorPosition;
+  let olderPosition = anchorPosition;
+  let newerPosition = anchorPosition;
+  let olderRows: readonly ConversationHistoryRow[] = [];
+  let newerRows: readonly ConversationHistoryRow[] = [];
+  let olderIndex = 0;
+  let newerIndex = 0;
+  let olderExhausted = false;
+  let newerExhausted = false;
+  let olderBlocked = false;
+  let newerBlocked = false;
+  let chooseOlder = true;
+
+  const nextOlder = async (): Promise<ConversationHistoryRow | null> => {
+    if (olderBlocked || olderExhausted) return null;
+    if (olderIndex >= olderRows.length) {
+      olderRows = await fetchConversationHistoryRows(
+        sql,
+        access.householdId,
+        anchor.channelId,
+        access.snapshotAt,
+        "older",
+        olderPosition,
+      );
+      olderIndex = 0;
+      if (olderRows.length === 0) {
+        olderExhausted = true;
+        return null;
+      }
+    }
+    return olderRows[olderIndex] ?? null;
+  };
+  const nextNewer = async (): Promise<ConversationHistoryRow | null> => {
+    if (newerBlocked || newerExhausted) return null;
+    if (newerIndex >= newerRows.length) {
+      newerRows = await fetchConversationHistoryRows(
+        sql,
+        access.householdId,
+        anchor.channelId,
+        access.snapshotAt,
+        "newer",
+        newerPosition,
+      );
+      newerIndex = 0;
+      if (newerRows.length === 0) {
+        newerExhausted = true;
+        return null;
+      }
+    }
+    return newerRows[newerIndex] ?? null;
+  };
+
+  while (!(olderExhausted || olderBlocked) || !(newerExhausted || newerBlocked)) {
+    const direction = chooseOlder ? "older" : "newer";
+    chooseOlder = !chooseOlder;
+    const row = direction === "older" ? await nextOlder() : await nextNewer();
+    if (!row) continue;
+    const candidatePosition = conversationHistoryPosition(row);
+    const candidateOldest = direction === "older" ? candidatePosition : oldestPosition;
+    const candidateNewest = direction === "newer" ? candidatePosition : newestPosition;
+    const candidateRows = [...selected, row].sort(compareConversationHistoryRows);
+    if (
+      serializedConversationHistoryBytes(
+        provisionalConversationHistoryReadPage(
+          access.householdId,
+          anchor,
+          candidateRows,
+          scopeDigest,
+          candidateOldest,
+          candidateNewest,
+        ),
+      ) > CONVERSATION_HISTORY_PAGE_BYTE_BUDGET
+    ) {
+      if (direction === "older") olderBlocked = true;
+      else newerBlocked = true;
+      continue;
+    }
+    selected.push(row);
+    if (direction === "older") {
+      olderIndex += 1;
+      olderPosition = candidatePosition;
+      oldestPosition = candidatePosition;
+      if (olderIndex >= olderRows.length && olderRows.length < CONVERSATION_HISTORY_FETCH_BATCH) {
+        olderExhausted = true;
+      }
+    } else {
+      newerIndex += 1;
+      newerPosition = candidatePosition;
+      newestPosition = candidatePosition;
+      if (newerIndex >= newerRows.length && newerRows.length < CONVERSATION_HISTORY_FETCH_BATCH) {
+        newerExhausted = true;
+      }
+    }
+  }
+  return settleConversationHistoryReadPage(sql, access, anchor, selected, scopeDigest);
+}
+
+async function readDirectionalConversationHistoryPage(
+  sql: postgres.TransactionSql,
+  access: ConversationHistoryAccess,
+  anchor: ConversationHistoryAnchor,
+  cursor: ConversationHistoryReadCursor,
+  scopeDigest: string,
+): Promise<ConversationHistoryReadPage> {
+  const selected: ConversationHistoryRow[] = [];
+  let position = cursor.position;
+  while (true) {
+    const rows = await fetchConversationHistoryRows(
+      sql,
+      access.householdId,
+      anchor.channelId,
+      access.snapshotAt,
+      cursor.direction,
+      position,
+    );
+    if (rows.length === 0) break;
+    let blocked = false;
+    for (const row of rows) {
+      const candidateRows = [...selected, row].sort(compareConversationHistoryRows);
+      const candidatePosition = conversationHistoryPosition(row);
+      const candidateOldest = conversationHistoryPosition(candidateRows[0] as ConversationHistoryRow);
+      const candidateNewest = conversationHistoryPosition(candidateRows.at(-1) as ConversationHistoryRow);
+      if (
+        serializedConversationHistoryBytes(
+          provisionalConversationHistoryReadPage(
+            access.householdId,
+            anchor,
+            candidateRows,
+            scopeDigest,
+            candidateOldest,
+            candidateNewest,
+          ),
+        ) > CONVERSATION_HISTORY_PAGE_BYTE_BUDGET
+      ) {
+        if (selected.length === 0) {
+          // Preserve exact content and reachability for a singleton larger than the normal
+          // presentation target. Its continuation still advances past this stable position.
+          selected.push(row);
+          position = candidatePosition;
+        }
+        blocked = true;
+        break;
+      }
+      selected.push(row);
+      position = candidatePosition;
+    }
+    if (blocked || rows.length < CONVERSATION_HISTORY_FETCH_BATCH) break;
+  }
+
+  if (selected.length === 0) {
+    return {
+      messages: [],
+      startReached: cursor.direction === "older",
+      endReached: cursor.direction === "newer",
+      olderCursor:
+        cursor.direction === "newer"
+          ? encodeConversationHistoryReadCursor({ ...cursor, direction: "older" })
+          : null,
+      newerCursor:
+        cursor.direction === "older"
+          ? encodeConversationHistoryReadCursor({ ...cursor, direction: "newer" })
+          : null,
+    };
+  }
+  return settleConversationHistoryReadPage(sql, access, anchor, selected, scopeDigest);
+}
+
+async function settleConversationHistoryReadPage(
+  sql: postgres.TransactionSql,
+  access: ConversationHistoryAccess,
+  anchor: ConversationHistoryAnchor,
+  rows: readonly ConversationHistoryRow[],
+  scopeDigest: string,
+): Promise<ConversationHistoryReadPage> {
+  const ordered = [...rows].sort(compareConversationHistoryRows);
+  const oldest = conversationHistoryPosition(ordered[0] as ConversationHistoryRow);
+  const newest = conversationHistoryPosition(ordered.at(-1) as ConversationHistoryRow);
+  const [hasOlder, hasNewer] = await Promise.all([
+    conversationHistoryExists(sql, access.householdId, anchor.channelId, access.snapshotAt, "older", oldest),
+    conversationHistoryExists(sql, access.householdId, anchor.channelId, access.snapshotAt, "newer", newest),
+  ]);
+  const olderCursor = hasOlder
+    ? encodeConversationHistoryReadCursor({
+        direction: "older",
+        scopeDigest,
+        anchorSourceId: anchor.sourceId,
+        channelId: anchor.channelId,
+        position: oldest,
+      })
+    : null;
+  const newerCursor = hasNewer
+    ? encodeConversationHistoryReadCursor({
+        direction: "newer",
+        scopeDigest,
+        anchorSourceId: anchor.sourceId,
+        channelId: anchor.channelId,
+        position: newest,
+      })
+    : null;
+  const result: ConversationHistoryReadPage = {
+    messages: ordered.map((row) =>
+      conversationHistoryMessage(access.householdId, access.snapshotAt.toISOString(), row),
+    ),
+    startReached: !hasOlder,
+    endReached: !hasNewer,
+    olderCursor,
+    newerCursor,
+  };
+  if (
+    result.messages.length > 1 &&
+    serializedConversationHistoryBytes(result) > CONVERSATION_HISTORY_PAGE_BYTE_BUDGET
+  ) {
+    throw new FlorenceStoreConflict("Conversation-history page exceeds its byte budget");
+  }
+  return result;
+}
+
+function provisionalConversationHistoryReadPage(
+  householdId: string,
+  anchor: ConversationHistoryAnchor,
+  rows: readonly ConversationHistoryRow[],
+  scopeDigest: string,
+  oldest: ConversationHistoryPosition,
+  newest: ConversationHistoryPosition,
+): ConversationHistoryReadPage {
+  return {
+    messages: rows.map((row) => conversationHistoryMessage(householdId, anchor.snapshotAt, row)),
+    startReached: false,
+    endReached: false,
+    olderCursor: encodeConversationHistoryReadCursor({
+      direction: "older",
+      scopeDigest,
+      anchorSourceId: anchor.sourceId,
+      channelId: anchor.channelId,
+      position: oldest,
+    }),
+    newerCursor: encodeConversationHistoryReadCursor({
+      direction: "newer",
+      scopeDigest,
+      anchorSourceId: anchor.sourceId,
+      channelId: anchor.channelId,
+      position: newest,
+    }),
+  };
+}
+
+async function fetchConversationHistorySearchRows(
+  sql: postgres.TransactionSql,
+  access: ConversationHistoryAccess,
+  input: Readonly<{
+    query: string | null;
+    after: Date | null;
+    before: Date | null;
+    position: ConversationHistoryPosition | null;
+  }>,
+): Promise<readonly ConversationHistoryRow[]> {
+  return sql<ConversationHistoryRow[]>`
+    select message.source_id,message.channel_id,channel.audience as channel_audience,
+      message.direction,
+      case when message.direction='outbound' then 'Florence' else sender.display_name end
+        as sender_name,
+      message.move_kind,message.text,message.reaction,message.has_attachments,
+      message.reply_to_source_id,message.turn_part,source.metadata,source.occurred_at,
+      to_char(source.occurred_at at time zone 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"')
+        as occurred_at_cursor
+    from messages message
+    join sources source on source.id=message.source_id
+    join linq_channels channel on channel.id=message.channel_id
+    left join people sender on sender.id=message.sender_adult_id
+    where source.household_id=${access.householdId} and source.kind='linq_message'
+      and message.channel_id in ${sql(access.channelIds)}
+      and source.created_at<=${access.snapshotAt}
+      and ((message.direction='inbound' and message.status='handled'
+          and message.handled_at<=${access.snapshotAt})
+        or (message.direction='outbound' and message.status='sent'
+          and message.sent_at<=${access.snapshotAt}))
+      and (${input.query}::text is null or position(
+        ${input.query}::text in lower(concat_ws(' ',message.text,message.reaction,
+          case when message.direction='outbound' then 'Florence' else sender.display_name end,
+          source.label))
+      )>0)
+      and (${input.after}::timestamptz is null or source.occurred_at>=${input.after})
+      and (${input.before}::timestamptz is null or source.occurred_at<${input.before})
+      and (${input.position?.occurredAt ?? null}::timestamptz is null
+        or (source.occurred_at,message.turn_part,source.id)<(
+          ${input.position?.occurredAt ?? null}::timestamptz,
+          ${input.position?.turnPart ?? null}::smallint,
+          ${input.position?.sourceId ?? null}::uuid
+        ))
+    order by source.occurred_at desc,message.turn_part desc,source.id desc
+    limit ${CONVERSATION_HISTORY_FETCH_BATCH}
+  `;
+}
+
+async function readExactConversationHistoryRow(
+  sql: postgres.TransactionSql,
+  access: ConversationHistoryAccess,
+  anchor: ConversationHistoryAnchor,
+): Promise<ConversationHistoryRow | null> {
+  const [row] = await sql<ConversationHistoryRow[]>`
+    select message.source_id,message.channel_id,channel.audience as channel_audience,
+      message.direction,
+      case when message.direction='outbound' then 'Florence' else sender.display_name end
+        as sender_name,
+      message.move_kind,message.text,message.reaction,message.has_attachments,
+      message.reply_to_source_id,message.turn_part,source.metadata,source.occurred_at,
+      to_char(source.occurred_at at time zone 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"')
+        as occurred_at_cursor
+    from messages message
+    join sources source on source.id=message.source_id
+    join linq_channels channel on channel.id=message.channel_id
+    left join people sender on sender.id=message.sender_adult_id
+    where source.id=${anchor.sourceId} and source.household_id=${access.householdId}
+      and source.kind='linq_message' and message.channel_id=${anchor.channelId}
+      and source.created_at<=${access.snapshotAt}
+      and ((message.direction='inbound' and message.status='handled'
+          and message.handled_at<=${access.snapshotAt})
+        or (message.direction='outbound' and message.status='sent'
+          and message.sent_at<=${access.snapshotAt}))
+    limit 1
+  `;
+  return row ?? null;
+}
+
+async function fetchConversationHistoryRows(
+  sql: postgres.TransactionSql,
+  householdId: string,
+  channelId: string,
+  snapshotAt: Date,
+  direction: "older" | "newer",
+  position: ConversationHistoryPosition,
+): Promise<readonly ConversationHistoryRow[]> {
+  assertUuid(channelId, "Conversation-history channel ID");
+  assertUuid(position.sourceId, "Conversation-history position source ID");
+  const occurredAt = canonicalConversationHistoryOccurredAt(position.occurredAt);
+  const selectOlder = sql<ConversationHistoryRow[]>`
+    select message.source_id,message.channel_id,channel.audience as channel_audience,
+      message.direction,
+      case when message.direction='outbound' then 'Florence' else sender.display_name end
+        as sender_name,
+      message.move_kind,message.text,message.reaction,message.has_attachments,
+      message.reply_to_source_id,message.turn_part,source.metadata,source.occurred_at,
+      to_char(source.occurred_at at time zone 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"')
+        as occurred_at_cursor
+    from messages message
+    join sources source on source.id=message.source_id
+    join linq_channels channel on channel.id=message.channel_id
+    left join people sender on sender.id=message.sender_adult_id
+    where source.household_id=${householdId} and source.kind='linq_message'
+      and message.channel_id=${channelId}
+      and source.created_at<=${snapshotAt}
+      and ((message.direction='inbound' and message.status='handled'
+          and message.handled_at<=${snapshotAt})
+        or (message.direction='outbound' and message.status='sent'
+          and message.sent_at<=${snapshotAt}))
+      and (source.occurred_at,message.turn_part,source.id)<(
+        ${occurredAt},${position.turnPart}::smallint,${position.sourceId}::uuid)
+    order by source.occurred_at desc,message.turn_part desc,source.id desc
+    limit ${CONVERSATION_HISTORY_FETCH_BATCH}
+  `;
+  if (direction === "older") return selectOlder;
+  return sql<ConversationHistoryRow[]>`
+    select message.source_id,message.channel_id,channel.audience as channel_audience,
+      message.direction,
+      case when message.direction='outbound' then 'Florence' else sender.display_name end
+        as sender_name,
+      message.move_kind,message.text,message.reaction,message.has_attachments,
+      message.reply_to_source_id,message.turn_part,source.metadata,source.occurred_at,
+      to_char(source.occurred_at at time zone 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"')
+        as occurred_at_cursor
+    from messages message
+    join sources source on source.id=message.source_id
+    join linq_channels channel on channel.id=message.channel_id
+    left join people sender on sender.id=message.sender_adult_id
+    where source.household_id=${householdId} and source.kind='linq_message'
+      and message.channel_id=${channelId}
+      and source.created_at<=${snapshotAt}
+      and ((message.direction='inbound' and message.status='handled'
+          and message.handled_at<=${snapshotAt})
+        or (message.direction='outbound' and message.status='sent'
+          and message.sent_at<=${snapshotAt}))
+      and (source.occurred_at,message.turn_part,source.id)>(
+        ${occurredAt},${position.turnPart}::smallint,${position.sourceId}::uuid)
+    order by source.occurred_at,message.turn_part,source.id
+    limit ${CONVERSATION_HISTORY_FETCH_BATCH}
+  `;
+}
+
+async function conversationHistoryExists(
+  sql: postgres.TransactionSql,
+  householdId: string,
+  channelId: string,
+  snapshotAt: Date,
+  direction: "older" | "newer",
+  position: ConversationHistoryPosition,
+): Promise<boolean> {
+  const occurredAt = canonicalConversationHistoryOccurredAt(position.occurredAt);
+  const [row] =
+    direction === "older"
+      ? await sql<{ present: boolean }[]>`
+          select exists (
+            select 1 from messages message join sources source on source.id=message.source_id
+            where source.household_id=${householdId} and source.kind='linq_message'
+              and message.channel_id=${channelId}
+              and source.created_at<=${snapshotAt}
+              and ((message.direction='inbound' and message.status='handled'
+                  and message.handled_at<=${snapshotAt})
+                or (message.direction='outbound' and message.status='sent'
+                  and message.sent_at<=${snapshotAt}))
+              and (source.occurred_at,message.turn_part,source.id)<(
+                ${occurredAt},${position.turnPart}::smallint,${position.sourceId}::uuid)
+          ) as present
+        `
+      : await sql<{ present: boolean }[]>`
+          select exists (
+            select 1 from messages message join sources source on source.id=message.source_id
+            where source.household_id=${householdId} and source.kind='linq_message'
+              and message.channel_id=${channelId}
+              and source.created_at<=${snapshotAt}
+              and ((message.direction='inbound' and message.status='handled'
+                  and message.handled_at<=${snapshotAt})
+                or (message.direction='outbound' and message.status='sent'
+                  and message.sent_at<=${snapshotAt}))
+              and (source.occurred_at,message.turn_part,source.id)>(
+                ${occurredAt},${position.turnPart}::smallint,${position.sourceId}::uuid)
+          ) as present
+        `;
+  return row?.present ?? false;
+}
+
+function conversationHistoryMessage(
+  householdId: string,
+  snapshotAt: string,
+  row: ConversationHistoryRow,
+): ConversationHistoryMessage {
+  if (!row.sender_name) {
+    throw new FlorenceStoreConflict("A stored conversation-history sender is missing");
+  }
+  const supersedesSourceId = jsonString(row.metadata, "supersedesSourceId");
+  if (supersedesSourceId) assertUuid(supersedesSourceId, "Superseded conversation source ID");
+  const nativeMove = outboundNativeMoveFromMetadata(row.metadata);
+  const nativeMedia =
+    nativeMove?.type === "message" && nativeMove.parts.some((part) => part.type === "media");
+  const hasAttachments = row.has_attachments || nativeMedia;
+  if (row.move_kind === "reaction" ? !row.reaction : row.text === null && !hasAttachments) {
+    throw new FlorenceStoreConflict("A stored conversation-history message has no visible content");
+  }
+  return {
+    anchor: encodeConversationHistoryAnchor({
+      householdId,
+      channelId: row.channel_id,
+      sourceId: row.source_id,
+      snapshotAt,
+    }),
+    sourceId: row.source_id,
+    conversation: row.channel_audience === "group" ? "family_group" : "private",
+    senderName: row.sender_name,
+    moveKind: row.move_kind,
+    text: row.text,
+    reaction: row.reaction,
+    occurredAt: row.occurred_at.toISOString(),
+    replyToSourceId: row.reply_to_source_id,
+    supersedesSourceId,
+    hasAttachments,
+  };
+}
+
+function conversationHistoryPosition(row: ConversationHistoryRow): ConversationHistoryPosition {
+  return {
+    occurredAt: row.occurred_at_cursor,
+    turnPart: row.turn_part,
+    sourceId: row.source_id,
+  };
+}
+
+function compareConversationHistoryRows(left: ConversationHistoryRow, right: ConversationHistoryRow): number {
+  return (
+    left.occurred_at_cursor.localeCompare(right.occurred_at_cursor) ||
+    left.turn_part - right.turn_part ||
+    left.source_id.localeCompare(right.source_id)
+  );
+}
+
+function normalizedConversationHistoryQuery(value: string | null): string | null {
+  const query = value?.normalize("NFKC").trim().toLocaleLowerCase("en-US") ?? "";
+  return query || null;
+}
+
+function serializedConversationHistoryBytes(value: unknown): number {
+  return Buffer.byteLength(JSON.stringify(value), "utf8");
+}
+
+function conversationHistorySearchScopeDigest(
+  access: ConversationHistoryAccess,
+  input: Readonly<{ query: string | null; after: string | null; before: string | null }>,
+): string {
+  return sha256(
+    `florence-conversation-history-search-v1\0${canonicalConversationHistoryJson({
+      householdId: access.householdId,
+      channelIds: [...access.channelIds].sort(),
+      snapshotAt: access.snapshotAt.toISOString(),
+      query: input.query,
+      after: input.after,
+      before: input.before,
+    })}`,
+  );
+}
+
+function conversationHistoryReadScopeDigest(anchor: ConversationHistoryAnchor): string {
+  return sha256(
+    `florence-conversation-history-read-v1\0${canonicalConversationHistoryJson({
+      ...anchor,
+    })}`,
+  );
+}
+
+function encodeConversationHistoryAnchor(anchor: ConversationHistoryAnchor): string {
+  assertUuid(anchor.householdId, "Conversation-history household ID");
+  assertUuid(anchor.channelId, "Conversation-history channel ID");
+  assertUuid(anchor.sourceId, "Conversation-history source ID");
+  const snapshotAt = canonicalConversationHistorySnapshotAt(anchor.snapshotAt);
+  const token = encodeConversationHistoryToken({
+    v: CONVERSATION_HISTORY_TOKEN_VERSION,
+    k: "a",
+    h: anchor.householdId,
+    c: anchor.channelId,
+    s: anchor.sourceId,
+    o: snapshotAt,
+  });
+  if (token.length > 500) {
+    throw new FlorenceStoreConflict("Conversation-history anchor is too large");
+  }
+  return token;
+}
+
+function decodeConversationHistoryAnchor(token: string): ConversationHistoryAnchor {
+  const value = decodeConversationHistoryToken(token);
+  assertConversationHistoryTokenKeys(value, ["c", "h", "k", "o", "s", "v", "x"]);
+  if (value.v !== CONVERSATION_HISTORY_TOKEN_VERSION || value.k !== "a") {
+    throw new FlorenceStoreConflict("Conversation-history anchor is invalid");
+  }
+  const householdId = historyTokenString(value.h, "Conversation-history household ID");
+  const channelId = historyTokenString(value.c, "Conversation-history channel ID");
+  const sourceId = historyTokenString(value.s, "Conversation-history source ID");
+  const snapshotAt = historyTokenString(value.o, "Conversation-history snapshot timestamp");
+  assertUuid(householdId, "Conversation-history household ID");
+  assertUuid(channelId, "Conversation-history channel ID");
+  assertUuid(sourceId, "Conversation-history source ID");
+  return {
+    householdId,
+    channelId,
+    sourceId,
+    snapshotAt: canonicalConversationHistorySnapshotAt(snapshotAt),
+  };
+}
+
+function encodeConversationHistorySearchCursor(
+  scopeDigest: string,
+  snapshotAt: Date,
+  position: ConversationHistoryPosition,
+): string {
+  assertDigest(scopeDigest, "Conversation-history search scope");
+  const canonicalSnapshotAt = canonicalConversationHistorySnapshotAt(snapshotAt.toISOString());
+  const canonicalPosition = canonicalConversationHistoryPosition(position);
+  return encodeConversationHistoryToken({
+    v: CONVERSATION_HISTORY_TOKEN_VERSION,
+    k: "s",
+    q: scopeDigest,
+    o: canonicalSnapshotAt,
+    t: canonicalPosition.occurredAt,
+    p: canonicalPosition.turnPart,
+    i: canonicalPosition.sourceId,
+  });
+}
+
+function decodeConversationHistorySearchCursor(token: string): ConversationHistorySearchCursor {
+  const value = decodeConversationHistoryToken(token);
+  assertConversationHistoryTokenKeys(value, ["i", "k", "o", "p", "q", "t", "v", "x"]);
+  if (value.v !== CONVERSATION_HISTORY_TOKEN_VERSION || value.k !== "s") {
+    throw new FlorenceStoreConflict("Conversation-history cursor is invalid");
+  }
+  const scopeDigest = historyTokenString(value.q, "Conversation-history search scope");
+  assertDigest(scopeDigest, "Conversation-history search scope");
+  const snapshotAt = historyTokenString(value.o, "Conversation-history snapshot timestamp");
+  return {
+    scopeDigest,
+    snapshotAt: instant(canonicalConversationHistorySnapshotAt(snapshotAt)),
+    position: decodedConversationHistoryPosition(value.t, value.p, value.i),
+  };
+}
+
+function encodeConversationHistoryReadCursor(cursor: ConversationHistoryReadCursor): string {
+  assertDigest(cursor.scopeDigest, "Conversation-history read scope");
+  assertUuid(cursor.anchorSourceId, "Conversation-history anchor source ID");
+  assertUuid(cursor.channelId, "Conversation-history channel ID");
+  const position = canonicalConversationHistoryPosition(cursor.position);
+  return encodeConversationHistoryToken({
+    v: CONVERSATION_HISTORY_TOKEN_VERSION,
+    k: "r",
+    q: cursor.scopeDigest,
+    a: cursor.anchorSourceId,
+    c: cursor.channelId,
+    d: cursor.direction,
+    t: position.occurredAt,
+    p: position.turnPart,
+    i: position.sourceId,
+  });
+}
+
+function decodeConversationHistoryReadCursor(
+  token: string,
+  scopeDigest: string,
+  anchor: ConversationHistoryAnchor,
+): ConversationHistoryReadCursor {
+  const value = decodeConversationHistoryToken(token);
+  assertConversationHistoryTokenKeys(value, ["a", "c", "d", "i", "k", "p", "q", "t", "v", "x"]);
+  const direction = value.d === "older" || value.d === "newer" ? value.d : null;
+  if (
+    value.v !== CONVERSATION_HISTORY_TOKEN_VERSION ||
+    value.k !== "r" ||
+    value.q !== scopeDigest ||
+    value.a !== anchor.sourceId ||
+    value.c !== anchor.channelId ||
+    direction === null
+  ) {
+    throw new FlorenceStoreConflict("Conversation-history cursor belongs to another anchored read");
+  }
+  return {
+    direction,
+    scopeDigest,
+    anchorSourceId: anchor.sourceId,
+    channelId: anchor.channelId,
+    position: decodedConversationHistoryPosition(value.t, value.p, value.i),
+  };
+}
+
+function canonicalConversationHistoryPosition(
+  position: ConversationHistoryPosition,
+): ConversationHistoryPosition {
+  assertUuid(position.sourceId, "Conversation-history position source ID");
+  return {
+    occurredAt: canonicalConversationHistoryOccurredAt(position.occurredAt),
+    turnPart: conversationHistoryTurnPart(position.turnPart),
+    sourceId: position.sourceId,
+  };
+}
+
+function decodedConversationHistoryPosition(
+  occurredAtValue: unknown,
+  turnPartValue: unknown,
+  sourceIdValue: unknown,
+): ConversationHistoryPosition {
+  const occurredAt = historyTokenString(occurredAtValue, "Conversation-history position timestamp");
+  const sourceId = historyTokenString(sourceIdValue, "Conversation-history position source ID");
+  assertUuid(sourceId, "Conversation-history position source ID");
+  return {
+    occurredAt: canonicalConversationHistoryOccurredAt(occurredAt),
+    turnPart: conversationHistoryTurnPart(turnPartValue),
+    sourceId,
+  };
+}
+
+function canonicalConversationHistoryOccurredAt(value: string): string {
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/u.test(value)) {
+    throw new FlorenceStoreConflict("Conversation-history cursor timestamp is not canonical");
+  }
+  instant(value);
+  return value;
+}
+
+function canonicalConversationHistorySnapshotAt(value: string): string {
+  if (instant(value).toISOString() !== value) {
+    throw new FlorenceStoreConflict("Conversation-history snapshot timestamp is not canonical");
+  }
+  return value;
+}
+
+function conversationHistoryTurnPart(value: unknown): -1 | 0 | 1 | 2 {
+  if (value !== -1 && value !== 0 && value !== 1 && value !== 2) {
+    throw new FlorenceStoreConflict("Conversation-history cursor turn part is invalid");
+  }
+  return value;
+}
+
+function encodeConversationHistoryToken(core: Readonly<Record<string, JsonValue>>): string {
+  const value = { ...core, x: conversationHistoryTokenCheck(core) };
+  return Buffer.from(JSON.stringify(value), "utf8").toString("base64url");
+}
+
+function decodeConversationHistoryToken(token: string): Record<string, unknown> {
+  if (!token || token.length > 1_024) {
+    throw new FlorenceStoreConflict("Conversation-history token is invalid");
+  }
+  let bytes: Buffer;
+  try {
+    bytes = Buffer.from(token, "base64url");
+  } catch {
+    throw new FlorenceStoreConflict("Conversation-history token is invalid");
+  }
+  if (
+    bytes.byteLength > CONVERSATION_HISTORY_TOKEN_MAX_BYTES ||
+    bytes.toString("base64url") !== token.replace(/=+$/u, "")
+  ) {
+    throw new FlorenceStoreConflict("Conversation-history token is invalid");
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(bytes.toString("utf8"));
+  } catch {
+    throw new FlorenceStoreConflict("Conversation-history token is invalid");
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new FlorenceStoreConflict("Conversation-history token is invalid");
+  }
+  const value = parsed as Record<string, unknown>;
+  const check = value.x;
+  if (typeof check !== "string" || !/^[0-9a-f]{64}$/u.test(check)) {
+    throw new FlorenceStoreConflict("Conversation-history token is invalid");
+  }
+  const { x: _check, ...core } = value;
+  if (check !== conversationHistoryTokenCheck(core)) {
+    throw new FlorenceStoreConflict("Conversation-history token is invalid");
+  }
+  return value;
+}
+
+function conversationHistoryTokenCheck(core: Readonly<Record<string, unknown>>): string {
+  return sha256(`florence-conversation-history-token-v1\0${canonicalConversationHistoryJson(core)}`);
+}
+
+function assertConversationHistoryTokenKeys(
+  value: Record<string, unknown>,
+  expected: readonly string[],
+): void {
+  const actual = Object.keys(value).sort();
+  const canonical = [...expected].sort();
+  if (!sameStrings(actual, canonical)) {
+    throw new FlorenceStoreConflict("Conversation-history token is invalid");
+  }
+}
+
+function historyTokenString(value: unknown, name: string): string {
+  if (typeof value !== "string" || !value) throw new FlorenceStoreConflict(`${name} is invalid`);
+  return value;
+}
+
+/** Canonical JSON/checksum discipline adapted from Florence's Vault cursor implementation. */
+function canonicalConversationHistoryJson(value: unknown): string {
+  if (value === null || typeof value === "string" || typeof value === "boolean") {
+    return JSON.stringify(value);
+  }
+  if (typeof value === "number" && Number.isFinite(value)) return JSON.stringify(value);
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => canonicalConversationHistoryJson(item)).join(",")}]`;
+  }
+  if (typeof value === "object") {
+    return `{${Object.entries(value)
+      .filter((entry) => entry[1] !== undefined)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, field]) => `${JSON.stringify(key)}:${canonicalConversationHistoryJson(field)}`)
+      .join(",")}}`;
+  }
+  throw new FlorenceStoreConflict("Conversation-history token contains invalid data");
 }
 
 async function claimedFamilyWorkPendingContext(

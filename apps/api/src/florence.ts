@@ -40,6 +40,7 @@ import type {
   ClaimedFamilyWorkCapabilityIdentity,
   CommitTurnInput,
   CompleteFounderOnboardingInput,
+  ConversationHistoryMessage,
   DueProactiveWork,
   FactDraft,
   FactRecord,
@@ -121,6 +122,7 @@ import {
   type FlorenceCalendarCatalogRead,
   type FlorenceCalendarWindowRead,
   type FlorenceConversationalGmailSource,
+  type FlorenceConversationHistoryMessage,
   type FlorenceDecision,
   type FlorenceFamilyCalendarWorkRequest,
   type FlorenceFamilyCalendarWorkResult,
@@ -1655,6 +1657,7 @@ export class Florence {
     const calendarTargets = new Map<string, GooglePersonalCalendarCatalogTarget>();
     const calendarEventTargets = new Map<string, CalendarEventTarget>();
     const visibility = turn.authority.audience === "group" ? "shared" : "adult_private";
+    const conversationHistoryObservedAt = this.#now().toISOString();
     const currentDocuments = (turn.currentDocuments ?? []).slice(-3);
     const jobMessages = [...turn.supersededMessages, turn.message];
     const currentImages = jobMessages
@@ -1966,6 +1969,36 @@ export class Florence {
             googleConnectionIdsUsed.add(evidence.connectionId);
           }
         }
+      },
+      searchConversationHistory: async ({ query, after, before, cursor }) => {
+        const page = await this.#store.searchConversationHistory({
+          authority: turn.authority,
+          currentSourceId: turn.message.sourceId,
+          observedAt: conversationHistoryObservedAt,
+          query,
+          after,
+          before,
+          cursor,
+        });
+        const messages = page.messages.map((message) => modelConversationHistoryMessage(message));
+        for (const message of messages) {
+          sourceIndex.set(message.sourceId, conversationHistorySource(message));
+        }
+        return { ...page, messages };
+      },
+      readConversationHistory: async ({ anchor, cursor }) => {
+        const page = await this.#store.readConversationHistory({
+          authority: turn.authority,
+          currentSourceId: turn.message.sourceId,
+          observedAt: conversationHistoryObservedAt,
+          anchor,
+          cursor,
+        });
+        const messages = page.messages.map((message) => modelConversationHistoryMessage(message));
+        for (const message of messages) {
+          sourceIndex.set(message.sourceId, conversationHistorySource(message));
+        }
+        return { ...page, messages };
       },
       searchVault: async (input) => vaultRecall.search(input),
       readVault: async (input) => vaultRecall.read(input),
@@ -3662,6 +3695,7 @@ export class Florence {
       const familyWorkSourceIndex = new Map(
         familyWorkMemoryCorpus.map((source) => [source.sourceId, source] as const),
       );
+      const familyWorkConversationHistoryObservedAt = this.#now().toISOString();
       const familyWorkGoogleConnections =
         google && familyWorkGoogleAdultId
           ? await google.status({
@@ -4068,12 +4102,14 @@ export class Florence {
           occurredAt,
         };
       };
-      const durableFamilyWorkSourceIds = new Set([
-        work.origin.message.sourceId,
-        ...(work.origin.replyTarget ? [work.origin.replyTarget.sourceId] : []),
-        ...work.origin.supersededMessages.map((message) => message.sourceId),
-        ...familyWorkHousehold.facts.flatMap((fact) => fact.sources.map((source) => source.id)),
-      ]);
+      const indexFamilyWorkConversationHistory = (
+        messages: readonly ConversationHistoryMessage[],
+      ): readonly FlorenceConversationHistoryMessage[] =>
+        messages.map((message) => {
+          const modelMessage = modelConversationHistoryMessage(message);
+          familyWorkSourceIndex.set(modelMessage.sourceId, conversationHistorySource(modelMessage));
+          return modelMessage;
+        });
       const runVaultWork = async (
         request: FlorenceVaultWorkRequest,
         taskSignal?: AbortSignal,
@@ -4120,12 +4156,7 @@ export class Florence {
           (request.memory.memoryKind === "artifact" && request.memory.title
             ? `artifact:${request.memory.artifactKind}:${sha256(request.memory.title.toLocaleLowerCase())}`
             : `${request.memory.memoryKind}:${sha256(request.statement.toLocaleLowerCase())}`);
-        const sourceIds = [
-          ...new Set([
-            ...request.sourceIds.filter((sourceId) => durableFamilyWorkSourceIds.has(sourceId)),
-            work.origin.message.sourceId,
-          ]),
-        ];
+        const sourceIds = [...new Set([...request.sourceIds, work.origin.message.sourceId])];
         const fact: FactDraft = {
           id: existing?.id ?? deterministicUuid(`family-work-fact\0${work.workId}\0${identity.callId}`),
           subjectPersonId: existing?.subjectPersonId ?? null,
@@ -4400,6 +4431,36 @@ export class Florence {
             : {}),
           searchVault: async (input) => familyWorkVaultRecall.search(input),
           readVault: async (input) => familyWorkVaultRecall.read(input),
+          searchConversationHistory: async ({ query, after, before, cursor }) => {
+            const page = await this.#store.searchClaimedFamilyWorkConversationHistory({
+              workId: work.workId,
+              generation: work.generation,
+              claimId: work.claimId,
+              occurredAt: familyWorkConversationHistoryObservedAt,
+              query,
+              after,
+              before,
+              cursor,
+            });
+            return {
+              ...page,
+              messages: indexFamilyWorkConversationHistory(page.messages),
+            };
+          },
+          readConversationHistory: async ({ anchor, cursor }) => {
+            const page = await this.#store.readClaimedFamilyWorkConversationHistory({
+              workId: work.workId,
+              generation: work.generation,
+              claimId: work.claimId,
+              occurredAt: familyWorkConversationHistoryObservedAt,
+              anchor,
+              cursor,
+            });
+            return {
+              ...page,
+              messages: indexFamilyWorkConversationHistory(page.messages),
+            };
+          },
           searchFamilyMemory: async ({ query, limit }) =>
             searchMemorySources(familyWorkSearchableMemory, query).slice(0, limit),
           readSource: async ({ sourceId }) => familyWorkSourceIndex.get(sourceId) ?? null,
@@ -8106,12 +8167,57 @@ function turnText(turn: InboundTurn["message"] | InboundTurn["recentMessages"][n
   return "Shared a family attachment.";
 }
 
+function modelConversationHistoryMessage(
+  message: ConversationHistoryMessage,
+): FlorenceConversationHistoryMessage {
+  return {
+    anchor: message.anchor,
+    sourceId: message.sourceId,
+    conversation: message.conversation,
+    senderName: message.senderName,
+    moveKind: message.moveKind,
+    text: conversationHistoryText(message),
+    occurredAt: message.occurredAt,
+    replyToSourceId: message.replyToSourceId,
+    supersedesSourceId: message.supersedesSourceId,
+    hasAttachments: message.hasAttachments,
+  };
+}
+
+function conversationHistorySource(message: FlorenceConversationHistoryMessage): FlorenceSource {
+  return {
+    sourceId: message.sourceId,
+    recordId: null,
+    kind: "message",
+    visibility: message.conversation === "family_group" ? "shared" : "adult_private",
+    label: message.senderName,
+    occurredAt: message.occurredAt,
+    text: message.text,
+  };
+}
+
+function conversationHistoryText(message: ConversationHistoryMessage): string {
+  if (message.moveKind === "reaction") {
+    return message.reaction?.trim()
+      ? `Reacted ${redactWebAccessToken(message.reaction)} to an earlier message.`
+      : "Reacted to an earlier message.";
+  }
+  const text = message.text?.trim() ? redactWebAccessToken(message.text) : null;
+  if (text && message.hasAttachments) return `${text}\nShared an attachment with this message.`;
+  if (text) return text;
+  if (message.hasAttachments) return "Shared an attachment.";
+  return message.moveKind === "reply" ? "Replied to an earlier message." : "Sent a message.";
+}
+
 function hasVerifiedInstruction(turn: InboundTurn["message"]): boolean {
   return Boolean(turn.authoredText?.trim() || (turn.voiceTranscriptPresent && turn.text?.trim()));
 }
 
 function redactWebAccessToken(value: string): string {
-  return value.replace(/wa1\.[A-Za-z0-9_-]+/gu, "[secure web link]");
+  return value.replace(
+    /(?:fs2\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+|(?:wa1|ps1)\.[A-Za-z0-9_-]+)/gu,
+    "[secure web link]",
+  );
 }
 
 function modelSafeGmailText(value: string): string {

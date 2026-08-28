@@ -1,5 +1,6 @@
-import { createHash } from "node:crypto";
+import { createCipheriv, createHash } from "node:crypto";
 import { describe, expect, test, vi } from "vitest";
+import { GoogleConnection, type GoogleConnectionStore } from "./index.js";
 import { executeGoogleWorkspaceOperation } from "./workspace.js";
 
 function jsonResponse(value: unknown, status = 200): Response {
@@ -34,6 +35,42 @@ function messagePayload(input: {
         data: Buffer.from(input.body, "utf8").toString("base64url"),
       },
     },
+  };
+}
+
+function refreshTokenEnvelope(input: {
+  key: Buffer;
+  connectionId: string;
+  householdId: string;
+  ownerAdultId: string;
+}): string {
+  const nonce = Buffer.alloc(12, 7);
+  const cipher = createCipheriv("aes-256-gcm", input.key, nonce);
+  cipher.setAAD(
+    Buffer.from(
+      `florence-google-refresh-v1\0${input.connectionId}\0${input.householdId}\0${input.ownerAdultId}`,
+    ),
+  );
+  const ciphertext = Buffer.concat([cipher.update("refresh-token", "utf8"), cipher.final()]);
+  return [
+    "g1",
+    nonce.toString("base64url"),
+    ciphertext.toString("base64url"),
+    cipher.getAuthTag().toString("base64url"),
+  ].join(".");
+}
+
+function calendarEvent(index: number): Record<string, unknown> {
+  const startsAt = new Date(Date.UTC(2026, 7, 29, index));
+  const endsAt = new Date(startsAt.getTime() + 30 * 60_000);
+  return {
+    id: `event-${index.toString().padStart(2, "0")}`,
+    etag: `"revision-${index}"`,
+    updated: "2026-08-28T18:00:00.000Z",
+    status: "confirmed",
+    summary: `Family event ${index}`,
+    start: { dateTime: startsAt.toISOString(), timeZone: "America/Los_Angeles" },
+    end: { dateTime: endsAt.toISOString(), timeZone: "America/Los_Angeles" },
   };
 }
 
@@ -189,5 +226,83 @@ describe("Gmail draft provider journey", () => {
       "GET /gmail/v1/users/me/drafts/draft-1?format=full",
       expect.stringContaining("GET /gmail/v1/users/me/messages?"),
     ]);
+  });
+});
+
+describe("initial Family Calendar review", () => {
+  test("exhausts every provider page inside the fixed review window", async () => {
+    const connectionId = "connection-1";
+    const householdId = "household-1";
+    const ownerAdultId = "adult-1";
+    const key = Buffer.alloc(32, 3);
+    const calendarRequests: URL[] = [];
+    const fetchMock = vi.fn<typeof fetch>(async (input) => {
+      const url = new URL(String(input));
+      if (url.origin === "https://oauth2.googleapis.com") {
+        return jsonResponse({ access_token: "access-token", token_type: "Bearer" });
+      }
+      if (url.origin === "https://www.googleapis.com") {
+        calendarRequests.push(url);
+        const pageToken = url.searchParams.get("pageToken");
+        return jsonResponse({
+          timeZone: "America/Los_Angeles",
+          items:
+            pageToken === null
+              ? Array.from({ length: 50 }, (_, index) => calendarEvent(index))
+              : [calendarEvent(50)],
+          ...(pageToken === null ? { nextPageToken: "page-2" } : {}),
+        });
+      }
+      throw new Error(`Unexpected provider request: ${url}`);
+    });
+    const store = {
+      async readActiveGoogleCredential() {
+        return {
+          connectionId,
+          householdId,
+          ownerAdultId,
+          refreshTokenEnvelope: refreshTokenEnvelope({ key, connectionId, householdId, ownerAdultId }),
+        };
+      },
+    } as unknown as GoogleConnectionStore;
+    const google = new GoogleConnection({
+      store,
+      clientId: "client-id",
+      clientSecret: "client-secret",
+      redirectUri: "https://app.tryflorence.com/oauth/google/callback",
+      encryptionKey: key,
+      fetch: fetchMock,
+    });
+
+    const result = await google.readInitialCalendarReview({
+      householdId,
+      ownerAdultId,
+      connectionId,
+      calendarId: "family-calendar",
+      currentTime: "2026-08-28T12:00:00.000-07:00",
+      limit: 50,
+    });
+
+    expect(result.status).toBe("complete");
+    expect(result.events.map((event) => event.providerEventId)).toEqual(
+      Array.from({ length: 51 }, (_, index) => `event-${index.toString().padStart(2, "0")}`),
+    );
+    expect(calendarRequests).toHaveLength(2);
+    expect(calendarRequests.map((url) => url.searchParams.get("pageToken"))).toEqual([null, "page-2"]);
+    expect(new Set(calendarRequests.map((url) => url.searchParams.get("timeMin"))).size).toBe(1);
+    expect(new Set(calendarRequests.map((url) => url.searchParams.get("timeMax"))).size).toBe(1);
+
+    calendarRequests.length = 0;
+    const bounded = await google.readCalendarWindow({
+      householdId,
+      ownerAdultId,
+      connectionId,
+      calendarId: "family-calendar",
+      timeMin: "2026-08-28T19:00:00.000Z",
+      timeMax: "2026-09-18T19:00:00.000Z",
+      limit: 50,
+    });
+    expect(bounded).toMatchObject({ status: "truncated", events: { length: 50 } });
+    expect(calendarRequests).toHaveLength(1);
   });
 });

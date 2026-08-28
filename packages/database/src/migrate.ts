@@ -10,12 +10,16 @@ const docketCompletionFile = fileURLToPath(new URL("../sql/004_docket_completion
 const docketCalendarCompatibilityFile = fileURLToPath(
   new URL("../sql/005_docket_calendar_compatibility.sql", import.meta.url),
 );
+const generalFamilyWorkStateFile = fileURLToPath(
+  new URL("../sql/006_general_family_work_state.sql", import.meta.url),
+);
 export const migrationFiles = [
   baselineFile,
   remindersFile,
   familyWorkFile,
   docketCompletionFile,
   docketCalendarCompatibilityFile,
+  generalFamilyWorkStateFile,
 ] as const;
 
 export async function migrateDatabase(connectionString: string, sqlFile?: string): Promise<void> {

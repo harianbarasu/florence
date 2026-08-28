@@ -25,6 +25,7 @@ import {
   LinqError,
   type LinqMediaReference,
   type LinqSendMessage,
+  type LinqSendMove,
   type LinqSendReaction,
   linqIdentitySubjectDigest,
 } from "@florence/linq";
@@ -79,6 +80,9 @@ const LINQ_SIGNING_KEY = Buffer.from("florence-release-webhook-key-32b", "utf8")
 const LINQ_SIGNING_SECRET = `whsec_${LINQ_SIGNING_KEY.toString("base64")}`;
 const INVITE_APPROVAL = "Yes, please text Alex.";
 const REINVITE_APPROVAL = "Please invite Alex again.";
+const PARTNER_INVITATION_APPROVAL_REPLY = "Got it—I’ll text Alex now.";
+const PARTNER_REINVITATION_APPROVAL_REPLY = PARTNER_INVITATION_APPROVAL_REPLY;
+const PARTNER_INVITATION_CONTRADICTION = "I can’t text Alex from here.";
 const PARTNER_SETUP_QUESTION = "What is this setup for?";
 const PARTNER_SETUP_HANDSHAKE_REPLY = "Hi Florence";
 const PARTNER_SETUP_REFUSAL = "I don’t want to join this.";
@@ -152,8 +156,12 @@ const HOUSEHOLD_INITIAL_ALL_CLEAR =
 const CONVERSATION_RECOVERY_REPLY =
   "I hit a snag answering that. I didn’t make or send any changes—please try once more.";
 const TRANSIENT_RETRY_REQUEST = "Can you check in with me?";
-const TRANSIENT_RETRY_CUE = "I hit a temporary snag. I’m trying again now.";
+const TRANSIENT_RETRY_CUE = "One sec—I hit a snag, but I’m trying that again.";
 const TRANSIENT_RETRY_REPLY = "I’m back—what would you like me to check?";
+const NO_RETENTION_OR_SCHEDULING_REQUEST =
+  "Answer this, but don’t remember it or schedule anything: the temporary code is blue.";
+const NO_RETENTION_OR_SCHEDULING_REPLY = "Understood—the temporary code is blue.";
+const NO_RETENTION_OR_SCHEDULING_FACT = "The temporary code is blue.";
 const STALE_RECEIPT_QUESTION = "Can you confirm this delivery is current?";
 const STALE_RECEIPT_REPLY = "This reply must have a current provider receipt.";
 const ONE_SHOT_REMINDER_REQUEST = "Remind me to pick up the kids at 2:45 today.";
@@ -187,6 +195,9 @@ const PRIVATE_CALENDAR_ADULT_TITLE = "Private medical appointment";
 const FAMILY_CALENDAR_MIXED_CHANGE_TITLE = "Maya’s school photo day";
 const FAMILY_CALENDAR_MIXED_CHANGE_SUMMARY = "Maya’s school photo day is September 3.";
 const PRIVATE_CALENDAR_OWNER_APPROVAL = "Yes, add that exact event.";
+const PRIVATE_CALENDAR_OWNER_APPROVAL_REPLY =
+  "Got it—I’ll add “Private anniversary dinner” to the family calendar.";
+const PRIVATE_CALENDAR_OWNER_CONTRADICTION = "I can’t add that to the family calendar.";
 const PRIVATE_CALENDAR_GENERIC_TODAY_REPLY = "I confirmed a private calendar commitment today.";
 const PRIVATE_CALENDAR_FACT_SLOT = "child:maya:private_soccer_clinic";
 const PRIVATE_CALENDAR_FACT = "Maya’s private soccer clinic is on the parent’s calendar.";
@@ -197,6 +208,21 @@ const PARTNER_PRIVATE_GOOGLE_FACT = "Alex’s recurring school pickup handoff is
 const GOOGLE_DELETION_GMAIL_SUBJECT = "Maya emergency-card reminder";
 const GOOGLE_DELETION_FACT_SLOT = "child:maya:school_office_hours";
 const GOOGLE_DELETION_FACT = "Muir Elementary’s school office closes at 4:00 p.m.";
+const GOOGLE_RECIPE_SUBJECT = "Family sesame noodles recipe";
+const GOOGLE_RECIPE_SLOT = "family:weeknight_sesame_noodles";
+const GOOGLE_RECIPE_STATEMENT = "The family has a reusable weeknight sesame noodles recipe.";
+const GOOGLE_RECIPE_TITLE = "Weeknight sesame noodles";
+const GOOGLE_RECIPE_DETAILS =
+  "Ingredients: 12 ounces spaghetti; 3 tablespoons soy sauce; 1 tablespoon sesame oil; 2 teaspoons rice vinegar. Method: cook the spaghetti and toss it with the sauce while warm. Family note: keep it mild.";
+const GOOGLE_RECIPE_QUESTION = "What was that mild noodle dinner we saved for hectic nights?";
+const GOOGLE_RECIPE_REPLY =
+  "The weeknight sesame noodles use spaghetti, soy sauce, sesame oil, and rice vinegar—tossed warm and kept mild.";
+const PROACTIVE_FAMILY_WORK_OBJECTIVE =
+  "Use the current household docket and saved weeknight recipe to prepare a practical family plan that removes the loose ends.";
+const PROACTIVE_FAMILY_WORK_KICKOFF =
+  "I’m turning those current loose ends and what I already know about your family into a practical plan now.";
+const PROACTIVE_FAMILY_WORK_RESULT =
+  "I put together a practical family plan from the current docket and the useful details already in the Vault.";
 const GOOGLE_DELETION_PRIVATE_ALERT = "Muir says Maya’s emergency card still needs a signature.";
 const UNRELATED_ACCOUNT_EMAIL_SUBJECT = "Your retail account password has changed";
 const UNRELATED_ACCOUNT_EMAIL_ALERT =
@@ -206,6 +232,10 @@ const UNRELATED_ACCOUNT_MONITOR_OBJECTIVE =
 const UNRELATED_ACCOUNT_FACT_SLOT = "adult:retail_account_security";
 const UNRELATED_ACCOUNT_FACT = "The retail account password changed.";
 const PRIVATE_INITIAL_ONLY_FINDING = "The school office contact stays private to this parent.";
+const PRIVATE_DOCKET_RECALL_REQUEST = "What was that private school-office loose end?";
+const PRIVATE_DOCKET_RECALL_REPLY = "The school office contact is still on your private docket.";
+const PRIVATE_DOCKET_HANDLED_REQUEST = "That private school-office loose end is handled.";
+const PRIVATE_DOCKET_HANDLED_REPLY = "Got it—I’ll take that off your private docket.";
 const SHARED_DUPLICATE_CONFLICT_SUMMARY = "Fall activity registration needs a family decision.";
 const PARTNER_DUPLICATE_CONFLICT_SUMMARY = "The family still needs to decide on fall registration.";
 const FOUNDER_FORM_SUMMARY = "Maya’s field-trip form still needs a parent response.";
@@ -419,6 +449,8 @@ type HarnessState = {
   cancelledMonitorSourceId: string | null;
   setupConversationFailuresRemaining: number;
   founderProductRecenterReview: boolean;
+  googleRecipeArtifactExercise: boolean;
+  proactiveFamilyWorkExercise: boolean;
   familyCalendarProvisioningFailuresRemaining: number;
   invalidGrantAdultId: string | null;
   invalidGrantTriggered: boolean;
@@ -473,7 +505,6 @@ release("Durable family work store", () => {
       continuationItems: [],
       pendingCall: null,
       steering: [],
-      publicMapResearchContext: [],
       progressRevision: 0,
       terminal: null,
     } as const;
@@ -924,7 +955,6 @@ release("Durable family work store", () => {
       browserSession: null,
       continuationItems: [],
       pendingCall: null,
-      publicMapResearchContext: [],
       progressRevision: 2,
       terminal: { outcome: "succeeded" as const, text: terminalText },
     };
@@ -966,13 +996,65 @@ release("Durable family work store", () => {
 });
 
 release("Florence parent journeys", () => {
+  test("delivers model-selected native mention and poll moves through the persisted outbox", async () => {
+    const request = "Can you ask Alex which dinner night works?";
+    let mentionedName = "";
+    const harness = await createHarness(async (input) => {
+      if (input.currentMessage.text !== request) {
+        return decision({ bubbles: [{ text: "Okay.", delayMs: 0 }] });
+      }
+      mentionedName =
+        input.household.adultNames.find((name) => name !== input.currentMessage.senderName) ?? "Alex";
+      return decision({
+        nativeMoves: [
+          {
+            type: "mention",
+            text: `${mentionedName}, which night works for dinner?`,
+            adultDisplayName: mentionedName,
+          },
+          {
+            type: "poll",
+            question: "Pick a night",
+            options: ["Tuesday", "Thursday"],
+          },
+        ],
+      });
+    });
+    await harness.readyHousehold();
+
+    await harness.accept("group", "native-mention-poll", request);
+    await harness.drain();
+
+    expect(harness.linq.moves).toHaveLength(3);
+    expect(harness.linq.moves.map((move) => move.move.type)).toEqual(["message", "message", "poll"]);
+    expect(harness.linq.moves[0]?.move).toEqual({
+      type: "message",
+      parts: [
+        {
+          type: "text",
+          text: `${mentionedName}, which night works for dinner?`,
+          mention: { handle: PARTNER_PHONE, range: [0, mentionedName.length] },
+        },
+      ],
+    });
+    expect(harness.linq.moves[1]?.move).toEqual({
+      type: "message",
+      parts: [{ type: "text", text: "Pick a night" }],
+    });
+    expect(harness.linq.moves[2]?.move).toEqual({
+      type: "poll",
+      options: ["Tuesday", "Thursday"],
+    });
+  }, 20_000);
+
   test("keeps private setup useful and recovers one two-parent family loop without duplicate work", async () => {
     let accessFollowUpHistory: readonly string[] = [];
     let accessFollowUpAuthoredText: string | null = null;
     let failNextReinviteConversation = false;
-    let contradictNextSuccessfulPartnerInvitation = false;
+    let customizeNextSuccessfulPartnerInvitation = false;
     let failNextGroupGreeting = false;
     let transientRetryAttempts = 0;
+    let retryCueLeakedIntoConversation = false;
     let activeReminderListSeen = false;
     let pausedReminderListSeen = false;
     const harness = await createHarness(async (input) => {
@@ -981,6 +1063,9 @@ release("Florence parent journeys", () => {
         if (transientRetryAttempts === 1) {
           throw new FlorenceReasonerError("transient", "Fake temporary model failure");
         }
+        retryCueLeakedIntoConversation = input.recentMessages.some(
+          (message) => message.text === TRANSIENT_RETRY_CUE,
+        );
         return decision({ bubbles: [{ text: TRANSIENT_RETRY_REPLY, delayMs: 0 }] });
       }
       if (
@@ -1001,16 +1086,42 @@ release("Florence parent journeys", () => {
           "Fake normal conversation output failed after isolated invitation approval",
         );
       }
-      if (contradictNextSuccessfulPartnerInvitation && input.currentMessage.text === REINVITE_APPROVAL) {
-        contradictNextSuccessfulPartnerInvitation = false;
+      if (customizeNextSuccessfulPartnerInvitation && input.currentMessage.text === REINVITE_APPROVAL) {
+        customizeNextSuccessfulPartnerInvitation = false;
         return decision({
-          bubbles: [
-            {
-              text: "I can’t send a setup text myself, but Alex can open Florence from their own phone to get started.",
-              delayMs: 0,
-            },
-          ],
+          reaction: "emphasize",
+          bubbles: [{ text: PARTNER_INVITATION_CONTRADICTION, delayMs: 0 }],
         });
+      }
+      if (input.currentMessage.text === INVITE_APPROVAL || input.currentMessage.text === REINVITE_APPROVAL) {
+        return decision({
+          bubbles: [{ text: PARTNER_INVITATION_CONTRADICTION, delayMs: 0 }],
+        });
+      }
+      if (input.currentMessage.text === NO_RETENTION_OR_SCHEDULING_REQUEST) {
+        return {
+          ...decision({
+            bubbles: [{ text: NO_RETENTION_OR_SCHEDULING_REPLY, delayMs: 0 }],
+            facts: [
+              remember(
+                NO_RETENTION_OR_SCHEDULING_FACT,
+                input.currentMessage.sourceId,
+                input.audience === "group" ? "household" : "private",
+              ),
+            ],
+            followUp: {
+              operation: "schedule",
+              followUpId: null,
+              objective: "Watch for use of the temporary code.",
+              currentConclusion: "The temporary code has not been used.",
+              endCondition: "The temporary code is used.",
+              nextCheck: "2026-08-20T19:00:00.000Z",
+              why: "The temporary code may need follow-through.",
+              sourceIds: [input.currentMessage.sourceId],
+            },
+          }),
+          policy: { retain: false, schedule: false, stopMessaging: false },
+        };
       }
       if (input.currentMessage.text === WEB_CALENDAR_ACCESS_REQUEST) {
         return decision({
@@ -1337,7 +1448,7 @@ release("Florence parent journeys", () => {
       .filter((message) => message.providerConversationId === PRIVATE_FOUNDER)
       .slice(founderMessagesBeforePermanentFailure);
     expect(permanentFailureNotices.map((message) => message.text)).toEqual([
-      "Got it—I’ll text Alex now.",
+      PARTNER_INVITATION_APPROVAL_REPLY,
       PARTNER_SETUP_DELIVERY_FAILURE_NOTICE,
     ]);
     expect((await harness.florence.workspaceForAdult(harness.founderAdultId)).workspace.setup).toMatchObject({
@@ -1367,6 +1478,7 @@ release("Florence parent journeys", () => {
     const founderMessagesBeforeReinvite = harness.linq.messages.filter(
       (message) => message.providerConversationId === PRIVATE_FOUNDER,
     ).length;
+    const reactionsBeforeFailedReinvite = harness.linq.reactions.length;
     harness.linq.partnerInitialPromptAcceptedRemaining = 1;
     const stoppedPartnerPromptVisible = harness.linq.pauseNextPartnerInitialPrompt();
     await harness.accept("private", "reinvite-partner-after-rejection", REINVITE_APPROVAL);
@@ -1385,6 +1497,13 @@ release("Florence parent journeys", () => {
       harness.linq.releasePartnerInitialPrompt();
     }
     await stoppedInvitationDrain;
+    expect(harness.linq.reactions.slice(reactionsBeforeFailedReinvite)).toEqual([]);
+    expect(
+      harness.linq.messages
+        .filter((message) => message.providerConversationId === PRIVATE_FOUNDER)
+        .slice(founderMessagesBeforeReinvite)
+        .map((message) => message.text),
+    ).toContain(PARTNER_REINVITATION_APPROVAL_REPLY);
     expect(harness.linq.partnerSetupLinkAttempts).toBe(0);
     expect(
       harness.linq.messages.some(
@@ -1403,10 +1522,11 @@ release("Florence parent journeys", () => {
       )`,
     );
 
-    contradictNextSuccessfulPartnerInvitation = true;
+    customizeNextSuccessfulPartnerInvitation = true;
     const founderMessagesBeforeSuccessfulReinvite = harness.linq.messages.filter(
       (message) => message.providerConversationId === PRIVATE_FOUNDER,
     ).length;
+    const reactionsBeforeSuccessfulReinvite = harness.linq.reactions.length;
     await harness.accept("private", "reinvite-partner-after-fast-stop", REINVITE_APPROVAL);
     await harness.drain();
     const reboundPartnerPrompt = harness.linq.createdChats.at(-1);
@@ -1422,12 +1542,15 @@ release("Florence parent journeys", () => {
       .filter((message) => message.providerConversationId === PRIVATE_FOUNDER)
       .slice(founderMessagesBeforeSuccessfulReinvite);
     expect(successfulReinviteFounderMessages.map((message) => message.text)).toEqual([
-      "Got it—I’ll text Alex now.",
+      PARTNER_REINVITATION_APPROVAL_REPLY,
     ]);
+    expect(harness.linq.reactions.slice(reactionsBeforeSuccessfulReinvite)).toEqual([]);
     const reinviteFounderMessages = harness.linq.messages
       .filter((message) => message.providerConversationId === PRIVATE_FOUNDER)
       .slice(founderMessagesBeforeReinvite);
-    expect(reinviteFounderMessages.map((message) => message.text)).toContain("Got it—I’ll text Alex now.");
+    expect(reinviteFounderMessages.map((message) => message.text)).toContain(
+      PARTNER_REINVITATION_APPROVAL_REPLY,
+    );
     expect(reinviteFounderMessages.some((message) => /finish the rest reliably/i.test(message.text))).toBe(
       false,
     );
@@ -1825,6 +1948,24 @@ release("Florence parent journeys", () => {
     });
     expect(partner.workspace.setup).toEqual(founder.workspace.setup);
 
+    const messagesBeforeNoRetentionRequest = harness.linq.messages.length;
+    await harness.accept("private", "no-retention-or-scheduling", NO_RETENTION_OR_SCHEDULING_REQUEST);
+    await harness.drain();
+    const noRetentionMessages = harness.linq.messages.slice(messagesBeforeNoRetentionRequest);
+    expect(noRetentionMessages.map((message) => message.text)).toEqual([NO_RETENTION_OR_SCHEDULING_REPLY]);
+    expect(noRetentionMessages.map((message) => message.text).join("\n")).not.toMatch(
+      /Vault|retain|schedule|follow-up|calendar change/i,
+    );
+    await harness.assertDatabase(
+      "A no-retention, no-scheduling turn changed durable state behind its natural reply",
+      `not exists (
+        select 1 from facts where value->>'statement'=${sqlLiteral(NO_RETENTION_OR_SCHEDULING_FACT)}
+      ) and not exists (
+        select 1 from proactive_work_sources
+        where source_id=${sqlLiteral(inboundSourceId("event-no-retention-or-scheduling"))}::uuid
+      )`,
+    );
+
     harness.state.now = Date.parse("2026-08-19T21:44:00.000Z");
     await harness.drain();
     const finiteReviewsBeforeReminder = harness.state.finiteReviews;
@@ -2042,6 +2183,7 @@ release("Florence parent journeys", () => {
     harness.state.now += 16_000;
     await harness.drain();
     expect(transientRetryAttempts).toBe(2);
+    expect(retryCueLeakedIntoConversation).toBe(false);
     expect(
       harness.linq.messages.filter(
         (message) => message.providerConversationId === FAMILY_GROUP && message.text === TRANSIENT_RETRY_CUE,
@@ -2197,6 +2339,267 @@ release("Florence parent journeys", () => {
     );
   }, 20_000);
 
+  test("starts one memory-grounded proactive job through the existing family-work loop", async () => {
+    let familyWorkRuns = 0;
+    const harness = await createHarness(async () => decision(), {
+      continueFamilyWork: async (input) => {
+        familyWorkRuns += 1;
+        expect(input.objective).toBe(PROACTIVE_FAMILY_WORK_OBJECTIVE);
+        expect(input.visibility).toBe("household");
+        expect(input.initiatingAdultId).toBe(founderSetup().adultId);
+        expect(input.origin.message).toMatchObject({
+          speaker: "florence",
+          text: expect.stringContaining(PROACTIVE_FAMILY_WORK_KICKOFF),
+          authoredText: expect.stringContaining(PROACTIVE_FAMILY_WORK_KICKOFF),
+          voiceTranscriptPresent: false,
+        });
+        expect(input.visibleSources?.some((source) => source.text.includes(GOOGLE_RECIPE_TITLE))).toBe(true);
+        return {
+          kind: "terminal",
+          state: {
+            ...input.state,
+            phase: "terminal",
+            claim: null,
+            pendingCall: null,
+            terminal: { outcome: "succeeded", text: PROACTIVE_FAMILY_WORK_RESULT },
+          },
+          outcome: "succeeded",
+          text: PROACTIVE_FAMILY_WORK_RESULT,
+        };
+      },
+    });
+    harness.state.googleRecipeArtifactExercise = true;
+    harness.state.proactiveFamilyWorkExercise = true;
+    await harness.readyHousehold();
+
+    expect(
+      harness.linq.messages.filter((message) => message.text.includes(PROACTIVE_FAMILY_WORK_KICKOFF)),
+    ).toHaveLength(1);
+    harness.state.now += 1_001;
+    await harness.drain();
+
+    expect(familyWorkRuns).toBe(1);
+    expect(
+      harness.linq.messages.filter((message) => message.text === PROACTIVE_FAMILY_WORK_RESULT),
+    ).toHaveLength(1);
+    await harness.assertDatabase(
+      "A proactive household judgment did not produce exactly one completed family task from its kickoff",
+      `(select count(*)=1 from proactive_work
+          where kind='family_task' and objective=${sqlLiteral(PROACTIVE_FAMILY_WORK_OBJECTIVE)}
+            and visibility='household' and status='completed')
+        and exists (
+          select 1 from proactive_work work
+          join proactive_work_sources work_source on work_source.work_id=work.id
+          join sources source on source.id=work_source.source_id
+          join messages message on message.source_id=source.id
+          where work.kind='family_task'
+            and work.objective=${sqlLiteral(PROACTIVE_FAMILY_WORK_OBJECTIVE)}
+            and message.direction='outbound'
+            and source.metadata->>'proactiveFamilyWorkId'=work.id::text
+        )`,
+    );
+
+    harness.state.now += 2 * 60_000;
+    await harness.drain();
+    expect(familyWorkRuns).toBe(1);
+    expect(
+      harness.linq.messages.filter((message) => message.text.includes(PROACTIVE_FAMILY_WORK_KICKOFF)),
+    ).toHaveLength(1);
+    expect(
+      harness.linq.messages.filter((message) => message.text === PROACTIVE_FAMILY_WORK_RESULT),
+    ).toHaveLength(1);
+  }, 20_000);
+
+  test("keeps a private durable task private while it reads private context and commits Family Calendar work", async () => {
+    const request =
+      "Check my school-form email, then add a Family Calendar block for us to sign Maya’s form Tuesday.";
+    const objective =
+      "Use my private school-form email to add a household-safe block for signing Maya’s form to the Family Calendar.";
+    const terminalText = "I added “Sign Maya’s school form” to the Family Calendar.";
+    const event = {
+      intervalKind: "timed" as const,
+      title: "Sign Maya’s school form",
+      startsAt: "2026-08-18T19:00:00.000Z",
+      endsAt: "2026-08-18T19:30:00.000Z",
+      timeZone: "America/Los_Angeles",
+      location: null,
+    };
+    let privateSourceRead = false;
+    let selectedFamilyCalendarRead = false;
+    let providerReceiptObserved = false;
+    const harness = await createHarness(
+      async (input) =>
+        input.currentMessage.text === request
+          ? decision({
+              familyWork: {
+                operation: "create",
+                workId: null,
+                objective,
+                instruction: null,
+              },
+            })
+          : decision(),
+      {
+        continueFamilyWork: async (input, reads) => {
+          expect(input.visibility).toBe("private");
+          expect(input.ownerAdultId).toBe(founderSetup().adultId);
+          expect(input.initiatingAdultId).toBe(founderSetup().adultId);
+          if (input.state.phase === "ready") {
+            const gmail = await reads.searchGmail?.({
+              query: "Maya school form needs signature",
+              limit: 10,
+            });
+            privateSourceRead =
+              gmail?.status === "complete" &&
+              gmail.sources.some(
+                (source) =>
+                  source.visibility === "adult_private" && source.text.includes("form needs a signature"),
+              );
+            if (!privateSourceRead) {
+              throw new Error("The private durable task could not read its initiating adult's Gmail");
+            }
+
+            const catalog = await reads.listCalendars?.();
+            const familyCalendar = catalog?.calendars.find(
+              (calendar) => calendar.primary === null && calendar.accessRole === null,
+            );
+            if (catalog?.status !== "complete" || !familyCalendar) {
+              throw new Error("The private durable task could not resolve the exact Family Calendar");
+            }
+            const personal = await reads.readCalendarWindow?.({
+              timeMin: "2026-08-18T07:00:00.000Z",
+              timeMax: "2026-08-19T07:00:00.000Z",
+              limit: 50,
+              scope: "primary",
+              calendarRefs: [],
+            });
+            if (
+              !personal?.events.some((calendarEvent) => calendarEvent.title === "Private calendar detail")
+            ) {
+              throw new Error("The private durable task lost its initiating adult's Calendar context");
+            }
+            const shared = await reads.readCalendarWindow?.({
+              timeMin: "2026-08-18T07:00:00.000Z",
+              timeMax: "2026-08-19T07:00:00.000Z",
+              limit: 50,
+              scope: "selected",
+              calendarRefs: [familyCalendar.calendarRef],
+            });
+            selectedFamilyCalendarRead =
+              shared?.status === "complete" &&
+              shared.calendars.length === 1 &&
+              shared.calendars[0]?.calendarRef === familyCalendar.calendarRef &&
+              shared.calendars[0].status === "complete";
+            if (!selectedFamilyCalendarRead) {
+              throw new Error("The private durable task could not read the selected Family Calendar");
+            }
+            return {
+              kind: "continue",
+              state: {
+                ...input.state,
+                phase: "tool_pending",
+                claim: null,
+                pendingCall: {
+                  callId: "private-family-calendar-create",
+                  name: "family_calendar_work",
+                  argumentsJson: JSON.stringify({ operation: "create", event, target: null }),
+                  attempt: 0,
+                },
+              },
+              progressText: null,
+              nextCheckDelayMs: 0,
+            };
+          }
+
+          if (!reads.runFamilyCalendarWork) {
+            throw new Error("The private durable task did not receive Family Calendar work");
+          }
+          const receipt = await reads.runFamilyCalendarWork({
+            operation: "create",
+            event,
+            target: null,
+          });
+          providerReceiptObserved =
+            receipt.status === "committed" &&
+            receipt.operation === "create" &&
+            receipt.providerEventId.length > 0 &&
+            receipt.providerRevision !== null;
+          if (!providerReceiptObserved) {
+            throw new Error("The private durable task did not receive a provider-confirmed Calendar receipt");
+          }
+          return {
+            kind: "terminal",
+            state: {
+              ...input.state,
+              phase: "terminal",
+              claim: null,
+              pendingCall: null,
+              terminal: { outcome: "succeeded", text: terminalText },
+            },
+            outcome: "succeeded",
+            text: terminalText,
+          };
+        },
+      },
+    );
+    await harness.readyHousehold();
+
+    const messagesBeforeRequest = harness.linq.messages.length;
+    await harness.accept("private", "private-durable-family-calendar", request);
+    await harness.drain();
+    harness.state.now += 1_001;
+    await harness.drain();
+
+    expect(privateSourceRead).toBe(true);
+    expect(selectedFamilyCalendarRead).toBe(true);
+    expect(providerReceiptObserved).toBe(true);
+    expect(
+      harness.state.calendarExecutions.filter(
+        (execution) =>
+          execution.calendarId === FAMILY_CALENDAR &&
+          execution.mutation.operation === "create" &&
+          execution.mutation.event.title === event.title,
+      ),
+    ).toHaveLength(1);
+    const taskMessages = harness.linq.messages.slice(messagesBeforeRequest);
+    expect(
+      taskMessages.filter(
+        (message) => message.providerConversationId === PRIVATE_FOUNDER && message.text === terminalText,
+      ),
+    ).toHaveLength(1);
+    expect(
+      taskMessages.filter(
+        (message) =>
+          message.providerConversationId === FAMILY_GROUP &&
+          (message.text === terminalText || message.text.includes(event.title)),
+      ),
+    ).toHaveLength(0);
+    await harness.assertDatabase(
+      "Private durable Family Calendar work did not keep its terminal delivery private",
+      `(select count(*)=1 from proactive_work
+          where kind='family_task' and objective=${sqlLiteral(objective)}
+            and visibility='private'
+            and owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid
+            and status='completed')
+        and (select count(*)=1 from messages terminal
+          join sources source on source.id=terminal.source_id
+          join linq_channels channel on channel.id=terminal.channel_id
+          where terminal.direction='outbound' and terminal.status='sent'
+            and terminal.text=${sqlLiteral(terminalText)}
+            and source.visibility='private'
+            and source.owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid
+            and channel.audience='private'
+            and channel.adult_one_id=${sqlLiteral(harness.founderAdultId)}::uuid
+            and channel.adult_two_id is null)
+        and not exists (
+          select 1 from messages message join linq_channels channel on channel.id=message.channel_id
+          where channel.audience='group'
+            and (message.text=${sqlLiteral(terminalText)}
+              or message.text like ${sqlLiteral(`%${event.title}%`)})
+        )`,
+    );
+  }, 20_000);
+
   test("runs authenticated browser work from the initiating parent in the family thread", async () => {
     const browserRuns: Parameters<FlorenceBrowserClient["run"]>[0][] = [];
     const closedSessions: Parameters<FlorenceBrowserClient["close"]>[0][] = [];
@@ -2309,81 +2712,50 @@ release("Florence parent journeys", () => {
     let ordinaryUnusedSourceId: string | null = null;
     let conversationalGoogleSourceId: string | null = null;
     let retainedGoogleMemorySourceId: string | null = null;
+    let googleRecipeSearchReturnedUsableDetails = false;
     let groupHouseholdFactWasVisible = false;
     const observedHouseholdDocket: {
       value: FlorenceReasonerInput["householdDocket"] | null;
     } = { value: null };
     const publicResearchCapture: {
       mainRequest: Record<string, unknown> | null;
-      publicRequests: Record<string, unknown>[];
-    } = { mainRequest: null, publicRequests: [] };
+      queries: string[];
+      sourceUrls: string[];
+    } = { mainRequest: null, queries: [], sourceUrls: [] };
     let publicResearchModelTurns = 0;
     let publicSearchTurns = 0;
-    let publicResearchNeedsFinal = false;
-    let publicFinalReply = PUBLIC_RESEARCH_REPLY;
-    let publicFinalUrls = [PUBLIC_RESEARCH_URL];
     const publicResearchReasoner = new FlorenceReasoner({ apiKey: "test-openai-key", model: "test-model" }, {
       responses: {
         stream: (request: Record<string, unknown>) => {
           publicResearchModelTurns += 1;
-          if (!publicResearchNeedsFinal) {
-            publicResearchNeedsFinal = true;
-            publicResearchCapture.mainRequest ??= request;
-            const currentInput = JSON.stringify(request.input);
-            const query = currentInput.includes(PUBLIC_NO_RESULT_REQUEST)
-              ? "9780143127796 2026-08-27"
-              : currentInput.includes(PUBLIC_SHORT_IDENTIFIER_REQUEST)
-                ? "X public social platform identifier"
-                : currentInput.includes(PUBLIC_CONCEPT_REQUEST)
-                  ? `access token password managers confirmation code format ${PUBLIC_CONCEPT_URL}`
-                  : "DL 747 live route status alternatives tonight";
-            const call = {
-              id: "public-research-tool-output",
-              type: "function_call",
-              call_id: "public-research-tool-call",
-              name: "research_public_web",
-              arguments: JSON.stringify({ query }),
-              status: "completed",
-            };
-            return fakeResponseStream(
-              [
-                {
-                  type: "response.output_item.added",
-                  item: call,
-                  output_index: 0,
-                  sequence_number: 1,
-                },
-              ],
-              {
-                output_parsed: null,
-                output: [call],
-              },
-            );
-          }
-          publicResearchNeedsFinal = false;
-          return fakeResponseStream([], {
-            output_parsed: decision({
-              bubbles: [{ text: publicFinalReply, delayMs: 0 }],
-              researchUrls: publicFinalUrls,
-            }),
-            output: [],
-          });
-        },
-        parse: (request: Record<string, unknown>) => {
-          publicResearchCapture.publicRequests.push(request);
+          publicResearchCapture.mainRequest ??= request;
           publicSearchTurns += 1;
-          const serializedInput = JSON.stringify(request.input);
-          const noResult = serializedInput.includes("9780143127796");
-          const shortIdentifier = serializedInput.includes(PUBLIC_SHORT_IDENTIFIER_REQUEST);
-          const publicConcept = serializedInput.includes("dQw4w9WgXcQ");
-          publicFinalReply = noResult
+          const currentInput = JSON.stringify(request.input);
+          const noResult = currentInput.includes(PUBLIC_NO_RESULT_REQUEST);
+          const shortIdentifier = currentInput.includes(PUBLIC_SHORT_IDENTIFIER_REQUEST);
+          const publicConcept = currentInput.includes(PUBLIC_CONCEPT_REQUEST);
+          const query = noResult
+            ? "9780143127796 2026-08-27"
+            : publicConcept
+              ? `access token password managers confirmation code format ${PUBLIC_CONCEPT_URL}`
+              : shortIdentifier
+                ? "X public social platform identifier"
+                : "DL 747 live route status alternatives tonight";
+          const sourceUrl = noResult
+            ? PUBLIC_NO_RESULT_SOURCE
+            : publicConcept
+              ? PUBLIC_CONCEPT_URL
+              : shortIdentifier
+                ? PUBLIC_SHORT_IDENTIFIER_URL
+                : PUBLIC_RESEARCH_URL;
+          const finalReply = noResult
             ? PUBLIC_NO_RESULT_REPLY
             : publicConcept
               ? PUBLIC_CONCEPT_REPLY
               : shortIdentifier
                 ? PUBLIC_SHORT_IDENTIFIER_REPLY
                 : PUBLIC_RESEARCH_REPLY;
-          publicFinalUrls = noResult
+          const finalUrls = noResult
             ? []
             : [
                 publicConcept
@@ -2392,42 +2764,27 @@ release("Florence parent journeys", () => {
                     ? PUBLIC_SHORT_IDENTIFIER_URL
                     : PUBLIC_RESEARCH_URL,
               ];
-          return {
-            output_parsed: {
-              outcome: noResult ? "no_result" : "result",
-              summary: publicFinalReply,
-              urls: publicFinalUrls,
-            },
+          publicResearchCapture.queries.push(query);
+          publicResearchCapture.sourceUrls.push(sourceUrl);
+          return fakeResponseStream([], {
+            output_parsed: decision({
+              reaction: finalReply === PUBLIC_RESEARCH_REPLY ? "emphasize" : null,
+              bubbles: [{ text: finalReply, delayMs: 0 }],
+              researchUrls: finalUrls,
+            }),
             output: [
               {
-                id: "web-search-flight-options",
+                id: `web-search-${publicSearchTurns}`,
                 type: "web_search_call",
                 status: "completed",
                 action: {
                   type: "search",
-                  query: noResult
-                    ? "9780143127796 2026-08-27"
-                    : publicConcept
-                      ? "access token password managers confirmation code format YouTube video"
-                      : shortIdentifier
-                        ? "X public identifier"
-                        : "DL 747 current route status alternatives tonight",
-                  sources: [
-                    {
-                      type: "url",
-                      url: noResult
-                        ? PUBLIC_NO_RESULT_SOURCE
-                        : publicConcept
-                          ? PUBLIC_CONCEPT_URL
-                          : shortIdentifier
-                            ? PUBLIC_SHORT_IDENTIFIER_URL
-                            : PUBLIC_RESEARCH_URL,
-                    },
-                  ],
+                  query,
+                  sources: [{ type: "url", url: sourceUrl }],
                 },
               },
             ],
-          };
+          });
         },
       },
     } as never);
@@ -2472,6 +2829,22 @@ release("Florence parent journeys", () => {
           docketCompletions: [candidate.candidateId],
         });
       }
+      if (input.currentMessage.text === PRIVATE_DOCKET_RECALL_REQUEST) {
+        if (!input.householdDocket.items.some((item) => item.summary === PRIVATE_INITIAL_ONLY_FINDING)) {
+          throw new Error("The owner-private initial finding was not retrievable in its adult's turn");
+        }
+        return decision({ bubbles: [{ text: PRIVATE_DOCKET_RECALL_REPLY, delayMs: 0 }] });
+      }
+      if (input.currentMessage.text === PRIVATE_DOCKET_HANDLED_REQUEST) {
+        const candidate = input.householdDocket.items.find(
+          (item) => item.summary === PRIVATE_INITIAL_ONLY_FINDING,
+        );
+        if (!candidate) throw new Error("The owner-private docket item was not available to complete");
+        return decision({
+          bubbles: [{ text: PRIVATE_DOCKET_HANDLED_REPLY, delayMs: 0 }],
+          docketCompletions: [candidate.candidateId],
+        });
+      }
       if (
         input.currentMessage.text === PUBLIC_RESEARCH_REQUEST ||
         input.currentMessage.text === PUBLIC_NO_RESULT_REQUEST ||
@@ -2492,6 +2865,24 @@ release("Florence parent journeys", () => {
         }
         retainedGoogleMemorySourceId = retained.sourceId;
         return decision({ bubbles: [{ text: GOOGLE_MEMORY_REPLY, delayMs: 5_000 }] });
+      }
+      if (input.currentMessage.text === GOOGLE_RECIPE_QUESTION) {
+        const matches = await reads.searchFamilyMemory?.({
+          query: "mild hectic night noodle dinner instructions",
+          limit: 5,
+        });
+        googleRecipeSearchReturnedUsableDetails =
+          matches?.some(
+            (source) =>
+              source.kind === "memory" &&
+              source.text.includes(GOOGLE_RECIPE_TITLE) &&
+              source.text.includes("12 ounces spaghetti") &&
+              source.text.includes("keep it mild"),
+          ) ?? false;
+        if (!googleRecipeSearchReturnedUsableDetails) {
+          throw new Error("The Google-derived recipe did not return usable details through memory search");
+        }
+        return decision({ bubbles: [{ text: GOOGLE_RECIPE_REPLY, delayMs: 0 }] });
       }
       if (input.currentMessage.text === GOOGLE_CITED_REPLY_QUESTION) {
         const connection = input.googleConnections.find((candidate) => candidate.kind === "personal");
@@ -2528,7 +2919,13 @@ release("Florence parent journeys", () => {
           bubbles: [
             { text: "I’ll keep an eye out and only bring you something genuinely useful.", delayMs: 0 },
           ],
-          facts: [remember("Maya likes soccer", input.currentMessage.sourceId)],
+          facts: [
+            remember(
+              "Maya likes soccer",
+              input.currentMessage.sourceId,
+              input.audience === "group" ? "household" : "private",
+            ),
+          ],
           interest: {
             operation: "create",
             interestWorkId: null,
@@ -2562,7 +2959,13 @@ release("Florence parent journeys", () => {
       nativeObservation.pdfBytes = pdf.bytes;
       return decision({
         bubbles: [{ text: "I found the deadline and I’ll keep an eye on it.", delayMs: 0 }],
-        facts: [remember("Maya’s field-trip form is due Tuesday", input.currentMessage.sourceId)],
+        facts: [
+          remember(
+            "Maya’s field-trip form is due Tuesday",
+            input.currentMessage.sourceId,
+            input.audience === "group" ? "household" : "private",
+          ),
+        ],
         followUp: {
           operation: "schedule",
           followUpId: null,
@@ -2579,6 +2982,7 @@ release("Florence parent journeys", () => {
     harness.state.initialClassifierFailuresRemaining = 1;
     harness.state.completeScanPaginationExercise = true;
     harness.state.founderProductRecenterReview = true;
+    harness.state.googleRecipeArtifactExercise = true;
     harness.state.initialHouseholdCalendarFailuresRemaining = 1;
     await harness.readyHousehold();
 
@@ -2715,23 +3119,18 @@ release("Florence parent journeys", () => {
       )`,
     );
     const rankedCandidates = incompleteWork.candidates.slice(0, 3);
-    await harness.store.completeHouseholdInitialBriefing({
-      workId: incompleteWork.workId,
-      selectedCandidateIds: rankedCandidates.map((candidate) => candidate.candidateId),
-      familyCalendarCursor: "{}",
-      bubbles: [
-        {
-          text: `Here’s what’s on the docket:\n${rankedCandidates
-            .map((candidate) => `• ${candidate.summary}`)
-            .join(
-              "\n",
-            )}\n\nI kept 3 lower-priority items on the docket too. Ask me anytime.\n\nDid I get that right? If I missed something, tell me here.`,
-          delayMs: 0,
-        },
-      ],
-      occurredAt: harness.iso(),
-    });
     await harness.drain();
+    const [householdBriefingInput] = harness.state.briefings;
+    if (!householdBriefingInput) throw new Error("The household briefing reasoner did not run");
+    expect(householdBriefingInput.memory).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          slot: GOOGLE_RECIPE_SLOT,
+          label: GOOGLE_RECIPE_TITLE,
+          text: expect.stringContaining("12 ounces spaghetti"),
+        }),
+      ]),
+    );
 
     const briefingMessages = harness.linq.messages.filter(
       (message) =>
@@ -2788,6 +3187,40 @@ release("Florence parent journeys", () => {
     });
     expect(retainedDocket.totalItems).toBe(6);
     expect(retainedDocket.items).toHaveLength(6);
+    const founderPrivateDocket = await harness.store.readHouseholdDocket({
+      householdId: incompleteWork.household.householdId,
+      viewerAdultId: harness.founderAdultId,
+      limit: 20,
+      now: harness.iso(),
+    });
+    expect(founderPrivateDocket.items.map((candidate) => candidate.summary)).toContain(
+      PRIVATE_INITIAL_ONLY_FINDING,
+    );
+    const partnerPrivateDocket = await harness.store.readHouseholdDocket({
+      householdId: incompleteWork.household.householdId,
+      viewerAdultId: harness.partnerAdultId,
+      limit: 20,
+      now: harness.iso(),
+    });
+    expect(partnerPrivateDocket.items.map((candidate) => candidate.summary)).not.toContain(
+      PRIVATE_INITIAL_ONLY_FINDING,
+    );
+    await harness.accept("private", "private-docket-recall", PRIVATE_DOCKET_RECALL_REQUEST);
+    await harness.drain();
+    expect(harness.linq.messages.some((message) => message.text === PRIVATE_DOCKET_RECALL_REPLY)).toBe(true);
+    await harness.accept("private", "private-docket-handled", PRIVATE_DOCKET_HANDLED_REQUEST);
+    await harness.drain();
+    expect(harness.linq.messages.some((message) => message.text === PRIVATE_DOCKET_HANDLED_REPLY)).toBe(true);
+    expect(
+      (
+        await harness.store.readHouseholdDocket({
+          householdId: incompleteWork.household.householdId,
+          viewerAdultId: harness.founderAdultId,
+          limit: 20,
+          now: harness.iso(),
+        })
+      ).items.map((candidate) => candidate.summary),
+    ).not.toContain(PRIVATE_INITIAL_ONLY_FINDING);
     await harness.accept("group", "household-docket", HOUSEHOLD_DOCKET_REQUEST, "partner");
     await harness.drain();
     expect(observedHouseholdDocket.value?.totalItems).toBe(6);
@@ -2865,6 +3298,33 @@ release("Florence parent journeys", () => {
     expect(JSON.stringify(partnerAfterInitialReview.vault)).not.toMatch(
       /hari-private@example\.com|Private school form/,
     );
+    const founderRecipe = founderAfterInitialReview.vault?.facts.find(
+      (fact) => fact.statement === GOOGLE_RECIPE_STATEMENT,
+    );
+    expect(founderRecipe).toMatchObject({
+      memoryKind: "artifact",
+      artifactKind: "recipe",
+      title: GOOGLE_RECIPE_TITLE,
+      details: GOOGLE_RECIPE_DETAILS,
+      tags: ["recipe", "noodles", "weeknight"],
+      visibility: "household",
+      source: { kind: "gmail" },
+    });
+    if (!founderRecipe) throw new Error("The Google-derived recipe artifact was not retained");
+    expect(partnerAfterInitialReview.vault?.facts.find((fact) => fact.id === founderRecipe.id)).toEqual(
+      expect.objectContaining({
+        memoryKind: "artifact",
+        artifactKind: "recipe",
+        title: GOOGLE_RECIPE_TITLE,
+        details: GOOGLE_RECIPE_DETAILS,
+        visibility: "household",
+        source: null,
+      }),
+    );
+    await harness.accept("private", "recall-google-recipe", GOOGLE_RECIPE_QUESTION, "partner");
+    await harness.drain();
+    expect(googleRecipeSearchReturnedUsableDetails).toBe(true);
+    expect(harness.linq.messages.some((message) => message.text === GOOGLE_RECIPE_REPLY)).toBe(true);
     await harness.assertDatabase(
       "A household Gmail fact duplicated its slot or lost either parent's private support",
       `(select count(*)=1 from facts
@@ -2912,24 +3372,22 @@ release("Florence parent journeys", () => {
     const publicResearchTimelineBefore = harness.state.timeline.length;
     await harness.accept("group", "public-identifier-research", PUBLIC_RESEARCH_REQUEST, "partner");
     await harness.drain();
-    expect(publicResearchModelTurns).toBe(2);
+    expect(publicResearchModelTurns).toBe(1);
     expect(publicSearchTurns).toBe(1);
     expect(publicResearchCapture.mainRequest?.tools).toEqual(
-      expect.arrayContaining([expect.objectContaining({ type: "function", name: "research_public_web" })]),
+      expect.arrayContaining([expect.objectContaining({ type: "web_search" })]),
     );
     expect(publicResearchCapture.mainRequest?.tools).not.toEqual(
-      expect.arrayContaining([expect.objectContaining({ type: "web_search" })]),
+      expect.arrayContaining([expect.objectContaining({ type: "function", name: "research_public_web" })]),
     );
-    expect(publicResearchCapture.publicRequests[0]?.tools).toEqual(
-      expect.arrayContaining([expect.objectContaining({ type: "web_search" })]),
-    );
-    expect(publicResearchCapture.publicRequests[0]?.include).toEqual(
+    expect(publicResearchCapture.mainRequest?.include).toEqual(
       expect.arrayContaining(["web_search_call.action.sources"]),
     );
-    expect(publicResearchCapture.publicRequests[0]?.tool_choice).toBe("required");
-    const isolatedPublicInput = JSON.stringify(publicResearchCapture.publicRequests[0]?.input);
-    expect(isolatedPublicInput).toContain("DL 747");
-    expect(isolatedPublicInput).not.toMatch(/Alex|Maya|Anbarasu|hari@example\.com|familyProfile|gmail/iu);
+    expect(publicResearchCapture.queries[0]).toContain("DL 747");
+    expect(publicResearchCapture.queries[0]).not.toMatch(
+      /Alex|Maya|Anbarasu|hari@example\.com|familyProfile|gmail/iu,
+    );
+    expect(publicResearchCapture.sourceUrls[0]).toBe(PUBLIC_RESEARCH_URL);
     expect(
       harness.linq.messages.filter(
         (message) =>
@@ -2941,13 +3399,13 @@ release("Florence parent journeys", () => {
       expect.objectContaining({
         providerConversationId: FAMILY_GROUP,
         targetProviderMessageId: "message-public-identifier-research",
-        reaction: "like",
+        reaction: "emphasize",
       }),
     ]);
     const publicResearchTimeline = harness.state.timeline.slice(publicResearchTimelineBefore);
-    expect(publicResearchTimeline.indexOf("reaction:like:message-public-identifier-research")).toBeLessThan(
-      publicResearchTimeline.indexOf(`message:${PUBLIC_RESEARCH_REPLY}`),
-    );
+    expect(
+      publicResearchTimeline.indexOf("reaction:emphasize:message-public-identifier-research"),
+    ).toBeLessThan(publicResearchTimeline.indexOf(`message:${PUBLIC_RESEARCH_REPLY}`));
     await harness.assertDatabase(
       "A foreground public lookup created fake background work",
       `not exists (
@@ -2961,25 +3419,16 @@ release("Florence parent journeys", () => {
     await harness.accept("group", "public-no-result-research", PUBLIC_NO_RESULT_REQUEST, "partner");
     await harness.drain();
     expect(publicSearchTurns).toBe(publicSearchesBeforeNoResult + 1);
-    const isolatedNumericPublicInput = JSON.stringify(publicResearchCapture.publicRequests[1]?.input);
-    expect(isolatedNumericPublicInput).toContain("9780143127796");
-    expect(isolatedNumericPublicInput).toContain("2026-08-27");
+    expect(publicResearchCapture.queries[1]).toContain("9780143127796");
+    expect(publicResearchCapture.queries[1]).toContain("2026-08-27");
     expect(harness.linq.messages.some((message) => message.text === PUBLIC_NO_RESULT_REPLY)).toBe(true);
     expect(harness.linq.messages.some((message) => message.text === PUBLIC_NO_RESULT_SOURCE)).toBe(false);
-    expect(harness.linq.reactions.slice(reactionsBeforeNoResult)).toEqual([
-      expect.objectContaining({
-        providerConversationId: FAMILY_GROUP,
-        targetProviderMessageId: "message-public-no-result-research",
-        reaction: "like",
-      }),
-    ]);
+    expect(harness.linq.reactions.slice(reactionsBeforeNoResult)).toEqual([]);
     const searchesBeforeShortIdentifier = publicSearchTurns;
     await harness.accept("group", "public-short-identifier", PUBLIC_SHORT_IDENTIFIER_REQUEST, "partner");
     await harness.drain();
     expect(publicSearchTurns).toBe(searchesBeforeShortIdentifier + 1);
-    expect(JSON.stringify(publicResearchCapture.publicRequests[2]?.input)).toContain(
-      PUBLIC_SHORT_IDENTIFIER_REQUEST,
-    );
+    expect(publicResearchCapture.queries[2]).toContain("X public social platform identifier");
     expect(harness.linq.messages.some((message) => message.text === PUBLIC_SHORT_IDENTIFIER_REPLY)).toBe(
       true,
     );
@@ -2988,11 +3437,10 @@ release("Florence parent journeys", () => {
     await harness.accept("group", "public-concept-search", PUBLIC_CONCEPT_REQUEST, "partner");
     await harness.drain();
     expect(publicSearchTurns).toBe(searchesBeforePublicConcept + 1);
-    const isolatedPublicConceptInput = JSON.stringify(publicResearchCapture.publicRequests[3]?.input);
-    expect(isolatedPublicConceptInput).toContain("access token");
-    expect(isolatedPublicConceptInput).toContain("password managers");
-    expect(isolatedPublicConceptInput).toContain("confirmation code format");
-    expect(isolatedPublicConceptInput).toContain(PUBLIC_CONCEPT_URL);
+    expect(publicResearchCapture.queries[3]).toContain("access token");
+    expect(publicResearchCapture.queries[3]).toContain("password managers");
+    expect(publicResearchCapture.queries[3]).toContain("confirmation code format");
+    expect(publicResearchCapture.queries[3]).toContain(PUBLIC_CONCEPT_URL);
     expect(harness.linq.messages.some((message) => message.text === PUBLIC_CONCEPT_REPLY)).toBe(true);
     const reactionsAfterPublicResearch = harness.linq.reactions.length;
     await harness.accept("group", "clarification-only", CLARIFICATION_ONLY_REQUEST, "partner");
@@ -3096,7 +3544,22 @@ release("Florence parent journeys", () => {
         (assessment) => assessment.adult.adultId === harness.founderAdultId,
       )?.currentFacts,
     ).toEqual(
-      expect.arrayContaining([{ slot: PRIVATE_SCHOOL_FACT_SLOT, statement: INITIAL_PRIVATE_SCHOOL_FACT }]),
+      expect.arrayContaining([
+        expect.objectContaining({
+          slot: PRIVATE_SCHOOL_FACT_SLOT,
+          statement: INITIAL_PRIVATE_SCHOOL_FACT,
+        }),
+        expect.objectContaining({
+          slot: GOOGLE_RECIPE_SLOT,
+          statement: GOOGLE_RECIPE_STATEMENT,
+          memory: expect.objectContaining({
+            memoryKind: "artifact",
+            artifactKind: "recipe",
+            title: GOOGLE_RECIPE_TITLE,
+            details: GOOGLE_RECIPE_DETAILS,
+          }),
+        }),
+      ]),
     );
     expect(founderAfterFactUpdate.vault?.facts.find((fact) => fact.id === googleCorrectableFact.id)).toEqual(
       expect.objectContaining({
@@ -4258,10 +4721,58 @@ release("Florence parent journeys", () => {
   }, 90_000);
 
   test("keeps private context isolated while both parents can manage shared memory, Calendar, and group repair", async () => {
+    const recipeRequest =
+      "Save our weeknight sesame noodles recipe for the family: 12 ounces spaghetti, 3 tablespoons soy sauce, 1 tablespoon sesame oil, and 2 teaspoons rice vinegar. Toss while warm.";
+    const recipeQuestion = "How do we make that sesame noodle dinner for hectic evenings again?";
+    const recipeStatement = "Our family has a reusable weeknight sesame noodles recipe.";
+    const recipeTitle = "Weeknight sesame noodles";
+    const recipeDetails =
+      "Ingredients: 12 ounces spaghetti; 3 tablespoons soy sauce; 1 tablespoon sesame oil; 2 teaspoons rice vinegar. Method: cook the spaghetti and toss it with the sauce ingredients while warm.";
+    const recipeReply =
+      "Our weeknight sesame noodles use 12 ounces of spaghetti, 3 tablespoons soy sauce, 1 tablespoon sesame oil, and 2 teaspoons rice vinegar; toss everything while warm.";
+    let recipeSearchReturnedUsableDetails = false;
     const harness = await createHarness(async (input, reads) => {
       const text = input.currentMessage.text;
+      if (text === recipeRequest) {
+        return decision({
+          facts: [
+            {
+              operation: "remember",
+              factId: null,
+              statement: recipeStatement,
+              visibility: "household",
+              memory: {
+                memoryKind: "artifact",
+                artifactKind: "recipe",
+                title: recipeTitle,
+                details: recipeDetails,
+                tags: ["recipe", "noodles", "weeknight"],
+              },
+              sourceIds: [input.currentMessage.sourceId],
+            },
+          ],
+        });
+      }
+      if (text === recipeQuestion) {
+        const matches = await reads.searchFamilyMemory?.({
+          query: "hectic evening sesame noodle dinner preparation notes",
+          limit: 5,
+        });
+        recipeSearchReturnedUsableDetails =
+          matches?.some(
+            (source) =>
+              source.kind === "memory" &&
+              source.text.includes(recipeTitle) &&
+              source.text.includes("12 ounces spaghetti") &&
+              source.text.includes("toss it with the sauce ingredients while warm"),
+          ) ?? false;
+        if (!recipeSearchReturnedUsableDetails) {
+          throw new Error("The saved recipe did not return usable details through memory search");
+        }
+        return decision({ bubbles: [{ text: recipeReply, delayMs: 0 }] });
+      }
       if (text === "My private backup contact is Sam.") {
-        return decision({ facts: [remember(text, input.currentMessage.sourceId)] });
+        return decision({ facts: [remember(text, input.currentMessage.sourceId, "private")] });
       }
       if (text === "Tell Alex that pickup is at 3:15.") {
         return decision({
@@ -4273,7 +4784,7 @@ release("Florence parent journeys", () => {
         });
       }
       if (text === "Pickup is at 2:45.") {
-        return decision({ facts: [remember(text, input.currentMessage.sourceId)] });
+        return decision({ facts: [remember(text, input.currentMessage.sourceId, "household")] });
       }
       const pickupMemory = input.visibleSources.find(
         (source) => source.kind === "memory" && source.text.includes("Pickup is at"),
@@ -4285,6 +4796,14 @@ release("Florence parent journeys", () => {
               operation: "correct",
               factId: pickupMemory.recordId,
               statement: "Pickup is at 3:00.",
+              visibility: "household",
+              memory: {
+                memoryKind: "fact",
+                artifactKind: null,
+                title: null,
+                details: null,
+                tags: [],
+              },
               sourceIds: [input.currentMessage.sourceId],
             },
           ],
@@ -4297,6 +4816,8 @@ release("Florence parent journeys", () => {
               operation: "forget",
               factId: pickupMemory.recordId,
               statement: null,
+              visibility: null,
+              memory: null,
               sourceIds: [input.currentMessage.sourceId],
             },
           ],
@@ -4324,6 +4845,11 @@ release("Florence parent journeys", () => {
           bubbles: [
             { text: "I checked every personal calendar; your family calendar stayed separate.", delayMs: 0 },
           ],
+        });
+      }
+      if (text === PRIVATE_CALENDAR_OWNER_APPROVAL) {
+        return decision({
+          bubbles: [{ text: PRIVATE_CALENDAR_OWNER_CONTRADICTION, delayMs: 0 }],
         });
       }
       if (text === "Add Maya pickup to the family calendar.") {
@@ -4359,6 +4885,39 @@ release("Florence parent journeys", () => {
     });
     await harness.readyHousehold();
 
+    await harness.accept("private", "save-family-recipe", recipeRequest);
+    await harness.drain();
+    const founderRecipe = (
+      await harness.florence.workspaceForAdult(harness.founderAdultId)
+    ).vault?.facts.find((fact) => fact.statement === recipeStatement);
+    const partnerRecipe = (
+      await harness.florence.workspaceForAdult(harness.partnerAdultId)
+    ).vault?.facts.find((fact) => fact.id === founderRecipe?.id);
+    expect(founderRecipe).toMatchObject({
+      memoryKind: "artifact",
+      artifactKind: "recipe",
+      title: recipeTitle,
+      details: recipeDetails,
+      tags: ["recipe", "noodles", "weeknight"],
+      visibility: "household",
+    });
+    expect(partnerRecipe).toMatchObject({
+      memoryKind: "artifact",
+      artifactKind: "recipe",
+      title: recipeTitle,
+      details: recipeDetails,
+      tags: ["recipe", "noodles", "weeknight"],
+      visibility: "household",
+    });
+    await harness.accept("private", "reuse-family-recipe", recipeQuestion, "partner");
+    await harness.drain();
+    expect(recipeSearchReturnedUsableDetails).toBe(true);
+    expect(
+      harness.linq.messages.some(
+        (message) => message.providerConversationId === PRIVATE_PARTNER && message.text === recipeReply,
+      ),
+    ).toBe(true);
+
     await harness.accept("private", "private-all-calendar-read", "What is on all of my calendars tomorrow?");
     await harness.drain();
     const privateAllCalendarReads = harness.state.personalCalendarReads.filter(
@@ -4386,6 +4945,21 @@ release("Florence parent journeys", () => {
     harness.state.now += 2 * 60_000;
     await harness.drain();
     expect(harness.state.privateCalendarAnniversaryDelivered).toBe(true);
+    const privateCalendarAssessment = [...harness.state.googleAssessments]
+      .reverse()
+      .find((assessment) =>
+        assessment.evidence.calendar.events.some(
+          (event) => event.title === PRIVATE_CALENDAR_ANNIVERSARY_TITLE,
+        ),
+      );
+    expect(privateCalendarAssessment?.memory).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          label: recipeTitle,
+          text: expect.stringContaining(recipeDetails),
+        }),
+      ]),
+    );
     const privateCalendarAnniversaryMessages = harness.linq.messages.slice(
       messagesBeforePrivateCalendarAnniversary,
     );
@@ -4472,6 +5046,16 @@ release("Florence parent journeys", () => {
     );
     await harness.drain();
     const ownerApprovedMessages = harness.linq.messages.slice(messagesBeforeOwnerCalendarApproval);
+    expect(
+      ownerApprovedMessages.filter(
+        (message) =>
+          message.providerConversationId === PRIVATE_FOUNDER &&
+          message.text === PRIVATE_CALENDAR_OWNER_APPROVAL_REPLY,
+      ),
+    ).toHaveLength(1);
+    expect(ownerApprovedMessages.map((message) => message.text)).not.toContain(
+      PRIVATE_CALENDAR_OWNER_CONTRADICTION,
+    );
     const groupCalendarConfirmation = ownerApprovedMessages.find(
       (message) =>
         message.providerConversationId === FAMILY_GROUP &&
@@ -5328,6 +5912,7 @@ class FakeLinq {
   readonly createChatAttempts: LinqCreateChat[] = [];
   readonly messages: LinqSendMessage[] = [];
   readonly sendMessageAttempts: LinqSendMessage[] = [];
+  readonly moves: LinqSendMove[] = [];
   readonly reactions: LinqSendReaction[] = [];
   readonly media = new Map<string, { reference: LinqMediaReference; bytes: Uint8Array }>();
   #partnerInitialPromptBarrier: {
@@ -5484,6 +6069,27 @@ class FakeLinq {
 
   async setTyping(): Promise<boolean> {
     return true;
+  }
+
+  async markRead(): Promise<boolean> {
+    return true;
+  }
+
+  async sendMove(input: LinqSendMove) {
+    const prior = this.ledger.sent.get(input.idempotencyKey);
+    if (prior) return prior;
+    this.moves.push(input);
+    this.ledger.nextMessageReceipt += 1;
+    const result = {
+      status: "committed" as const,
+      providerState: "sent" as const,
+      idempotencyKey: input.idempotencyKey,
+      providerReceiptId: `native-${this.ledger.nextMessageReceipt}`,
+      detail: null,
+      occurredAt: new Date(this.state.now).toISOString(),
+    };
+    this.ledger.sent.set(input.idempotencyKey, result);
+    return result;
   }
 
   async sendMessage(input: LinqSendMessage) {
@@ -5718,6 +6324,8 @@ async function createHarness(
     cancelledMonitorSourceId: null,
     setupConversationFailuresRemaining: 0,
     founderProductRecenterReview: false,
+    googleRecipeArtifactExercise: false,
+    proactiveFamilyWorkExercise: false,
     familyCalendarProvisioningFailuresRemaining: 0,
     invalidGrantAdultId: null,
     invalidGrantTriggered: false,
@@ -5881,6 +6489,7 @@ function createReasoner(
       const founder = input.adult.firstName === "Hari";
       const unrelated = gmail.filter((source) => source.subject === UNRELATED_ACCOUNT_EMAIL_SUBJECT);
       const eligibleGmail = gmail.filter((source) => source.subject !== UNRELATED_ACCOUNT_EMAIL_SUBJECT);
+      const recipeSource = eligibleGmail.find((source) => source.subject === GOOGLE_RECIPE_SUBJECT);
       const paginatedCalendarSource = calendar.find((source) => source.title === PAGINATED_CALENDAR_TITLE);
       if (paginatedCalendarSource) {
         return {
@@ -5888,7 +6497,7 @@ function createReasoner(
             {
               privateSummary: PAGINATED_CALENDAR_FOLLOW_UP,
               actionAnchor: PAGINATED_CALENDAR_TITLE,
-              familyRelevance: "child_care_school_or_activity" as const,
+              familyRelevance: "household" as const,
               sourceIds: [paginatedCalendarSource.sourceId],
               urgency: "watch" as const,
               dueAt: "2026-09-03T17:00:00.000Z",
@@ -5923,7 +6532,7 @@ function createReasoner(
             {
               privateSummary: PRIVATE_CALENDAR_GENERIC_TODAY_REPLY,
               actionAnchor: PRIVATE_INITIAL_CALENDAR_ONLY_EVENT.title,
-              familyRelevance: "child_care_school_or_activity" as const,
+              familyRelevance: "household" as const,
               sourceIds: calendar.map((source) => source.sourceId),
               urgency: "soon" as const,
               dueAt: null,
@@ -5937,7 +6546,7 @@ function createReasoner(
           dismissedSourceIds: [],
         };
       }
-      const source = eligibleGmail[0];
+      const source = eligibleGmail.find((candidate) => candidate.subject !== GOOGLE_RECIPE_SUBJECT);
       if (!source) {
         const ownerPrivateSource = unrelated[0];
         if (founder && state.initialUnrelatedAccountReview && ownerPrivateSource) {
@@ -5980,7 +6589,7 @@ function createReasoner(
             : "Hari’s private school email has the original form."
           : "Alex’s private school email has the permission-slip deadline.",
         actionAnchor: founder ? "field-trip form" : "permission-slip deadline",
-        familyRelevance: "child_care_school_or_activity" as const,
+        familyRelevance: "household" as const,
         sourceIds: [source.sourceId],
         urgency: "soon" as const,
         dueAt: "2026-08-19T16:00:00.000Z",
@@ -6018,7 +6627,7 @@ function createReasoner(
                 ? "The school form still needs confirmation on Hari’s side."
                 : "Florence is watching for confirmation that Maya’s field-trip form is signed.",
               actionAnchor: "Muir Elementary",
-              familyRelevance: "child_care_school_or_activity" as const,
+              familyRelevance: "household" as const,
               sourceIds: [source.sourceId],
               urgency: "soon" as const,
               dueAt: "2026-08-19T16:00:00.000Z",
@@ -6043,7 +6652,7 @@ function createReasoner(
             {
               privateSummary: "The fall activity registration window opens Wednesday.",
               actionAnchor: "activity registration window",
-              familyRelevance: "child_care_school_or_activity" as const,
+              familyRelevance: "household" as const,
               sourceIds: [source.sourceId],
               urgency: "soon" as const,
               dueAt: "2026-08-20T16:00:00.000Z",
@@ -6061,7 +6670,7 @@ function createReasoner(
             {
               privateSummary: "Friday’s pickup handoff has not been assigned.",
               actionAnchor: "pickup handoff",
-              familyRelevance: "household_logistics" as const,
+              familyRelevance: "household" as const,
               sourceIds: [source.sourceId],
               urgency: "soon" as const,
               dueAt: "2026-08-21T21:45:00.000Z",
@@ -6081,7 +6690,7 @@ function createReasoner(
                 ? "One more private school detail remains unresolved."
                 : PRIVATE_INITIAL_ONLY_FINDING,
               actionAnchor: "private school detail",
-              familyRelevance: "child_care_school_or_activity" as const,
+              familyRelevance: "owner_private" as const,
               sourceIds: [source.sourceId],
               urgency: "watch" as const,
               dueAt: null,
@@ -6096,7 +6705,7 @@ function createReasoner(
             {
               privateSummary: "The fall activity registration window is also on Alex’s side.",
               actionAnchor: "activity registration window",
-              familyRelevance: "child_care_school_or_activity" as const,
+              familyRelevance: "household" as const,
               sourceIds: [source.sourceId],
               urgency: "soon" as const,
               dueAt: "2026-08-20T16:00:00.000Z",
@@ -6114,7 +6723,7 @@ function createReasoner(
             {
               privateSummary: "The family meeting is on Alex’s calendar for Tuesday evening.",
               actionAnchor: "family meeting",
-              familyRelevance: "household_logistics" as const,
+              familyRelevance: "household" as const,
               sourceIds: [source.sourceId],
               urgency: "watch" as const,
               dueAt: "2026-09-01T15:00:00.000Z",
@@ -6136,13 +6745,15 @@ function createReasoner(
           {
             slot: founder ? PRIVATE_SCHOOL_FACT_SLOT : PARTNER_PRIVATE_GOOGLE_FACT_SLOT,
             statement: founder ? INITIAL_PRIVATE_SCHOOL_FACT : PARTNER_PRIVATE_GOOGLE_FACT,
-            familyRelevance: "child_care_school_or_activity" as const,
+            memory: googleFactMemory(founder ? INITIAL_PRIVATE_SCHOOL_FACT : PARTNER_PRIVATE_GOOGLE_FACT),
+            familyRelevance: "household" as const,
             sourceIds: [source.sourceId],
           },
           {
             slot: SHARED_SCHOOL_CONTACT_SLOT,
             statement: SHARED_SCHOOL_CONTACT_FACT,
-            familyRelevance: "child_care_school_or_activity" as const,
+            memory: googleFactMemory(SHARED_SCHOOL_CONTACT_FACT),
+            familyRelevance: "household" as const,
             sourceIds: [source.sourceId],
           },
           ...(founder
@@ -6150,15 +6761,33 @@ function createReasoner(
                 {
                   slot: GOOGLE_CORRECTION_SLOT,
                   statement: GOOGLE_CORRECTION_FACT,
-                  familyRelevance: "child_care_school_or_activity" as const,
+                  memory: googleFactMemory(GOOGLE_CORRECTION_FACT),
+                  familyRelevance: "household" as const,
                   sourceIds: [source.sourceId],
                 },
               ]
             : []),
+          ...(recipeSource
+            ? [
+                {
+                  slot: GOOGLE_RECIPE_SLOT,
+                  statement: GOOGLE_RECIPE_STATEMENT,
+                  memory: {
+                    memoryKind: "artifact" as const,
+                    artifactKind: "recipe" as const,
+                    title: GOOGLE_RECIPE_TITLE,
+                    details: GOOGLE_RECIPE_DETAILS,
+                    tags: ["recipe", "noodles", "weeknight"],
+                  },
+                  familyRelevance: "household" as const,
+                  sourceIds: [recipeSource.sourceId],
+                },
+              ]
+            : []),
         ],
-        dismissedSourceIds: [...unrelated, ...calendar, ...eligibleGmail.slice(1)].map(
-          (candidate) => candidate.sourceId,
-        ),
+        dismissedSourceIds: [...unrelated, ...calendar, ...eligibleGmail]
+          .filter((candidate) => candidate.sourceId !== source.sourceId && candidate !== recipeSource)
+          .map((candidate) => candidate.sourceId),
       };
     },
     synthesizeHouseholdBriefing: async (
@@ -6166,16 +6795,34 @@ function createReasoner(
     ) => {
       state.briefings.push(input);
       const selected = input.candidates.slice(0, 3);
+      const remaining = input.candidates.length - selected.length;
+      if (state.proactiveFamilyWorkExercise) {
+        expect(selected.length).toBeGreaterThan(0);
+        expect(
+          input.memory.some(
+            (item) => item.label === GOOGLE_RECIPE_TITLE && item.text.includes("keep it mild"),
+          ),
+        ).toBe(true);
+      }
       return {
         selectedCandidateIds: selected.map((candidate) => candidate.candidateId),
         bubbles: [
           {
-            text: `Here’s what I found:\n${selected
-              .map((candidate) => `– ${candidate.summary}`)
-              .join("\n")}\n\nDid I get that right? If I missed something, tell me here.`,
+            text: `Here’s what I found:\n${selected.map((candidate) => `– ${candidate.summary}`).join("\n")}${
+              remaining > 0
+                ? `\n\nI kept ${remaining} lower-priority items on the docket too. Ask me anytime.`
+                : ""
+            }${state.proactiveFamilyWorkExercise ? `\n\n${PROACTIVE_FAMILY_WORK_KICKOFF}` : ""}\n\nDid I get that right? If I missed something, tell me here.`,
             delayMs: 0,
           },
         ],
+        nextJob: state.proactiveFamilyWorkExercise
+          ? {
+              objective: PROACTIVE_FAMILY_WORK_OBJECTIVE,
+              kickoffBubbleIndex: 0,
+              candidateIds: selected.slice(0, 1).map((candidate) => candidate.candidateId),
+            }
+          : null,
       };
     },
     assessGoogleChanges: async (input: Parameters<FlorenceReasoner["assessGoogleChanges"]>[0]) => {
@@ -6218,7 +6865,7 @@ function createReasoner(
               {
                 privateDetail: null,
                 actionAnchor: FAMILY_CALENDAR_MIXED_CHANGE_TITLE,
-                familyRelevance: "child_care_school_or_activity" as const,
+                familyRelevance: "household" as const,
                 householdConclusion: {
                   category: "family_date" as const,
                   summary: FAMILY_CALENDAR_MIXED_CHANGE_SUMMARY,
@@ -6242,7 +6889,7 @@ function createReasoner(
                 {
                   privateDetail: `${PRIVATE_CALENDAR_ADULT_TITLE} is on Tuesday.`,
                   actionAnchor: PRIVATE_CALENDAR_ADULT_TITLE,
-                  familyRelevance: "household_logistics" as const,
+                  familyRelevance: "household" as const,
                   householdConclusion: {
                     category: "loose_end" as const,
                     summary: `${PRIVATE_CALENDAR_ADULT_TITLE} is on Tuesday at ${PRIVATE_CALENDAR_ADULT_EVENT.location}.`,
@@ -6277,7 +6924,7 @@ function createReasoner(
                   {
                     privateDetail: `${PRIVATE_CALENDAR_ANNIVERSARY_TITLE} is on Monday.`,
                     actionAnchor: PRIVATE_CALENDAR_ANNIVERSARY_TITLE,
-                    familyRelevance: "household_logistics" as const,
+                    familyRelevance: "household" as const,
                     householdConclusion: {
                       category: "family_date" as const,
                       summary: `${PRIVATE_CALENDAR_ANNIVERSARY_TITLE} is on Monday at ${PRIVATE_CALENDAR_ANNIVERSARY_EVENT.location}.`,
@@ -6332,7 +6979,7 @@ function createReasoner(
                       {
                         privateDetail: PRIVATE_CALENDAR_GENERIC_TODAY_REPLY,
                         actionAnchor: PRIVATE_CALENDAR_ONLY_TITLE,
-                        familyRelevance: "child_care_school_or_activity" as const,
+                        familyRelevance: "household" as const,
                         householdConclusion: {
                           category: "conflict" as const,
                           summary: `${PRIVATE_CALENDAR_ONLY_TITLE} overlaps ${PRIVATE_CALENDAR_CONFLICT_TITLE}.`,
@@ -6353,7 +7000,7 @@ function createReasoner(
                         {
                           privateDetail: GOOGLE_DELETION_PRIVATE_ALERT,
                           actionAnchor: "emergency card",
-                          familyRelevance: "child_care_school_or_activity" as const,
+                          familyRelevance: "household" as const,
                           householdConclusion: null,
                           sourceIds: [deletionSource.sourceId],
                           urgency: "soon" as const,
@@ -6373,7 +7020,7 @@ function createReasoner(
                         {
                           privateDetail: null,
                           actionAnchor: GOOGLE_DELETION_FAMILY_DATE.title,
-                          familyRelevance: "child_care_school_or_activity" as const,
+                          familyRelevance: "household" as const,
                           householdConclusion: null,
                           sourceIds: [deletionSource.sourceId],
                           urgency: "soon" as const,
@@ -6393,6 +7040,7 @@ function createReasoner(
               {
                 slot: UNRELATED_ACCOUNT_FACT_SLOT,
                 statement: UNRELATED_ACCOUNT_FACT,
+                memory: googleFactMemory(UNRELATED_ACCOUNT_FACT),
                 familyRelevance: "owner_private" as const,
                 sourceIds: [unrelatedAccountSource.sourceId],
               },
@@ -6402,7 +7050,8 @@ function createReasoner(
                 {
                   slot: PRIVATE_CALENDAR_FACT_SLOT,
                   statement: PRIVATE_CALENDAR_FACT,
-                  familyRelevance: "child_care_school_or_activity" as const,
+                  memory: googleFactMemory(PRIVATE_CALENDAR_FACT),
+                  familyRelevance: "household" as const,
                   sourceIds: [calendarOnlySource.sourceId],
                 },
               ]
@@ -6411,7 +7060,8 @@ function createReasoner(
                   {
                     slot: GOOGLE_DELETION_FACT_SLOT,
                     statement: GOOGLE_DELETION_FACT,
-                    familyRelevance: "child_care_school_or_activity" as const,
+                    memory: googleFactMemory(GOOGLE_DELETION_FACT),
+                    familyRelevance: "household" as const,
                     sourceIds: [deletionSource.sourceId],
                   },
                 ]
@@ -6420,13 +7070,15 @@ function createReasoner(
                     {
                       slot: PRIVATE_SCHOOL_FACT_SLOT,
                       statement: UPDATED_PRIVATE_SCHOOL_FACT,
-                      familyRelevance: "child_care_school_or_activity" as const,
+                      memory: googleFactMemory(UPDATED_PRIVATE_SCHOOL_FACT),
+                      familyRelevance: "household" as const,
                       sourceIds: [source.sourceId],
                     },
                     {
                       slot: GOOGLE_CORRECTION_SLOT,
                       statement: GOOGLE_CORRECTION_FACT,
-                      familyRelevance: "child_care_school_or_activity" as const,
+                      memory: googleFactMemory(GOOGLE_CORRECTION_FACT),
+                      familyRelevance: "household" as const,
                       sourceIds: [source.sourceId],
                     },
                   ]
@@ -6435,7 +7087,8 @@ function createReasoner(
                       {
                         slot: OVERLAP_GMAIL_FACT_SLOT,
                         statement: "Maya’s school bus route reminder is current.",
-                        familyRelevance: "child_care_school_or_activity" as const,
+                        memory: googleFactMemory("Maya’s school bus route reminder is current."),
+                        familyRelevance: "household" as const,
                         sourceIds: [overlap.sourceId],
                       },
                     ]
@@ -6765,6 +7418,22 @@ function createGoogle(store: PostgresFlorenceStore, state: HarnessState): Google
         attachmentsStatus: "complete" as const,
         attachments: !initialUnrelatedAccount && founder ? [SCHOOL_ATTACHMENT] : [],
       };
+      const recipe = {
+        messageId: "gmail-family-sesame-noodles-recipe",
+        threadId: "thread-gmail-family-sesame-noodles-recipe",
+        historyId: "102",
+        from: "family-recipes@example.test",
+        subject: GOOGLE_RECIPE_SUBJECT,
+        sentAt: new Date(Date.parse(input.before) - 500).toISOString(),
+        text: `${GOOGLE_RECIPE_STATEMENT} ${GOOGLE_RECIPE_DETAILS}`,
+        textStatus: "complete" as const,
+        attachmentsStatus: "complete" as const,
+        attachments: [],
+      };
+      const recipeMessages =
+        state.googleRecipeArtifactExercise && founder && input.connectionId === FOUNDER_GOOGLE
+          ? [recipe]
+          : [];
       if (state.completeScanPaginationExercise && founder && input.connectionId === FOUNDER_GOOGLE) {
         if (input.pageToken === undefined) {
           return {
@@ -6788,7 +7457,7 @@ function createGoogle(store: PostgresFlorenceStore, state: HarnessState): Google
       } else {
         expect(input.pageToken).toBeUndefined();
       }
-      return { status: "complete" as const, nextPageToken: null, messages: [relevant] };
+      return { status: "complete" as const, nextPageToken: null, messages: [relevant, ...recipeMessages] };
     },
     readCalendarBaselineTargetsPage: async (input: {
       householdId: string;
@@ -7531,6 +8200,7 @@ function decision(
   input: {
     reaction?: FlorenceDecision["conversation"]["reaction"];
     bubbles?: FlorenceDecision["conversation"]["bubbles"];
+    nativeMoves?: FlorenceDecision["conversation"]["nativeMoves"];
     facts?: FlorenceDecision["facts"];
     followUp?: FlorenceDecision["followUp"];
     reminder?: FlorenceDecision["reminder"];
@@ -7549,6 +8219,7 @@ function decision(
       replyToCurrentMessage: false,
       reaction: input.reaction ?? null,
       bubbles: input.bubbles ?? [],
+      nativeMoves: input.nativeMoves ?? null,
     },
     facts: input.facts ?? [],
     followUp: input.followUp ?? null,
@@ -7563,8 +8234,35 @@ function decision(
   };
 }
 
-function remember(statement: string, sourceId: string): FlorenceDecision["facts"][number] {
-  return { operation: "remember", factId: null, statement, sourceIds: [sourceId] };
+function remember(
+  statement: string,
+  sourceId: string,
+  visibility: "private" | "household",
+): FlorenceDecision["facts"][number] {
+  return {
+    operation: "remember",
+    factId: null,
+    statement,
+    visibility,
+    memory: {
+      memoryKind: "fact",
+      artifactKind: null,
+      title: null,
+      details: null,
+      tags: [],
+    },
+    sourceIds: [sourceId],
+  };
+}
+
+function googleFactMemory(statement: string) {
+  return {
+    memoryKind: "fact" as const,
+    artifactKind: null,
+    title: null,
+    details: statement,
+    tags: [],
+  };
 }
 
 function calendarDecision(

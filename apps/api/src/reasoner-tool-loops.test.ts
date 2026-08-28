@@ -52,7 +52,70 @@ function familyWorkOrigin(text: string, speaker = "adult-1"): FamilyWorkOriginCo
 }
 
 describe("Florence reasoner capability cutover", () => {
-  test("ordinary parent turns cannot use a reaction as their whole response", async () => {
+  test("the model can choose a native group mention and poll within one human-sized turn", async () => {
+    const requests: Record<string, unknown>[] = [];
+    const decision = ordinaryDecision();
+    decision.conversation.bubbles = [];
+    decision.conversation.nativeMoves = [
+      { type: "mention", text: "Jackson, which night works best?", adultDisplayName: "Jackson" },
+      {
+        type: "poll",
+        question: "Dinner this week?",
+        options: ["Tuesday", "Thursday"],
+      },
+    ];
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        stream: (request: Record<string, unknown>) => {
+          requests.push(request);
+          return fakeStream({ status: "completed", output_parsed: decision, output: [] });
+        },
+      },
+    } as never);
+    const input = foregroundInput();
+    input.audience = "group";
+    input.googleConnections = [
+      { emailLabel: "Family", calendarAvailable: true, kind: "family", writesEnabled: false },
+    ];
+
+    const result = await reasoner.decide(input, inertReads());
+
+    expect(result.conversation.nativeMoves).toEqual(decision.conversation.nativeMoves);
+    expect(String(requests[0]?.instructions)).toContain("conversation.nativeMoves");
+    expect(String(requests[0]?.instructions)).toContain("three physical sends");
+  });
+
+  test("native rich links and custom reactions stay grounded in exact research and Message sources", async () => {
+    const decision = ordinaryDecision({ researchUrls: [PUBLIC_URL] });
+    decision.conversation.bubbles = [];
+    decision.conversation.nativeMoves = [
+      { type: "rich_link", url: PUBLIC_URL },
+      {
+        type: "reaction",
+        operation: "add",
+        targetSourceId: "turn-1",
+        partIndex: 0,
+        reaction: { type: "custom", emoji: "🙌" },
+      },
+    ];
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        stream: () =>
+          fakeStream({
+            status: "completed",
+            output_parsed: decision,
+            output: [completedWebSearch(PUBLIC_URL)],
+          }),
+      },
+    } as never);
+
+    const result = await reasoner.decide(foregroundInput(), inertReads());
+
+    expect(result.conversation.nativeMoves).toEqual(decision.conversation.nativeMoves);
+    expect(result.researchUrls).toEqual([PUBLIC_URL]);
+  });
+
+  test("a natural reaction can be the whole visible move for a low-content acknowledgement", async () => {
     const decision = ordinaryDecision();
     decision.conversation.reaction = "like";
     decision.conversation.bubbles = [];
@@ -62,9 +125,23 @@ describe("Florence reasoner capability cutover", () => {
       },
     } as never);
 
+    await expect(reasoner.decide(foregroundInput(), inertReads())).resolves.toMatchObject({
+      conversation: { reaction: "like", bubbles: [] },
+    });
+  });
+
+  test("ordinary parent turns still cannot be totally silent", async () => {
+    const decision = ordinaryDecision();
+    decision.conversation.bubbles = [];
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        stream: () => fakeStream({ status: "completed", output_parsed: decision, output: [] }),
+      },
+    } as never);
+
     await expect(reasoner.decide(foregroundInput(), inertReads())).rejects.toMatchObject({
       code: "invalid_output",
-      message: expect.stringContaining("no bubble or application-owned outcome"),
+      message: expect.stringContaining("no visible conversational move"),
     });
   });
 
@@ -194,36 +271,24 @@ describe("Florence reasoner capability cutover", () => {
                   status: "completed",
                   output_parsed: null,
                   output: [
-                    functionCall("find-trip", "research_public_web", {
-                      query: "school field trip permission form deadline",
-                    }),
+                    completedWebSearch(
+                      searchUrl,
+                      "school field trip permission form deadline",
+                      "field-trip-search",
+                    ),
+                    functionCall("open-trip", "read_public_page", { url: searchUrl }),
                   ],
                 }
-              : modelTurn === 2
-                ? {
-                    status: "completed",
-                    output_parsed: null,
-                    output: [functionCall("open-trip", "read_public_page", { url: searchUrl })],
-                  }
-                : {
-                    status: "completed",
-                    output_parsed: ordinaryDecision({
-                      bubbleText: "The permission form is due Tuesday at 3 PM.",
-                      researchUrls: [searchUrl],
-                    }),
-                    output: [],
-                  },
+              : {
+                  status: "completed",
+                  output_parsed: ordinaryDecision({
+                    bubbleText: "The permission form is due Tuesday at 3 PM.",
+                    researchUrls: [searchUrl],
+                  }),
+                  output: [],
+                },
           );
         },
-        parse: () => ({
-          status: "completed",
-          output_parsed: {
-            outcome: "result",
-            summary: "The school posted a field-trip page.",
-            urls: [searchUrl],
-          },
-          output: [completedWebSearch(searchUrl)],
-        }),
       },
     } as never);
 
@@ -236,11 +301,14 @@ describe("Florence reasoner capability cutover", () => {
     });
 
     expect(result.conversation.bubbles[0]?.text).toContain("Tuesday at 3 PM");
-    expect(JSON.stringify(requests[2]?.input)).toContain("Permission form due Tuesday at 3 PM");
+    expect(JSON.stringify(requests[1]?.input)).toContain("Permission form due Tuesday at 3 PM");
+    expect(requests[0]?.tools).toEqual(
+      expect.arrayContaining([expect.objectContaining({ type: "web_search" })]),
+    );
     expect(result.researchUrls).toEqual([searchUrl]);
   });
 
-  test("durable work reads a linked PDF at a persisted checkpoint", async () => {
+  test("durable work composes a linked PDF read inline before answering", async () => {
     const pdfUrl = "https://school.example/forms/field-trip.pdf";
     const modelRequests: Record<string, unknown>[] = [];
     const modelResponses = [
@@ -280,7 +348,6 @@ describe("Florence reasoner capability cutover", () => {
       continuationItems: [],
       pendingCall: null,
       steering: [],
-      publicMapResearchContext: [],
       progressRevision: 0,
       terminal: null,
     };
@@ -382,14 +449,7 @@ describe("Florence reasoner capability cutover", () => {
       }),
     };
 
-    const planned = await reasoner.continueFamilyWork(input, reads);
-    if (planned.kind !== "continue") throw new Error("Durable PDF read was not planned");
-    expect(planned.state).toMatchObject({ phase: "tool_pending" });
-    const read = await reasoner.continueFamilyWork({ ...input, state: planned.state }, reads);
-    if (read.kind !== "continue") throw new Error("Durable PDF read did not settle");
-    expect(JSON.stringify(read.state.continuationItems)).toContain("Parent signature required");
-    expect(Buffer.byteLength(JSON.stringify(read.state))).toBeLessThan(240 * 1024);
-    const terminal = await reasoner.continueFamilyWork({ ...input, state: read.state }, reads);
+    const terminal = await reasoner.continueFamilyWork(input, reads);
     expect(terminal).toMatchObject({
       kind: "terminal",
       outcome: "succeeded",
@@ -402,8 +462,9 @@ describe("Florence reasoner capability cutover", () => {
     expect(JSON.stringify(modelRequests[0]?.input)).toContain("Which form should I use?");
     expect(JSON.stringify(modelRequests[0]?.input)).toContain('"type":"input_image"');
     expect(JSON.stringify(modelRequests[0]?.input)).toContain('"type":"input_file"');
-    expect(JSON.stringify(modelRequests[1]?.input)).not.toContain('"type":"input_image"');
-    expect(JSON.stringify(modelRequests[1]?.input)).not.toContain('"type":"input_file"');
+    expect(JSON.stringify(modelRequests[1]?.input)).toContain("Parent signature required");
+    expect(JSON.stringify(modelRequests[1]?.input)).toContain('"type":"input_image"');
+    expect(JSON.stringify(modelRequests[1]?.input)).toContain('"type":"input_file"');
   });
 
   test("durable household work calls a business and reports the transcript-backed outcome", async () => {
@@ -505,7 +566,6 @@ describe("Florence reasoner capability cutover", () => {
         continuationItems: [],
         pendingCall: null,
         steering: [],
-        publicMapResearchContext: [],
         progressRevision: 0,
         terminal: null,
       },
@@ -545,8 +605,8 @@ describe("Florence reasoner capability cutover", () => {
     if (plannedCall.kind !== "continue") throw new Error("Dentist call was not planned");
     const started = await reasoner.continueFamilyWork({ ...input, state: plannedCall.state }, reads);
     if (started.kind !== "continue") throw new Error("Dentist call did not start");
-    expect(started.progressText).toContain("placed the call");
-    expect(started.nextCheckDelayMs).toBe(5_000);
+    expect(started.progressText).toBeNull();
+    expect(started.nextCheckDelayMs).toBe(0);
     expect(started.state.activePhoneCall).toEqual({
       provider: "bland",
       kind: "agent",
@@ -628,7 +688,6 @@ describe("Florence reasoner capability cutover", () => {
           attempt: 1,
         },
         steering: [],
-        publicMapResearchContext: [],
         progressRevision: 0,
         terminal: null,
       },
@@ -724,7 +783,6 @@ describe("Florence reasoner capability cutover", () => {
           attempt: 1,
         },
         steering: [],
-        publicMapResearchContext: [],
         progressRevision: 0,
         terminal: null,
       },
@@ -767,7 +825,7 @@ describe("Florence reasoner capability cutover", () => {
       outcome: "deferred",
       text: null,
       resumeAt: "2026-08-27T22:00:00.000Z",
-      progressText: "I’m still waiting for the dentist’s reply.",
+      progressText: null,
     } as const;
     const modelResponses = [
       {
@@ -887,7 +945,6 @@ describe("Florence reasoner capability cutover", () => {
         continuationItems: [],
         pendingCall: null,
         steering: [],
-        publicMapResearchContext: [],
         progressRevision: 0,
         terminal: null,
       },
@@ -1126,7 +1183,6 @@ describe("Florence reasoner capability cutover", () => {
       continuationItems: [],
       pendingCall: null,
       steering: [],
-      publicMapResearchContext: [],
       progressRevision: 0,
       terminal: null,
     };
@@ -1243,7 +1299,7 @@ describe("Florence reasoner capability cutover", () => {
     if (navigationPlanned.kind !== "continue") throw new Error("Portal navigation was not planned");
     const navigated = await reasoner.continueFamilyWork({ ...input, state: navigationPlanned.state }, reads);
     if (navigated.kind !== "continue") throw new Error("Portal navigation did not settle");
-    expect(navigated.progressText).toContain("Family Camp Portal");
+    expect(navigated).toMatchObject({ progressText: null, nextCheckDelayMs: 0 });
 
     const handoffPlanned = await reasoner.continueFamilyWork({ ...input, state: navigated.state }, reads);
     if (handoffPlanned.kind !== "continue") throw new Error("Portal handoff was not planned");
@@ -1317,6 +1373,9 @@ describe("Florence reasoner capability cutover", () => {
     expect(
       browserOperations.filter((operation) => operation.kind === "click" && operation.ref === "e12"),
     ).toHaveLength(1);
+    expect(
+      modelRequests.every((request) => JSON.stringify(request.input).includes('"type":"input_file"')),
+    ).toBe(true);
     expect(JSON.stringify(modelRequests[3]?.input)).toContain("I’m signed in—keep going.");
     expect(awaitingApproval.question).toContain("June 15–19, 2027");
     expect(JSON.stringify(modelRequests[8]?.input)).toContain("Yes—submit this exact registration now.");
@@ -1681,57 +1740,42 @@ describe("Florence reasoner capability cutover", () => {
                   status: "completed",
                   output_parsed: null,
                   output: [
-                    functionCall("flight-status", "research_public_web", {
-                      query: "DL 747 status route tonight JFK LAX",
+                    completedWebSearch(
+                      statusUrl,
+                      "DL 747 status route tonight JFK LAX",
+                      "flight-status-search",
+                    ),
+                    functionCall("flight-options", "flights_search", {
+                      origin: "JFK",
+                      destination: "LAX",
+                      departureDate: "2026-08-27",
+                      returnDate: null,
+                      adults: 1,
+                      children: 0,
+                      infants: 0,
+                      cabinClass: "economy",
+                      preferredAirlines: [],
+                      maxStops: 0,
+                      outboundDepartureHours: { from: 17, to: 23 },
+                      maxPrice: null,
+                      allowSelfTransfer: false,
+                      allowOvernightStopovers: false,
+                      allowAirportChanges: false,
+                      sort: "quality",
                     }),
                   ],
                 }
-              : modelTurn === 2
-                ? {
-                    status: "completed",
-                    output_parsed: null,
-                    output: [
-                      functionCall("flight-options", "flights_search", {
-                        origin: "JFK",
-                        destination: "LAX",
-                        departureDate: "2026-08-27",
-                        returnDate: null,
-                        adults: 1,
-                        children: 0,
-                        infants: 0,
-                        cabinClass: "economy",
-                        preferredAirlines: [],
-                        maxStops: 0,
-                        outboundDepartureHours: { from: 17, to: 23 },
-                        maxPrice: null,
-                        allowSelfTransfer: false,
-                        allowOvernightStopovers: false,
-                        allowAirportChanges: false,
-                        sort: "quality",
-                      }),
-                    ],
-                  }
-                : {
-                    status: "completed",
-                    output_parsed: ordinaryDecision({
-                      bubbleText:
-                        "DL 747 is delayed tonight from JFK to LAX. I found a direct alternative leaving at 7:00 PM for $412.",
-                      researchUrls: [statusUrl, bookingUrl],
-                    }),
-                    output: [],
-                  },
+              : {
+                  status: "completed",
+                  output_parsed: ordinaryDecision({
+                    bubbleText:
+                      "DL 747 is delayed tonight from JFK to LAX. I found a direct alternative leaving at 7:00 PM for $412.",
+                    researchUrls: [statusUrl, bookingUrl],
+                  }),
+                  output: [],
+                },
           );
         },
-        parse: () => ({
-          status: "completed",
-          output_parsed: {
-            outcome: "result",
-            summary:
-              "DL 747 on August 27, 2026 is delayed from JFK to LAX; scheduled 5:30 PM local departure and 8:46 PM local arrival.",
-            urls: [statusUrl],
-          },
-          output: [completedWebSearch(statusUrl)],
-        }),
       },
     } as never);
     const input = foregroundInput();
@@ -1775,7 +1819,7 @@ describe("Florence reasoner capability cutover", () => {
     );
     expect(workStarts).toBe(1);
     expect(
-      functionOutputEnvelopes(requests[2]).find((envelope) => envelope.callId === "flight-options"),
+      functionOutputEnvelopes(requests[1]).find((envelope) => envelope.callId === "flight-options"),
     ).toMatchObject({
       outcome: "succeeded",
       output: {
@@ -1794,21 +1838,15 @@ describe("Florence reasoner capability cutover", () => {
     const firstResponses = [
       {
         status: "completed",
-        output_parsed: null,
-        output: [
-          functionCall("durable-flight-status", "research_public_web", {
-            query: "DL 747 live status route tonight",
-          }),
-        ],
-      },
-      {
-        status: "completed",
         output_parsed: {
-          outcome: "result",
-          summary: "DL 747 is delayed tonight from JFK to LAX.",
-          urls: [statusUrl],
+          outcome: "deferred",
+          text: null,
+          resumeAt: "2026-08-27T20:05:00.000Z",
+          progressText: null,
         },
-        output: [completedWebSearch(statusUrl)],
+        output: [
+          completedWebSearch(statusUrl, "DL 747 live status route tonight", "durable-flight-status-search"),
+        ],
       },
     ];
     const firstReasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
@@ -1833,7 +1871,6 @@ describe("Florence reasoner capability cutover", () => {
       continuationItems: [],
       pendingCall: null,
       steering: [],
-      publicMapResearchContext: [],
       progressRevision: 0,
       terminal: null,
     };
@@ -1860,46 +1897,20 @@ describe("Florence reasoner capability cutover", () => {
       currentTime: NOW,
     };
 
-    const plannedStatus = await firstReasoner.continueFamilyWork(input, {});
-    expect(plannedStatus).toMatchObject({ kind: "continue", state: { phase: "tool_pending" } });
-    if (plannedStatus.kind !== "continue") throw new Error("Status lookup was not planned");
-    const checkedStatus = await firstReasoner.continueFamilyWork(
-      { ...input, state: plannedStatus.state },
-      {},
-    );
+    const checkedStatus = await firstReasoner.continueFamilyWork(input, {});
     expect(checkedStatus).toMatchObject({
-      kind: "continue",
-      progressText: expect.stringContaining("DL 747 is delayed"),
-      state: { phase: "ready", progressRevision: 1 },
+      kind: "deferred",
+      progressText: null,
+      state: { phase: "ready", progressRevision: 0 },
     });
-    if (checkedStatus.kind !== "continue") throw new Error("Status lookup did not settle");
+    if (checkedStatus.kind !== "deferred") throw new Error("Status lookup did not settle inline");
+    expect(JSON.stringify(checkedStatus.state.continuationItems)).toContain(statusUrl);
+    expect(firstRequests[0]?.tools).toEqual(
+      expect.arrayContaining([expect.objectContaining({ type: "web_search" })]),
+    );
 
     const resumedRequests: Record<string, unknown>[] = [];
     const resumedResponses = [
-      {
-        status: "completed",
-        output_parsed: null,
-        output: [
-          functionCall("durable-flight-options", "flights_search", {
-            origin: "JFK",
-            destination: "LAX",
-            departureDate: "2026-08-27",
-            returnDate: null,
-            adults: 1,
-            children: 0,
-            infants: 0,
-            cabinClass: "economy",
-            preferredAirlines: ["DL"],
-            maxStops: 0,
-            outboundDepartureHours: { from: 17, to: 23 },
-            maxPrice: null,
-            allowSelfTransfer: false,
-            allowOvernightStopovers: false,
-            allowAirportChanges: false,
-            sort: "quality",
-          }),
-        ],
-      },
       {
         status: "completed",
         output_parsed: null,
@@ -1944,73 +1955,39 @@ describe("Florence reasoner capability cutover", () => {
       },
     } as never);
     let flightSearches = 0;
-    const plannedAlternatives = await resumedReasoner.continueFamilyWork(
-      { ...input, state: checkedStatus.state },
-      {
-        async runFlights() {
-          flightSearches += 1;
-          return flightResult(bookingUrl, 2);
-        },
-      },
-    );
-    expect(plannedAlternatives).toMatchObject({
-      kind: "continue",
-      state: { phase: "tool_pending" },
-    });
-    if (plannedAlternatives.kind !== "continue") throw new Error("Alternative search was not planned");
-    const steeredPendingState = steerFamilyWorkState(plannedAlternatives.state, {
+    const steeredState = steerFamilyWorkState(checkedStatus.state, {
       sourceId: "00000000-0000-4000-8000-000000000001",
       text: "JetBlue is fine too, but nothing before 7 PM.",
       occurredAt: "2026-08-27T20:01:00.000Z",
     });
-    expect(steeredPendingState).toMatchObject({
+    expect(steeredState).toMatchObject({
       phase: "ready",
       generation: 1,
       pendingCall: null,
     });
-    expect(JSON.stringify(steeredPendingState.continuationItems)).not.toContain("durable-flight-options");
-    expect(JSON.stringify(steeredPendingState.continuationItems)).toContain("durable-flight-status");
-    const replannedAlternatives = await resumedReasoner.continueFamilyWork(
-      { ...input, state: steeredPendingState },
-      {
-        async runFlights() {
-          flightSearches += 1;
-          return flightResult(bookingUrl, 2);
-        },
-      },
-    );
-    if (replannedAlternatives.kind !== "continue") {
-      throw new Error("Steered alternative search was not replanned");
-    }
-    const searchedAlternatives = await resumedReasoner.continueFamilyWork(
-      { ...input, state: replannedAlternatives.state },
-      {
-        async runFlights() {
-          flightSearches += 1;
-          return flightResult(bookingUrl, 2);
-        },
-      },
-    );
-    if (searchedAlternatives.kind !== "continue") throw new Error("Alternative search did not settle");
+    expect(JSON.stringify(steeredState.continuationItems)).toContain("durable-flight-status");
     const terminal = await resumedReasoner.continueFamilyWork(
-      { ...input, state: searchedAlternatives.state },
-      {},
+      { ...input, state: steeredState },
+      {
+        async runFlights() {
+          flightSearches += 1;
+          return flightResult(bookingUrl, 2);
+        },
+      },
     );
 
     expect(flightSearches).toBe(1);
-    expect(JSON.stringify(resumedRequests[1]?.input)).toContain(
+    expect(JSON.stringify(resumedRequests[0]?.input)).toContain(
       "JetBlue is fine too, but nothing before 7 PM.",
     );
-    expect(JSON.parse(replannedAlternatives.state.pendingCall?.argumentsJson ?? "{}")).toMatchObject({
-      departureDate: "2026-08-27",
-      preferredAirlines: ["DL", "B6"],
-      outboundDepartureHours: { from: 19, to: 23 },
-    });
+    expect(JSON.stringify(resumedRequests[1]?.input)).toContain(
+      '\\"preferredAirlines\\":[\\"DL\\",\\"B6\\"]',
+    );
     expect(terminal).toMatchObject({
       kind: "terminal",
       outcome: "succeeded",
       text: expect.stringContaining("1. Delta nonstop"),
-      state: { phase: "terminal", progressRevision: 2 },
+      state: { phase: "terminal", progressRevision: 1 },
     });
     if (terminal.kind !== "terminal") throw new Error("Durable flight work did not finish");
     expect(terminal.text).toContain("2. JetBlue nonstop");
@@ -2018,11 +1995,337 @@ describe("Florence reasoner capability cutover", () => {
     expect(terminal.text).toContain(secondBookingUrl);
   });
 
-  test("durable work ends cleanly before an oversized checkpoint can retry forever", async () => {
+  test("one durable household objective composes Vault, reminder, and Family Calendar receipts", async () => {
+    const calendarRef = "calendar-family";
+    const modelRequests: Record<string, unknown>[] = [];
+    const responses = [
+      {
+        status: "completed",
+        output_parsed: null,
+        output: [
+          functionCall("remember-dinner", "vault_work", {
+            operation: "remember",
+            factId: null,
+            statement: "Tuesday dinner is sheet-pan chicken with lemon potatoes.",
+            visibility: "household",
+            memory: {
+              memoryKind: "artifact",
+              artifactKind: "recipe",
+              title: "Sheet-pan chicken with lemon potatoes",
+              details: "Roast chicken thighs and lemon potatoes together at 425°F until browned.",
+              tags: ["dinner", "chicken"],
+            },
+            sourceIds: ["source-adult-1"],
+          }),
+        ],
+      },
+      {
+        status: "completed",
+        output_parsed: null,
+        output: [
+          functionCall("list-dinner-reminders", "reminder_work", {
+            operation: "list",
+            reminderId: null,
+            action: null,
+            schedule: null,
+          }),
+        ],
+      },
+      {
+        status: "completed",
+        output_parsed: null,
+        output: [
+          functionCall("remind-dinner", "reminder_work", {
+            operation: "create",
+            reminderId: null,
+            action: "Start Tuesday dinner prep",
+            schedule: { kind: "once", at: "2026-09-01T23:00:00.000Z" },
+          }),
+        ],
+      },
+      {
+        status: "completed",
+        output_parsed: null,
+        output: [functionCall("list-family-calendar", "list_calendars", {})],
+      },
+      {
+        status: "completed",
+        output_parsed: null,
+        output: [
+          functionCall("read-family-calendar", "read_calendar_window", {
+            timeMin: "2026-09-01T00:00:00.000Z",
+            timeMax: "2026-09-02T00:00:00.000Z",
+            limit: 50,
+            scope: "selected",
+            calendarRefs: [calendarRef],
+          }),
+        ],
+      },
+      {
+        status: "completed",
+        output_parsed: null,
+        output: [
+          functionCall("add-dinner", "family_calendar_work", {
+            operation: "create",
+            event: {
+              intervalKind: "timed",
+              title: "Family dinner",
+              startsAt: "2026-09-02T01:00:00.000Z",
+              endsAt: "2026-09-02T02:00:00.000Z",
+              timeZone: "America/Los_Angeles",
+              location: null,
+            },
+            target: null,
+          }),
+        ],
+      },
+      {
+        status: "completed",
+        output_parsed: {
+          outcome: "succeeded",
+          text: "Dinner is saved, prep is scheduled, and the Family Calendar is updated.",
+          resumeAt: null,
+          progressText: null,
+        },
+        output: [],
+      },
+    ];
     const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
       responses: {
-        parse() {
-          throw new Error("An oversized durable checkpoint must not reach the model");
+        parse(request: Record<string, unknown>) {
+          modelRequests.push(request);
+          const response = responses.shift();
+          if (!response) throw new Error("Unexpected household-work request");
+          return response;
+        },
+      },
+    } as never);
+    const input = {
+      workId: "family-work-dinner",
+      objective: "Save Tuesday's recipe, remind us to start prep, and put dinner on our calendar.",
+      visibility: "household" as const,
+      ownerAdultId: null,
+      origin: familyWorkOrigin(
+        "Save Tuesday's recipe, remind us to start prep, and put dinner on our calendar.",
+      ),
+      household: {
+        householdId: "household-1",
+        familyLabel: "Test family",
+        timeZone: "America/Los_Angeles",
+        postalCode: "90045",
+        adults: [{ adultId: "adult-1", firstName: "Hari", displayName: "Hari Anbarasu" }],
+        children: [],
+      },
+      googleConnections: [
+        {
+          emailLabel: "Test Family Calendar",
+          calendarAvailable: true,
+          kind: "family" as const,
+          writesEnabled: true,
+        },
+      ],
+      state: {
+        kind: "family_work_v1" as const,
+        version: 1 as const,
+        generation: 0,
+        phase: "ready" as const,
+        claim: null,
+        activePhoneCall: null,
+        activeTextMessage: null,
+        browserSession: null,
+        continuationItems: [],
+        pendingCall: null,
+        steering: [],
+        progressRevision: 0,
+        terminal: null,
+      },
+      currentTime: NOW,
+    };
+    let vaultReceipt: Awaited<
+      ReturnType<NonNullable<Parameters<typeof reasoner.continueFamilyWork>[1]["runVaultWork"]>>
+    > | null = null;
+    let vaultCommits = 0;
+    const capabilityCalls: string[] = [];
+    const reads = {
+      async runVaultWork() {
+        capabilityCalls.push("vault_work");
+        if (!vaultReceipt) {
+          vaultCommits += 1;
+          vaultReceipt = {
+            operation: "remember" as const,
+            status: "committed" as const,
+            factId: "fact-dinner",
+            statement: "Tuesday dinner is sheet-pan chicken with lemon potatoes.",
+          };
+        }
+        return vaultReceipt;
+      },
+      async runReminderWork(request: { operation: string }) {
+        capabilityCalls.push(`reminder_work:${request.operation}`);
+        if (request.operation === "list") return { status: "listed" as const, reminders: [] };
+        return {
+          status: "committed" as const,
+          operation: "create" as const,
+          reminderId: "reminder-dinner",
+          action: "Start Tuesday dinner prep",
+          schedule: { kind: "once" as const, at: "2026-09-01T23:00:00.000Z" },
+          state: "active" as const,
+          nextAt: "2026-09-01T23:00:00.000Z",
+          lastRunAt: null,
+          createdAt: NOW,
+          deliveryStatus: null,
+        };
+      },
+      async runFamilyCalendarWork() {
+        capabilityCalls.push("family_calendar_work");
+        return {
+          status: "committed" as const,
+          operation: "create" as const,
+          providerEventId: "provider-dinner",
+          providerRevision: "revision-1",
+        };
+      },
+      async listCalendars() {
+        return {
+          status: "complete" as const,
+          calendars: [
+            {
+              calendarRef,
+              label: "Test Family Calendar",
+              timeZone: "America/Los_Angeles",
+              primary: null,
+              accessRole: null,
+              eventCoverage: "readable" as const,
+            },
+          ],
+          totalCalendarCount: 1,
+        };
+      },
+      async readCalendarWindow() {
+        return {
+          status: "complete" as const,
+          calendars: [
+            {
+              calendarRef,
+              label: "Test Family Calendar",
+              timeZone: "America/Los_Angeles",
+              primary: null,
+              accessRole: null,
+              status: "complete" as const,
+              eventCount: 0,
+            },
+          ],
+          totalCalendarCount: 1,
+          events: [],
+          totalEventCount: 0,
+        };
+      },
+    };
+
+    const vaultPlanned = await reasoner.continueFamilyWork(input, reads);
+    if (vaultPlanned.kind !== "continue") throw new Error("Vault work was not planned");
+    const vaultSettled = await reasoner.continueFamilyWork({ ...input, state: vaultPlanned.state }, reads);
+    const vaultCrashReplay = await reasoner.continueFamilyWork(
+      { ...input, state: vaultPlanned.state },
+      reads,
+    );
+    expect(vaultSettled).toMatchObject({ kind: "continue", state: { phase: "ready" } });
+    expect(vaultCrashReplay).toMatchObject({ kind: "continue", state: { phase: "ready" } });
+    expect(vaultCommits).toBe(1);
+    if (vaultSettled.kind !== "continue") throw new Error("Vault work did not settle");
+
+    const reminderPlanned = await reasoner.continueFamilyWork({ ...input, state: vaultSettled.state }, reads);
+    if (reminderPlanned.kind !== "continue") throw new Error("Reminder work was not planned");
+    const reminderSettled = await reasoner.continueFamilyWork(
+      { ...input, state: reminderPlanned.state },
+      reads,
+    );
+    if (reminderSettled.kind !== "continue") throw new Error("Reminder work did not settle");
+
+    const calendarPlanned = await reasoner.continueFamilyWork(
+      { ...input, state: reminderSettled.state },
+      reads,
+    );
+    if (calendarPlanned.kind !== "continue") throw new Error("Calendar work was not planned");
+    const calendarSettled = await reasoner.continueFamilyWork(
+      { ...input, state: calendarPlanned.state },
+      reads,
+    );
+    if (calendarSettled.kind !== "continue") throw new Error("Calendar work did not settle");
+    const terminal = await reasoner.continueFamilyWork({ ...input, state: calendarSettled.state }, reads);
+
+    expect(terminal).toMatchObject({
+      kind: "terminal",
+      outcome: "succeeded",
+      text: expect.stringContaining("Family Calendar is updated"),
+    });
+    expect(capabilityCalls).toEqual([
+      "vault_work",
+      "vault_work",
+      "reminder_work:list",
+      "reminder_work:create",
+      "family_calendar_work",
+    ]);
+    expect(modelRequests[0]?.tools).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: "vault_work" }),
+        expect.objectContaining({ name: "reminder_work" }),
+        expect.objectContaining({ name: "family_calendar_work" }),
+      ]),
+    );
+  });
+
+  test("durable work compacts complete history and preserves its recent tail before continuing", async () => {
+    const oldResultUrl = "https://example.com/older-comparison";
+    const recentResultUrl = "https://example.com/recent-comparison";
+    const compactionRequests: Record<string, unknown>[] = [];
+    const continuationRequests: Record<string, unknown>[] = [];
+    const compactionSummary = `## Goal
+Compare the useful family options.
+
+## Constraints & Preferences
+- Keep the recent option in consideration.
+
+## Progress
+### Done
+- [x] Reviewed the older comparison at ${oldResultUrl}.
+
+### In Progress
+- [ ] Compare it with the recent option.
+
+### Blocked
+- (none)
+
+## Key Decisions
+- **Retain exact sources**: The older comparison URL is still needed.
+
+## Next Steps
+1. Finish the comparison using the retained recent result.
+
+## Critical Context
+- Older source: ${oldResultUrl}`;
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        create(request: Record<string, unknown>) {
+          compactionRequests.push(request);
+          return {
+            status: "completed",
+            output_text: compactionSummary,
+            output: [],
+          };
+        },
+        parse(request: Record<string, unknown>) {
+          continuationRequests.push(request);
+          return {
+            status: "completed",
+            output_parsed: {
+              outcome: "succeeded",
+              text: `The recent option is the better fit. Details: ${recentResultUrl}`,
+              resumeAt: null,
+              progressText: null,
+            },
+            output: [],
+          };
         },
       },
     } as never);
@@ -2036,15 +2339,19 @@ describe("Florence reasoner capability cutover", () => {
       activeTextMessage: null,
       browserSession: null,
       continuationItems: [
-        {
-          type: "message",
-          role: "user",
-          content: [{ type: "input_text", text: "x".repeat(241 * 1024) }],
-        },
+        familyWorkResultMessage("older-comparison", {
+          observation: "Older comparison result",
+          url: oldResultUrl,
+          details: `older:${"x".repeat(180 * 1024)}`,
+        }),
+        familyWorkResultMessage("recent-comparison", {
+          observation: "Recent comparison result",
+          url: recentResultUrl,
+          details: `recent:${"y".repeat(80 * 1024)}`,
+        }),
       ],
       pendingCall: null,
       steering: [],
-      publicMapResearchContext: [],
       progressRevision: 4,
       terminal: null,
     };
@@ -2070,9 +2377,26 @@ describe("Florence reasoner capability cutover", () => {
       {},
     );
 
+    expect(compactionRequests).toHaveLength(1);
+    expect(compactionRequests[0]).toMatchObject({
+      tools: [],
+      instructions: expect.stringContaining("ONLY output the structured summary"),
+    });
+    const compactionInput = JSON.stringify(compactionRequests[0]?.input);
+    expect(compactionInput).toContain(oldResultUrl);
+    expect(compactionInput).not.toContain(recentResultUrl);
+
+    expect(continuationRequests).toHaveLength(1);
+    const compactedInput = JSON.stringify(continuationRequests[0]?.input);
+    expect(compactedInput).toContain("The task history before this point was compacted");
+    expect(compactedInput).toContain(oldResultUrl);
+    expect(compactedInput).toContain(recentResultUrl);
+    expect(compactedInput).not.toContain("x".repeat(10_000));
+    expect(Buffer.byteLength(compactedInput, "utf8")).toBeLessThan(120 * 1024);
     expect(result).toMatchObject({
       kind: "terminal",
-      outcome: "failed",
+      outcome: "succeeded",
+      text: expect.stringContaining(recentResultUrl),
       state: {
         phase: "terminal",
         continuationItems: [],
@@ -2177,7 +2501,9 @@ describe("Florence reasoner capability cutover", () => {
       objective: expect.stringContaining("Email the school"),
     });
     expect(result.policy.schedule).toBe(false);
-    expect(String(requests[0]?.instructions)).toContain("do not turn a send request into an unsent draft");
+    expect(String(requests[0]?.instructions)).toContain(
+      "do not substitute advice, a draft, or a promise for requested execution",
+    );
     expect(functionOutputEnvelopes(requests[1])).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
@@ -2253,7 +2579,6 @@ describe("Florence reasoner capability cutover", () => {
       continuationItems: [],
       pendingCall: null,
       steering: [],
-      publicMapResearchContext: [],
       progressRevision: 0,
       terminal: null,
     };
@@ -2473,7 +2798,6 @@ describe("Florence reasoner capability cutover", () => {
         continuationItems: [],
         pendingCall: null,
         steering: [],
-        publicMapResearchContext: [],
         progressRevision: 0,
         terminal: null,
       },
@@ -2531,18 +2855,47 @@ describe("Florence reasoner capability cutover", () => {
       throw new Error(`Unexpected Google operation ${operation.operation}`);
     };
 
-    let state: FamilyWorkStateV1 = input.state;
-    for (let index = 0; index < 3; index += 1) {
-      const planned = await reasoner.continueFamilyWork({ ...input, state }, { runGoogleWorkspace });
-      if (planned.kind !== "continue") throw new Error("Gmail draft step was not planned");
-      const executed = await reasoner.continueFamilyWork(
-        { ...input, state: planned.state },
-        { runGoogleWorkspace },
-      );
-      if (executed.kind !== "continue") throw new Error("Gmail draft step did not execute");
-      state = executed.state;
-    }
-    const terminal = await reasoner.continueFamilyWork({ ...input, state }, { runGoogleWorkspace });
+    const draftPlanned = await reasoner.continueFamilyWork(input, { runGoogleWorkspace });
+    expect(draftPlanned).toMatchObject({
+      kind: "continue",
+      state: {
+        phase: "tool_pending",
+        pendingCall: { callId: "draft-school-forward", name: "gmail_draft_work" },
+      },
+    });
+    if (draftPlanned.kind !== "continue") throw new Error("Gmail forward draft was not planned");
+    expect(operations.map((operation) => operation.operation)).toEqual(["gmail_get"]);
+
+    const draftCreated = await reasoner.continueFamilyWork(
+      { ...input, state: draftPlanned.state },
+      { runGoogleWorkspace },
+    );
+    if (draftCreated.kind !== "continue") throw new Error("Gmail forward draft was not created");
+    expect(operations.map((operation) => operation.operation)).toEqual(["gmail_get", "gmail_draft_create"]);
+
+    const sendPlanned = await reasoner.continueFamilyWork(
+      { ...input, state: draftCreated.state },
+      { runGoogleWorkspace },
+    );
+    expect(sendPlanned).toMatchObject({
+      kind: "continue",
+      state: {
+        phase: "tool_pending",
+        pendingCall: { callId: "send-school-forward", name: "gmail_draft_work" },
+      },
+    });
+    if (sendPlanned.kind !== "continue") throw new Error("Exact Gmail draft send was not planned");
+    expect(operations).toHaveLength(2);
+
+    const sent = await reasoner.continueFamilyWork(
+      { ...input, state: sendPlanned.state },
+      { runGoogleWorkspace },
+    );
+    if (sent.kind !== "continue") throw new Error("Exact Gmail draft was not sent");
+    const terminal = await reasoner.continueFamilyWork(
+      { ...input, state: sent.state },
+      { runGoogleWorkspace },
+    );
 
     expect(operations[1]).toMatchObject({
       operation: "gmail_draft_create",
@@ -2564,7 +2917,7 @@ describe("Florence reasoner capability cutover", () => {
     });
   });
 
-  test("durable work lists Calendars and reads a selected reference across checkpoints", async () => {
+  test("durable work composes Calendar reads and replans a transient read inline", async () => {
     const calendarRef = "calendar-school";
     const calendarWindowArguments = {
       timeMin: "2026-08-28T00:00:00.000Z",
@@ -2573,6 +2926,7 @@ describe("Florence reasoner capability cutover", () => {
       scope: "selected",
       calendarRefs: [calendarRef],
     };
+    const modelRequests: Record<string, unknown>[] = [];
     const modelResponses = [
       {
         status: "completed",
@@ -2600,7 +2954,8 @@ describe("Florence reasoner capability cutover", () => {
     ];
     const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
       responses: {
-        parse() {
+        parse(request: Record<string, unknown>) {
+          modelRequests.push(request);
           const response = modelResponses.shift();
           if (!response) throw new Error("Unexpected durable Calendar model turn");
           return response;
@@ -2619,7 +2974,6 @@ describe("Florence reasoner capability cutover", () => {
       continuationItems: [],
       pendingCall: null,
       steering: [],
-      publicMapResearchContext: [],
       progressRevision: 0,
       terminal: null,
     };
@@ -2637,6 +2991,14 @@ describe("Florence reasoner capability cutover", () => {
         adults: [{ adultId: "adult-1", firstName: "Hari", displayName: "Hari Anbarasu" }],
         children: [],
       },
+      googleConnections: [
+        {
+          emailLabel: "Personal Google",
+          calendarAvailable: true,
+          kind: "personal" as const,
+          writesEnabled: false,
+        },
+      ],
       state,
       currentTime: NOW,
     };
@@ -2704,42 +3066,14 @@ describe("Florence reasoner capability cutover", () => {
       },
     };
 
-    const listPlanned = await reasoner.continueFamilyWork(input, reads);
-    if (listPlanned.kind !== "continue") throw new Error("Calendar listing was not planned");
-    const listed = await reasoner.continueFamilyWork({ ...input, state: listPlanned.state }, reads);
-    if (listed.kind !== "continue") throw new Error("Calendar listing was not executed");
-    expect(JSON.stringify(listed.state.continuationItems)).toContain(calendarRef);
-
-    const windowPlanned = await reasoner.continueFamilyWork({ ...input, state: listed.state }, reads);
-    if (windowPlanned.kind !== "continue") throw new Error("Calendar window was not planned");
-    expect(windowPlanned.state).toMatchObject({
-      phase: "tool_pending",
-      pendingCall: { callId: "read-work-calendar", name: "read_calendar_window" },
-    });
-    const transientRead = await reasoner.continueFamilyWork({ ...input, state: windowPlanned.state }, reads);
-    if (transientRead.kind !== "continue") throw new Error("Calendar transient failure was not settled");
-    expect(transientRead.state.continuationItems).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          type: "function_call_output",
-          output: expect.stringContaining('"retryable":true'),
-        }),
-      ]),
-    );
-    const retryPlanned = await reasoner.continueFamilyWork({ ...input, state: transientRead.state }, reads);
-    if (retryPlanned.kind !== "continue") throw new Error("Calendar retry was not planned");
-    expect(retryPlanned.state).toMatchObject({
-      phase: "tool_pending",
-      pendingCall: { callId: "read-work-calendar-retry", name: "read_calendar_window" },
-    });
-    const windowRead = await reasoner.continueFamilyWork({ ...input, state: retryPlanned.state }, reads);
-    if (windowRead.kind !== "continue") throw new Error("Calendar window was not read");
-    const terminal = await reasoner.continueFamilyWork({ ...input, state: windowRead.state }, reads);
+    const terminal = await reasoner.continueFamilyWork(input, reads);
 
     expect(calendarInputs).toEqual([
       expect.objectContaining({ scope: "selected", calendarRefs: [calendarRef] }),
       expect.objectContaining({ scope: "selected", calendarRefs: [calendarRef] }),
     ]);
+    expect(JSON.stringify(modelRequests[1]?.input)).toContain(calendarRef);
+    expect(JSON.stringify(modelRequests[2]?.input)).toContain('\\"retryable\\":true');
     expect(terminal).toMatchObject({
       kind: "terminal",
       outcome: "succeeded",
@@ -2747,13 +3081,14 @@ describe("Florence reasoner capability cutover", () => {
     });
   });
 
-  test("public place verification receives the map candidates selected earlier in the turn", async () => {
+  test("public place verification composes map candidates with direct web search", async () => {
     let modelTurn = 0;
-    const publicResearchRequests: Record<string, unknown>[] = [];
+    const modelRequests: Record<string, unknown>[] = [];
     let workStarts = 0;
     const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
       responses: {
-        stream: () => {
+        stream: (request: Record<string, unknown>) => {
+          modelRequests.push(request);
           modelTurn += 1;
           return fakeStream(
             modelTurn === 1
@@ -2769,30 +3104,18 @@ describe("Florence reasoner capability cutover", () => {
                     }),
                   ],
                 }
-              : modelTurn === 2
-                ? {
-                    status: "completed",
-                    output_parsed: null,
-                    output: [
-                      functionCall("research-call", "research_public_web", {
-                        query: "Junior's Times Square current opening hours",
-                      }),
-                    ],
-                  }
-                : {
-                    status: "completed",
-                    output_parsed: ordinaryDecision({ researchUrls: [PUBLIC_URL] }),
-                    output: [],
-                  },
+              : {
+                  status: "completed",
+                  output_parsed: ordinaryDecision({ researchUrls: [PUBLIC_URL] }),
+                  output: [
+                    completedWebSearch(
+                      PUBLIC_URL,
+                      "Junior's Times Square current opening hours",
+                      "place-hours-search",
+                    ),
+                  ],
+                },
           );
-        },
-        parse: (request: Record<string, unknown>) => {
-          publicResearchRequests.push(request);
-          return {
-            status: "completed",
-            output_parsed: { outcome: "result", summary: "Open now", urls: [PUBLIC_URL] },
-            output: [completedWebSearch(PUBLIC_URL)],
-          };
         },
       },
     } as never);
@@ -2851,11 +3174,11 @@ describe("Florence reasoner capability cutover", () => {
       },
     );
 
-    const isolatedInput = JSON.stringify(publicResearchRequests[0]?.input);
-    expect(isolatedInput).toContain("Junior's");
-    expect(isolatedInput).toContain("1515 Broadway, New York");
-    expect(isolatedInput).toContain("juniorscheesecake.com");
-    expect(isolatedInput).not.toContain("40.7582151");
+    expect(modelRequests[0]?.tools).toEqual(
+      expect.arrayContaining([expect.objectContaining({ type: "web_search" })]),
+    );
+    expect(JSON.stringify(modelRequests[1]?.input)).toContain("Junior's");
+    expect(JSON.stringify(modelRequests[1]?.input)).toContain("1515 Broadway, New York");
     expect(workStarts).toBe(1);
   });
 
@@ -2943,6 +3266,149 @@ describe("Florence reasoner capability cutover", () => {
     )?.output;
     expect(Array.isArray(attachmentOutput)).toBe(true);
     expect(JSON.stringify(attachmentOutput)).toContain("input_file");
+    expect(JSON.stringify(requests)).not.toContain("connectionId");
+  });
+
+  test("durable private work composes visible memory and Gmail attachments inline", async () => {
+    const gmail = conversationalGmailSource();
+    const memory = {
+      sourceId: "memory-pickup-source",
+      recordId: "memory-pickup-fact",
+      kind: "memory" as const,
+      visibility: "adult_private" as const,
+      label: "School pickup",
+      occurredAt: NOW,
+      text: "School pickup is normally at 2:45 PM.",
+    };
+    const requests: Record<string, unknown>[] = [];
+    const responses = [
+      {
+        status: "completed",
+        output_parsed: null,
+        output: [functionCall("memory-search", "search_family_memory", { query: "pickup", limit: 5 })],
+      },
+      {
+        status: "completed",
+        output_parsed: null,
+        output: [functionCall("memory-read", "read_source", { sourceId: memory.sourceId })],
+      },
+      {
+        status: "completed",
+        output_parsed: null,
+        output: [functionCall("durable-gmail-search", "search_gmail", { query: "school form", limit: 3 })],
+      },
+      {
+        status: "completed",
+        output_parsed: null,
+        output: [
+          functionCall("durable-gmail-attachment", "read_gmail_attachment", {
+            sourceId: gmail.sourceId,
+            attachmentRef: gmail.attachments[0]?.attachmentRef ?? "missing-attachment",
+          }),
+        ],
+      },
+      {
+        status: "completed",
+        output_parsed: {
+          outcome: "succeeded",
+          text: "Pickup is at 2:45 PM, and the attached school form confirms the updated instructions.",
+        },
+        output: [],
+      },
+    ];
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        parse(request: Record<string, unknown>) {
+          requests.push(request);
+          const response = responses.shift();
+          if (!response) throw new Error("Unexpected durable private-read model turn");
+          return response;
+        },
+      },
+    } as never);
+    let attachmentReads = 0;
+
+    const result = await reasoner.continueFamilyWork(
+      {
+        workId: "family-work-private-reads",
+        objective: "Check what we know about pickup and verify the latest school form in Gmail.",
+        visibility: "private",
+        ownerAdultId: "adult-1",
+        origin: familyWorkOrigin(
+          "Check what we know about pickup and verify the latest school form in Gmail.",
+        ),
+        household: {
+          householdId: "household-1",
+          familyLabel: "Test family",
+          timeZone: "America/Los_Angeles",
+          postalCode: "90045",
+          adults: [{ adultId: "adult-1", firstName: "Hari", displayName: "Hari Anbarasu" }],
+          children: [],
+        },
+        visibleSources: [memory],
+        googleConnections: [
+          {
+            emailLabel: "Personal Google",
+            calendarAvailable: true,
+            kind: "personal",
+            writesEnabled: false,
+          },
+        ],
+        state: {
+          kind: "family_work_v1",
+          version: 1,
+          generation: 0,
+          phase: "ready",
+          claim: null,
+          activePhoneCall: null,
+          activeTextMessage: null,
+          browserSession: null,
+          continuationItems: [],
+          pendingCall: null,
+          steering: [],
+          progressRevision: 0,
+          terminal: null,
+        },
+        currentTime: NOW,
+      },
+      {
+        async searchFamilyMemory() {
+          return [memory];
+        },
+        async readSource() {
+          return memory;
+        },
+        async searchGmail() {
+          return { status: "complete", sources: [gmail] };
+        },
+        async readGmailAttachment(input) {
+          attachmentReads += 1;
+          return {
+            sourceId: input.sourceId,
+            attachmentRef: input.attachment.attachmentRef,
+            filename: input.attachment.filename,
+            mimeType: input.attachment.mimeType,
+            bytes: new Uint8Array(Buffer.from("%PDF-")),
+          };
+        },
+      },
+    );
+
+    expect(result).toMatchObject({
+      kind: "terminal",
+      outcome: "succeeded",
+      text: expect.stringContaining("2:45 PM"),
+    });
+    expect(attachmentReads).toBe(1);
+    expect(((requests[0]?.tools as { name: string }[]) ?? []).map((tool) => tool.name)).toEqual(
+      expect.arrayContaining([
+        "search_family_memory",
+        "read_source",
+        "search_gmail",
+        "read_gmail_attachment",
+      ]),
+    );
+    expect(JSON.stringify(requests.at(-1)?.input)).toContain("input_file");
     expect(JSON.stringify(requests)).not.toContain("connectionId");
   });
 
@@ -3129,6 +3595,10 @@ describe("Florence reasoner capability cutover", () => {
         "read_private_gmail_attachment",
       ]);
     }
+    expect(JSON.stringify(requests[2])).toContain("artifact:recipe:weeknight-noodles");
+    expect(JSON.stringify(requests[2])).toContain(
+      "A reusable family recipe with noodles, sesame oil, soy sauce, and rice vinegar.",
+    );
     for (const continuation of [requests[1], requests[3]]) {
       const output = functionOutputs(continuation)[0]?.output;
       expect(Array.isArray(output)).toBe(true);
@@ -3187,6 +3657,7 @@ function ordinaryDecision(input: { bubbleText?: string; researchUrls?: string[] 
       replyToCurrentMessage: false,
       reaction: null,
       bubbles: [{ text: input.bubbleText ?? "Done.", delayMs: 0 }],
+      nativeMoves: null,
     },
     facts: [],
     followUp: null,
@@ -3282,12 +3753,12 @@ function attachmentCall(callId: string) {
   });
 }
 
-function completedWebSearch(url: string) {
+function completedWebSearch(url: string, query = "current result", id = "web-search-1") {
   return {
-    id: "web-search-1",
+    id,
     type: "web_search_call" as const,
     status: "completed" as const,
-    action: { type: "search" as const, query: "current result", sources: [{ type: "url", url }] },
+    action: { type: "search" as const, query, sources: [{ type: "url", url }] },
   };
 }
 
@@ -3551,6 +4022,13 @@ function privateAssessmentInput(
       },
     },
     activeMonitors: [],
+    memory: [
+      {
+        slot: "artifact:recipe:weeknight-noodles",
+        label: "Weeknight noodles",
+        text: "A reusable family recipe with noodles, sesame oil, soy sauce, and rice vinegar.",
+      },
+    ],
     currentFacts: [],
   };
 }

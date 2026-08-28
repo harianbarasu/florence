@@ -6,12 +6,14 @@ import {
   completeFamilyOnboardingInputSchema,
   type DeleteGoogleDerivedDataResponse,
   type DisconnectGoogleConnectionResponse,
+  decodeMemoryPresentation,
   type FamilyCalendarMonthView,
   type FamilyMemberInput,
   type FamilyMemberMutationInput,
   familyCalendarMonthViewSchema,
   familyMemberMutationInputSchema,
   familyMemberProfileSchema,
+  type MemoryPresentation,
   type PatchFamilyMemberInput,
   type PatchWatchInput,
   type PreferencesInput,
@@ -35,11 +37,13 @@ import type {
   CalendarEvidenceDraft,
   CalendarOfferApproval,
   CalendarOfferDraft,
+  ClaimedFamilyWorkCapabilityIdentity,
   CommitTurnInput,
   CompleteFounderOnboardingInput,
   DueProactiveWork,
   FactDraft,
   FactRecord,
+  FamilyCalendarMutation,
   FamilyCalendarReviewProposal,
   FamilyGroupCreationWork,
   FamilyMemberRecord,
@@ -47,6 +51,7 @@ import type {
   FiniteMonitorDraft,
   FiniteMonitorUpdate,
   GoogleEvidenceDraft,
+  GoogleStableFactContext,
   HouseholdRecord,
   InboundPreparationContext,
   InboundTurn,
@@ -57,11 +62,12 @@ import type {
   JsonObject,
   LinqAuthority,
   MessagesEnrollmentResult,
+  OutboundNativeMoveDraft,
   PostgresFlorenceStore,
   PreparedInboundContent,
   ProactiveDelivery,
+  ReminderMutation,
   ReviewedGoogleSourceDisposition,
-  SharedBriefingCandidate,
   SourceRecord,
 } from "@florence/database";
 import {
@@ -101,6 +107,7 @@ import {
   type LinqReactionProposal,
 } from "@florence/linq";
 import type { FlorenceBrowserClient, FlorenceBrowserOperation } from "./browser.js";
+import { CapabilityAdapterError } from "./capability-lifecycle.js";
 import type { EnrollmentCodes, WebAccessPath } from "./enrollment.js";
 import type { FlorenceFlightsClient } from "./flights.js";
 import type { FlorenceMapsClient } from "./maps.js";
@@ -111,6 +118,8 @@ import {
   type FlorenceCalendarWindowRead,
   type FlorenceConversationalGmailSource,
   type FlorenceDecision,
+  type FlorenceFamilyCalendarWorkRequest,
+  type FlorenceFamilyCalendarWorkResult,
   type FlorenceNarrowFamilyProfile,
   type FlorencePrivateCalendarEvent,
   type FlorencePrivateGmailSource,
@@ -119,7 +128,11 @@ import {
   type FlorenceReasoner,
   FlorenceReasonerError,
   type FlorenceReasonerInput,
+  type FlorenceReminderWorkRequest,
+  type FlorenceReminderWorkResult,
   type FlorenceSource,
+  type FlorenceVaultWorkRequest,
+  type FlorenceVaultWorkResult,
   type FlorenceVoiceNoteInput,
 } from "./reasoner.js";
 import type {
@@ -142,7 +155,7 @@ const GOOGLE_WORKSPACE_ACTION_SCOPES = [
 ] as const;
 const LOOP_IDLE_MS = 250;
 const RETRY_MS = 15_000;
-const WORK_CUE_MS = 6_000;
+const LINQ_TYPING_REFRESH_MS = 60_000;
 type OutboundDeliveryDisposition = "sent_now" | "already_sent" | "claimed" | "failed";
 const ARTIFACT_PURGE_INTERVAL_MS = 60 * 60_000;
 const QUIET_START_HOUR = 20;
@@ -157,6 +170,8 @@ type ActiveInbound = {
   controller: AbortController;
   knownSourceIds: Set<string>;
 };
+
+type InboundPresence = { stop: () => void };
 
 export class Florence {
   readonly #store: PostgresFlorenceStore;
@@ -812,7 +827,7 @@ export class Florence {
       });
     }
 
-    await this.#setTyping({
+    void this.#setTyping({
       providerConversationId: input.providerConversationId,
       expectedAuthority,
       active: true,
@@ -879,7 +894,7 @@ export class Florence {
       }
       throw error;
     } finally {
-      await this.#setTyping({
+      void this.#setTyping({
         providerConversationId: input.providerConversationId,
         expectedAuthority,
         active: false,
@@ -1160,6 +1175,7 @@ export class Florence {
 
   async #runCycle(): Promise<boolean> {
     let worked = false;
+    let inboundPresence: InboundPresence | null = null;
     await this.#settleInboundAccepts();
     await this.#purgeExpiredArtifacts();
     if ((await this.#store.expirePartnerInvitations({ now: this.#now().toISOString() })) > 0) {
@@ -1167,15 +1183,19 @@ export class Florence {
     }
     const inbound = await this.#store.readNextInbound(this.#now().toISOString());
     if (inbound) {
-      await this.#handleInbound(inbound);
+      inboundPresence = await this.#handleInbound(inbound);
       worked = true;
     }
-    await this.#settleInboundAccepts();
-    const outbound = await this.#store.readNextOutbound(this.#now().toISOString());
-    await this.#settleInboundAccepts();
-    if (outbound) {
-      await this.#deliverOutbound(outbound.sourceId);
-      worked = true;
+    try {
+      await this.#settleInboundAccepts();
+      const outbound = await this.#store.readNextOutbound(this.#now().toISOString());
+      await this.#settleInboundAccepts();
+      if (outbound) {
+        await this.#deliverOutbound(outbound.sourceId);
+        worked = true;
+      }
+    } finally {
+      inboundPresence?.stop();
     }
     await this.#settleInboundAccepts();
     const familyGroup = this.#linqSenderPhoneNumber
@@ -1240,91 +1260,112 @@ export class Florence {
     }
   }
 
-  async #handleInbound(turn: InboundTurn): Promise<void> {
+  async #handleInbound(turn: InboundTurn): Promise<InboundPresence | null> {
     const observed = await this.#linq.observeChat(turn.authority.providerConversationId);
     if (!sameAuthority(observed, turn.authority)) {
       await this.#store.commitTurn({
         sourceId: turn.message.sourceId,
         handledAt: this.#now().toISOString(),
       });
-      return;
+      return null;
     }
-    const sender = turn.household.members.find(
-      (member) => member.id === turn.authority.senderAdultId && member.kind === "adult",
-    );
-    const googleActive =
-      turn.authority.audience !== "private" ||
-      (await this.#hasActiveGoogle(turn.authority.householdId, turn.authority.senderAdultId));
-    const onboardingComplete = Boolean(sender && profileString(sender.profile, "onboardingCompletedAt"));
-    if (turn.authority.audience === "private" && (!googleActive || !onboardingComplete)) {
-      if (turn.message.moveKind === "reaction") {
-        await this.#store.commitTurn({
-          sourceId: turn.message.sourceId,
-          handledAt: this.#now().toISOString(),
-        });
-        return;
-      }
-      const stage = googleActive ? "family_profile" : "connect_google";
-      const fallbackText = googleActive
-        ? "I’m here. Finish the short family setup on the private page, then send me the first thing you want off your plate."
-        : "I’m here. Connect your own Google account on the private setup page so I can help with real family logistics.";
-      let bubbles = [{ text: fallbackText, delayMs: 0 }];
-      let stopMessaging = false;
-      if (this.#reasoner) {
-        try {
-          const setup = await this.#reasoner.converseDuringSetup({
-            stage,
-            parentName: sender?.displayName ?? null,
-            currentMessage: { text: turnText(turn.message), occurredAt: turn.message.occurredAt },
-            recentMessages: turn.recentMessages.slice(-8).map((message) => ({
-              sender: message.speaker === "florence" ? "florence" : "parent",
-              text: turnText(message),
-              occurredAt: message.occurredAt,
-            })),
-            nextStep: googleActive ? "finish_family_profile" : "connect_google",
-          });
-          bubbles = setup.requestsFreshLink
-            ? [{ text: "Of course—here’s a fresh link to finish setup.", delayMs: 0 }]
-            : [...setup.bubbles];
-          stopMessaging = setup.stopMessaging;
-        } catch {
-          bubbles = [{ text: fallbackText, delayMs: 0 }];
-        }
-      }
-      if (stopMessaging) {
-        await this.#store.commitTurn({
-          sourceId: turn.message.sourceId,
-          stopChannel: true,
-          handledAt: this.#now().toISOString(),
-        });
-        return;
-      }
-      const accessUrl = this.#issueWebAccessUrl(turn, "/");
-      if (accessUrl) bubbles.push({ text: accessUrl, delayMs: 0 });
-      await this.#store.commitTurn(
-        decisionCommit(
-          turn,
-          {
-            policy: { retain: false, schedule: false, stopMessaging: false },
-            conversation: {
-              replyToCurrentMessage: true,
-              reaction: null,
-              bubbles,
+    const presence =
+      turn.message.moveKind === "reaction"
+        ? null
+        : this.#beginInboundPresence({
+            providerConversationId: turn.authority.providerConversationId,
+            expectedAuthority: {
+              audience: turn.authority.audience,
+              participantIdentityDigests: turn.authority.expectedParticipantIdentityDigests,
             },
-            facts: [],
-            followUp: null,
-            reminder: null,
-            familyWork: null,
-            docketCompletions: null,
-            calendar: null,
-            householdUpdate: null,
-          },
-          this.#now(),
-        ),
+            observedAuthority: {
+              providerConversationId: turn.authority.providerConversationId,
+              authority: observed,
+            },
+          });
+    try {
+      const sender = turn.household.members.find(
+        (member) => member.id === turn.authority.senderAdultId && member.kind === "adult",
       );
-      return;
+      const googleActive =
+        turn.authority.audience !== "private" ||
+        (await this.#hasActiveGoogle(turn.authority.householdId, turn.authority.senderAdultId));
+      const onboardingComplete = Boolean(sender && profileString(sender.profile, "onboardingCompletedAt"));
+      if (turn.authority.audience === "private" && (!googleActive || !onboardingComplete)) {
+        if (turn.message.moveKind === "reaction") {
+          await this.#store.commitTurn({
+            sourceId: turn.message.sourceId,
+            handledAt: this.#now().toISOString(),
+          });
+          return presence;
+        }
+        const stage = googleActive ? "family_profile" : "connect_google";
+        const fallbackText = googleActive
+          ? "I’m here. Finish the short family setup on the private page, then send me the first thing you want off your plate."
+          : "I’m here. Connect your own Google account on the private setup page so I can help with real family logistics.";
+        let bubbles = [{ text: fallbackText, delayMs: 0 }];
+        let stopMessaging = false;
+        if (this.#reasoner) {
+          try {
+            const setup = await this.#reasoner.converseDuringSetup({
+              stage,
+              parentName: sender?.displayName ?? null,
+              currentMessage: { text: turnText(turn.message), occurredAt: turn.message.occurredAt },
+              recentMessages: turn.recentMessages.slice(-8).map((message) => ({
+                sender: message.speaker === "florence" ? "florence" : "parent",
+                text: turnText(message),
+                occurredAt: message.occurredAt,
+              })),
+              nextStep: googleActive ? "finish_family_profile" : "connect_google",
+            });
+            bubbles = setup.requestsFreshLink
+              ? [{ text: "Of course—here’s a fresh link to finish setup.", delayMs: 0 }]
+              : [...setup.bubbles];
+            stopMessaging = setup.stopMessaging;
+          } catch {
+            bubbles = [{ text: fallbackText, delayMs: 0 }];
+          }
+        }
+        if (stopMessaging) {
+          await this.#store.commitTurn({
+            sourceId: turn.message.sourceId,
+            stopChannel: true,
+            handledAt: this.#now().toISOString(),
+          });
+          return presence;
+        }
+        const accessUrl = this.#issueWebAccessUrl(turn, "/");
+        if (accessUrl) bubbles.push({ text: accessUrl, delayMs: 0 });
+        await this.#store.commitTurn(
+          decisionCommit(
+            turn,
+            {
+              policy: { retain: false, schedule: false, stopMessaging: false },
+              conversation: {
+                replyToCurrentMessage: true,
+                reaction: null,
+                bubbles,
+                nativeMoves: null,
+              },
+              facts: [],
+              followUp: null,
+              reminder: null,
+              familyWork: null,
+              docketCompletions: null,
+              calendar: null,
+              householdUpdate: null,
+            },
+            this.#now(),
+          ),
+        );
+        return presence;
+      }
+      await this.#respondEnrolled(turn);
+      return presence;
+    } catch (error) {
+      presence?.stop();
+      throw error;
     }
-    await this.#respondEnrolled(turn);
   }
 
   async #respondEnrolled(turn: InboundTurn): Promise<void> {
@@ -1420,55 +1461,24 @@ export class Florence {
           if (!(error instanceof FlorenceReasonerError)) throw error;
         }
       }
-      const expectedAuthority = {
-        audience: turn.authority.audience,
-        participantIdentityDigests: turn.authority.expectedParticipantIdentityDigests,
-      };
       const attachmentJob =
         turn.message.images.length > 0 ||
         (turn.currentDocuments?.length ?? 0) > 0 ||
         turn.supersededMessages.some((message) => message.images.length > 0);
-      let typing = false;
-      let workTimer: ReturnType<typeof setTimeout> | null = null;
-      let workCue: Promise<void> | null = null;
-      let reactionCue: Promise<void> | null = null;
       let substantiveWorkStarted = false;
-      let immediateReactionStaged = false;
       const startWork = () => {
-        if (substantiveWorkStarted) return;
         substantiveWorkStarted = true;
-        workTimer = setTimeout(() => {
-          if (controller.signal.aborted) return;
-          workCue = this.#tryTurnCue(turn.message.sourceId, "work").then(() => undefined);
-        }, WORK_CUE_MS);
-        reactionCue = this.#tryTurnCue(turn.message.sourceId, "reaction").then((staged) => {
-          immediateReactionStaged = staged;
-        });
       };
       try {
         if (attachmentJob) startWork();
         controller.signal.throwIfAborted();
-        typing =
-          turn.authority.audience === "private" &&
-          (await this.#setTyping({
-            providerConversationId: turn.authority.providerConversationId,
-            expectedAuthority,
-            active: true,
-          }));
         const context = await this.#reasonerContext(turn);
         controller.signal.throwIfAborted();
         const decision = await this.#reasoner.decide(context.input, context.reads, controller.signal, {
           onWorkStarted: startWork,
         });
-        if (workTimer) clearTimeout(workTimer);
-        workTimer = null;
-        if (workCue) await workCue;
-        if (reactionCue) await reactionCue;
         controller.signal.throwIfAborted();
-        const requested = this.#appendRequestedWebAccess(
-          turn,
-          enforcePolicy(decision, turn.message.moveKind !== "reaction"),
-        );
+        const requested = this.#appendRequestedWebAccess(turn, enforcePolicy(decision));
         const approval = approvedCalendarOffer;
         const partnerApproval = requested.policy.stopMessaging ? null : approvedPartnerInvitation;
         const committedDecision =
@@ -1476,21 +1486,7 @@ export class Florence {
             ? {
                 ...requested,
                 policy: { ...requested.policy, schedule: true, stopMessaging: false },
-                conversation: {
-                  replyToCurrentMessage: true,
-                  reaction: null,
-                  bubbles: [
-                    {
-                      text:
-                        approval && partnerApproval
-                          ? `Got it—I’ll add that calendar item and text ${partnerApproval.firstName} now.`
-                          : approval
-                            ? "Got it—I’ll add that calendar item now."
-                            : `Got it—I’ll text ${partnerApproval?.firstName ?? "your partner"} now.`,
-                      delayMs: 0,
-                    },
-                  ],
-                },
+                conversation: approvedActionConversation(approval, partnerApproval),
                 calendar: null,
                 householdUpdate: null,
                 webAccessPath: null,
@@ -1498,7 +1494,6 @@ export class Florence {
             : requested;
         const committed = await this.#store.commitTurn(
           decisionCommit(turn, committedDecision, this.#now(), {
-            omitReaction: immediateReactionStaged,
             approveCalendarOffer: approval,
             approvePartnerInvitation: partnerApproval,
             googleEvidence: context.googleEvidence(),
@@ -1536,27 +1531,13 @@ export class Florence {
       } catch (error) {
         if (controller.signal.aborted) return;
         if (error instanceof FlorenceReasonerError && !error.retryable) {
-          if (workTimer) clearTimeout(workTimer);
-          workTimer = null;
-          if (workCue) await workCue;
-          if (reactionCue) await reactionCue;
           if (approvedCalendarOffer || approvedPartnerInvitation) {
-            const actionText =
-              approvedCalendarOffer && approvedPartnerInvitation
-                ? `Got it—I’ll add that calendar item and text ${approvedPartnerInvitation.firstName} now.`
-                : approvedCalendarOffer
-                  ? "Got it—I’ll add that calendar item now."
-                  : `Got it—I’ll text ${approvedPartnerInvitation?.firstName ?? "your partner"} now.`;
             await this.#store.commitTurn(
               decisionCommit(
                 turn,
                 {
                   policy: { retain: false, schedule: true, stopMessaging: false },
-                  conversation: {
-                    replyToCurrentMessage: true,
-                    reaction: null,
-                    bubbles: [{ text: actionText, delayMs: 0 }],
-                  },
+                  conversation: approvedActionConversation(approvedCalendarOffer, approvedPartnerInvitation),
                   facts: [],
                   followUp: null,
                   reminder: null,
@@ -1567,7 +1548,6 @@ export class Florence {
                 },
                 this.#now(),
                 {
-                  omitReaction: immediateReactionStaged,
                   approveCalendarOffer: approvedCalendarOffer,
                   approvePartnerInvitation: approvedPartnerInvitation,
                 },
@@ -1583,6 +1563,7 @@ export class Florence {
                       conversation: {
                         replyToCurrentMessage: true,
                         reaction: null,
+                        nativeMoves: null,
                         bubbles: [
                           {
                             text: "I couldn’t finish that just now. I didn’t change anything. Want me to try again?",
@@ -1599,7 +1580,6 @@ export class Florence {
                       householdUpdate: null,
                     },
                     this.#now(),
-                    { omitReaction: immediateReactionStaged },
                   )
                 : turn.message.moveKind === "reaction"
                   ? { sourceId: turn.message.sourceId, handledAt: this.#now().toISOString() }
@@ -1610,6 +1590,7 @@ export class Florence {
                         conversation: {
                           replyToCurrentMessage: true,
                           reaction: null,
+                          nativeMoves: null,
                           bubbles: [
                             {
                               text: "Sorry—I hit a snag before I could answer. Try me again and I’ll take another run at it.",
@@ -1626,28 +1607,12 @@ export class Florence {
                         householdUpdate: null,
                       },
                       this.#now(),
-                      { omitReaction: immediateReactionStaged },
                     ),
             );
           }
           return;
         }
-        if (workTimer) clearTimeout(workTimer);
-        workTimer = null;
-        if (workCue) await workCue;
-        if (reactionCue) await reactionCue;
         await this.#retryInbound(turn.message.sourceId, errorText(error));
-      } finally {
-        if (workTimer) clearTimeout(workTimer);
-        if (workCue) await workCue;
-        if (reactionCue) await reactionCue;
-        if (typing) {
-          await this.#setTyping({
-            providerConversationId: turn.authority.providerConversationId,
-            expectedAuthority,
-            active: false,
-          });
-        }
       }
     } finally {
       if (this.#activeInbound === active) this.#activeInbound = null;
@@ -1664,7 +1629,13 @@ export class Florence {
     const members = new Map(turn.household.members.map((member) => [member.id, member.displayName]));
     const memorySourceCorpus = memorySources(turn.facts);
     const searchableMemorySources = representativeMemorySources(memorySourceCorpus);
-    const visibleSources = selectVisibleMemorySources(searchableMemorySources, turnText(turn.message));
+    const visibleSources = selectVisibleMemorySources(searchableMemorySources, {
+      primary: turnText(turn.message),
+      context: [
+        ...(turn.replyTarget ? [turnText(turn.replyTarget)] : []),
+        ...turn.recentMessages.slice(-6).map(turnText),
+      ],
+    });
     const sourceIndex = new Map(memorySourceCorpus.map((source) => [source.sourceId, source]));
     const googleEvidence = new Map<string, GoogleEvidenceDraft>();
     const pendingGoogleEvidence = new Map<string, GoogleEvidenceDraft>();
@@ -1873,55 +1844,12 @@ export class Florence {
       `event_${sha256(
         `${turn.message.sourceId}\0${activeGoogleConnection?.connectionId ?? "unavailable"}\0${event.calendarId}\0${event.providerEventId}\0${event.providerRevision}`,
       ).slice(0, 32)}`;
-    const readExactFamilyCatalog = async (
-      calendarId: string,
-    ): Promise<
-      Readonly<{
-        read: GooglePersonalCalendarCatalogRead;
-        credential: ActiveFamilyCalendarCredential;
-      }>
-    > => {
-      const google = this.#google;
-      const firstCredential = orderedFamilyCalendarCredentials[0];
-      if (!google || !firstCredential) throw new Error("The Family Calendar credential is unavailable");
-      let lastAvailable: GooglePersonalCalendarCatalogRead | null = null;
-      let lastUnavailable: GooglePersonalCalendarCatalogRead | null = null;
-      let lastCredential = firstCredential;
-      for (const credential of orderedFamilyCalendarCredentials) {
-        try {
-          const read = await google.readExactCalendarCatalog({
-            householdId: turn.authority.householdId,
-            ownerAdultId: credential.ownerAdultId,
-            connectionId: credential.connectionId,
-            calendarId,
-          });
-          if (read.status !== "unavailable") {
-            if (read.calendars[0]?.eventCoverage === "readable") return { read, credential };
-            lastAvailable = read;
-            lastCredential = credential;
-            continue;
-          }
-          lastUnavailable = read;
-          lastCredential = credential;
-        } catch (error) {
-          if (error instanceof GoogleConnectionError && error.code === "credential_invalid_grant") {
-            continue;
-          }
-          throw error;
-        }
-      }
-      if (lastAvailable) return { read: lastAvailable, credential: lastCredential };
-      if (lastUnavailable) return { read: lastUnavailable, credential: lastCredential };
-      return {
-        read: await google.readExactCalendarCatalog({
-          householdId: turn.authority.householdId,
-          ownerAdultId: firstCredential.ownerAdultId,
-          connectionId: firstCredential.connectionId,
-          calendarId,
-        }),
-        credential: firstCredential,
-      };
-    };
+    const readExactFamilyCatalog = (calendarId: string) =>
+      this.#readExactFamilyCalendarCatalog({
+        householdId: turn.authority.householdId,
+        calendarId,
+        credentials: orderedFamilyCalendarCredentials,
+      });
     const readExactFamilyWindow = async (input: {
       calendarId: string;
       timeMin: string;
@@ -1932,60 +1860,12 @@ export class Florence {
         read: GooglePersonalCalendarWindowRead;
         credential: ActiveFamilyCalendarCredential;
       }>
-    > => {
-      const google = this.#google;
-      const firstCredential = orderedFamilyCalendarCredentials[0];
-      if (!google || !firstCredential) throw new Error("The Family Calendar credential is unavailable");
-      let lastIncomplete: GooglePersonalCalendarWindowRead | null = null;
-      let lastCredential = firstCredential;
-      for (const credential of orderedFamilyCalendarCredentials) {
-        try {
-          const catalog = await google.readExactCalendarCatalog({
-            householdId: turn.authority.householdId,
-            ownerAdultId: credential.ownerAdultId,
-            connectionId: credential.connectionId,
-            calendarId: input.calendarId,
-          });
-          if (catalog.status === "unavailable") {
-            lastCredential = credential;
-            continue;
-          }
-          const read = await google.readExactCalendarWindow({
-            householdId: turn.authority.householdId,
-            ownerAdultId: credential.ownerAdultId,
-            connectionId: credential.connectionId,
-            calendarId: input.calendarId,
-            timeMin: input.timeMin,
-            timeMax: input.timeMax,
-            limit: input.limit,
-          });
-          const exactTarget = read.calendars.find((calendar) => calendar.calendarId === input.calendarId);
-          if (exactTarget?.status === "complete" && exactTarget.accessRole !== "freeBusyReader") {
-            return { read, credential };
-          }
-          lastIncomplete = read;
-          lastCredential = credential;
-        } catch (error) {
-          if (error instanceof GoogleConnectionError && error.code === "credential_invalid_grant") {
-            continue;
-          }
-          throw error;
-        }
-      }
-      if (lastIncomplete) return { read: lastIncomplete, credential: lastCredential };
-      return {
-        read: await google.readExactCalendarWindow({
-          householdId: turn.authority.householdId,
-          ownerAdultId: firstCredential.ownerAdultId,
-          connectionId: firstCredential.connectionId,
-          calendarId: input.calendarId,
-          timeMin: input.timeMin,
-          timeMax: input.timeMax,
-          limit: input.limit,
-        }),
-        credential: firstCredential,
-      };
-    };
+    > =>
+      this.#readExactFamilyCalendarWindow({
+        householdId: turn.authority.householdId,
+        credentials: orderedFamilyCalendarCredentials,
+        ...input,
+      });
     const readConversationCalendarCatalog = async (): Promise<
       Readonly<{
         read: GooglePersonalCalendarCatalogRead;
@@ -2076,7 +1956,7 @@ export class Florence {
         }
       },
       searchFamilyMemory: async ({ query, limit }) =>
-        searchSources(searchableMemorySources, query).slice(0, limit),
+        searchMemorySources(searchableMemorySources, query).slice(0, limit),
       listCalendars: async (): Promise<FlorenceCalendarCatalogRead> => {
         if (!this.#google || !activeGoogleConnection || !googleOwnerAdultId) {
           return {
@@ -2441,33 +2321,40 @@ export class Florence {
         return "failed";
       }
       const result =
-        outbound.moveKind === "reaction"
-          ? await this.#linq.sendReaction({
+        outbound.nativeMove !== null
+          ? await this.#linq.sendMove({
               idempotencyKey: outbound.idempotencyKey,
               providerConversationId: outbound.providerConversationId,
               expectedAuthority: outbound.expectedAuthority,
-              targetProviderMessageId: requiredText(
-                outbound.replyToProviderMessageId,
-                "Reaction target message",
-              ),
-              reaction: reaction(outbound.reaction),
+              move: outbound.nativeMove,
             })
-          : await this.#linq.sendMessage({
-              idempotencyKey: outbound.idempotencyKey,
-              providerConversationId: outbound.providerConversationId,
-              expectedAuthority: outbound.expectedAuthority,
-              text: requiredText(outbound.text, "Outbound message"),
-              ...(outbound.moveKind === "reply"
-                ? {
-                    replyTo: {
-                      providerMessageId: requiredText(
-                        outbound.replyToProviderMessageId,
-                        "Reply target message",
-                      ),
-                    },
-                  }
-                : {}),
-            });
+          : outbound.moveKind === "reaction"
+            ? await this.#linq.sendReaction({
+                idempotencyKey: outbound.idempotencyKey,
+                providerConversationId: outbound.providerConversationId,
+                expectedAuthority: outbound.expectedAuthority,
+                targetProviderMessageId: requiredText(
+                  outbound.replyToProviderMessageId,
+                  "Reaction target message",
+                ),
+                reaction: reaction(outbound.reaction),
+              })
+            : await this.#linq.sendMessage({
+                idempotencyKey: outbound.idempotencyKey,
+                providerConversationId: outbound.providerConversationId,
+                expectedAuthority: outbound.expectedAuthority,
+                text: requiredText(outbound.text, "Outbound message"),
+                ...(outbound.moveKind === "reply"
+                  ? {
+                      replyTo: {
+                        providerMessageId: requiredText(
+                          outbound.replyToProviderMessageId,
+                          "Reply target message",
+                        ),
+                      },
+                    }
+                  : {}),
+              });
       if (result.status === "committed") {
         await this.#store.completeOutbound({
           sourceId,
@@ -2495,11 +2382,10 @@ export class Florence {
     }
   }
 
-  async #tryTurnCue(sourceId: string, cue: "reaction" | "work" | "retry"): Promise<boolean> {
+  async #tryRetryCue(sourceId: string): Promise<boolean> {
     try {
-      const cueSourceId = await this.#store.stageTurnCue({
+      const cueSourceId = await this.#store.stageRetryCue({
         sourceId,
-        cue,
         occurredAt: this.#now().toISOString(),
       });
       if (!cueSourceId) return false;
@@ -2512,7 +2398,7 @@ export class Florence {
   }
 
   async #retryInbound(sourceId: string, error: string): Promise<void> {
-    await this.#tryTurnCue(sourceId, "retry");
+    await this.#tryRetryCue(sourceId);
     try {
       await this.#store.retryInbound({
         sourceId,
@@ -2586,31 +2472,56 @@ export class Florence {
     }
     try {
       if (work.kind === "initial_household_briefing") {
+        const currentTime = this.#now().toISOString();
         const familyCalendar = await this.#google.readInitialCalendarReview({
           householdId: work.household.householdId,
           ownerAdultId: work.familyCalendarOwnerAdultId,
           connectionId: work.familyCalendarOwnerConnectionId,
           calendarId: work.familyCalendarId,
-          currentTime: this.#now().toISOString(),
+          currentTime,
           limit: 50,
         });
         if (familyCalendar.status !== "complete" || !familyCalendar.cursor) {
           throw new Error("The Family Calendar baseline is temporarily unavailable");
         }
-        const selectedCandidates = work.candidates.slice(0, 3);
-        const decision = {
-          selectedCandidateIds: selectedCandidates.map((candidate) => candidate.candidateId),
-          bubbles: householdInitialBriefingBubbles(
-            selectedCandidates,
-            work.candidates.length - selectedCandidates.length,
+        const household = await this.#store.readHousehold({ householdId: work.household.householdId });
+        if (!household) throw new Error("The initial briefing household is unavailable");
+        const decision = await this.#reasoner.synthesizeHouseholdBriefing({
+          currentTime,
+          familyProfile: initialFamilyProfile(work.household),
+          memory: proactiveMemoryContext(household.facts, {
+            primary: [
+              ...work.candidates.map((candidate) => candidate.summary),
+              ...familyCalendar.events.flatMap((event) => (event.title ? [event.title] : [])),
+            ].join("\n"),
+            context: [],
+          }),
+          familyCalendar: familyCalendar.events.map((event) =>
+            event.intervalKind === "timed"
+              ? {
+                  intervalKind: event.intervalKind,
+                  title: event.title,
+                  startsAt: event.startsAt,
+                  endsAt: event.endsAt,
+                  timeZone: event.timeZone,
+                }
+              : {
+                  intervalKind: event.intervalKind,
+                  title: event.title,
+                  startDate: event.startDate,
+                  endDate: event.endDate,
+                },
           ),
-        };
+          candidates: [...work.candidates],
+        });
         await this.#store.completeHouseholdInitialBriefing({
           workId: work.workId,
           selectedCandidateIds: decision.selectedCandidateIds,
           familyCalendarCursor: JSON.stringify(familyCalendar.cursor),
           bubbles: decision.bubbles,
-          occurredAt: this.#now().toISOString(),
+          nextJob: decision.nextJob,
+          executionAdultId: work.familyCalendarOwnerAdultId,
+          occurredAt: currentTime,
         });
         return;
       }
@@ -3231,6 +3142,7 @@ export class Florence {
         privateSummary: finding.privateSummary,
         ...(finding.actionAnchorDigest ? { actionAnchorDigest: finding.actionAnchorDigest } : {}),
         sourceIds: finding.sourceIds,
+        familyRelevance: finding.familyRelevance,
         householdCandidate: finding.householdCandidate,
         monitor: finding.monitor ?? null,
         familyCalendar: finding.familyCalendar ?? null,
@@ -3292,13 +3204,17 @@ export class Florence {
           adult: { adultId: work.adultId, firstName: work.adultFirstName },
           googleConnection: { connectionId: work.connectionId, status: "active", kind: "personal" },
           currentTime: scan.anchoredAt,
-          currentFacts: [
-            ...work.currentFacts,
-            ...resolvedInitialGoogleFacts(scan.outcomes.facts).map(({ slot, statement }) => ({
-              slot,
-              statement,
-            })),
-          ].slice(-100),
+          currentFacts: relevantGoogleFacts(
+            [
+              ...work.currentFacts,
+              ...resolvedInitialGoogleFacts(scan.outcomes.facts).map(({ slot, statement, memory }) => ({
+                slot,
+                statement,
+                memory,
+              })),
+            ],
+            privateGoogleMemoryQuery(batch),
+          ),
           sources: batch,
           reviewKind: "initial",
         },
@@ -3526,6 +3442,9 @@ export class Florence {
     }
     const familyWorkExecutionAdultId = work.ownerAdultId ?? work.initiatingAdultId;
     const familyWorkGoogleAdultId = familyWorkExecutionAdultId;
+    if (work.visibility === "private" && !familyWorkExecutionAdultId) {
+      throw new Error("Private family work lost its adult owner");
+    }
     const browser = this.#browser && familyWorkExecutionAdultId ? this.#browser : null;
     const familyWorkOriginImages = [
       ...(work.origin.replyTarget ? [work.origin.replyTarget] : []),
@@ -3598,6 +3517,19 @@ export class Florence {
         // Keep the durable task retryable; its exact create request will reconcile by provider log.
       }
     };
+    const latestClaimedFamilyWorkState = async (): Promise<FamilyWorkStateV1> => {
+      try {
+        return (
+          (await this.#store.readClaimedFamilyWorkState({
+            workId: work.workId,
+            generation: work.generation,
+            claimId: work.claimId,
+          })) ?? work.state
+        );
+      } catch {
+        return work.state;
+      }
+    };
     try {
       const maps = this.#maps;
       const publicPages = this.#publicPages;
@@ -3605,53 +3537,201 @@ export class Florence {
       const flights = this.#flights;
       const telephony = this.#telephony;
       const google = this.#google;
-      const familyWorkGoogleConnections = google
-        ? await google.status({
-            householdId: work.household.householdId,
-            ownerAdultId: familyWorkGoogleAdultId,
-          })
-        : [];
-      const familyWorkCalendarConnection = familyWorkGoogleConnections.find(
-        (connection) => connection.status === "active",
+      const familyWorkHousehold = await this.#store.readHousehold({
+        householdId: work.household.householdId,
+        ...(work.visibility === "private" && familyWorkExecutionAdultId
+          ? { viewerAdultId: familyWorkExecutionAdultId }
+          : {}),
+      });
+      if (!familyWorkHousehold) throw new Error("The family task household is unavailable");
+      const familyWorkMemoryCorpus = memorySources(familyWorkHousehold.facts);
+      const familyWorkSearchableMemory = representativeMemorySources(familyWorkMemoryCorpus);
+      const familyWorkVisibleSources = selectVisibleMemorySources(familyWorkSearchableMemory, {
+        primary: work.objective,
+        context: [
+          turnText(work.origin.message),
+          ...(work.origin.replyTarget ? [turnText(work.origin.replyTarget)] : []),
+          ...work.origin.supersededMessages.slice(-6).map(turnText),
+        ],
+      });
+      const familyWorkSourceIndex = new Map(
+        familyWorkMemoryCorpus.map((source) => [source.sourceId, source] as const),
       );
+      const familyWorkGoogleConnections =
+        google && familyWorkGoogleAdultId
+          ? await google.status({
+              householdId: work.household.householdId,
+              ownerAdultId: familyWorkGoogleAdultId,
+            })
+          : [];
+      const familyWorkFamilyCalendarCredentials =
+        google && familyWorkHousehold.familyCalendarId
+          ? await this.#store.readActiveFamilyCalendarCredentials({
+              householdId: work.household.householdId,
+            })
+          : [];
+      const familyWorkCalendarConnection =
+        work.visibility === "private"
+          ? familyWorkGoogleConnections.find((connection) => connection.status === "active")
+          : undefined;
       const familyWorkWorkspaceConnection = familyWorkGoogleConnections.find(
         (connection) =>
           connection.status === "active" &&
           GOOGLE_WORKSPACE_ACTION_SCOPES.every((scope) => connection.grantedScopes.includes(scope)),
       );
-      const familyWorkHousehold = familyWorkCalendarConnection
-        ? await this.#store.readHousehold({
-            householdId: work.household.householdId,
-            viewerAdultId: familyWorkGoogleAdultId,
-          })
-        : null;
+      const familyWorkGoogleModelConnections =
+        work.visibility === "household"
+          ? familyWorkFamilyCalendarCredentials.length > 0 && familyWorkHousehold.familyCalendarId
+            ? [
+                {
+                  emailLabel:
+                    familyWorkHousehold.familyCalendarLabel ?? familyWorkHousehold.name ?? "Family Calendar",
+                  calendarAvailable: true,
+                  kind: "family" as const,
+                  writesEnabled: true,
+                },
+              ]
+            : []
+          : familyWorkCalendarConnection
+            ? [
+                {
+                  emailLabel: familyWorkCalendarConnection.emailLabel ?? "Connected Google account",
+                  calendarAvailable: true,
+                  kind: "personal" as const,
+                  writesEnabled: familyWorkWorkspaceConnection !== undefined,
+                },
+              ]
+            : [];
+      const familyWorkGmailAttachmentIndex = new Map<string, GmailAttachmentReference>();
+      const familyWorkCalendarTargets = new Map<string, CalendarEventTarget>();
       const familyWorkCalendarRef = (calendarId: string): string => {
-        if (!familyWorkCalendarConnection) throw new Error("Google Calendar is unavailable");
-        return `calendar_${sha256(
-          `${work.workId}\0${familyWorkCalendarConnection.connectionId}\0${calendarId}`,
-        ).slice(0, 32)}`;
+        const connectionIdentity =
+          calendarId === familyWorkHousehold.familyCalendarId
+            ? "family"
+            : familyWorkCalendarConnection?.connectionId;
+        if (!connectionIdentity) throw new Error("Google Calendar is unavailable");
+        return `calendar_${sha256(`${work.workId}\0${connectionIdentity}\0${calendarId}`).slice(0, 32)}`;
       };
+      const familyWorkCalendarEventRef = (
+        event: GooglePersonalCalendarWindowRead["events"][number],
+      ): string =>
+        `event_${sha256(
+          `${work.workId}\0${event.calendarId === familyWorkHousehold.familyCalendarId ? "family" : familyWorkCalendarConnection?.connectionId}\0${event.calendarId}\0${event.providerEventId}\0${event.providerRevision}`,
+        ).slice(0, 32)}`;
+      const rememberFamilyWorkCalendarEvent = (
+        event: GooglePersonalCalendarWindowRead["events"][number],
+      ): string => {
+        const eventRef = familyWorkCalendarEventRef(event);
+        if (event.title) {
+          familyWorkCalendarTargets.set(eventRef, {
+            providerEventId: event.providerEventId,
+            providerRevision: event.providerRevision,
+            observedEvent:
+              event.intervalKind === "all_day"
+                ? {
+                    intervalKind: "all_day",
+                    title: event.title,
+                    startDate: event.startDate,
+                    endDate: event.endDate,
+                    location: event.location,
+                  }
+                : {
+                    intervalKind: "timed",
+                    title: event.title,
+                    startsAt: event.startsAt,
+                    endsAt: event.endsAt,
+                    timeZone: event.timeZone,
+                    location: event.location,
+                  },
+          });
+        }
+        return eventRef;
+      };
+      const readFamilyWorkExactCalendarCatalog = (calendarId: string) =>
+        this.#readExactFamilyCalendarCatalog({
+          householdId: work.household.householdId,
+          calendarId,
+          credentials: familyWorkFamilyCalendarCredentials,
+        });
+      const readFamilyWorkExactCalendarWindow = async (input: {
+        calendarId: string;
+        timeMin: string;
+        timeMax: string;
+        limit: number;
+      }) =>
+        this.#readExactFamilyCalendarWindow({
+          householdId: work.household.householdId,
+          credentials: familyWorkFamilyCalendarCredentials,
+          ...input,
+        });
       const listFamilyWorkCalendars = async (): Promise<FlorenceCalendarCatalogRead> => {
-        if (!google || !familyWorkCalendarConnection) {
+        if (!google) {
           return { status: "unavailable", calendars: [], totalCalendarCount: 0 };
         }
-        const read = await google.readPersonalCalendarCatalog({
+        if (work.visibility === "household") {
+          const calendarId = familyWorkHousehold.familyCalendarId;
+          if (!calendarId || familyWorkFamilyCalendarCredentials.length === 0) {
+            return { status: "unavailable", calendars: [], totalCalendarCount: 0 };
+          }
+          const { read } = await readFamilyWorkExactCalendarCatalog(calendarId);
+          return {
+            status: read.status,
+            calendars: read.calendars.map((calendar) => ({
+              calendarRef: familyWorkCalendarRef(calendar.calendarId),
+              label: familyWorkHousehold.familyCalendarLabel ?? familyWorkHousehold.name,
+              timeZone: familyWorkHousehold.timeZone,
+              primary: null,
+              accessRole: null,
+              eventCoverage: calendar.eventCoverage,
+            })),
+            totalCalendarCount: read.totalCalendarCount,
+          };
+        }
+        if (!familyWorkCalendarConnection || !familyWorkGoogleAdultId) {
+          return { status: "unavailable", calendars: [], totalCalendarCount: 0 };
+        }
+        const personalRead = await google.readPersonalCalendarCatalog({
           householdId: work.household.householdId,
           ownerAdultId: familyWorkGoogleAdultId,
           connectionId: familyWorkCalendarConnection.connectionId,
           excludedFamilyCalendarId: familyWorkHousehold?.familyCalendarId ?? null,
         });
+        const familyRead =
+          familyWorkHousehold.familyCalendarId && familyWorkFamilyCalendarCredentials.length > 0
+            ? (await readFamilyWorkExactCalendarCatalog(familyWorkHousehold.familyCalendarId)).read
+            : null;
+        const statuses = [personalRead.status, ...(familyRead ? [familyRead.status] : [])];
+        const status: FlorenceCalendarCatalogRead["status"] = statuses.every(
+          (candidate) => candidate === "complete",
+        )
+          ? "complete"
+          : statuses.every((candidate) => candidate === "unavailable")
+            ? "unavailable"
+            : "partial";
         return {
-          status: read.status,
-          calendars: read.calendars.slice(0, 100).map((calendar) => ({
-            calendarRef: familyWorkCalendarRef(calendar.calendarId),
-            label: calendar.label ?? (calendar.primary ? "Primary calendar" : "Calendar"),
-            timeZone: calendar.timeZone,
-            primary: calendar.primary,
-            accessRole: calendar.accessRole,
-            eventCoverage: calendar.eventCoverage,
-          })),
-          totalCalendarCount: read.totalCalendarCount,
+          status,
+          calendars: [
+            ...personalRead.calendars.slice(0, 99).map((calendar) => ({
+              calendarRef: familyWorkCalendarRef(calendar.calendarId),
+              label: calendar.label ?? (calendar.primary ? "Primary calendar" : "Calendar"),
+              timeZone: calendar.timeZone,
+              primary: calendar.primary,
+              accessRole: calendar.accessRole,
+              eventCoverage: calendar.eventCoverage,
+            })),
+            ...(familyRead
+              ? familyRead.calendars.slice(0, 1).map((calendar) => ({
+                  calendarRef: familyWorkCalendarRef(calendar.calendarId),
+                  label:
+                    familyWorkHousehold.familyCalendarLabel ?? familyWorkHousehold.name ?? "Family Calendar",
+                  timeZone: familyWorkHousehold.timeZone,
+                  primary: null,
+                  accessRole: null,
+                  eventCoverage: calendar.eventCoverage,
+                }))
+              : []),
+          ],
+          totalCalendarCount: personalRead.totalCalendarCount + (familyRead?.totalCalendarCount ?? 0),
         };
       };
       const readFamilyWorkCalendarWindow = async (input: {
@@ -3661,7 +3741,7 @@ export class Florence {
         scope: "all" | "primary" | "selected";
         calendarRefs: readonly string[];
       }): Promise<FlorenceCalendarWindowRead> => {
-        if (!google || !familyWorkCalendarConnection) {
+        if (!google) {
           return {
             status: "unavailable",
             calendars: [],
@@ -3670,25 +3750,10 @@ export class Florence {
             totalEventCount: 0,
           };
         }
-        let calendarIds: readonly string[] | undefined;
-        if (input.scope === "selected") {
-          const catalog = await google.readPersonalCalendarCatalog({
-            householdId: work.household.householdId,
-            ownerAdultId: familyWorkGoogleAdultId,
-            connectionId: familyWorkCalendarConnection.connectionId,
-            excludedFamilyCalendarId: familyWorkHousehold?.familyCalendarId ?? null,
-          });
-          const idsByRef = new Map(
-            catalog.calendars.map((calendar) => [
-              familyWorkCalendarRef(calendar.calendarId),
-              calendar.calendarId,
-            ]),
-          );
-          const resolved = input.calendarRefs.flatMap((calendarRef) => {
-            const calendarId = idsByRef.get(calendarRef);
-            return calendarId ? [calendarId] : [];
-          });
-          if (resolved.length !== input.calendarRefs.length) {
+        let read: GooglePersonalCalendarWindowRead;
+        if (work.visibility === "household") {
+          const calendarId = familyWorkHousehold.familyCalendarId;
+          if (!calendarId || familyWorkFamilyCalendarCredentials.length === 0) {
             return {
               status: "unavailable",
               calendars: [],
@@ -3697,16 +3762,10 @@ export class Florence {
               totalEventCount: 0,
             };
           }
-          calendarIds = resolved;
-        } else if (input.scope === "primary") {
-          const catalog = await google.readPersonalCalendarCatalog({
-            householdId: work.household.householdId,
-            ownerAdultId: familyWorkGoogleAdultId,
-            connectionId: familyWorkCalendarConnection.connectionId,
-            excludedFamilyCalendarId: familyWorkHousehold?.familyCalendarId ?? null,
-          });
-          const primary = catalog.calendars.find((calendar) => calendar.primary);
-          if (!primary) {
+          if (
+            input.scope === "selected" &&
+            (input.calendarRefs.length !== 1 || input.calendarRefs[0] !== familyWorkCalendarRef(calendarId))
+          ) {
             return {
               status: "unavailable",
               calendars: [],
@@ -3715,43 +3774,139 @@ export class Florence {
               totalEventCount: 0,
             };
           }
-          calendarIds = [primary.calendarId];
+          read = (
+            await readFamilyWorkExactCalendarWindow({
+              calendarId,
+              timeMin: input.timeMin,
+              timeMax: input.timeMax,
+              limit: input.limit,
+            })
+          ).read;
+        } else {
+          if (!familyWorkCalendarConnection || !familyWorkGoogleAdultId) {
+            return {
+              status: "unavailable",
+              calendars: [],
+              totalCalendarCount: 0,
+              events: [],
+              totalEventCount: 0,
+            };
+          }
+          const familyCalendarId = familyWorkHousehold.familyCalendarId;
+          const selectedFamilyCalendar =
+            input.scope === "selected" &&
+            familyCalendarId !== null &&
+            input.calendarRefs.length === 1 &&
+            input.calendarRefs[0] === familyWorkCalendarRef(familyCalendarId);
+          if (selectedFamilyCalendar) {
+            if (familyWorkFamilyCalendarCredentials.length === 0) {
+              return {
+                status: "unavailable",
+                calendars: [],
+                totalCalendarCount: 0,
+                events: [],
+                totalEventCount: 0,
+              };
+            }
+            read = (
+              await readFamilyWorkExactCalendarWindow({
+                calendarId: familyCalendarId,
+                timeMin: input.timeMin,
+                timeMax: input.timeMax,
+                limit: input.limit,
+              })
+            ).read;
+          } else {
+            let calendarIds: readonly string[] | undefined;
+            const catalog = async () =>
+              google.readPersonalCalendarCatalog({
+                householdId: work.household.householdId,
+                ownerAdultId: familyWorkGoogleAdultId,
+                connectionId: familyWorkCalendarConnection.connectionId,
+                excludedFamilyCalendarId: familyCalendarId,
+              });
+            if (input.scope === "selected") {
+              const idsByRef = new Map(
+                (await catalog()).calendars.map((calendar) => [
+                  familyWorkCalendarRef(calendar.calendarId),
+                  calendar.calendarId,
+                ]),
+              );
+              const resolved = input.calendarRefs.flatMap((calendarRef) => {
+                const calendarId = idsByRef.get(calendarRef);
+                return calendarId ? [calendarId] : [];
+              });
+              if (resolved.length !== input.calendarRefs.length) {
+                return {
+                  status: "unavailable",
+                  calendars: [],
+                  totalCalendarCount: 0,
+                  events: [],
+                  totalEventCount: 0,
+                };
+              }
+              calendarIds = resolved;
+            } else if (input.scope === "primary") {
+              const primary = (await catalog()).calendars.find((calendar) => calendar.primary);
+              if (!primary) {
+                return {
+                  status: "unavailable",
+                  calendars: [],
+                  totalCalendarCount: 0,
+                  events: [],
+                  totalEventCount: 0,
+                };
+              }
+              calendarIds = [primary.calendarId];
+            }
+            read = await google.readPersonalCalendarWindow({
+              householdId: work.household.householdId,
+              ownerAdultId: familyWorkGoogleAdultId,
+              connectionId: familyWorkCalendarConnection.connectionId,
+              excludedFamilyCalendarId: familyCalendarId,
+              timeMin: input.timeMin,
+              timeMax: input.timeMax,
+              ...(calendarIds === undefined ? {} : { calendarIds }),
+              limit: input.limit,
+            });
+          }
         }
-        const read = await google.readPersonalCalendarWindow({
-          householdId: work.household.householdId,
-          ownerAdultId: familyWorkGoogleAdultId,
-          connectionId: familyWorkCalendarConnection.connectionId,
-          excludedFamilyCalendarId: familyWorkHousehold?.familyCalendarId ?? null,
-          timeMin: input.timeMin,
-          timeMax: input.timeMax,
-          ...(calendarIds === undefined ? {} : { calendarIds }),
-          limit: input.limit,
-        });
-        const labels = new Map(read.calendars.map((calendar) => [calendar.calendarId, calendar.label]));
-        const eventRef = (event: GooglePersonalCalendarWindowRead["events"][number]): string =>
-          `event_${sha256(
-            `${work.workId}\0${familyWorkCalendarConnection.connectionId}\0${event.calendarId}\0${event.providerEventId}\0${event.providerRevision}`,
-          ).slice(0, 32)}`;
+        const labels = new Map(
+          read.calendars.map((calendar) => [
+            calendar.calendarId,
+            calendar.calendarId === familyWorkHousehold.familyCalendarId
+              ? (familyWorkHousehold.familyCalendarLabel ?? familyWorkHousehold.name)
+              : calendar.label,
+          ]),
+        );
         return {
           status: read.status,
           calendars: read.calendars.slice(0, 100).map((calendar) => ({
             calendarRef: familyWorkCalendarRef(calendar.calendarId),
-            label: calendar.label,
-            timeZone: calendar.timeZone,
-            primary: calendar.status === "missing" ? null : calendar.primary,
-            accessRole: calendar.accessRole,
+            label: labels.get(calendar.calendarId) ?? null,
+            timeZone:
+              calendar.calendarId === familyWorkHousehold.familyCalendarId
+                ? familyWorkHousehold.timeZone
+                : calendar.timeZone,
+            primary:
+              calendar.calendarId === familyWorkHousehold.familyCalendarId || calendar.status === "missing"
+                ? null
+                : calendar.primary,
+            accessRole:
+              calendar.calendarId === familyWorkHousehold.familyCalendarId ? null : calendar.accessRole,
             status: calendar.status,
             eventCount: calendar.eventCount,
           })),
           totalCalendarCount: read.totalCalendarCount,
           totalEventCount: read.totalEventCount,
-          events: read.events.map((event) =>
-            event.intervalKind === "all_day"
+          events: read.events.map((event) => {
+            const ref = rememberFamilyWorkCalendarEvent(event);
+            return event.intervalKind === "all_day"
               ? {
                   intervalKind: event.intervalKind,
                   calendarRef: familyWorkCalendarRef(event.calendarId),
                   calendarLabel: labels.get(event.calendarId) ?? null,
-                  eventRef: eventRef(event),
+                  eventRef: ref,
                   title: event.title,
                   startDate: event.startDate,
                   endDate: event.endDate,
@@ -3764,7 +3919,7 @@ export class Florence {
                   intervalKind: event.intervalKind,
                   calendarRef: familyWorkCalendarRef(event.calendarId),
                   calendarLabel: labels.get(event.calendarId) ?? null,
-                  eventRef: eventRef(event),
+                  eventRef: ref,
                   title: event.title,
                   startsAt: event.startsAt,
                   endsAt: event.endsAt,
@@ -3773,9 +3928,331 @@ export class Florence {
                   busy: event.busy,
                   timeZone: event.timeZone,
                   location: event.location,
-                },
-          ),
+                };
+          }),
         };
+      };
+      const familyWorkPendingCapabilityIdentity = (
+        name: ClaimedFamilyWorkCapabilityIdentity["name"],
+        occurredAt = this.#now().toISOString(),
+      ): ClaimedFamilyWorkCapabilityIdentity => {
+        const pending = work.state.pendingCall;
+        if (!pending || pending.name !== name) {
+          throw new Error(`Durable ${name} lost its pending capability metadata`);
+        }
+        return {
+          workId: work.workId,
+          generation: work.generation,
+          claimId: work.claimId,
+          callId: pending.callId,
+          name,
+          argumentsJson: pending.argumentsJson,
+          occurredAt,
+        };
+      };
+      const durableFamilyWorkSourceIds = new Set([
+        work.origin.message.sourceId,
+        ...(work.origin.replyTarget ? [work.origin.replyTarget.sourceId] : []),
+        ...work.origin.supersededMessages.map((message) => message.sourceId),
+        ...familyWorkHousehold.facts.flatMap((fact) => fact.sources.map((source) => source.id)),
+      ]);
+      const runVaultWork = async (
+        request: FlorenceVaultWorkRequest,
+        taskSignal?: AbortSignal,
+      ): Promise<FlorenceVaultWorkResult> => {
+        taskSignal?.throwIfAborted();
+        const identity = familyWorkPendingCapabilityIdentity("vault_work");
+        if (request.operation === "forget") {
+          const existing = familyWorkHousehold.facts.find((fact) => fact.id === request.factId);
+          if (
+            !existing ||
+            (work.visibility === "household" && existing.visibility !== "household") ||
+            (work.visibility === "private" &&
+              existing.visibility === "private" &&
+              existing.ownerAdultId !== familyWorkExecutionAdultId)
+          ) {
+            throw new Error("Durable work cannot forget memory outside its conversation");
+          }
+          const receipt = await this.#store.runClaimedFamilyWorkDatabaseCapability({
+            ...identity,
+            capability: { name: "vault_work", mutation: { operation: "forget", factId: request.factId } },
+          });
+          return receipt.output as FlorenceVaultWorkResult;
+        }
+
+        const existing =
+          request.operation === "correct"
+            ? familyWorkHousehold.facts.find((fact) => fact.id === request.factId)
+            : null;
+        if (request.operation === "correct" && !existing) {
+          throw new Error("Durable work cannot correct memory it has not read");
+        }
+        if (work.visibility === "household" && request.visibility !== "household") {
+          throw new Error("Household-visible work cannot create private memory");
+        }
+        if (existing && existing.visibility !== request.visibility) {
+          throw new Error("A memory correction cannot change who can see it");
+        }
+        const ownerAdultId = request.visibility === "private" ? familyWorkExecutionAdultId : null;
+        if (request.visibility === "private" && !ownerAdultId) {
+          throw new Error("Private durable memory lost its adult owner");
+        }
+        const slot =
+          existing?.slot ??
+          (request.memory.memoryKind === "artifact" && request.memory.title
+            ? `artifact:${request.memory.artifactKind}:${sha256(request.memory.title.toLocaleLowerCase())}`
+            : `${request.memory.memoryKind}:${sha256(request.statement.toLocaleLowerCase())}`);
+        const sourceIds = [
+          ...new Set([
+            ...request.sourceIds.filter((sourceId) => durableFamilyWorkSourceIds.has(sourceId)),
+            work.origin.message.sourceId,
+          ]),
+        ];
+        const fact: FactDraft = {
+          id: existing?.id ?? deterministicUuid(`family-work-fact\0${work.workId}\0${identity.callId}`),
+          subjectPersonId: existing?.subjectPersonId ?? null,
+          kind: existing?.kind ?? (request.memory.memoryKind === "preference" ? "preference" : "general"),
+          slot,
+          label: request.memory.title ?? existing?.label ?? request.statement.slice(0, 160),
+          value: {
+            statement: request.statement,
+            memoryKind: request.memory.memoryKind,
+            artifactKind: request.memory.artifactKind,
+            title: request.memory.title,
+            details: request.memory.details,
+            tags: request.memory.tags,
+          },
+          visibility: request.visibility,
+          ownerAdultId,
+          sourceIds,
+        };
+        const receipt = await this.#store.runClaimedFamilyWorkDatabaseCapability({
+          ...identity,
+          capability: { name: "vault_work", mutation: { operation: request.operation, fact } },
+        });
+        return receipt.output as FlorenceVaultWorkResult;
+      };
+      const runReminderWork = async (
+        request: FlorenceReminderWorkRequest,
+        taskSignal?: AbortSignal,
+      ): Promise<FlorenceReminderWorkResult> => {
+        taskSignal?.throwIfAborted();
+        if (request.operation === "list") {
+          const reminders = await this.#store.readClaimedFamilyWorkReminders({
+            workId: work.workId,
+            generation: work.generation,
+            claimId: work.claimId,
+            occurredAt: this.#now().toISOString(),
+          });
+          return {
+            status: "listed",
+            reminders: reminders.map((reminder) => ({
+              reminderId: reminder.reminderId,
+              action: reminder.action,
+              schedule:
+                reminder.schedule.kind === "weekly"
+                  ? { ...reminder.schedule, weekdays: [...reminder.schedule.weekdays] }
+                  : reminder.schedule,
+              state: reminder.status,
+              nextAt: reminder.nextAt,
+              lastRunAt: reminder.lastRunAt,
+              createdAt: reminder.createdAt,
+            })),
+          };
+        }
+        const identity = familyWorkPendingCapabilityIdentity("reminder_work");
+        const mutation: ReminderMutation =
+          request.operation === "create"
+            ? {
+                operation: "create",
+                reminderId: deterministicUuid(`family-work-reminder\0${work.workId}\0${identity.callId}`),
+                action: request.action,
+                schedule: request.schedule,
+                visibility: work.visibility,
+                ownerAdultId: work.visibility === "private" ? familyWorkExecutionAdultId : null,
+              }
+            : request.operation === "update"
+              ? {
+                  operation: "update",
+                  reminderId: request.reminderId,
+                  action: request.action,
+                  schedule: request.schedule,
+                }
+              : { operation: request.operation, reminderId: request.reminderId };
+        const receipt = await this.#store.runClaimedFamilyWorkDatabaseCapability({
+          ...identity,
+          capability: { name: "reminder_work", mutation },
+        });
+        return receipt.output as FlorenceReminderWorkResult;
+      };
+      const resolveFamilyWorkCalendarTarget = async (
+        request: Exclude<FlorenceFamilyCalendarWorkRequest, { operation: "create" }>,
+      ): Promise<CalendarEventTarget> => {
+        let target = familyWorkCalendarTargets.get(request.target.eventRef) ?? null;
+        if (!target) {
+          const calendarId = familyWorkHousehold.familyCalendarId;
+          if (!calendarId) throw new Error("The Family Calendar is unavailable");
+          const targetStart =
+            request.target.observedEvent.intervalKind === "all_day"
+              ? zonedCalendarDateStart(request.target.observedEvent.startDate, familyWorkHousehold.timeZone)
+              : new Date(request.target.observedEvent.startsAt);
+          const read: GooglePersonalCalendarWindowRead = (
+            await readFamilyWorkExactCalendarWindow({
+              calendarId,
+              timeMin: new Date(targetStart.getTime() - 60_000).toISOString(),
+              timeMax: new Date(targetStart.getTime() + 60_000).toISOString(),
+              limit: 50,
+            })
+          ).read;
+          if (
+            read.status !== "complete" ||
+            read.calendars.some((calendar) => calendar.status !== "complete")
+          ) {
+            throw new Error("The exact Family Calendar event could not be completely re-read");
+          }
+          for (const event of read.events) rememberFamilyWorkCalendarEvent(event);
+          target = familyWorkCalendarTargets.get(request.target.eventRef) ?? null;
+        }
+        if (
+          !target ||
+          JSON.stringify(target.observedEvent) !== JSON.stringify(request.target.observedEvent)
+        ) {
+          throw new Error("The Family Calendar event changed before it could be updated");
+        }
+        return target;
+      };
+      const assertCompleteFamilyCalendarCoverage = async (
+        event: Extract<FlorenceFamilyCalendarWorkRequest, { operation: "create" }>["event"],
+      ): Promise<void> => {
+        const calendarId = familyWorkHousehold.familyCalendarId;
+        if (!calendarId) throw new Error("The Family Calendar is unavailable");
+        const intervalStart =
+          event.intervalKind === "all_day"
+            ? zonedCalendarDateStart(event.startDate, familyWorkHousehold.timeZone)
+            : new Date(event.startsAt);
+        const intervalEnd =
+          event.intervalKind === "all_day"
+            ? zonedCalendarDateStart(event.endDate, familyWorkHousehold.timeZone)
+            : new Date(event.endsAt);
+        const maxWindowMs = 31 * 24 * 60 * 60_000;
+        for (let cursor = intervalStart.getTime(); cursor < intervalEnd.getTime(); ) {
+          const end = Math.min(cursor + maxWindowMs, intervalEnd.getTime());
+          const read: GooglePersonalCalendarWindowRead = (
+            await readFamilyWorkExactCalendarWindow({
+              calendarId,
+              timeMin: new Date(cursor).toISOString(),
+              timeMax: new Date(end).toISOString(),
+              limit: 50,
+            })
+          ).read;
+          if (
+            read.status !== "complete" ||
+            read.calendars.length !== 1 ||
+            read.calendars[0]?.calendarId !== calendarId ||
+            read.calendars[0].status !== "complete"
+          ) {
+            throw new Error("The Family Calendar interval could not be completely re-read");
+          }
+          cursor = end;
+        }
+      };
+      const runFamilyCalendarWork = async (
+        request: FlorenceFamilyCalendarWorkRequest,
+        taskSignal?: AbortSignal,
+      ): Promise<FlorenceFamilyCalendarWorkResult> => {
+        taskSignal?.throwIfAborted();
+        if (
+          !google ||
+          !familyWorkHousehold.familyCalendarId ||
+          familyWorkFamilyCalendarCredentials.length === 0
+        ) {
+          throw new Error("Shared Family Calendar work is unavailable");
+        }
+        const identity = familyWorkPendingCapabilityIdentity("family_calendar_work");
+        const initialPreparation = await this.#store.prepareClaimedFamilyWorkCalendarCapability(identity);
+        if (initialPreparation.status === "replayed") {
+          return initialPreparation.receipt.output as FlorenceFamilyCalendarWorkResult;
+        }
+        if (request.operation === "create") {
+          await assertCompleteFamilyCalendarCoverage(request.event);
+        }
+        const mutation: FamilyCalendarMutation =
+          request.operation === "create"
+            ? request
+            : request.operation === "delete"
+              ? {
+                  operation: "delete",
+                  event: null,
+                  target: await resolveFamilyWorkCalendarTarget(request),
+                }
+              : {
+                  operation: "update",
+                  event: request.event,
+                  target: await resolveFamilyWorkCalendarTarget(request),
+                };
+        const prepared = await this.#store.prepareClaimedFamilyWorkCalendarCapability({
+          ...identity,
+          occurredAt: this.#now().toISOString(),
+        });
+        if (prepared.status === "replayed") {
+          return prepared.receipt.output as FlorenceFamilyCalendarWorkResult;
+        }
+        taskSignal?.throwIfAborted();
+        let result: Awaited<ReturnType<GoogleConnection["executeCalendar"]>>;
+        try {
+          result = await google.executeCalendar({
+            actionId: deterministicUuid(
+              `family-work-calendar\0${work.workId}\0${sha256(identity.argumentsJson)}`,
+            ),
+            householdId: work.household.householdId,
+            connectionId: prepared.credential.connectionId,
+            ownerAdultId: prepared.credential.ownerAdultId,
+            calendarId: prepared.credential.calendarId,
+            mutation,
+          });
+        } catch (error) {
+          taskSignal?.throwIfAborted();
+          if (error instanceof GoogleCalendarTransientError) {
+            throw new CapabilityAdapterError("transient", "Google Calendar is temporarily unavailable.");
+          }
+          if (credentialInvalidGrant(error)) {
+            throw new CapabilityAdapterError(
+              "permanent",
+              "Google Calendar needs to be reconnected before Florence can make that change.",
+            );
+          }
+          throw new CapabilityAdapterError("permanent", "Google Calendar could not complete that change.");
+        }
+        if (result.status === "credential_rejected") {
+          await google.disconnect({
+            connectionId: prepared.credential.connectionId,
+            householdId: work.household.householdId,
+            ownerAdultId: prepared.credential.ownerAdultId,
+            now: result.occurredAt,
+          });
+          throw new CapabilityAdapterError(
+            "permanent",
+            "Google Calendar needs to be reconnected before Florence can make that change.",
+          );
+        }
+        if (result.status === "failed") {
+          throw new CapabilityAdapterError(
+            "permanent",
+            result.detail || "Google Calendar could not complete that change.",
+          );
+        }
+        const output: FlorenceFamilyCalendarWorkResult = {
+          status: "committed",
+          operation: request.operation,
+          providerEventId: result.providerEventId,
+          providerRevision: result.providerRevision,
+        };
+        const receipt = await this.#store.checkpointClaimedFamilyWorkCapabilityReceipt({
+          ...identity,
+          occurredAt: result.occurredAt,
+          output,
+        });
+        return receipt.output as FlorenceFamilyCalendarWorkResult;
       };
       const step = await reasoner.continueFamilyWork(
         {
@@ -3786,10 +4263,93 @@ export class Florence {
           initiatingAdultId: work.initiatingAdultId,
           origin: work.origin,
           household: work.household,
+          visibleSources: familyWorkVisibleSources,
+          googleConnections: familyWorkGoogleModelConnections,
           state: work.state,
           currentTime: this.#now().toISOString(),
         },
         {
+          runVaultWork,
+          runReminderWork,
+          ...(google && familyWorkHousehold.familyCalendarId && familyWorkFamilyCalendarCredentials.length > 0
+            ? { runFamilyCalendarWork }
+            : {}),
+          searchFamilyMemory: async ({ query, limit }) =>
+            searchMemorySources(familyWorkSearchableMemory, query).slice(0, limit),
+          readSource: async ({ sourceId }) => familyWorkSourceIndex.get(sourceId) ?? null,
+          ...(google && familyWorkCalendarConnection && familyWorkExecutionAdultId
+            ? {
+                searchGmail: async ({ query, after, before, limit }) => {
+                  const evidence = await google.searchGmail({
+                    householdId: work.household.householdId,
+                    ownerAdultId: familyWorkExecutionAdultId,
+                    connectionId: familyWorkCalendarConnection.connectionId,
+                    query,
+                    ...(after === null ? {} : { after }),
+                    ...(before === null ? {} : { before }),
+                    limit,
+                  });
+                  const sources = evidence.messages.map((message): FlorenceConversationalGmailSource => {
+                    const draft = draftGmailEvidence({
+                      householdId: work.household.householdId,
+                      ownerAdultId: familyWorkExecutionAdultId,
+                      connectionId: familyWorkCalendarConnection.connectionId,
+                      ...message,
+                    });
+                    for (const attachment of message.attachments) {
+                      familyWorkGmailAttachmentIndex.set(
+                        `${draft.id}\0${gmailAttachmentRefFor(draft.id, attachment)}`,
+                        attachment,
+                      );
+                    }
+                    return {
+                      sourceId: draft.id,
+                      kind: "gmail",
+                      visibility: "adult_private",
+                      sentAt: message.sentAt,
+                      sender: modelSafeGmailText(message.from),
+                      subject: message.subject === null ? null : modelSafeGmailText(message.subject),
+                      text: modelSafeGmailText(message.text),
+                      textStatus: message.textStatus,
+                      attachments: message.attachments.map((attachment) => ({
+                        attachmentRef: gmailAttachmentRefFor(draft.id, attachment),
+                        filename: attachment.filename,
+                        mimeType: attachment.mimeType,
+                        sizeBytes: attachment.sizeBytes,
+                      })),
+                      attachmentsStatus: message.attachmentsStatus,
+                    };
+                  });
+                  return { status: evidence.status, sources };
+                },
+                readGmailAttachment: async ({ sourceId, attachment }) => {
+                  const providerReference = familyWorkGmailAttachmentIndex.get(
+                    `${sourceId}\0${attachment.attachmentRef}`,
+                  );
+                  if (
+                    !providerReference ||
+                    providerReference.filename !== attachment.filename ||
+                    providerReference.mimeType !== attachment.mimeType ||
+                    providerReference.sizeBytes !== attachment.sizeBytes
+                  ) {
+                    throw new Error("The Gmail attachment reference changed before it could be read");
+                  }
+                  const read = await google.readGmailAttachment({
+                    householdId: work.household.householdId,
+                    ownerAdultId: familyWorkExecutionAdultId,
+                    connectionId: familyWorkCalendarConnection.connectionId,
+                    attachment: providerReference,
+                  });
+                  return {
+                    sourceId,
+                    attachmentRef: attachment.attachmentRef,
+                    filename: read.filename,
+                    mimeType: read.mimeType,
+                    bytes: read.bytes,
+                  };
+                },
+              }
+            : {}),
           ...(publicPages
             ? { runPublicPage: (request, taskSignal) => publicPages.run(request, taskSignal) }
             : {}),
@@ -3918,7 +4478,7 @@ export class Florence {
                 },
               }
             : {}),
-          ...(familyWorkCalendarConnection
+          ...(familyWorkCalendarConnection || familyWorkFamilyCalendarCredentials.length > 0
             ? {
                 listCalendars: listFamilyWorkCalendars,
                 readCalendarWindow: readFamilyWorkCalendarWindow,
@@ -3958,7 +4518,7 @@ export class Florence {
               now: this.#now(),
             });
           },
-          ...(google && familyWorkWorkspaceConnection
+          ...(google && work.visibility === "private" && familyWorkWorkspaceConnection
             ? {
                 runGoogleWorkspace: (operation: GoogleWorkspaceOperation, taskSignal?: AbortSignal) =>
                   google.runWorkspace(
@@ -4091,6 +4651,7 @@ export class Florence {
         if (cancelled) await stopUncheckpointedPhoneCall(true);
         if (cancelled) await adoptUncheckpointedTextMessage();
         const interruptedAt = this.#now();
+        const retryState = await latestClaimedFamilyWorkState();
         const settlement = await this.#store.settleFamilyWorkClaim({
           workId: work.workId,
           generation: work.generation,
@@ -4099,7 +4660,7 @@ export class Florence {
           result: {
             type: "retry",
             state: {
-              ...work.state,
+              ...retryState,
               claim: null,
               activePhoneCall: cancelled
                 ? work.state.activePhoneCall
@@ -4118,6 +4679,7 @@ export class Florence {
         }
         return;
       }
+      const retryState = await latestClaimedFamilyWorkState();
       const settlement = await this.#store.settleFamilyWorkClaim({
         workId: work.workId,
         generation: work.generation,
@@ -4126,7 +4688,7 @@ export class Florence {
         result: {
           type: "retry",
           state: {
-            ...work.state,
+            ...retryState,
             claim: null,
             activePhoneCall: uncheckpointedPhoneCall ?? work.state.activePhoneCall,
             activeTextMessage: uncheckpointedTextMessage ?? work.state.activeTextMessage,
@@ -4411,6 +4973,12 @@ export class Florence {
         });
         return;
       }
+
+      const household = await this.#store.readHousehold({
+        householdId: work.household.householdId,
+        ...(work.visibility === "private" ? { viewerAdultId: work.adultId } : {}),
+      });
+      if (!household) throw new Error("The proactive Google review household is unavailable");
 
       const gmailMessages: GmailEvidence[] = [];
       let removedGmailSourceIds: string[] = [];
@@ -4761,7 +5329,11 @@ export class Florence {
               currentTime,
               evidence,
               activeMonitors: [...work.activeMonitors],
-              currentFacts: work.kind === "personal_google_poll" ? [...work.currentFacts] : [],
+              memory: proactiveMemoryContext(household.facts, privateGoogleMemoryQuery(batch)),
+              currentFacts:
+                work.kind === "personal_google_poll"
+                  ? relevantGoogleFacts(work.currentFacts, privateGoogleMemoryQuery(batch))
+                  : [],
             },
             readTools,
           ),
@@ -4775,7 +5347,9 @@ export class Florence {
         const current = mergedFacts.get(fact.slot);
         if (
           current &&
-          (current.statement !== fact.statement || current.familyRelevance !== fact.familyRelevance)
+          (current.statement !== fact.statement ||
+            current.familyRelevance !== fact.familyRelevance ||
+            !sameMemoryPresentation(current.memory, fact.memory))
         ) {
           throw new Error(`Google change batches disagreed about stable fact ${fact.slot}`);
         }
@@ -4786,19 +5360,19 @@ export class Florence {
             : fact,
         );
       }
+      const proactiveNextJobs = decisions.flatMap((candidate, decisionIndex) => {
+        const nextJob = candidate.nextJob ?? null;
+        const finding = nextJob ? candidate.findings[nextJob.findingIndex] : null;
+        return nextJob && finding ? [{ nextJob, finding, decisionIndex }] : [];
+      });
+      const proactiveUrgencyRank = { now: 0, soon: 1, watch: 2 } as const;
       const decision = {
         findings: decisions.flatMap((candidate) => candidate.findings),
         facts: [...mergedFacts.values()],
       };
-      const activeMonitorIds = new Set(work.activeMonitors.map((monitor) => monitor.monitorId));
-      const retainedFindings = decision.findings.filter((finding) => {
-        if (work.kind !== "personal_google_poll") return finding.materialChange;
-        const existingMonitorChange =
-          finding.monitor !== null &&
-          finding.monitor.operation !== "create" &&
-          activeMonitorIds.has(finding.monitor.monitorId);
-        return finding.familyRelevance !== "owner_private" || finding.materialChange || existingMonitorChange;
-      });
+      const retainedFindings = decision.findings.filter(
+        (finding) => work.kind === "personal_google_poll" || finding.materialChange,
+      );
       const storeFindings = retainedFindings.map((finding) => {
         const sharing = privateCalendarSafeBackgroundSharing({
           familyRelevance: finding.familyRelevance,
@@ -4809,23 +5383,44 @@ export class Florence {
           adultFirstName: work.adultFirstName,
           timeZone: work.household.timeZone,
         });
+        const proposedNextJob = proactiveNextJobs.find((candidate) => candidate.finding === finding) ?? null;
+        const nextJobCandidate =
+          proposedNextJob &&
+          (proposedNextJob.nextJob.visibility === "private"
+            ? work.visibility === "private" && finding.privateDetail.trim().length > 0
+            : sharing.conclusion !== null)
+            ? proposedNextJob
+            : null;
         return {
           ...finding,
           householdConclusion: sharing.conclusion,
           familyCalendar: sharing.familyCalendar,
+          nextJobCandidate,
         };
       });
+      const selectedNextJobFindingIndex = storeFindings
+        .flatMap((finding, index) =>
+          finding.nextJobCandidate ? [{ finding, index, candidate: finding.nextJobCandidate }] : [],
+        )
+        .sort(
+          (left, right) =>
+            proactiveUrgencyRank[left.finding.urgency] - proactiveUrgencyRank[right.finding.urgency] ||
+            (left.finding.dueAt ? Date.parse(left.finding.dueAt) : Number.POSITIVE_INFINITY) -
+              (right.finding.dueAt ? Date.parse(right.finding.dueAt) : Number.POSITIVE_INFINITY) ||
+            left.candidate.decisionIndex - right.candidate.decisionIndex,
+        )[0]?.index;
       const retainedFacts = decision.facts.filter((fact) => fact.familyRelevance !== "owner_private");
       let deliveries = storeFindings
+        .map((finding, index) => ({ finding, index }))
         .filter(
-          (finding) =>
+          ({ finding }) =>
             work.visibility === "private" ||
             finding.householdConclusion !== null ||
             finding.monitor !== null ||
             (finding.familyCalendar ?? null) !== null,
         )
         .map(
-          (finding): ProactiveDelivery => ({
+          ({ finding, index }): ProactiveDelivery => ({
             privateDetail:
               work.visibility === "private"
                 ? privateGoogleFindingDetail({
@@ -4848,6 +5443,13 @@ export class Florence {
             dueAt: finding.dueAt,
             monitor: finding.monitor,
             familyCalendar: finding.familyCalendar ?? null,
+            nextJob:
+              index === selectedNextJobFindingIndex && finding.nextJobCandidate
+                ? {
+                    objective: finding.nextJobCandidate.nextJob.objective,
+                    visibility: finding.nextJobCandidate.nextJob.visibility,
+                  }
+                : null,
             surfaceNow: finding.materialChange,
             preserveDocket: !finding.materialChange,
           }),
@@ -4862,6 +5464,7 @@ export class Florence {
             .filter(({ delivery }) => delivery.surfaceNow !== false)
             .sort(
               (left, right) =>
+                Number(right.delivery.nextJob !== null) - Number(left.delivery.nextJob !== null) ||
                 urgencyRank[left.delivery.urgency] - urgencyRank[right.delivery.urgency] ||
                 dueRank(left.delivery) - dueRank(right.delivery) ||
                 left.index - right.index,
@@ -4891,6 +5494,7 @@ export class Florence {
       );
       await this.#store.completeGooglePoll({
         workId: work.workId,
+        executionAdultId: work.adultId,
         gmailCursor: nextGmailCursor ? googleGmailPollCursor(nextGmailCursor, work.connectionId) : null,
         calendarCursor: nextCalendarCursor,
         googleEvidence: [...googleEvidence.values()],
@@ -5207,6 +5811,122 @@ export class Florence {
     return connections.some((connection) => connection.status === "active");
   }
 
+  async #readExactFamilyCalendarCatalog(input: {
+    householdId: string;
+    calendarId: string;
+    credentials: readonly ActiveFamilyCalendarCredential[];
+  }): Promise<
+    Readonly<{
+      read: GooglePersonalCalendarCatalogRead;
+      credential: ActiveFamilyCalendarCredential;
+    }>
+  > {
+    const google = this.#google;
+    const firstCredential = input.credentials[0];
+    if (!google || !firstCredential) throw new Error("The Family Calendar credential is unavailable");
+    let lastAvailable: Readonly<{
+      read: GooglePersonalCalendarCatalogRead;
+      credential: ActiveFamilyCalendarCredential;
+    }> | null = null;
+    let lastUnavailable: Readonly<{
+      read: GooglePersonalCalendarCatalogRead;
+      credential: ActiveFamilyCalendarCredential;
+    }> | null = null;
+    for (const credential of input.credentials) {
+      try {
+        const read = await google.readExactCalendarCatalog({
+          householdId: input.householdId,
+          ownerAdultId: credential.ownerAdultId,
+          connectionId: credential.connectionId,
+          calendarId: input.calendarId,
+        });
+        if (read.status !== "unavailable") {
+          if (read.calendars[0]?.eventCoverage === "readable") return { read, credential };
+          lastAvailable = { read, credential };
+          continue;
+        }
+        lastUnavailable = { read, credential };
+      } catch (error) {
+        if (error instanceof GoogleConnectionError && error.code === "credential_invalid_grant") continue;
+        throw error;
+      }
+    }
+    if (lastAvailable) return lastAvailable;
+    if (lastUnavailable) return lastUnavailable;
+    return {
+      read: await google.readExactCalendarCatalog({
+        householdId: input.householdId,
+        ownerAdultId: firstCredential.ownerAdultId,
+        connectionId: firstCredential.connectionId,
+        calendarId: input.calendarId,
+      }),
+      credential: firstCredential,
+    };
+  }
+
+  async #readExactFamilyCalendarWindow(input: {
+    householdId: string;
+    calendarId: string;
+    timeMin: string;
+    timeMax: string;
+    limit: number;
+    credentials: readonly ActiveFamilyCalendarCredential[];
+  }): Promise<
+    Readonly<{
+      read: GooglePersonalCalendarWindowRead;
+      credential: ActiveFamilyCalendarCredential;
+    }>
+  > {
+    const google = this.#google;
+    const firstCredential = input.credentials[0];
+    if (!google || !firstCredential) throw new Error("The Family Calendar credential is unavailable");
+    let lastIncomplete: Readonly<{
+      read: GooglePersonalCalendarWindowRead;
+      credential: ActiveFamilyCalendarCredential;
+    }> | null = null;
+    for (const credential of input.credentials) {
+      try {
+        const catalog = await google.readExactCalendarCatalog({
+          householdId: input.householdId,
+          ownerAdultId: credential.ownerAdultId,
+          connectionId: credential.connectionId,
+          calendarId: input.calendarId,
+        });
+        if (catalog.status === "unavailable") continue;
+        const read = await google.readExactCalendarWindow({
+          householdId: input.householdId,
+          ownerAdultId: credential.ownerAdultId,
+          connectionId: credential.connectionId,
+          calendarId: input.calendarId,
+          timeMin: input.timeMin,
+          timeMax: input.timeMax,
+          limit: input.limit,
+        });
+        const exactTarget = read.calendars.find((calendar) => calendar.calendarId === input.calendarId);
+        if (exactTarget?.status === "complete" && exactTarget.accessRole !== "freeBusyReader") {
+          return { read, credential };
+        }
+        lastIncomplete = { read, credential };
+      } catch (error) {
+        if (error instanceof GoogleConnectionError && error.code === "credential_invalid_grant") continue;
+        throw error;
+      }
+    }
+    if (lastIncomplete) return lastIncomplete;
+    return {
+      read: await google.readExactCalendarWindow({
+        householdId: input.householdId,
+        ownerAdultId: firstCredential.ownerAdultId,
+        connectionId: firstCredential.connectionId,
+        calendarId: input.calendarId,
+        timeMin: input.timeMin,
+        timeMax: input.timeMax,
+        limit: input.limit,
+      }),
+      credential: firstCredential,
+    };
+  }
+
   async #householdForAdult(adultId: string): Promise<HouseholdRecord> {
     const household = await this.#householdForAdultOrNull(adultId);
     if (!household) throw new Error("The adult does not belong to a Florence household");
@@ -5290,6 +6010,37 @@ export class Florence {
     } catch {
       return false;
     }
+  }
+
+  #beginInboundPresence(input: {
+    providerConversationId: string;
+    expectedAuthority: Parameters<LinqClient["setTyping"]>[0]["expectedAuthority"];
+    observedAuthority: NonNullable<Parameters<LinqClient["setTyping"]>[0]["observedAuthority"]>;
+  }): InboundPresence {
+    let stopped = false;
+    let refreshTimer: ReturnType<typeof setTimeout> | null = null;
+    let refreshInFlight: Promise<boolean> | null = null;
+    const typingInput = { ...input, active: true } as const;
+    const refresh = (): void => {
+      if (stopped) return;
+      const request = this.#setTyping(typingInput);
+      refreshInFlight = request;
+      void request.finally(() => {
+        if (refreshInFlight === request) refreshInFlight = null;
+        if (!stopped) refreshTimer = setTimeout(refresh, LINQ_TYPING_REFRESH_MS);
+      });
+    };
+    refresh();
+    void this.#linq.markRead(input).catch(() => false);
+    return {
+      stop: () => {
+        if (stopped) return;
+        stopped = true;
+        if (refreshTimer) clearTimeout(refreshTimer);
+        const finish = refreshInFlight ?? Promise.resolve(false);
+        void finish.finally(() => this.#setTyping({ ...input, active: false }));
+      },
+    };
   }
 
   #wake(): void {
@@ -5386,6 +6137,7 @@ function workspace(
               {
                 id: fact.id,
                 statement: factStatement(fact),
+                ...vaultMemoryFields(fact),
                 visibility: fact.visibility,
                 source: source ? vaultSource(source) : null,
                 recordedAt: source?.occurredAt ?? null,
@@ -5480,22 +6232,253 @@ function memberPatch(member: PatchFamilyMemberInput) {
   };
 }
 
+function proactiveMemoryContext(
+  facts: readonly FactRecord[],
+  query: MemorySearchContext,
+): {
+  slot: string;
+  label: string;
+  text: string;
+}[] {
+  const factsById = new Map(facts.map((fact) => [fact.id, fact]));
+  return selectVisibleMemorySources(representativeMemorySources(memorySources(facts)), query).flatMap(
+    (source) => {
+      const fact = source.recordId ? factsById.get(source.recordId) : null;
+      if (!fact) return [];
+      const presentation = vaultMemoryFields(fact);
+      return [
+        {
+          slot: fact.slot,
+          label: presentation.title ?? fact.label,
+          text: vaultMemoryText(fact, presentation).slice(0, 12_000),
+        },
+      ];
+    },
+  );
+}
+
+function relevantGoogleFacts(
+  facts: readonly GoogleStableFactContext[],
+  query: MemorySearchContext,
+): GoogleStableFactContext[] {
+  const bySlot = new Map(facts.map((fact) => [fact.slot, fact]));
+  const sources: FlorenceSource[] = [...bySlot.values()].map((fact) => ({
+    sourceId: deterministicUuid(`google-stable-fact-context\0${fact.slot}`),
+    recordId: fact.slot,
+    kind: "memory",
+    visibility: "adult_private",
+    label: fact.memory.title ?? fact.statement,
+    occurredAt: null,
+    text: memoryPresentationText(fact.statement, fact.memory),
+  }));
+  return selectVisibleMemorySources(sources, query).flatMap((source) => {
+    const fact = source.recordId ? bySlot.get(source.recordId) : null;
+    return fact ? [fact] : [];
+  });
+}
+
 function memorySources(facts: readonly FactRecord[]): FlorenceSource[] {
   return facts.flatMap((fact) => {
+    const presentation = vaultMemoryFields(fact);
     const sources = fact.sources.length > 0 ? fact.sources : [null];
     return sources.map((source) => ({
       sourceId: source?.id ?? fact.id,
       recordId: fact.id,
       kind: "memory" as const,
       visibility: fact.visibility === "household" ? ("shared" as const) : ("adult_private" as const),
-      label: fact.label,
+      label: presentation.title ?? fact.label,
       occurredAt: source?.occurredAt ?? fact.updatedAt,
-      text: factStatement(fact),
+      text: vaultMemoryText(fact, presentation),
     }));
   });
 }
 
+function vaultMemoryText(fact: FactRecord, presentation = vaultMemoryFields(fact)): string {
+  return memoryPresentationText(factStatement(fact), presentation);
+}
+
+function memoryPresentationText(statement: string, presentation: MemoryPresentation): string {
+  const parts = [statement];
+  parts.push(`Memory kind: ${presentation.memoryKind}`);
+  if (presentation.title) parts.push(`Title: ${presentation.title}`);
+  if (presentation.artifactKind) parts.push(`Artifact: ${presentation.artifactKind}`);
+  if (presentation.details && presentation.details !== statement) {
+    parts.push(presentation.details.slice(0, 6_000));
+  }
+  if (presentation.tags.length > 0) parts.push(`Tags: ${presentation.tags.join(", ")}`);
+  return parts.join("\n");
+}
+
 const VISIBLE_MEMORY_SOURCE_LIMIT = 50;
+
+type MemorySearchContext = Readonly<{
+  primary: string;
+  context: readonly string[];
+}>;
+
+type RankedMemorySource = Readonly<{
+  source: FlorenceSource;
+  score: number;
+}>;
+
+const MEMORY_FUNCTION_WORDS = new Set([
+  "a",
+  "an",
+  "and",
+  "are",
+  "as",
+  "at",
+  "be",
+  "by",
+  "for",
+  "from",
+  "in",
+  "is",
+  "it",
+  "me",
+  "my",
+  "of",
+  "on",
+  "or",
+  "our",
+  "the",
+  "that",
+  "these",
+  "this",
+  "those",
+  "to",
+  "us",
+  "was",
+  "we",
+  "were",
+  "with",
+  "you",
+  "your",
+]);
+
+function normalizedMemoryTokens(value: string): string[] {
+  return (
+    value
+      .normalize("NFKD")
+      .replace(/\p{M}+/gu, "")
+      .toLocaleLowerCase()
+      .match(/[\p{L}\p{N}]+/gu) ?? []
+  ).filter((token) => !MEMORY_FUNCTION_WORDS.has(token) && (/^\p{N}+$/u.test(token) || token.length >= 2));
+}
+
+function memoryTokenVariants(token: string): ReadonlySet<string> {
+  const variants = new Set([token]);
+  if (!/^\p{L}+$/u.test(token)) return variants;
+
+  if (token.endsWith("ies") && token.length > 4) {
+    variants.add(`${token.slice(0, -3)}y`);
+  } else {
+    if (token.endsWith("s") && !token.endsWith("ss") && token.length > 3) {
+      variants.add(token.slice(0, -1));
+    }
+    if (token.endsWith("es") && /(?:s|x|z|ch|sh)es$/u.test(token)) {
+      variants.add(token.slice(0, -2));
+    }
+  }
+
+  if (token.endsWith("y") && token.length > 2) {
+    variants.add(`${token.slice(0, -1)}ies`);
+  } else {
+    variants.add(`${token}s`);
+    if (/(?:s|x|z|ch|sh)$/u.test(token)) variants.add(`${token}es`);
+  }
+  return variants;
+}
+
+function memoryTermIndex(tokens: readonly string[]): Set<string> {
+  const index = new Set<string>();
+  for (const token of tokens) {
+    for (const variant of memoryTokenVariants(token)) index.add(variant);
+  }
+  return index;
+}
+
+function hasMemoryTerm(index: ReadonlySet<string>, token: string): boolean {
+  for (const variant of memoryTokenVariants(token)) {
+    if (index.has(variant)) return true;
+  }
+  return false;
+}
+
+function exactAdjacentMemoryMatches(query: readonly string[], target: readonly string[]): number {
+  if (query.length < 2 || target.length < 2) return 0;
+  const targetPairs = new Set<string>();
+  for (let index = 0; index < target.length - 1; index += 1) {
+    targetPairs.add(`${target[index]}\u0000${target[index + 1]}`);
+  }
+  let matches = 0;
+  for (let index = 0; index < query.length - 1; index += 1) {
+    if (targetPairs.has(`${query[index]}\u0000${query[index + 1]}`)) matches += 1;
+  }
+  return matches;
+}
+
+function rankMemorySources(
+  sources: readonly FlorenceSource[],
+  query: MemorySearchContext,
+): RankedMemorySource[] {
+  const indexedSources = sources.map((source) => {
+    const labelTokens = normalizedMemoryTokens(source.label);
+    const bodyTokens = normalizedMemoryTokens(source.text);
+    return {
+      source,
+      labelTokens,
+      bodyTokens,
+      labelTerms: memoryTermIndex(labelTokens),
+      bodyTerms: memoryTermIndex(bodyTokens),
+    };
+  });
+  const primaryTokens = normalizedMemoryTokens(query.primary);
+  const contextTokens = query.context.map(normalizedMemoryTokens);
+  const weightedQueryTerms = new Map<string, number>();
+  for (const token of primaryTokens) weightedQueryTerms.set(token, 3);
+  for (const tokens of contextTokens) {
+    for (const token of tokens) {
+      if (!weightedQueryTerms.has(token)) weightedQueryTerms.set(token, 1);
+    }
+  }
+  const corpusSize = indexedSources.length;
+  const inverseDocumentFrequency = new Map<string, number>();
+  for (const token of weightedQueryTerms.keys()) {
+    const documentFrequency = indexedSources.reduce(
+      (count, source) =>
+        count + (hasMemoryTerm(source.labelTerms, token) || hasMemoryTerm(source.bodyTerms, token) ? 1 : 0),
+      0,
+    );
+    inverseDocumentFrequency.set(token, Math.log((corpusSize + 1) / (documentFrequency + 1)) + 1);
+  }
+
+  return indexedSources
+    .map((indexed): RankedMemorySource => {
+      let score = 0;
+      for (const [token, contextWeight] of weightedQueryTerms) {
+        const fieldWeight = hasMemoryTerm(indexed.labelTerms, token)
+          ? 2
+          : hasMemoryTerm(indexed.bodyTerms, token)
+            ? 1
+            : 0;
+        score += contextWeight * fieldWeight * (inverseDocumentFrequency.get(token) ?? 1);
+      }
+      score += Math.min(3, exactAdjacentMemoryMatches(primaryTokens, indexed.labelTokens)) * 0.3;
+      score += Math.min(3, exactAdjacentMemoryMatches(primaryTokens, indexed.bodyTokens)) * 0.15;
+      for (const tokens of contextTokens) {
+        score += Math.min(2, exactAdjacentMemoryMatches(tokens, indexed.labelTokens)) * 0.1;
+        score += Math.min(2, exactAdjacentMemoryMatches(tokens, indexed.bodyTokens)) * 0.05;
+      }
+      return { source: indexed.source, score };
+    })
+    .sort(
+      (left, right) =>
+        right.score - left.score ||
+        (right.source.occurredAt ?? "").localeCompare(left.source.occurredAt ?? "") ||
+        right.source.sourceId.localeCompare(left.source.sourceId),
+    );
+}
 
 function representativeMemorySources(sources: readonly FlorenceSource[]): FlorenceSource[] {
   const byFact = new Map<string, FlorenceSource>();
@@ -5515,38 +6498,24 @@ function representativeMemorySources(sources: readonly FlorenceSource[]): Floren
 
 function selectVisibleMemorySources(
   sources: readonly FlorenceSource[],
-  currentMessage: string,
+  query: MemorySearchContext,
 ): FlorenceSource[] {
-  const queryTerms = new Set(
-    (currentMessage.toLocaleLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []).filter((term) => term.length >= 3),
-  );
-  const relevance = (source: FlorenceSource): number => {
-    const sourceTerms = new Set(
-      (`${source.label}\n${source.text}`.toLocaleLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []).filter(
-        (term) => term.length >= 3,
-      ),
-    );
-    let score = 0;
-    for (const term of queryTerms) {
-      if (sourceTerms.has(term)) score += 1;
-    }
-    return score;
-  };
-  return [...sources]
-    .sort(
-      (left, right) =>
-        relevance(right) - relevance(left) ||
-        (right.occurredAt ?? "").localeCompare(left.occurredAt ?? "") ||
-        right.sourceId.localeCompare(left.sourceId),
-    )
+  return rankMemorySources(sources, query)
+    .map(({ source }) => source)
     .slice(0, VISIBLE_MEMORY_SOURCE_LIMIT);
 }
 
-function enforcePolicy(decision: FlorenceDecision, announceRestrictions: boolean): FlorenceDecision {
+function searchMemorySources(sources: readonly FlorenceSource[], query: string): FlorenceSource[] {
+  return rankMemorySources(sources, { primary: query, context: [] })
+    .filter(({ score }) => score > 0)
+    .map(({ source }) => source);
+}
+
+function enforcePolicy(decision: FlorenceDecision): FlorenceDecision {
   if (decision.policy.stopMessaging) {
     return {
       policy: decision.policy,
-      conversation: { replyToCurrentMessage: false, reaction: null, bubbles: [] },
+      conversation: { replyToCurrentMessage: false, reaction: null, bubbles: [], nativeMoves: null },
       facts: [],
       followUp: null,
       reminder: null,
@@ -5560,7 +6529,6 @@ function enforcePolicy(decision: FlorenceDecision, announceRestrictions: boolean
   }
   const retain = decision.policy.retain;
   const schedule = decision.policy.schedule;
-  const reminder = decision.reminder;
   const calendar = schedule ? decision.calendar : null;
   const interest =
     decision.interest?.operation === "stop"
@@ -5568,27 +6536,12 @@ function enforcePolicy(decision: FlorenceDecision, announceRestrictions: boolean
       : retain && schedule
         ? (decision.interest ?? null)
         : null;
-  const confirmation = !announceRestrictions
-    ? null
-    : !retain && !schedule
-      ? "I didn’t retain anything in the Vault or schedule anything."
-      : !retain
-        ? "I didn’t retain anything in the Vault."
-        : !schedule
-          ? "I didn’t schedule a follow-up or propose a calendar change."
-          : null;
-  const bubbles = decision.conversation.bubbles.map((bubble) => ({ ...bubble }));
-  if (confirmation) {
-    const last = bubbles.at(-1);
-    if (last) last.text = `${last.text}\n\n${confirmation}`;
-    else bubbles.push({ text: confirmation, delayMs: 0 });
-  }
   return {
     policy: decision.policy,
-    conversation: { ...decision.conversation, bubbles },
+    conversation: decision.conversation,
     facts: retain ? decision.facts : decision.facts.filter((fact) => fact.operation === "forget"),
     followUp: schedule ? decision.followUp : null,
-    reminder,
+    reminder: decision.reminder,
     familyWork: decision.familyWork,
     docketCompletions: decision.docketCompletions,
     interest,
@@ -5683,9 +6636,17 @@ function decisionCommit(
           ]
         : []
       : decision.conversation.bubbles;
+  const nativeResearchUrls = new Set(
+    (decision.conversation.nativeMoves ?? []).flatMap((move) =>
+      move.type === "rich_link" || move.type === "media" ? [move.url] : [],
+    ),
+  );
   const bubbles = decision.householdUpdate
     ? []
-    : appendResearchSourceBubble(baseBubbles, decision.researchUrls ?? []);
+    : appendResearchSourceBubble(
+        baseBubbles,
+        (decision.researchUrls ?? []).filter((url) => !nativeResearchUrls.has(url)),
+      );
   const facts: FactDraft[] = [];
   const deleteFactIds: string[] = [];
   for (const [index, change] of decision.facts.entries()) {
@@ -5694,7 +6655,8 @@ function decisionCommit(
       const canDelete =
         turn.authority.audience === "group"
           ? existing?.visibility === "household"
-          : existing?.visibility === "private" && existing.ownerAdultId === turn.authority.senderAdultId;
+          : existing?.visibility === "household" ||
+            (existing?.visibility === "private" && existing.ownerAdultId === turn.authority.senderAdultId);
       if (!canDelete) {
         throw new FlorenceReasonerError(
           "invalid_output",
@@ -5707,17 +6669,37 @@ function decisionCommit(
     const existing =
       change.operation === "correct" ? turn.facts.find((fact) => fact.id === change.factId) : null;
     const statement = change.statement;
-    const visibility = turn.authority.audience === "group" ? "household" : "private";
+    const visibility = change.visibility;
+    if (turn.authority.audience === "group" && visibility !== "household") {
+      throw new FlorenceReasonerError("invalid_output", "A family-group turn cannot create private memory");
+    }
+    if (existing && existing.visibility !== visibility) {
+      throw new FlorenceReasonerError(
+        "invalid_output",
+        "A memory correction cannot silently change who can see it",
+      );
+    }
     const ownerAdultId = visibility === "private" ? turn.authority.senderAdultId : null;
     const sameScope = existing?.visibility === visibility && existing.ownerAdultId === ownerAdultId;
-    const slot = existing?.slot ?? `general:${sha256(statement.toLocaleLowerCase())}`;
+    const slot =
+      existing?.slot ??
+      (change.memory.memoryKind === "artifact" && change.memory.title
+        ? `artifact:${change.memory.artifactKind}:${sha256(change.memory.title.toLocaleLowerCase())}`
+        : `${change.memory.memoryKind}:${sha256(statement.toLocaleLowerCase())}`);
     facts.push({
       id: sameScope ? existing.id : deterministicUuid(`fact\0${turn.message.sourceId}\0${index}`),
       subjectPersonId: existing?.subjectPersonId ?? null,
-      kind: existing?.kind ?? "general",
+      kind: existing?.kind ?? (change.memory.memoryKind === "preference" ? "preference" : "general"),
       slot,
-      label: existing?.label ?? statement.slice(0, 160),
-      value: { statement },
+      label: change.memory.title ?? existing?.label ?? statement.slice(0, 160),
+      value: {
+        statement,
+        memoryKind: change.memory.memoryKind,
+        artifactKind: change.memory.artifactKind,
+        title: change.memory.title,
+        details: change.memory.details,
+        tags: change.memory.tags,
+      },
       visibility,
       ownerAdultId,
       sourceIds:
@@ -5770,6 +6752,7 @@ function decisionCommit(
     });
   }
   let delay = 0;
+  let messagePart = 0;
   bubbles.forEach((bubble, index) => {
     delay += bubble.delayMs;
     outbound.push({
@@ -5781,10 +6764,124 @@ function decisionCommit(
         ? { replyToSourceId: responseTargetSourceId }
         : {}),
       turnId,
-      turnPart: index as 0 | 1 | 2,
+      turnPart: messagePart as 0 | 1 | 2,
       notBefore: new Date(now.getTime() + delay).toISOString(),
     });
+    messagePart += 1;
   });
+  for (const [nativeIndex, move] of (decision.conversation.nativeMoves ?? []).entries()) {
+    if (move.type === "reaction") {
+      outbound.push({
+        sourceId: deterministicUuid(`outbound\0${turnId}\0native\0${nativeIndex}`),
+        idempotencyKey: `turn:${turn.message.sourceId}:native:${nativeIndex}`,
+        moveKind: "reaction",
+        reaction: move.reaction.type === "tapback" ? move.reaction.reaction : move.reaction.emoji,
+        replyToSourceId: move.targetSourceId,
+        nativeMove: {
+          type: "reaction",
+          operation: move.operation,
+          ...(move.partIndex === null || move.partIndex === undefined ? {} : { partIndex: move.partIndex }),
+          reaction: move.reaction,
+        },
+        turnId,
+        turnPart: -1,
+        notBefore: new Date(now.getTime() + delay).toISOString(),
+      });
+      continue;
+    }
+    if (move.type === "poll") {
+      const questionMove: OutboundNativeMoveDraft = {
+        type: "message",
+        parts: [{ type: "text", text: move.question }],
+      };
+      outbound.push({
+        sourceId: deterministicUuid(`outbound\0${turnId}\0native\0${nativeIndex}\0question`),
+        idempotencyKey: `turn:${turn.message.sourceId}:native:${nativeIndex}:question`,
+        moveKind: "message",
+        text: move.question,
+        nativeMove: questionMove,
+        turnId,
+        turnPart: messagePart as 0 | 1 | 2,
+        notBefore: new Date(now.getTime() + delay).toISOString(),
+      });
+      messagePart += 1;
+      outbound.push({
+        sourceId: deterministicUuid(`outbound\0${turnId}\0native\0${nativeIndex}\0poll`),
+        idempotencyKey: `turn:${turn.message.sourceId}:native:${nativeIndex}:poll`,
+        moveKind: "message",
+        text: `Poll: ${move.options.join(" / ")}`,
+        nativeMove: { type: "poll", options: move.options },
+        turnId,
+        turnPart: messagePart as 0 | 1 | 2,
+        notBefore: new Date(now.getTime() + delay).toISOString(),
+      });
+      messagePart += 1;
+      continue;
+    }
+    const nativeMove: OutboundNativeMoveDraft =
+      move.type === "mention"
+        ? (() => {
+            if (turn.authority.audience !== "group") {
+              throw new FlorenceReasonerError("invalid_output", "A mention requires the family group");
+            }
+            const adults = turn.household.members.filter(
+              (member) =>
+                member.kind === "adult" &&
+                member.status === "verified" &&
+                member.messagesIdentity === "connected" &&
+                member.messagesAddress !== null &&
+                member.displayName === move.adultDisplayName &&
+                turn.authority.adultIds.includes(member.id),
+            );
+            if (adults.length !== 1 || !adults[0]?.messagesAddress) {
+              throw new FlorenceReasonerError(
+                "invalid_output",
+                "A mention must resolve one exact enrolled adult",
+              );
+            }
+            const start = move.text.indexOf(move.adultDisplayName);
+            if (start < 0) {
+              throw new FlorenceReasonerError(
+                "invalid_output",
+                "A mention must contain the adult's exact display name",
+              );
+            }
+            return {
+              type: "message" as const,
+              parts: [
+                {
+                  type: "text" as const,
+                  text: move.text,
+                  mention: {
+                    handle: adults[0].messagesAddress,
+                    range: [start, start + move.adultDisplayName.length] as const,
+                  },
+                },
+              ],
+            };
+          })()
+        : move.type === "rich_link"
+          ? { type: "message", parts: [{ type: "link", url: move.url }] }
+          : { type: "message", parts: [{ type: "media", source: { type: "url", url: move.url } }] };
+    const text = move.type === "mention" ? move.text : move.url;
+    outbound.push({
+      sourceId: deterministicUuid(`outbound\0${turnId}\0native\0${nativeIndex}`),
+      idempotencyKey: `turn:${turn.message.sourceId}:native:${nativeIndex}`,
+      moveKind: "message",
+      text,
+      nativeMove,
+      turnId,
+      turnPart: messagePart as 0 | 1 | 2,
+      notBefore: new Date(now.getTime() + delay).toISOString(),
+    });
+    messagePart += 1;
+  }
+  if (outbound.length > 3 || messagePart > 3) {
+    throw new FlorenceReasonerError(
+      "invalid_output",
+      "A Florence turn can make at most three physical Messages sends",
+    );
+  }
   const reminderMutation: CommitTurnInput["reminderMutation"] =
     decision.reminder?.operation === "create"
       ? {
@@ -5872,6 +6969,24 @@ function decisionCommit(
     ...calendar,
     handledAt: now.toISOString(),
   };
+}
+
+function approvedActionConversation(
+  calendarOffer: InboundTurn["pendingCalendarOffers"][number] | null,
+  partnerInvitation: InboundTurn["pendingPartnerInvitation"],
+): FlorenceDecision["conversation"] {
+  const bubbles: FlorenceDecision["conversation"]["bubbles"] = [];
+  if (partnerInvitation) {
+    bubbles.push({ text: `Got it—I’ll text ${partnerInvitation.firstName} now.`, delayMs: 0 });
+  }
+  if (calendarOffer) {
+    bubbles.push({
+      text: `Got it—I’ll add “${calendarOffer.event.title}” to the family calendar.`,
+      delayMs: bubbles.length === 0 ? 0 : 250,
+    });
+  }
+  if (bubbles.length === 0) throw new Error("An approved action acknowledgement requires an action");
+  return { replyToCurrentMessage: true, reaction: null, bubbles, nativeMoves: null };
 }
 
 function calendarOfferText(event: CalendarOfferDraft["mutation"]["event"], calendarLabel: string): string {
@@ -5980,6 +7095,21 @@ function vaultSource(source: SourceRecord): VaultSource {
 
 function factStatement(fact: FactRecord): string {
   return factValueStatement(fact.value);
+}
+
+function vaultMemoryFields(fact: FactRecord): MemoryPresentation {
+  return decodeMemoryPresentation(fact.value);
+}
+
+function sameMemoryPresentation(left: MemoryPresentation, right: MemoryPresentation): boolean {
+  return (
+    left.memoryKind === right.memoryKind &&
+    left.artifactKind === right.artifactKind &&
+    left.title === right.title &&
+    left.details === right.details &&
+    left.tags.length === right.tags.length &&
+    left.tags.every((tag, index) => tag === right.tags[index])
+  );
 }
 
 function factValueStatement(value: unknown): string {
@@ -6144,6 +7274,21 @@ function privateGoogleModelBatches<T>(sources: readonly T[]): T[][] {
   }
   if (batch.length > 0) batches.push(batch);
   return batches;
+}
+
+function privateGoogleMemoryQuery(
+  sources: readonly (FlorencePrivateGmailSource | FlorencePrivateCalendarEvent)[],
+): MemorySearchContext {
+  return {
+    primary: sources
+      .map((source) =>
+        source.kind === "gmail"
+          ? [source.sender, source.subject, source.text].filter((value) => value != null).join("\n")
+          : [source.title, source.startsAt, source.startDate].filter((value) => value != null).join("\n"),
+      )
+      .join("\n"),
+    context: [],
+  };
 }
 
 function digestOpaqueProviderState(value: string): string {
@@ -6643,14 +7788,6 @@ function approvalReplyTargetsPrompt(
   return replyToSourceId === null || replyToSourceId === approvalPromptSourceId;
 }
 
-function searchSources(sources: readonly FlorenceSource[], query: string): FlorenceSource[] {
-  const words = query.toLocaleLowerCase().split(/\s+/).filter(Boolean);
-  return sources.filter((source) => {
-    const haystack = `${source.label}\n${source.text}`.toLocaleLowerCase();
-    return words.every((word) => haystack.includes(word));
-  });
-}
-
 function calendarConfirmationVerb(operation: "create" | "update" | "delete"): string {
   return operation === "create" ? "Added" : operation === "update" ? "Updated" : "Removed";
 }
@@ -6990,29 +8127,6 @@ function privateInitialReviewFindingSummary(input: {
   timeZone: string;
 }): string {
   return privateGoogleFindingDetail(input).replaceAll(/\s*\n\s*/gu, " ");
-}
-
-function householdInitialBriefingBubbles(
-  candidates: readonly SharedBriefingCandidate[],
-  deferredCount = 0,
-): readonly { text: string; delayMs: number }[] {
-  if (candidates.length === 0) {
-    return [
-      {
-        text: "I don’t have a household item to flag right now. I’ll keep watching.",
-        delayMs: 0,
-      },
-    ];
-  }
-  const deferred =
-    deferredCount > 0
-      ? `I kept ${deferredCount} lower-priority ${deferredCount === 1 ? "item" : "items"} on the docket too. Ask me anytime.`
-      : null;
-  return renderInitialBriefingSections(
-    [{ heading: "Here’s what’s on the docket:", items: candidates.map((candidate) => candidate.summary) }],
-    [deferred, "Did I get that right? If I missed something, tell me here."].filter(Boolean).join("\n\n"),
-    [],
-  );
 }
 
 function renderInitialBriefingSections(

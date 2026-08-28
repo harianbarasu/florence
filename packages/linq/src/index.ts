@@ -5,6 +5,7 @@ const LINQ_WEBHOOK_VERSION = "2026-02-03";
 const MAX_WEBHOOK_BYTES = 1024 * 1024;
 const DEFAULT_MAX_MEDIA_BYTES = 20 * 1024 * 1024;
 const MAX_OBSERVED_CHAT_HANDLES = 32;
+const PRESENCE_REQUEST_TIMEOUT_MS = 1_500;
 
 type HeaderValue = string | readonly string[] | undefined;
 export type LinqWebhookHeaders = Headers | Readonly<Record<string, HeaderValue>>;
@@ -178,9 +179,69 @@ export type LinqConversationAuthority = {
   participantIdentityDigests: readonly string[];
 };
 
+export type LinqObservedConversationAuthority = {
+  providerConversationId: string;
+  authority: LinqConversationAuthority;
+};
+
 export type LinqMessageReplyTarget = {
   providerMessageId: string;
   partIndex?: number;
+};
+
+export type LinqMessageMention = {
+  /** Exact current group participant handle (E.164 or Apple ID email), never display text. */
+  handle: string;
+  /** Inclusive-exclusive UTF-16 code-unit range within the text part. */
+  range?: readonly [start: number, end: number];
+};
+
+export type LinqMessagePart =
+  | {
+      type: "text";
+      text: string;
+      mention?: LinqMessageMention | null;
+    }
+  | {
+      /** Rich preview. Linq requires this to be the message's only part. */
+      type: "link";
+      url: string;
+    }
+  | {
+      type: "media";
+      source: { type: "url"; url: string } | { type: "attachment"; providerAttachmentId: string };
+    };
+
+export type LinqReaction = "love" | "like" | "dislike" | "laugh" | "emphasize" | "question";
+
+export type LinqReactionValue =
+  | { type: "tapback"; reaction: LinqReaction }
+  | { type: "custom"; emoji: string };
+
+export type LinqNativeMove =
+  | {
+      type: "message";
+      parts: readonly LinqMessagePart[];
+      replyTo?: LinqMessageReplyTarget | null;
+    }
+  | {
+      type: "reaction";
+      operation: "add" | "remove";
+      targetProviderMessageId: string;
+      partIndex?: number;
+      reaction: LinqReactionValue;
+    }
+  | {
+      /** Linq polls have no question field; callers send any question as a preceding text move. */
+      type: "poll";
+      options: readonly string[];
+    };
+
+export type LinqSendMove = {
+  idempotencyKey: string;
+  providerConversationId: string;
+  expectedAuthority: LinqConversationAuthority;
+  move: LinqNativeMove;
 };
 
 export type LinqSendMessage = {
@@ -209,8 +270,6 @@ export type LinqCreatedChat = {
   };
 };
 
-export type LinqReaction = "love" | "like" | "dislike" | "laugh" | "emphasize" | "question";
-
 export type LinqSendReaction = {
   /** Persist this key before calling. Linq's reaction endpoint has no idempotency parameter. */
   idempotencyKey: string;
@@ -233,7 +292,7 @@ export type LinqObservedChat = LinqConversationAuthority & {
 export type LinqDeliveryResult =
   | {
       status: "committed";
-      providerState: "accepted" | "sent" | "delivered" | "read" | "reaction_added";
+      providerState: "accepted" | "sent" | "delivered" | "read" | "reaction_added" | "reaction_removed";
       idempotencyKey: string;
       providerReceiptId: string;
       detail: null;
@@ -378,47 +437,138 @@ export class LinqClient {
     }
   }
 
-  /** Best-effort presence only. Group typing is deliberately unsupported by Florence. */
+  /** Best-effort native presence only. Failure never changes message handling. */
   async setTyping(input: {
     providerConversationId: string;
     expectedAuthority: LinqConversationAuthority;
+    /** Reuse authority observed by the inbound acceptance path instead of issuing another GET. */
+    observedAuthority?: LinqObservedConversationAuthority;
     active: boolean;
   }): Promise<boolean> {
     const conversationId = bounded(input.providerConversationId, "Provider conversation ID", 500);
     const expected = expectedChatAuthority(input.expectedAuthority);
-    if (expected?.audience !== "private") return false;
+    if (!expected) return false;
     try {
-      const observed = await this.observeChat(conversationId);
-      if (!sameChatAuthority(expected, observed)) return false;
-      const response = await this.#fetch(
+      const supplied =
+        input.observedAuthority &&
+        bounded(input.observedAuthority.providerConversationId, "Observed conversation ID", 500) ===
+          conversationId
+          ? expectedChatAuthority(input.observedAuthority.authority)
+          : null;
+      const observed = input.observedAuthority ? supplied : await this.observeChat(conversationId);
+      if (!observed || !sameChatAuthority(expected, observed)) return false;
+      return await this.bestEffortPresenceRequest(
         this.endpoint(`chats/${encodeURIComponent(conversationId)}/typing`),
-        {
-          method: input.active ? "POST" : "DELETE",
-          headers: this.headers(),
-          redirect: "error",
-        },
+        input.active ? "POST" : "DELETE",
       );
-      return response.ok;
     } catch {
       return false;
     }
   }
 
-  async sendMessage(input: LinqSendMessage): Promise<LinqDeliveryResult> {
+  /** Best-effort read receipt for an accepted inbound private-chat message. */
+  async markRead(input: {
+    providerConversationId: string;
+    expectedAuthority: LinqConversationAuthority;
+    /** Reuse authority observed by the inbound acceptance path instead of issuing another GET. */
+    observedAuthority?: LinqObservedConversationAuthority;
+  }): Promise<boolean> {
     const conversationId = bounded(input.providerConversationId, "Provider conversation ID", 500);
-    const idempotencyKey = bounded(input.idempotencyKey, "Message idempotency key", 255);
-    const text = bounded(input.text, "Message text", 10_000);
-    const authorityFailure = await this.authorityFailure(
-      conversationId,
-      expectedChatAuthority(input.expectedAuthority),
-      idempotencyKey,
-    );
-    if (authorityFailure) return authorityFailure;
+    const expected = expectedChatAuthority(input.expectedAuthority);
+    if (expected?.audience !== "private") return false;
+    try {
+      const supplied =
+        input.observedAuthority &&
+        bounded(input.observedAuthority.providerConversationId, "Observed conversation ID", 500) ===
+          conversationId
+          ? expectedChatAuthority(input.observedAuthority.authority)
+          : null;
+      const observed = input.observedAuthority ? supplied : await this.observeChat(conversationId);
+      if (!observed || !sameChatAuthority(expected, observed)) return false;
+      return await this.bestEffortPresenceRequest(
+        this.endpoint(`chats/${encodeURIComponent(conversationId)}/read`),
+        "POST",
+      );
+    } catch {
+      return false;
+    }
+  }
 
-    const replyTo = input.replyTo
+  /** One native conversation surface; higher layers choose the move, this adapter owns Linq semantics. */
+  async sendMove(input: LinqSendMove): Promise<LinqDeliveryResult> {
+    const conversationId = bounded(input.providerConversationId, "Provider conversation ID", 500);
+    const idempotencyKey = bounded(input.idempotencyKey, "Linq move idempotency key", 255);
+    const expected = expectedChatAuthority(input.expectedAuthority);
+    if (!expected) {
+      return this.failed(idempotencyKey, "Florence did not supply valid current chat authority.");
+    }
+    let observed: LinqObservedChat;
+    try {
+      observed = await this.observeChat(conversationId);
+    } catch (error) {
+      if (error instanceof LinqError && error.retryable) throw error;
+      return this.failed(idempotencyKey, "Linq could not verify the current chat authority.");
+    }
+    if (!sameChatAuthority(expected, observed)) {
+      return this.failed(
+        idempotencyKey,
+        "Linq chat participants no longer match Florence's delivery authority.",
+      );
+    }
+
+    switch (input.move.type) {
+      case "message":
+        return this.sendNativeMessage(conversationId, idempotencyKey, expected, observed, input.move);
+      case "reaction":
+        return this.sendNativeReaction(conversationId, idempotencyKey, input.move);
+      case "poll":
+        return this.sendNativePoll(conversationId, idempotencyKey, input.move);
+    }
+  }
+
+  /** Current text-only callers remain thin clients of the native move surface. */
+  async sendMessage(input: LinqSendMessage): Promise<LinqDeliveryResult> {
+    return this.sendMove({
+      idempotencyKey: input.idempotencyKey,
+      providerConversationId: input.providerConversationId,
+      expectedAuthority: input.expectedAuthority,
+      move: {
+        type: "message",
+        parts: [{ type: "text", text: input.text }],
+        ...(input.replyTo ? { replyTo: input.replyTo } : {}),
+      },
+    });
+  }
+
+  /** Current tapback callers remain thin clients of the native move surface. */
+  async sendReaction(input: LinqSendReaction): Promise<LinqDeliveryResult> {
+    return this.sendMove({
+      idempotencyKey: input.idempotencyKey,
+      providerConversationId: input.providerConversationId,
+      expectedAuthority: input.expectedAuthority,
+      move: {
+        type: "reaction",
+        operation: "add",
+        targetProviderMessageId: input.targetProviderMessageId,
+        ...(input.partIndex === undefined ? {} : { partIndex: input.partIndex }),
+        reaction: { type: "tapback", reaction: input.reaction },
+      },
+    });
+  }
+
+  private async sendNativeMessage(
+    conversationId: string,
+    idempotencyKey: string,
+    expected: LinqConversationAuthority,
+    observed: LinqObservedChat,
+    move: Extract<LinqNativeMove, { type: "message" }>,
+  ): Promise<LinqDeliveryResult> {
+    const parts = nativeMessageParts(move.parts, expected, observed);
+
+    const replyTo = move.replyTo
       ? {
-          message_id: bounded(input.replyTo.providerMessageId, "Reply target message ID", 500),
-          part_index: nonnegativeInteger(input.replyTo.partIndex ?? 0, "Reply target part index"),
+          message_id: bounded(move.replyTo.providerMessageId, "Reply target message ID", 500),
+          part_index: nonnegativeInteger(move.replyTo.partIndex ?? 0, "Reply target part index"),
         }
       : undefined;
     let response: Response;
@@ -429,7 +579,7 @@ export class LinqClient {
         redirect: "error",
         body: JSON.stringify({
           message: {
-            parts: [{ type: "text", value: text }],
+            parts,
             idempotency_key: idempotencyKey,
             preferred_service: "iMessage",
             ...(replyTo ? { reply_to: replyTo } : {}),
@@ -457,10 +607,19 @@ export class LinqClient {
       const message = object(payload.message, "send response message");
       const receiptId = string(message.id, "send response message id");
       const occurredAt = timestamp(message.created_at, "send response created_at");
-      const providerState = outboundMessageState(
+      const providerState = createdChatMessageState(
         message.delivery_status,
         "send response message delivery_status",
       );
+      if (providerState === "failed") {
+        return {
+          status: "failed",
+          idempotencyKey,
+          providerReceiptId: null,
+          detail: "Linq reported message delivery failed.",
+          occurredAt,
+        };
+      }
       return {
         status: "committed",
         providerState,
@@ -475,20 +634,17 @@ export class LinqClient {
     }
   }
 
-  async sendReaction(input: LinqSendReaction): Promise<LinqDeliveryResult> {
-    const conversationId = bounded(input.providerConversationId, "Provider conversation ID", 500);
-    const idempotencyKey = bounded(input.idempotencyKey, "Reaction idempotency key", 255);
-    const targetMessageId = bounded(input.targetProviderMessageId, "Reaction target message ID", 500);
-    const authorityFailure = await this.authorityFailure(
-      conversationId,
-      expectedChatAuthority(input.expectedAuthority),
-      idempotencyKey,
-    );
-    if (authorityFailure) return authorityFailure;
-
+  private async sendNativeReaction(
+    conversationId: string,
+    idempotencyKey: string,
+    move: Extract<LinqNativeMove, { type: "reaction" }>,
+  ): Promise<LinqDeliveryResult> {
+    const targetMessageId = bounded(move.targetProviderMessageId, "Reaction target message ID", 500);
+    const operation = reactionOperation(move.operation);
     const partIndex =
-      input.partIndex === undefined ? 0 : nonnegativeInteger(input.partIndex, "Reaction target part index");
-    const desiredReaction = reactionType(input.reaction);
+      move.partIndex === undefined ? 0 : nonnegativeInteger(move.partIndex, "Reaction target part index");
+    const desiredReaction = nativeReaction(move.reaction);
+    const desiredPresence = operation === "add";
     let before: ObservedReactionTarget;
     try {
       before = await this.readReactionTarget(conversationId, targetMessageId, partIndex, desiredReaction);
@@ -496,12 +652,12 @@ export class LinqClient {
       if (error instanceof LinqError && error.retryable) throw error;
       return this.failed(idempotencyKey, "The reaction target is not a message in the authorized chat.");
     }
-    if (before.hasOwnReaction) {
+    if (before.hasOwnReaction === desiredPresence) {
       return {
         status: "committed",
-        providerState: "reaction_added",
+        providerState: operation === "add" ? "reaction_added" : "reaction_removed",
         idempotencyKey,
-        providerReceiptId: reactionStateReceipt(targetMessageId, partIndex, desiredReaction),
+        providerReceiptId: reactionStateReceipt(targetMessageId, partIndex, operation, desiredReaction),
         detail: null,
         occurredAt: this.#now().toISOString(),
       };
@@ -516,8 +672,9 @@ export class LinqClient {
           headers: this.headers(),
           redirect: "error",
           body: JSON.stringify({
-            operation: "add",
-            type: desiredReaction,
+            operation,
+            type: desiredReaction.type === "tapback" ? desiredReaction.reaction : "custom",
+            ...(desiredReaction.type === "custom" ? { custom_emoji: desiredReaction.emoji } : {}),
             part_index: partIndex,
           }),
         },
@@ -527,6 +684,7 @@ export class LinqClient {
         conversationId,
         targetMessageId,
         partIndex,
+        operation,
         desiredReaction,
         idempotencyKey,
         null,
@@ -538,6 +696,7 @@ export class LinqClient {
         conversationId,
         targetMessageId,
         partIndex,
+        operation,
         desiredReaction,
         idempotencyKey,
         null,
@@ -559,6 +718,7 @@ export class LinqClient {
       conversationId,
       targetMessageId,
       partIndex,
+      operation,
       desiredReaction,
       idempotencyKey,
       traceId,
@@ -570,19 +730,20 @@ export class LinqClient {
     conversationId: string,
     targetMessageId: string,
     partIndex: number,
-    reaction: LinqReaction,
+    operation: "add" | "remove",
+    reaction: LinqReactionValue,
     idempotencyKey: string,
     traceId: string | null,
     unknownDetail: string,
   ): Promise<LinqDeliveryResult> {
     try {
       const observed = await this.readReactionTarget(conversationId, targetMessageId, partIndex, reaction);
-      if (observed.hasOwnReaction) {
+      if (observed.hasOwnReaction === (operation === "add")) {
         return {
           status: "committed",
-          providerState: "reaction_added",
+          providerState: operation === "add" ? "reaction_added" : "reaction_removed",
           idempotencyKey,
-          providerReceiptId: traceId ?? reactionStateReceipt(targetMessageId, partIndex, reaction),
+          providerReceiptId: traceId ?? reactionStateReceipt(targetMessageId, partIndex, operation, reaction),
           detail: null,
           occurredAt: this.#now().toISOString(),
         };
@@ -597,7 +758,7 @@ export class LinqClient {
     conversationId: string,
     targetMessageId: string,
     partIndex: number,
-    reaction: LinqReaction,
+    reaction: LinqReactionValue,
   ): Promise<ObservedReactionTarget> {
     const response = await this.request(
       this.endpoint(`messages/${encodeURIComponent(targetMessageId)}`),
@@ -617,9 +778,59 @@ export class LinqClient {
         : array(reactionsValue, "reaction target part reactions");
     const hasOwnReaction = reactions.some((value) => {
       const candidate = object(value, "reaction target reaction");
-      return candidate.is_me === true && candidate.type === reaction;
+      if (candidate.is_me !== true) return false;
+      if (reaction.type === "tapback") return candidate.type === reaction.reaction;
+      return candidate.type === "custom" && candidate.custom_emoji === reaction.emoji;
     });
     return { hasOwnReaction };
+  }
+
+  private async sendNativePoll(
+    conversationId: string,
+    idempotencyKey: string,
+    move: Extract<LinqNativeMove, { type: "poll" }>,
+  ): Promise<LinqDeliveryResult> {
+    const options = nativePollOptions(move.options);
+    let response: Response;
+    try {
+      response = await this.#fetch(this.endpoint(`chats/${encodeURIComponent(conversationId)}/polls`), {
+        method: "POST",
+        headers: this.headers(),
+        redirect: "error",
+        body: JSON.stringify({
+          poll: {
+            options: options.map((text) => ({ text })),
+            idempotency_key: idempotencyKey,
+          },
+        }),
+      });
+    } catch (error) {
+      throw retryable("Unable to reach Linq while creating a poll", error);
+    }
+    if (!response.ok) {
+      if (retryableStatus(response.status)) {
+        throw retryable(`Linq poll creation is temporarily unavailable (HTTP ${response.status})`);
+      }
+      return this.failed(idempotencyKey, `Linq rejected poll creation (HTTP ${response.status}).`);
+    }
+    try {
+      const payload = object(await response.json(), "poll response");
+      literal(payload.chat_id, conversationId, "poll response chat_id");
+      const receiptId = string(payload.message_id, "poll response message_id");
+      const occurredAt = timestamp(payload.created_at, "poll response created_at");
+      object(payload.poll, "poll response poll");
+      return {
+        status: "committed",
+        providerState: "accepted",
+        idempotencyKey,
+        providerReceiptId: receiptId,
+        detail: null,
+        occurredAt,
+      };
+    } catch (error) {
+      if (error instanceof LinqError && error.retryable) throw error;
+      throw retryable("Linq accepted the poll but returned an invalid receipt", error);
+    }
   }
 
   async fetchMedia(reference: LinqMediaReference): Promise<FetchedLinqMedia> {
@@ -670,24 +881,22 @@ export class LinqClient {
     return new URL(`${LINQ_API_BASE_URL}/${path}`);
   }
 
-  private async authorityFailure(
-    conversationId: string,
-    expected: LinqConversationAuthority | null,
-    idempotencyKey: string,
-  ): Promise<LinqDeliveryResult | null> {
-    if (!expected) {
-      return this.failed(idempotencyKey, "Florence did not supply valid current chat authority.");
-    }
-    let observed: LinqObservedChat;
+  private async bestEffortPresenceRequest(url: URL, method: "POST" | "DELETE"): Promise<boolean> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), PRESENCE_REQUEST_TIMEOUT_MS);
     try {
-      observed = await this.observeChat(conversationId);
-    } catch (error) {
-      if (error instanceof LinqError && error.retryable) throw error;
-      return this.failed(idempotencyKey, "Linq could not verify the current chat authority.");
+      const response = await this.#fetch(url, {
+        method,
+        headers: this.headers(),
+        redirect: "error",
+        signal: controller.signal,
+      });
+      return response.ok;
+    } catch {
+      return false;
+    } finally {
+      clearTimeout(timeout);
     }
-    return sameChatAuthority(expected, observed)
-      ? null
-      : this.failed(idempotencyKey, "Linq chat participants no longer match Florence's delivery authority.");
   }
 
   private failed(idempotencyKey: string, detail: string): LinqDeliveryResult {
@@ -959,6 +1168,100 @@ function reactionType(value: LinqReaction): LinqReaction {
   fail("configuration", "Linq reaction type is invalid");
 }
 
+function reactionOperation(value: "add" | "remove"): "add" | "remove" {
+  if (value === "add" || value === "remove") return value;
+  fail("configuration", "Linq reaction operation must be add or remove");
+}
+
+function nativeReaction(value: LinqReactionValue): LinqReactionValue {
+  if (value?.type === "tapback") {
+    return { type: "tapback", reaction: reactionType(value.reaction) };
+  }
+  if (value?.type === "custom") {
+    return { type: "custom", emoji: bounded(value.emoji, "Custom reaction emoji", 64) };
+  }
+  fail("configuration", "Linq reaction content is invalid");
+}
+
+function nativeMessageParts(
+  value: readonly LinqMessagePart[],
+  expected: LinqConversationAuthority,
+  observed: LinqObservedChat,
+): Record<string, unknown>[] {
+  if (!Array.isArray(value) || value.length === 0 || value.length > 100) {
+    fail("configuration", "A Linq message requires between 1 and 100 parts");
+  }
+  if (value.some((part) => part?.type === "link") && value.length !== 1) {
+    fail("configuration", "A Linq rich link must be the message's only part");
+  }
+  if (value.some((part, index) => part?.type === "text" && value[index - 1]?.type === "text")) {
+    fail("configuration", "A Linq message cannot contain consecutive text parts");
+  }
+  if (value.filter((part) => part?.type === "media" && part.source?.type === "url").length > 40) {
+    fail("configuration", "A Linq message cannot contain more than 40 URL media parts");
+  }
+  return value.map((part, index) => {
+    if (part?.type === "text") {
+      const text = bounded(part.text, `Message text part ${index + 1}`, 10_000);
+      if (!part.mention) return { type: "text", value: text };
+      if (expected.audience !== "group" || observed.audience !== "group") {
+        fail("configuration", "Linq mentions require a group chat");
+      }
+      const handle = bounded(part.mention.handle, "Mention participant handle", 500);
+      if (!observed.participants.some((participant) => participant.phoneNumber === handle)) {
+        fail("configuration", "A Linq mention target must be a current group participant");
+      }
+      const range = part.mention.range;
+      if (range === undefined) return { type: "text", value: text, mention: handle };
+      if (!Array.isArray(range) || range.length !== 2) {
+        fail("configuration", "A Linq mention range requires exactly two UTF-16 offsets");
+      }
+      const start = nonnegativeInteger(range[0], "Mention range start");
+      const end = nonnegativeInteger(range[1], "Mention range end");
+      if (start >= end || end > text.length) {
+        fail("configuration", "A Linq mention range must identify a non-empty slice of its text part");
+      }
+      return { type: "text", value: text, mention: handle, mention_range: [start, end] };
+    }
+    if (part?.type === "link") {
+      return { type: "link", value: outboundHttpsUrl(part.url, "Rich link URL", 2_048) };
+    }
+    if (part?.type === "media") {
+      if (part.source?.type === "url") {
+        return { type: "media", url: outboundHttpsUrl(part.source.url, "Media URL", 10_000) };
+      }
+      if (part.source?.type === "attachment") {
+        return {
+          type: "media",
+          attachment_id: bounded(part.source.providerAttachmentId, "Media provider attachment ID", 500),
+        };
+      }
+    }
+    return fail("configuration", `Linq message part ${index + 1} is invalid`);
+  });
+}
+
+function nativePollOptions(value: readonly string[]): string[] {
+  if (!Array.isArray(value) || value.length < 2) {
+    fail("configuration", "A Linq poll requires at least 2 options");
+  }
+  return value.map((option, index) => bounded(option, `Poll option ${index + 1}`, 10_000));
+}
+
+function outboundHttpsUrl(value: unknown, name: string, maximum: number): string {
+  const text = bounded(value, name, maximum);
+  let url: URL;
+  try {
+    url = new URL(text);
+  } catch (error) {
+    throw new LinqError("configuration", `${name} must be a valid HTTPS URL`, false, { cause: error });
+  }
+  if (url.protocol !== "https:" || url.username || url.password) {
+    fail("configuration", `${name} must use HTTPS without embedded credentials`);
+  }
+  return text;
+}
+
 function webhookReactionType(value: unknown): LinqReaction | "custom" | "sticker" {
   if (value === "custom" || value === "sticker") return value;
   if (
@@ -974,9 +1277,15 @@ function webhookReactionType(value: unknown): LinqReaction | "custom" | "sticker
   fail("invalid_payload", "Linq webhook reaction type is invalid");
 }
 
-function reactionStateReceipt(targetMessageId: string, partIndex: number, reaction: LinqReaction): string {
+function reactionStateReceipt(
+  targetMessageId: string,
+  partIndex: number,
+  operation: "add" | "remove",
+  reaction: LinqReactionValue,
+): string {
+  const content = reaction.type === "tapback" ? `tapback:${reaction.reaction}` : `custom:${reaction.emoji}`;
   return `reaction-state:${createHash("sha256")
-    .update(`${targetMessageId}\0${partIndex}\0${reaction}`, "utf8")
+    .update(`${targetMessageId}\0${partIndex}\0${operation}\0${content}`, "utf8")
     .digest("hex")}`;
 }
 

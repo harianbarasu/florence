@@ -134,8 +134,64 @@ export const vaultSourceSchema = z
   .strict();
 export type VaultSource = z.infer<typeof vaultSourceSchema>;
 
-export const vaultFactSchema = z
+const memoryKindSchema = z.enum(["fact", "preference", "routine", "artifact"]);
+const artifactKindSchema = z.enum(["recipe", "list", "plan", "note", "reference", "other"]);
+
+export const memoryPresentationSchema = z
   .object({
+    memoryKind: memoryKindSchema.default("fact"),
+    artifactKind: artifactKindSchema.nullable().default(null),
+    title: nonempty(300).nullable().default(null),
+    details: nonempty(12_000).nullable().default(null),
+    tags: z.array(nonempty(80)).max(20).default([]),
+  })
+  .strict()
+  .superRefine((memory, context) => {
+    const normalizedTags = memory.tags.map((tag) => tag.toLocaleLowerCase("en-US"));
+    if (new Set(normalizedTags).size !== normalizedTags.length) {
+      context.addIssue({
+        code: "custom",
+        path: ["tags"],
+        message: "Memory tags must be unique.",
+      });
+    }
+    if (memory.memoryKind === "artifact") {
+      if (memory.artifactKind === null || memory.title === null || memory.details === null) {
+        context.addIssue({
+          code: "custom",
+          message: "A reusable artifact needs a kind, title, and usable details.",
+        });
+      }
+      return;
+    }
+    if (memory.artifactKind !== null) {
+      context.addIssue({
+        code: "custom",
+        path: ["artifactKind"],
+        message: "Only a reusable artifact may have an artifact kind.",
+      });
+    }
+  });
+export type MemoryPresentation = z.infer<typeof memoryPresentationSchema>;
+const storedMemoryPresentationSchema = memoryPresentationSchema.required();
+
+/** Decode only the explicit presentation persisted by current writers and migration 006. */
+export function decodeMemoryPresentation(value: unknown): MemoryPresentation {
+  const keys = ["memoryKind", "artifactKind", "title", "details", "tags"] as const;
+  if (!isUnknownRecord(value) || keys.some((key) => !Object.hasOwn(value, key))) {
+    throw new Error("Stored memory presentation is missing explicit fields");
+  }
+  return storedMemoryPresentationSchema.parse({
+    memoryKind: value.memoryKind,
+    artifactKind: value.artifactKind,
+    title: value.title,
+    details: value.details,
+    tags: value.tags,
+  });
+}
+
+export const vaultFactSchema = memoryPresentationSchema
+  .safeExtend({
     id: idSchema,
     statement: nonempty(4_000),
     visibility: vaultVisibilitySchema,
@@ -146,6 +202,10 @@ export const vaultFactSchema = z
   })
   .strict();
 export type VaultFact = z.infer<typeof vaultFactSchema>;
+
+function isUnknownRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
 
 const vaultWatchFields = {
   workId: idSchema,

@@ -17,6 +17,7 @@ type JsonPrimitive = boolean | number | string | null;
 export type JsonValue = JsonPrimitive | readonly JsonValue[] | { readonly [key: string]: JsonValue };
 
 export type CapabilityExecutionMode = "parallel" | "sequential";
+export type CapabilityExecutionBoundary = "inline" | "external";
 export type CapabilityCompletion = "complete" | "truncated";
 export type CapabilityTerminalOutcome = "succeeded" | "failed" | "cancelled" | "protocol_rejected";
 
@@ -50,6 +51,29 @@ export type CapabilityAvailabilityProbe<TContext> = (
   signal: AbortSignal,
 ) => boolean | Promise<boolean>;
 
+export interface CapabilityPresentationInput<TContext> {
+  readonly context: Readonly<TContext>;
+  readonly capabilityName: string;
+  readonly baseDescription: string;
+  readonly baseModelSchema: JsonValue;
+}
+
+export interface CapabilityPresentation {
+  readonly description?: string;
+  readonly modelSchema?: JsonValue;
+}
+
+/**
+ * Adapted port of Hermes's per-definition dynamic_schema_overrides
+ * (6dcebea7, tools/registry.py:204-233, 1044-1090). The resolver runs for
+ * every catalog snapshot so the model sees the contract for this context,
+ * rather than a wider static contract that execution would later reject.
+ */
+export type CapabilityPresentationResolver<TContext> = (
+  input: CapabilityPresentationInput<TContext>,
+  signal: AbortSignal,
+) => CapabilityPresentation | Promise<CapabilityPresentation>;
+
 export interface CapabilityAdmissionInput<TContext> {
   readonly context: Readonly<TContext>;
   readonly capabilityName: string;
@@ -61,6 +85,16 @@ export type CapabilityAdmissionPredicate<TContext> = (
   signal: AbortSignal,
 ) => boolean | Promise<boolean>;
 
+export interface CapabilityExecutionBoundaryInput<TContext> {
+  readonly context: Readonly<TContext>;
+  readonly capabilityName: string;
+  readonly canonicalArguments: JsonValue;
+}
+
+export type CapabilityExecutionBoundaryResolver<TContext> = (
+  input: CapabilityExecutionBoundaryInput<TContext>,
+) => CapabilityExecutionBoundary;
+
 export interface CapabilityDefinition<TContext, TArguments = unknown, TOutput = unknown> {
   readonly name: string;
   readonly description: string;
@@ -68,9 +102,12 @@ export interface CapabilityDefinition<TContext, TArguments = unknown, TOutput = 
   readonly inputSchema: z.ZodType<TArguments>;
   readonly outputSchema: z.ZodType<TOutput>;
   readonly executionMode: CapabilityExecutionMode;
+  /** Resolve only from canonical arguments and current context; callers may replay this after a checkpoint. */
+  readonly executionBoundary: CapabilityExecutionBoundary | CapabilityExecutionBoundaryResolver<TContext>;
   readonly timeoutMs: number;
   readonly maxOutputBytes: number;
   readonly availability?: CapabilityAvailabilityProbe<TContext>;
+  readonly presentation?: CapabilityPresentationResolver<TContext>;
   readonly admit?: CapabilityAdmissionPredicate<TContext>;
   readonly execute: (
     input: CapabilityExecutionInput<TContext, TArguments>,
@@ -90,6 +127,7 @@ export interface CapabilityCatalogEntry {
   readonly name: string;
   readonly description: string;
   readonly parameters: JsonValue;
+  readonly executionBoundary: CapabilityExecutionBoundary;
 }
 
 export interface CapabilityCatalogSnapshot {
@@ -121,17 +159,24 @@ export interface ExecuteCapabilityCallsInput<TContext> {
   readonly calls: readonly RawCapabilityCall[];
   readonly completion: CapabilityCompletion;
   readonly signal?: AbortSignal;
-  readonly onStart?: () => void;
+  readonly onStart?: () => void | Promise<void>;
+  /**
+   * Called after validation, admission, and argument-sensitive boundary
+   * resolution, but before any call in a batch executes. Returning true
+   * leaves every call unexecuted for a durable checkpoint.
+   */
+  readonly suspendBeforeExternal?: () => boolean | Promise<boolean>;
 }
 
 export interface CapabilityBatchResult {
   /** Terminal envelopes are always returned in assistant source order. */
   readonly results: readonly CapabilityTerminalEnvelope[];
+  readonly suspendedBeforeExternal: boolean;
 }
 
 interface NormalizedDefinition<TContext> {
   readonly definition: ErasedCapabilityDefinition<TContext>;
-  readonly catalog: CapabilityCatalogEntry;
+  readonly baseCatalog: CapabilityCatalogEntry;
 }
 
 /** Immutable typed registry and execution kernel. */
@@ -149,10 +194,15 @@ export class CapabilityRegistry<TContext> {
         definition.name,
         Object.freeze({
           definition,
-          catalog: deepFreeze({
+          baseCatalog: deepFreeze({
             name: definition.name,
             description: definition.description,
             parameters: cloneCanonicalJson(definition.modelSchema),
+            // A call-sensitive definition is conservatively external for
+            // legacy catalog consumers. Execution always uses its resolved
+            // canonical-argument boundary below.
+            executionBoundary:
+              typeof definition.executionBoundary === "function" ? "external" : definition.executionBoundary,
           }),
         }),
       );
@@ -173,7 +223,8 @@ export class CapabilityRegistry<TContext> {
         const available = await settleAvailability(entry.definition.availability, context, localSignal);
         if (!available) continue;
       }
-      tools.push(entry.catalog);
+      const presentation = await settlePresentation(entry, context, localSignal);
+      if (presentation) tools.push(presentation);
     }
 
     return deepFreeze({ tools });
@@ -185,11 +236,11 @@ export class CapabilityRegistry<TContext> {
     const results: Array<CapabilityTerminalEnvelope | undefined> = new Array(input.calls.length);
     const normalizedCalls = input.calls.map((call, sourceIndex) => normalizeRawCall(call, sourceIndex));
     let started = false;
-    const notifyStart = (): void => {
+    const notifyStart = async (): Promise<void> => {
       if (started) return;
       started = true;
       try {
-        input.onStart?.();
+        await input.onStart?.();
       } catch {
         // Presentation callbacks do not participate in execution.
       }
@@ -209,6 +260,7 @@ export class CapabilityRegistry<TContext> {
     }
 
     if (input.completion === "truncated") {
+      if (normalizedCalls.length > 0) await notifyStart();
       for (const call of normalizedCalls) {
         terminalize(
           call,
@@ -262,9 +314,34 @@ export class CapabilityRegistry<TContext> {
         );
         continue;
       }
-      prepared.push({ call, definition, arguments: parsed.arguments });
-      notifyStart();
+      const executionBoundary = resolveExecutionBoundary(definition, input.context, parsed.arguments);
+      if (!executionBoundary) {
+        terminalize(
+          call,
+          protocolFailure(
+            "invalid_execution_boundary",
+            "That capability call could not determine how it should execute.",
+          ),
+        );
+        continue;
+      }
+      prepared.push({ call, definition, arguments: parsed.arguments, executionBoundary });
     }
+
+    // Adapted from Pi's batch preparation/execution split and truncated-call
+    // rejection (4e494929, packages/agent/src/agent-loop.ts:374-526): prepare
+    // the whole ordered batch before any adapter runs. Florence adds one
+    // durable seam here—if any prepared call is external, the caller may
+    // checkpoint the untouched batch before execution.
+    if (
+      !outerSignal.aborted &&
+      prepared.some((item) => item.executionBoundary === "external") &&
+      (await input.suspendBeforeExternal?.()) === true
+    ) {
+      if (!outerSignal.aborted) return suspendedBatch();
+    }
+
+    if (normalizedCalls.length > 0) await notifyStart();
 
     const runOne = async (item: PreparedCall<TContext>): Promise<void> => {
       if (results[item.call.sourceIndex]) return;
@@ -307,6 +384,7 @@ interface PreparedCall<TContext> {
   readonly call: NormalizedRawCall;
   readonly definition: ErasedCapabilityDefinition<TContext>;
   readonly arguments: JsonValue;
+  readonly executionBoundary: CapabilityExecutionBoundary;
 }
 
 interface TerminalSeed {
@@ -336,6 +414,49 @@ async function settleAvailability<TContext>(
   }
 }
 
+async function settlePresentation<TContext>(
+  entry: NormalizedDefinition<TContext>,
+  context: Readonly<TContext>,
+  signal: AbortSignal,
+): Promise<CapabilityCatalogEntry | null> {
+  const { definition, baseCatalog } = entry;
+  if (!definition.presentation) return baseCatalog;
+  if (signal.aborted) return null;
+  try {
+    const override = await raceAbort(
+      Promise.resolve().then(() =>
+        definition.presentation?.(
+          {
+            context,
+            capabilityName: definition.name,
+            baseDescription: definition.description,
+            baseModelSchema: cloneCanonicalJson(definition.modelSchema),
+          },
+          signal,
+        ),
+      ),
+      signal,
+    );
+    if (!override) return null;
+    const description = z
+      .string()
+      .trim()
+      .min(1)
+      .max(2_000)
+      .parse(override.description ?? definition.description);
+    const parameters = cloneCanonicalJson(override.modelSchema ?? definition.modelSchema);
+    return deepFreeze({
+      ...baseCatalog,
+      description,
+      parameters,
+    });
+  } catch {
+    // A dynamic contract that cannot be resolved is omitted rather than
+    // exposing a wider static contract that would mislead the model.
+    return null;
+  }
+}
+
 async function settleAdmission<TContext>(
   definition: ErasedCapabilityDefinition<TContext>,
   context: Readonly<TContext>,
@@ -362,6 +483,24 @@ async function settleAdmission<TContext>(
     );
   } catch {
     return false;
+  }
+}
+
+function resolveExecutionBoundary<TContext>(
+  definition: ErasedCapabilityDefinition<TContext>,
+  context: Readonly<TContext>,
+  canonicalArguments: JsonValue,
+): CapabilityExecutionBoundary | null {
+  if (typeof definition.executionBoundary !== "function") return definition.executionBoundary;
+  try {
+    const resolved = definition.executionBoundary({
+      context,
+      capabilityName: definition.name,
+      canonicalArguments,
+    });
+    return resolved === "inline" || resolved === "external" ? resolved : null;
+  } catch {
+    return null;
   }
 }
 
@@ -403,15 +542,14 @@ async function runPreparedCall<TContext>(input: {
     .then((result) => normalizeAdapterSuccess(result, definition))
     .catch((error: unknown) => normalizeAdapterFailure(error));
 
-  let settleCancellation: (() => void) | undefined;
+  // Match Pi's started-tool semantics: forward cancellation to the adapter,
+  // then await its settlement (or the bounded timeout) so a remote effect's
+  // returned handle is not discarded merely because the parent cancelled.
   const cutoff = new Promise<TerminalSeed>((resolve) => {
     timer = setTimeout(() => {
       controller.abort(new Error("Capability timed out"));
       resolve(failureSeed("timeout", "The capability timed out before returning a result.", true));
     }, definition.timeoutMs);
-    settleCancellation = () => resolve(cancelledSeed());
-    if (input.outerSignal.aborted) settleCancellation();
-    else input.outerSignal.addEventListener("abort", settleCancellation, { once: true });
   });
 
   try {
@@ -421,7 +559,6 @@ async function runPreparedCall<TContext>(input: {
   } finally {
     if (timer) clearTimeout(timer);
     input.outerSignal.removeEventListener("abort", onAbort);
-    if (settleCancellation) input.outerSignal.removeEventListener("abort", settleCancellation);
     controller.abort(new Error("Capability execution settled"));
   }
 }
@@ -488,9 +625,11 @@ function normalizeDefinition<TContext>(
     inputSchema: definition.inputSchema,
     outputSchema: definition.outputSchema,
     executionMode: definition.executionMode,
+    executionBoundary: definition.executionBoundary,
     timeoutMs,
     maxOutputBytes,
     ...(definition.availability ? { availability: definition.availability } : {}),
+    ...(definition.presentation ? { presentation: definition.presentation } : {}),
     ...(definition.admit ? { admit: definition.admit } : {}),
     execute: definition.execute,
   });
@@ -597,10 +736,6 @@ function cancelledBeforeStart(): TerminalSeed {
   );
 }
 
-function cancelledSeed(): TerminalSeed {
-  return errorSeed("cancelled", "cancelled", "The capability call was cancelled.", false);
-}
-
 function failureSeed(errorCode: string, safeMessage: string, retryable: boolean): TerminalSeed {
   return errorSeed("failed", errorCode, safeMessage, retryable);
 }
@@ -619,12 +754,17 @@ function errorSeed(
   };
 }
 
+function suspendedBatch(): CapabilityBatchResult {
+  return deepFreeze({ results: [], suspendedBeforeExternal: true });
+}
+
 function freezeBatch(results: readonly (CapabilityTerminalEnvelope | undefined)[]): CapabilityBatchResult {
   if (results.some((result) => !result)) {
     throw new Error("Capability execution ended without terminalizing every call");
   }
   return deepFreeze({
     results: results as readonly CapabilityTerminalEnvelope[],
+    suspendedBeforeExternal: false,
   });
 }
 

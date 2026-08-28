@@ -117,6 +117,9 @@ importers:
 
   packages/database:
     dependencies:
+      '@florence/contracts':
+        specifier: workspace:*
+        version: link:../contracts
       postgres:
         specifier: 3.4.9
         version: 3.4.9

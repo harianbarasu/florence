@@ -180,6 +180,17 @@ export type GoogleCalendarWindowRead = {
   cursor: GoogleCalendarBoundedCursor | null;
 };
 
+type GoogleCalendarWindowInput = {
+  householdId: string;
+  ownerAdultId: string;
+  connectionId: string;
+  calendarId?: string;
+  timeMin: string;
+  timeMax: string;
+  limit?: number;
+  eventSelection?: "busy" | "all";
+};
+
 export type GoogleCalendarChange = {
   providerEventId: string;
   providerRevision: string;
@@ -2060,27 +2071,28 @@ export class GoogleConnection {
     limit?: number;
   }): Promise<GoogleCalendarWindowRead> {
     const timeMin = explicitInstant(input.currentTime);
-    return this.readCalendarWindow({
-      householdId: input.householdId,
-      ownerAdultId: input.ownerAdultId,
-      connectionId: input.connectionId,
-      ...(input.calendarId === undefined ? {} : { calendarId: input.calendarId }),
-      timeMin: timeMin.toISOString(),
-      timeMax: new Date(timeMin.getTime() + 21 * 24 * 60 * 60_000).toISOString(),
-      ...(input.limit === undefined ? {} : { limit: input.limit }),
-    });
+    return this.#readCalendarWindow(
+      {
+        householdId: input.householdId,
+        ownerAdultId: input.ownerAdultId,
+        connectionId: input.connectionId,
+        ...(input.calendarId === undefined ? {} : { calendarId: input.calendarId }),
+        timeMin: timeMin.toISOString(),
+        timeMax: new Date(timeMin.getTime() + 21 * 24 * 60 * 60_000).toISOString(),
+        ...(input.limit === undefined ? {} : { limit: input.limit }),
+      },
+      true,
+    );
   }
 
-  async readCalendarWindow(input: {
-    householdId: string;
-    ownerAdultId: string;
-    connectionId: string;
-    calendarId?: string;
-    timeMin: string;
-    timeMax: string;
-    limit?: number;
-    eventSelection?: "busy" | "all";
-  }): Promise<GoogleCalendarWindowRead> {
+  async readCalendarWindow(input: GoogleCalendarWindowInput): Promise<GoogleCalendarWindowRead> {
+    return this.#readCalendarWindow(input, false);
+  }
+
+  async #readCalendarWindow(
+    input: GoogleCalendarWindowInput,
+    exhaustProviderPages: boolean,
+  ): Promise<GoogleCalendarWindowRead> {
     const calendarId = calendarTarget(input.calendarId);
     const timeMin = explicitInstant(input.timeMin);
     const timeMax = explicitInstant(input.timeMax);
@@ -2106,53 +2118,85 @@ export class GoogleConnection {
     try {
       const accessToken = await this.#calendarAccessToken(credential);
       const cursorCapturedAt = new Date();
-      const query = new URLSearchParams({
-        fields:
-          "nextPageToken,timeZone,items(id,etag,updated,status,summary,location,start,end,transparency,attendees(self,responseStatus))",
-        maxResults: String(limit),
-        orderBy: "startTime",
-        showDeleted: "false",
-        singleEvents: "true",
-        timeMax: timeMax.toISOString(),
-        timeMin: timeMin.toISOString(),
-      });
-      let response: Response;
-      try {
-        response = await this.#fetch(
-          `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events?${query}`,
-          {
-            headers: { authorization: `Bearer ${accessToken}` },
-            signal: AbortSignal.timeout(15_000),
-          },
-        );
-      } catch (error) {
-        throw transientCalendarError("Google Calendar read failed", error);
+      const cursor: GoogleCalendarBoundedCursor = {
+        kind: "calendar_updated_min_v1",
+        calendarId,
+        updatedMin: new Date(cursorCapturedAt.getTime() - CALENDAR_CURSOR_OVERLAP_MS).toISOString(),
+        windowTimeMin: timeMin.toISOString(),
+        windowTimeMax: timeMax.toISOString(),
+        overlapMs: CALENDAR_CURSOR_OVERLAP_MS,
+      };
+      const events: GoogleCalendarWindowEvent[] = [];
+      const seenEventIds = new Set<string>();
+      const seenPageTokens = new Set<string>();
+      let pageToken: string | null = null;
+      let observedCalendarTimeZone: string | null = null;
+      while (true) {
+        const query = new URLSearchParams({
+          fields:
+            "nextPageToken,timeZone,items(id,etag,updated,status,summary,location,start,end,transparency,attendees(self,responseStatus))",
+          maxResults: String(limit),
+          orderBy: "startTime",
+          showDeleted: "false",
+          singleEvents: "true",
+          timeMax: timeMax.toISOString(),
+          timeMin: timeMin.toISOString(),
+        });
+        if (pageToken) query.set("pageToken", pageToken);
+        let response: Response;
+        try {
+          response = await this.#fetch(
+            `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events?${query}`,
+            {
+              headers: { authorization: `Bearer ${accessToken}` },
+              signal: AbortSignal.timeout(15_000),
+            },
+          );
+        } catch (error) {
+          throw transientCalendarError("Google Calendar read failed", error);
+        }
+        if (transientHttpStatus(response.status)) {
+          throw transientCalendarError(`Google Calendar read returned HTTP ${response.status}`);
+        }
+        if (!response.ok) return { status: "unavailable", events: [], cursor: null };
+        const body = await safeJson(response);
+        const pageTimeZone = stringField(body, "timeZone");
+        if (observedCalendarTimeZone !== null && observedCalendarTimeZone !== pageTimeZone) {
+          return { status: "unavailable", events: [], cursor: null };
+        }
+        observedCalendarTimeZone = pageTimeZone;
+        for (const event of recordArray(body.items)) {
+          const calendarEvent = calendarWindowEvent(event, pageTimeZone, timeMin, timeMax, eventSelection);
+          if (!calendarEvent) continue;
+          if (exhaustProviderPages && seenEventIds.has(calendarEvent.providerEventId)) {
+            return { status: "unavailable", events: [], cursor: null };
+          }
+          seenEventIds.add(calendarEvent.providerEventId);
+          events.push(calendarEvent);
+        }
+        const nextPageToken = body.nextPageToken;
+        if (nextPageToken === undefined) break;
+        if (typeof nextPageToken !== "string" || !nextPageToken) {
+          return { status: "unavailable", events: [], cursor: null };
+        }
+        if (!exhaustProviderPages) {
+          return {
+            status: "truncated",
+            events,
+            cursor,
+          };
+        }
+        if (seenPageTokens.has(nextPageToken)) {
+          return { status: "unavailable", events: [], cursor: null };
+        }
+        seenPageTokens.add(nextPageToken);
+        pageToken = nextPageToken;
       }
-      if (transientHttpStatus(response.status)) {
-        throw transientCalendarError(`Google Calendar read returned HTTP ${response.status}`);
-      }
-      if (!response.ok) return { status: "unavailable", events: [], cursor: null };
-      const body = await safeJson(response);
-      const calendarTimeZone = stringField(body, "timeZone");
-      const nextPageToken = body.nextPageToken;
-      if (nextPageToken !== undefined && (typeof nextPageToken !== "string" || !nextPageToken)) {
-        return { status: "unavailable", events: [], cursor: null };
-      }
-      const events = recordArray(body.items).flatMap((event) => {
-        const calendarEvent = calendarWindowEvent(event, calendarTimeZone, timeMin, timeMax, eventSelection);
-        return calendarEvent ? [calendarEvent] : [];
-      });
+      if (exhaustProviderPages) events.sort(compareCalendarWindowEvents);
       return {
-        status: nextPageToken ? "truncated" : "complete",
+        status: "complete",
         events,
-        cursor: {
-          kind: "calendar_updated_min_v1",
-          calendarId,
-          updatedMin: new Date(cursorCapturedAt.getTime() - CALENDAR_CURSOR_OVERLAP_MS).toISOString(),
-          windowTimeMin: timeMin.toISOString(),
-          windowTimeMax: timeMax.toISOString(),
-          overlapMs: CALENDAR_CURSOR_OVERLAP_MS,
-        },
+        cursor,
       };
     } catch (error) {
       if (

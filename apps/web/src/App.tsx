@@ -60,6 +60,8 @@ const CALENDAR_WEEKDAYS = [
   { short: "S", long: "Saturday" },
 ] as const;
 const CALENDAR_SKELETON_CELLS = Array.from({ length: 35 }, (_, index) => `calendar-skeleton-${index + 1}`);
+const GOOGLE_LOGO_URL = "/google/g-logo.png";
+const GOOGLE_SIGN_IN_BUTTON_URL = "/google/standard-button-white.png";
 
 type CalendarMonthCell = {
   key: string;
@@ -853,7 +855,7 @@ function GoogleSetupStep({
       />
       <div className="setup-google-card">
         <span className="google-mark" aria-hidden="true">
-          G
+          <img src={GOOGLE_LOGO_URL} alt="" />
         </span>
         <div>
           <strong>Google Workspace</strong>
@@ -866,10 +868,24 @@ function GoogleSetupStep({
           {error}
         </p>
       )}
-      <button className="button primary wide" type="button" onClick={onConnect} disabled={isPending}>
-        {isPending ? "Opening Google…" : "Connect Google Workspace"}
-      </button>
+      <GoogleConnectButton isPending={isPending} onConnect={onConnect} />
     </div>
+  );
+}
+
+function GoogleConnectButton({ isPending, onConnect }: { isPending: boolean; onConnect: () => void }) {
+  return (
+    <button
+      className="google-sign-in-button"
+      type="button"
+      onClick={onConnect}
+      disabled={isPending}
+      aria-label={isPending ? "Opening Google sign in" : "Sign in with Google"}
+      aria-busy={isPending}
+    >
+      <img src={GOOGLE_SIGN_IN_BUTTON_URL} alt="" width="177" height="40" />
+      {isPending && <span className="visually-hidden">Opening Google…</span>}
+    </button>
   );
 }
 
@@ -1355,13 +1371,17 @@ export function VaultPage() {
   }
   const adults = vault.members.filter((member) => member.kind === "adult");
   const children = vault.members.filter((member) => member.kind === "child");
+  const ordinaryFacts = vault.facts.filter((fact) => fact.memoryKind === "fact");
+  const preferencesAndRoutines = vault.facts.filter(
+    (fact) => fact.memoryKind === "preference" || fact.memoryKind === "routine",
+  );
+  const library = vault.facts.filter((fact) => fact.memoryKind === "artifact");
   const foundingAdult = adults.find((member) => member.postalCode !== undefined) ?? null;
-  const viewerName = view.viewer.displayName ? firstName(view.viewer.displayName) : "you";
 
   return (
     <Page
       title="Vault"
-      intro={`What Florence may use for ${viewerName} and the family. Shared household knowledge appears for both parents; private Google evidence stays visible only to its owner.`}
+      intro="The people, knowledge, and reusable things Florence remembers for your household."
     >
       {editing && (
         <MemberEditor
@@ -1416,7 +1436,29 @@ export function VaultPage() {
 
       <VaultSection label="Facts">
         <FactList
-          facts={vault.facts}
+          facts={ordinaryFacts}
+          emptyTitle="No facts visible yet"
+          emptyDetail="Useful household knowledge Florence learns will appear here."
+          isSaving={patchFact.isPending || deleteFact.isPending}
+          onCorrect={(factId, input) => patchFact.mutateAsync({ factId, input })}
+          onDelete={(factId) => deleteFact.mutateAsync(factId)}
+        />
+      </VaultSection>
+
+      <VaultSection label="Preferences & routines">
+        <FactList
+          facts={preferencesAndRoutines}
+          emptyTitle="No preferences or routines yet"
+          emptyDetail="Family preferences, constraints, and recurring routines Florence learns will appear here."
+          isSaving={patchFact.isPending || deleteFact.isPending}
+          onCorrect={(factId, input) => patchFact.mutateAsync({ factId, input })}
+          onDelete={(factId) => deleteFact.mutateAsync(factId)}
+        />
+      </VaultSection>
+
+      <VaultSection label="Library">
+        <ArtifactList
+          artifacts={library}
           isSaving={patchFact.isPending || deleteFact.isPending}
           onCorrect={(factId, input) => patchFact.mutateAsync({ factId, input })}
           onDelete={(factId) => deleteFact.mutateAsync(factId)}
@@ -1674,7 +1716,7 @@ function GoogleConnector({ view, callbackStatus }: { view: WorkspaceView; callba
   return (
     <article className="connector-card">
       <div className="google-mark" aria-hidden="true">
-        G
+        <img src={GOOGLE_LOGO_URL} alt="" />
       </div>
       <div className="connector-copy">
         <strong>Your Google Workspace</strong>
@@ -1702,14 +1744,7 @@ function GoogleConnector({ view, callbackStatus }: { view: WorkspaceView; callba
       </div>
       <div className="connector-actions">
         {!accounts.length && (
-          <button
-            className="button pill"
-            type="button"
-            onClick={() => void connect()}
-            disabled={start.isPending}
-          >
-            {start.isPending ? "Opening…" : "Connect"}
-          </button>
+          <GoogleConnectButton isPending={start.isPending} onConnect={() => void connect()} />
         )}
         {accounts.map((account) => (
           <button
@@ -2055,22 +2090,21 @@ function WatchRow({
 
 function FactList({
   facts,
+  emptyTitle,
+  emptyDetail,
   isSaving,
   onCorrect,
   onDelete,
 }: {
   facts: VaultFact[];
+  emptyTitle: string;
+  emptyDetail: string;
   isSaving: boolean;
   onCorrect: (factId: string, input: PatchFactInput) => Promise<unknown>;
   onDelete: (factId: string) => Promise<unknown>;
 }) {
   if (!facts.length) {
-    return (
-      <EmptyVaultRow
-        title="No facts visible to you yet"
-        detail="Shared facts and your private facts will appear here."
-      />
-    );
+    return <EmptyVaultRow title={emptyTitle} detail={emptyDetail} />;
   }
   return (
     <div className="vault-data-list">
@@ -2137,12 +2171,13 @@ function FactRow({
       ) : (
         <>
           <div className="vault-data-copy">
+            {fact.memoryKind !== "fact" && (
+              <span className="memory-kind-label">
+                {fact.memoryKind === "preference" ? "Preference" : "Routine"}
+              </span>
+            )}
             <strong>{fact.statement}</strong>
-            <p>
-              {fact.source
-                ? sourceSummary(fact.visibility, fact.source.label)
-                : "Shared with the household · Learned from connected family information"}
-            </p>
+            <p>{factSourceSummary(fact)}</p>
           </div>
           <div className="row-actions">
             {fact.editable && (
@@ -2166,6 +2201,161 @@ function FactRow({
       {error && <p className="form-error">{error}</p>}
     </div>
   );
+}
+
+function ArtifactList({
+  artifacts,
+  isSaving,
+  onCorrect,
+  onDelete,
+}: {
+  artifacts: VaultFact[];
+  isSaving: boolean;
+  onCorrect: (factId: string, input: PatchFactInput) => Promise<unknown>;
+  onDelete: (factId: string) => Promise<unknown>;
+}) {
+  if (!artifacts.length) {
+    return (
+      <EmptyVaultRow
+        title="Your library is empty"
+        detail="Recipes, lists, plans, notes, and useful references Florence saves for later will appear here."
+      />
+    );
+  }
+  return (
+    <div className="library-list">
+      {artifacts.map((artifact) => (
+        <ArtifactCard
+          key={artifact.id}
+          artifact={artifact}
+          isSaving={isSaving}
+          onCorrect={onCorrect}
+          onDelete={onDelete}
+        />
+      ))}
+    </div>
+  );
+}
+
+function ArtifactCard({
+  artifact,
+  isSaving,
+  onCorrect,
+  onDelete,
+}: {
+  artifact: VaultFact;
+  isSaving: boolean;
+  onCorrect: (factId: string, input: PatchFactInput) => Promise<unknown>;
+  onDelete: (factId: string) => Promise<unknown>;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [statement, setStatement] = useState(artifact.statement);
+  const [error, setError] = useState<string | null>(null);
+  const title = artifact.title ?? artifact.statement;
+
+  async function correct(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setError(null);
+    try {
+      await onCorrect(artifact.id, { statement: statement.trim() });
+      setEditing(false);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Florence could not correct this library item.");
+    }
+  }
+
+  async function remove() {
+    if (!window.confirm("Delete this item from Florence's library?")) return;
+    setError(null);
+    try {
+      await onDelete(artifact.id);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Florence could not delete this library item.");
+    }
+  }
+
+  return (
+    <article className="library-card">
+      {editing ? (
+        <form className="fact-editor" onSubmit={(event) => void correct(event)}>
+          <label className="field">
+            <span>Summary Florence should remember</span>
+            <input value={statement} onChange={(event) => setStatement(event.target.value)} required />
+          </label>
+          <div className="row-actions">
+            <button className="text-button" type="button" onClick={() => setEditing(false)}>
+              Cancel
+            </button>
+            <button className="button pill" type="submit" disabled={isSaving || !statement.trim()}>
+              Save correction
+            </button>
+          </div>
+        </form>
+      ) : (
+        <>
+          <header className="library-card-heading">
+            <span className="artifact-kind-label">{artifactKindLabel(artifact.artifactKind)}</span>
+            <h3>{title}</h3>
+          </header>
+          {artifact.title && artifact.statement !== artifact.title && (
+            <p className="library-summary">{artifact.statement}</p>
+          )}
+          {artifact.details && <p className="library-details">{artifact.details}</p>}
+          {!!artifact.tags.length && (
+            <ul className="library-tags" aria-label="Tags">
+              {[...new Set(artifact.tags)].map((tag) => (
+                <li key={tag}>{tag}</li>
+              ))}
+            </ul>
+          )}
+          <footer className="library-card-footer">
+            <p>{factSourceSummary(artifact)}</p>
+            <div className="row-actions">
+              {artifact.editable && (
+                <button className="text-button" type="button" onClick={() => setEditing(true)}>
+                  Correct summary
+                </button>
+              )}
+              {artifact.deletable && (
+                <button
+                  className="text-button danger"
+                  type="button"
+                  onClick={() => void remove()}
+                  disabled={isSaving}
+                >
+                  <Trash2 size={13} /> Delete
+                </button>
+              )}
+            </div>
+          </footer>
+        </>
+      )}
+      {error && <p className="form-error">{error}</p>}
+    </article>
+  );
+}
+
+function artifactKindLabel(kind: VaultFact["artifactKind"]): string {
+  switch (kind) {
+    case "recipe":
+      return "Recipe";
+    case "list":
+      return "List";
+    case "plan":
+      return "Plan";
+    case "note":
+      return "Note";
+    case "reference":
+      return "Reference";
+    default:
+      return "Saved item";
+  }
+}
+
+function factSourceSummary(fact: VaultFact): string {
+  return fact.source
+    ? sourceSummary(fact.visibility, fact.source.label)
+    : `${fact.visibility === "private" ? "Private to you" : "Shared with the household"} · Source not available`;
 }
 
 function PeopleList({

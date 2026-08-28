@@ -843,7 +843,12 @@ a {
   place-items: center;
   border: 1px solid var(--border);
   border-radius: 9px;
-  background: var(--muted);
+  background: #ffffff;
+}
+
+.google-mark img {
+  width: 18px;
+  height: 18px;
 }
 
 .connector-card {
@@ -853,12 +858,6 @@ a {
   align-items: center;
   padding: 12px 16px;
   border-radius: 12px;
-}
-
-.google-mark {
-  color: #4285f4;
-  font-size: 16px;
-  font-weight: 600;
 }
 
 .connector-copy {
@@ -1201,6 +1200,123 @@ a {
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 12px;
   align-items: end;
+}
+
+.memory-kind-label,
+.artifact-kind-label {
+  display: block;
+  width: fit-content;
+  margin-bottom: 5px;
+  color: var(--secondary);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.library-list {
+  display: grid;
+  gap: 10px;
+}
+
+.library-card {
+  display: grid;
+  gap: 12px;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+}
+
+.library-card-heading {
+  display: grid;
+  gap: 2px;
+}
+
+.library-card-heading h3 {
+  font-size: 16px;
+  font-weight: 500;
+  line-height: 1.35;
+}
+
+.library-summary,
+.library-details {
+  line-height: 1.5;
+}
+
+.library-summary,
+.library-card-footer {
+  color: var(--secondary);
+}
+
+.library-details {
+  white-space: pre-wrap;
+}
+
+.library-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.library-tags li {
+  padding: 4px 8px;
+  border-radius: 999px;
+  background: var(--muted);
+  color: var(--secondary);
+  font-size: 11px;
+}
+
+.library-card-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding-top: 2px;
+  font-size: 12px;
+}
+
+.google-sign-in-button {
+  display: inline-flex;
+  width: 177px;
+  height: 40px;
+  align-items: center;
+  justify-content: center;
+  justify-self: center;
+  padding: 0;
+  overflow: hidden;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  cursor: pointer;
+  line-height: 0;
+}
+
+.google-sign-in-button img {
+  display: block;
+  width: 177px;
+  height: 40px;
+}
+
+.google-sign-in-button:hover:not(:disabled) {
+  filter: brightness(0.98);
+}
+
+.google-sign-in-button:focus-visible {
+  outline: 2px solid var(--text);
+  outline-offset: 3px;
+}
+
+.google-sign-in-button:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+
+.connector-actions .google-sign-in-button {
+  justify-self: auto;
 }
 
 .preference-card {
@@ -1791,6 +1907,11 @@ a {
 
   .watch-actions {
     flex-wrap: wrap;
+  }
+
+  .library-card-footer {
+    align-items: flex-start;
+    flex-direction: column;
   }
 
   .member-editor {

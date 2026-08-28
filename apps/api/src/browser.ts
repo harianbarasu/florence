@@ -34,6 +34,8 @@ const MAX_PROVIDER_RESPONSE_BYTES = 1 * 1_024 * 1_024;
 const MAX_COMMAND_STDOUT_BYTES = 256 * 1_024;
 const MAX_COMMAND_STDERR_BYTES = 64 * 1_024;
 const MAX_INPUT_CHARS = 20_000;
+const MAX_UPLOAD_BYTES = 20 * 1_024 * 1_024;
+const MAX_UPLOAD_FILENAME_BYTES = 255;
 
 export interface FlorenceBrowserSession {
   readonly sessionId: string;
@@ -45,6 +47,7 @@ export type FlorenceBrowserOperation =
   | { readonly kind: "snapshot"; readonly compact?: boolean }
   | { readonly kind: "click"; readonly ref: string }
   | { readonly kind: "type"; readonly ref: string; readonly text: string }
+  | { readonly kind: "upload"; readonly ref: string; readonly attachmentRef: string }
   | { readonly kind: "select"; readonly ref: string; readonly values: readonly string[] }
   | { readonly kind: "check"; readonly ref: string; readonly checked: boolean }
   | { readonly kind: "press"; readonly key: string }
@@ -80,6 +83,10 @@ export interface FlorenceBrowserRunInput {
   readonly attempt: number;
   readonly session: FlorenceBrowserSession | null;
   readonly operation: FlorenceBrowserOperation;
+  readonly uploadFile?: {
+    readonly filename: string;
+    readonly bytes: Uint8Array;
+  };
 }
 
 export interface FlorenceBrowserRunResult {
@@ -182,6 +189,7 @@ interface PageMetadata {
 
 const UNCERTAIN_RETRY_OPERATIONS = new Set<FlorenceBrowserOperation["kind"]>([
   "click",
+  "upload",
   "press",
   "scroll",
   "back",
@@ -296,7 +304,7 @@ export class BrowserbaseBrowserClient implements FlorenceBrowserClient {
       if (input.operation.kind !== "snapshot" && input.operation.kind !== "screenshot") {
         if (input.operation.kind !== "owner_handoff") {
           actionMayHaveHappened = UNCERTAIN_RETRY_OPERATIONS.has(input.operation.kind);
-          await this.#performOperation(sessionDetails, input.operation, localSignal);
+          await this.#performOperation(sessionDetails, input.operation, input.uploadFile, localSignal);
         }
       }
 
@@ -488,6 +496,7 @@ export class BrowserbaseBrowserClient implements FlorenceBrowserClient {
       FlorenceBrowserOperation,
       { readonly kind: "snapshot" | "screenshot" | "owner_handoff" }
     >,
+    uploadFile: FlorenceBrowserRunInput["uploadFile"],
     signal: AbortSignal,
   ): Promise<void> {
     let command: string;
@@ -508,6 +517,15 @@ export class BrowserbaseBrowserClient implements FlorenceBrowserClient {
         command = "fill";
         args = [normalizeRef(operation.ref), boundedInput(operation.text, "Browser text")];
         break;
+      case "upload":
+        if (!uploadFile) {
+          throw new FlorenceBrowserError(
+            "invalid_input",
+            "Choose a parent-provided file before uploading it to this page.",
+          );
+        }
+        await this.#uploadFile(session, operation.ref, uploadFile, signal);
+        return;
       case "select":
         if (operation.values.length < 1 || operation.values.length > 20) {
           throw new FlorenceBrowserError("invalid_input", "Choose between one and twenty dropdown values.");
@@ -552,6 +570,29 @@ export class BrowserbaseBrowserClient implements FlorenceBrowserClient {
     }
 
     await this.#agentBrowser(session, command, args, signal, timeoutMs);
+  }
+
+  async #uploadFile(
+    session: BrowserbaseSessionDetails,
+    ref: string,
+    uploadFile: NonNullable<FlorenceBrowserRunInput["uploadFile"]>,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const filename = sanitizedUploadFilename(uploadFile.filename);
+    const bytes = boundedUploadBytes(uploadFile.bytes);
+    const directory = await mkdtemp(join(tmpdir(), "florence-browser-upload-"));
+    const path = join(directory, filename);
+    try {
+      const handle = await open(path, "wx", 0o600);
+      try {
+        await handle.writeFile(bytes);
+      } finally {
+        await handle.close();
+      }
+      await this.#agentBrowser(session, "upload", [normalizeRef(ref), path], signal, this.#commandTimeoutMs);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
   }
 
   async #observePage(
@@ -964,6 +1005,25 @@ function validateRunInput(input: FlorenceBrowserRunInput): void {
   if (!Number.isInteger(input.attempt) || input.attempt < 1 || input.attempt > 100) {
     throw new FlorenceBrowserError("invalid_input", "Browser attempt must be a positive integer.");
   }
+  if (input.operation.kind === "upload") {
+    normalizeRef(input.operation.ref);
+    validateNonEmptyInput(input.operation.attachmentRef, "Browser attachment reference", 500);
+    if (input.attempt === 1 && !input.uploadFile) {
+      throw new FlorenceBrowserError(
+        "invalid_input",
+        "Choose a parent-provided file before uploading it to this page.",
+      );
+    }
+    if (input.uploadFile) {
+      sanitizedUploadFilename(input.uploadFile.filename);
+      boundedUploadBytes(input.uploadFile.bytes);
+    }
+  } else if (input.uploadFile !== undefined) {
+    throw new FlorenceBrowserError(
+      "invalid_input",
+      "Browser file bytes may only be supplied for an upload step.",
+    );
+  }
 }
 
 function validateSession(session: FlorenceBrowserSession): void {
@@ -1063,6 +1123,39 @@ function boundedInput(value: string, label: string): string {
     throw new FlorenceBrowserError("invalid_input", `${label} is too long.`);
   }
   return value;
+}
+
+function sanitizedUploadFilename(value: string): string {
+  if (typeof value !== "string") {
+    throw new FlorenceBrowserError("invalid_input", "The upload filename is invalid.");
+  }
+  const normalized = value.normalize("NFKC").trim();
+  if (!normalized || Buffer.byteLength(normalized, "utf8") > MAX_UPLOAD_FILENAME_BYTES) {
+    throw new FlorenceBrowserError(
+      "invalid_input",
+      `The upload filename must be at most ${MAX_UPLOAD_FILENAME_BYTES} bytes.`,
+    );
+  }
+  const sanitized = [...normalized]
+    .map((character) => {
+      const codePoint = character.codePointAt(0) ?? 0;
+      return codePoint < 32 || codePoint === 127 || '<>:"/\\|?*'.includes(character) ? "_" : character;
+    })
+    .join("")
+    .replace(/^\.+/, "")
+    .trim();
+  if (!sanitized) return "attachment";
+  return sanitized;
+}
+
+function boundedUploadBytes(value: Uint8Array): Uint8Array<ArrayBuffer> {
+  if (!(value instanceof Uint8Array) || value.byteLength < 1 || value.byteLength > MAX_UPLOAD_BYTES) {
+    throw new FlorenceBrowserError(
+      "invalid_input",
+      `Browser uploads must be between 1 byte and ${MAX_UPLOAD_BYTES} bytes.`,
+    );
+  }
+  return new Uint8Array(value);
 }
 
 function requireNonEmpty(value: string, label: string, maximumChars: number): string {

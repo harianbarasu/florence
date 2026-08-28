@@ -3855,6 +3855,51 @@ export class Florence {
                   if (pendingCall?.name !== "browser_work") {
                     throw new Error("Durable browser work lost its pending call metadata");
                   }
+                  const uploadFile =
+                    operation.kind === "upload" && pendingCall.attempt === 1
+                      ? await (async () => {
+                          if (!this.#imageVault) {
+                            throw new Error("Florence attachment upload is not configured");
+                          }
+                          const image = familyWorkOriginImages.find(
+                            (candidate) => candidate.assetId === operation.attachmentRef,
+                          );
+                          if (image) {
+                            const read = await this.#imageVault.read({
+                              householdId: work.household.householdId,
+                              signalId: image.sourceId,
+                              image: { assetId: image.assetId, mimeType: image.mimeType },
+                            });
+                            return {
+                              filename: browserImageUploadFilename(image.assetId, read.mimeType),
+                              bytes: read.bytes,
+                            };
+                          }
+                          const document = familyWorkOriginDocuments.find(
+                            (candidate) => candidate.id === operation.attachmentRef,
+                          );
+                          if (!document) {
+                            throw new Error(
+                              "Browser upload requires an image or PDF from the initiating Messages context",
+                            );
+                          }
+                          const read = this.#imageVault.openPdf({
+                            documentId: document.id,
+                            householdId: work.household.householdId,
+                            signalId: document.parentSourceId,
+                            filename: document.filename,
+                            mimeType: document.mimeType,
+                            contentDigest: document.contentDigest,
+                            contentEnvelope: document.contentEnvelope,
+                            discardAfter: document.discardAfter,
+                            now: this.#now(),
+                          });
+                          return {
+                            filename: browserPdfUploadFilename(document.filename, document.id),
+                            bytes: read.bytes,
+                          };
+                        })()
+                      : undefined;
                   const result = await browser.run(
                     {
                       workId: work.workId,
@@ -3863,6 +3908,7 @@ export class Florence {
                       attempt: pendingCall.attempt,
                       session: browserSession,
                       operation,
+                      ...(uploadFile ? { uploadFile } : {}),
                     },
                     taskSignal,
                   );
@@ -6528,6 +6574,24 @@ function reasonerImage(image: InboundTurn["message"]["images"][number]): {
     throw new Error("Current-message HEIC bytes were not normalized before persistence");
   }
   return { assetId: image.assetId, mimeType: image.mimeType };
+}
+
+function browserImageUploadFilename(
+  assetId: string,
+  mimeType: "image/jpeg" | "image/png" | "image/webp",
+): string {
+  const extension = mimeType === "image/jpeg" ? "jpg" : mimeType === "image/png" ? "png" : "webp";
+  return `attachment-${assetId.slice(0, 8)}.${extension}`;
+}
+
+function browserPdfUploadFilename(filename: string, documentId: string): string {
+  const basename = filename
+    .normalize("NFKC")
+    .trim()
+    .replace(/\.pdf$/iu, "")
+    .trim()
+    .slice(0, 50);
+  return `${basename || `attachment-${documentId.slice(0, 8)}`}.pdf`;
 }
 
 function turnText(turn: InboundTurn["message"] | InboundTurn["recentMessages"][number]): string {

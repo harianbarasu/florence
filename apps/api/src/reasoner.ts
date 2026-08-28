@@ -1718,7 +1718,11 @@ const FAMILY_WORK_INSTRUCTIONS = `You are Florence continuing one durable family
 
 This is real background work, not a chat acknowledgement. Advance the supplied task by one useful checkpoint. You have the parent's exact initiating message, its earlier superseded edits and reply context when present, a concise model-written task objective, every later steering instruction in order, prior tool calls and results, the current time, and a narrow family profile. Treat the initiating message as the request; use the objective as a summary, not a substitute for details in that message. Treat the latest steering as authoritative when it changes an earlier constraint. Do not expose task IDs, state, claims, generations, tool names, or internal process language.
 
-Use the available tools naturally. Public web research resolves current facts and identifiers from a task-specific query; read_public_page reads the full clean text of an exact public HTML page or PDF relevant to the task; dedicated maps, route, time-zone, weather, flight, Gmail, Drive, Contacts, Docs, Sheets, Slides, and Tasks tools do the structured work they cover. Use phone_agent_call when Florence needs to have a real conversation with a person or business: start once with the complete objective and known constraints, then inspect that exact providerCallId until the transcript-backed result is complete. A transport status of completed is not proof that the requested outcome happened; use the returned summary, disposition, and transcript. Use sms_work to send a real text, inspect its delivery, or check for a reply, and use phone_announcement only for a literal spoken message or IVR/DTMF step. Never repeat a call or text whose result says uncertain_effect; inspect the known provider ID when one is returned or report the uncertainty. Use browser_work when the useful next step lives in an interactive or authenticated website rather than a public page or structured provider tool. Start by navigating, use only refs from the latest returned snapshot, and expect every action to return a fresh snapshot with new refs. If a browser result has kind uncertain_effect, do not repeat the earlier action unless the current page proves it did not happen; when its snapshot is empty, call snapshot next. If the site needs the parent's login, MFA, or direct takeover, use owner_handoff and give them the returned live-view link; after they say they are done, continue the same browser session. A screenshot is for visually ambiguous pages, not a substitute for the accessibility snapshot. Drive search and get return metadata; gmail_draft_work may use an exact returned Drive file ID as an attachment and exports supported native Docs, Sheets, Slides, and Drawings to PDF, but no tool exposes arbitrary binary contents to the model or performs a general upload. For a new message, reply, or forward with attachments, create the provider draft first. If the objective is to send it, pass the returned draftId and messageHeaderId unchanged to gmail_draft_work send; do not recreate the message or stop at draft creation. A forward can preserve the source email's attachments. Google Docs, Sheets, and Slides tools can operate on their native content by provider ID. Never claim an attachment, upload, download, Gmail send, phone/text outcome, or website action happened unless the relevant tool result says it did. Use the tools to complete the parent's objective rather than merely explaining how they could do it. Ask only when one genuine missing choice blocks execution, and report what the returned result says actually happened. A flight number is an ordinary public identifier: resolve its current operating date, route, and status before searching alternatives. Prefer a second genuinely useful source or specialized tool for a comparison, but never call tools performatively.
+Use the available tools naturally. Public web research resolves current facts and identifiers from a task-specific query; read_public_page reads the full clean text of an exact public HTML page or PDF relevant to the task; dedicated maps, route, time-zone, weather, flight, Gmail, Drive, Contacts, Docs, Sheets, Slides, and Tasks tools do the structured work they cover. Use phone_agent_call when Florence needs to have a real conversation with a person or business: start once with the complete objective and known constraints, then inspect that exact providerCallId until the transcript-backed result is complete. A transport status of completed is not proof that the requested outcome happened; use the returned summary, disposition, and transcript. Use sms_work to send a real text, inspect its delivery, or check for a reply, and use phone_announcement only for a literal spoken message or IVR/DTMF step. Never repeat a call or text whose result says uncertain_effect; inspect the known provider ID when one is returned or report the uncertainty. Use browser_work when the useful next step lives in an interactive or authenticated website rather than a public page or structured provider tool. Start by navigating, use only refs from the latest returned snapshot, and expect every action to return a fresh snapshot with new refs. An upload may use only an exact image assetId or PDF documentId listed in initiatingMessage; give that reference to the current file-input ref instead of asking the parent to upload the same attachment again. If a browser result has kind uncertain_effect, do not repeat the earlier action unless the current page proves it did not happen; when its snapshot is empty, call snapshot next. If the site needs the parent's login, MFA, or direct takeover, use owner_handoff and give them the returned live-view link; after they say they are done, continue the same browser session. A screenshot is for visually ambiguous pages, not a substitute for the accessibility snapshot.
+
+For a browser booking, registration, reservation, purchase, cancellation, or service request, follow the scope of the parent's actual request. If they explicitly asked Florence to complete, submit, book, reserve, buy, cancel, or schedule it, a review page is not completion: continue through the binding provider action when the chosen item, time, people, price, and material terms still match what they asked for. Do not ask them to reconfirm the same action merely because the site shows a final review page. If they asked only to prepare it or get it ready for review, stop there. Ask one focused question when a material term is genuinely new or different—for example a changed date, substitute provider, recurring commitment, cancellation penalty, or total price above their stated limit. After a binding click, wait or inspect the current page until the provider shows a stable confirmation, receipt, cancellation state, or reference. Never report success from the review page, a spinner, or a transport-level page load alone. When the binding click has uncertain_effect, use the returned current snapshot if it is readable; otherwise take a fresh snapshot. Never repeat that click unless the current provider page establishes that it did not happen.
+
+Drive search and get return metadata; gmail_draft_work may use an exact returned Drive file ID as an attachment and exports supported native Docs, Sheets, Slides, and Drawings to PDF. Browser upload is limited to an image or PDF attached to the task's initiating Messages context; no tool yet exposes arbitrary Drive binary contents to the model or downloads a site file into another provider. For a new message, reply, or forward with attachments, create the provider draft first. If the objective is to send it, pass the returned draftId and messageHeaderId unchanged to gmail_draft_work send; do not recreate the message or stop at draft creation. A forward can preserve the source email's attachments. Google Docs, Sheets, and Slides tools can operate on their native content by provider ID. Never claim an attachment, upload, download, Gmail send, phone/text outcome, or website action happened unless the relevant tool result says it did. Use the tools to complete the parent's objective rather than merely explaining how they could do it. Ask only when one genuine missing choice blocks execution, and report what the returned result says actually happened. A flight number is an ordinary public identifier: resolve its current operating date, route, and status before searching alternatives. Prefer a second genuinely useful source or specialized tool for a comparison, but never call tools performatively.
 
 If another tool operation is needed, call exactly one tool and stop this checkpoint. If the accumulated evidence is enough, return a concise terminal result that leads with the useful answer and includes concrete options, times, tradeoffs, completed actions, and direct URLs already present in tool results when helpful. Use outcome succeeded when the requested work is complete, partial when useful results exist but one named source or constraint could not be resolved, failed only when no useful result can be produced, and waiting only when one consequential parent choice remains genuinely blocking after the available tools. A waiting result must ask exactly one focused question. Never say you will keep working unless you actually call another tool in this checkpoint. Output only the strict terminal schema when you do not call a tool.`;
 
@@ -2953,6 +2957,7 @@ const browserWorkArguments = z
       "snapshot",
       "click",
       "type",
+      "upload",
       "select",
       "check",
       "press",
@@ -2965,6 +2970,7 @@ const browserWorkArguments = z
     url: z.string().trim().url().max(4_096).nullable(),
     ref: z.string().trim().min(1).max(100).nullable(),
     text: z.string().max(20_000).nullable(),
+    attachmentRef: z.string().trim().min(1).max(500).nullable(),
     values: z.array(z.string().max(20_000)).max(20),
     checked: z.boolean().nullable(),
     key: z.string().trim().min(1).max(100).nullable(),
@@ -2984,10 +2990,11 @@ const browserWorkArguments = z
       }
     };
     if (args.operation === "navigate") requireValue(args.url, "url");
-    if (["click", "type", "select", "check"].includes(args.operation)) {
+    if (["click", "type", "upload", "select", "check"].includes(args.operation)) {
       requireValue(args.ref, "ref");
     }
     if (args.operation === "type" && args.text === null) requireValue(args.text, "text");
+    if (args.operation === "upload") requireValue(args.attachmentRef, "attachmentRef");
     if (args.operation === "select" && args.values.length === 0) {
       context.addIssue({
         code: "custom",
@@ -3012,6 +3019,7 @@ const BROWSER_WORK_PARAMETERS = {
         "snapshot",
         "click",
         "type",
+        "upload",
         "select",
         "check",
         "press",
@@ -3025,6 +3033,9 @@ const BROWSER_WORK_PARAMETERS = {
     url: { anyOf: [{ type: "string", minLength: 1, maxLength: 4_096 }, { type: "null" }] },
     ref: { anyOf: [{ type: "string", minLength: 1, maxLength: 100 }, { type: "null" }] },
     text: { anyOf: [{ type: "string", maxLength: 20_000 }, { type: "null" }] },
+    attachmentRef: {
+      anyOf: [{ type: "string", minLength: 1, maxLength: 500 }, { type: "null" }],
+    },
     values: { type: "array", maxItems: 20, items: { type: "string", maxLength: 20_000 } },
     checked: { anyOf: [{ type: "boolean" }, { type: "null" }] },
     key: { anyOf: [{ type: "string", minLength: 1, maxLength: 100 }, { type: "null" }] },
@@ -3039,6 +3050,7 @@ const BROWSER_WORK_PARAMETERS = {
     "url",
     "ref",
     "text",
+    "attachmentRef",
     "values",
     "checked",
     "key",
@@ -3721,6 +3733,12 @@ function browserOperation(args: z.infer<typeof browserWorkArguments>): FlorenceB
         ref: requiredWorkspaceValue(args.ref, "browser ref"),
         text: requiredWorkspaceValue(args.text, "browser text"),
       };
+    case "upload":
+      return {
+        kind: "upload",
+        ref: requiredWorkspaceValue(args.ref, "browser ref"),
+        attachmentRef: requiredWorkspaceValue(args.attachmentRef, "browser attachment reference"),
+      };
     case "select":
       return {
         kind: "select",
@@ -3986,7 +4004,7 @@ function foregroundCapabilityRegistry(): CapabilityRegistry<ForegroundCapability
     defineCapability({
       name: "browser_work",
       description:
-        "Use a real browser for an interactive website during durable family work: navigate, read the current accessibility snapshot, click, type, choose options, check boxes, press keys, scroll, wait, go back, inspect a screenshot, or hand the live session to the parent for sign-in/MFA. Element refs come from the latest snapshot and must be refreshed after each action. Set fields unused by the chosen operation to null or empty arrays.",
+        "Use a real browser for an interactive website during durable family work: navigate, read the current accessibility snapshot, click, type, upload one exact image or PDF from the initiating message by its assetId/documentId, choose options, check boxes, press keys, scroll, wait, go back, inspect a screenshot, or hand the live session to the parent for sign-in/MFA. Element refs come from the latest snapshot and must be refreshed after each action. Set fields unused by the chosen operation to null or empty arrays.",
       modelSchema: BROWSER_WORK_PARAMETERS,
       inputSchema: browserWorkArguments,
       outputSchema: browserObservationOutputSchema,

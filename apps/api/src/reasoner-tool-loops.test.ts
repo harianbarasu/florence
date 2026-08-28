@@ -1,3 +1,4 @@
+import { access, readFile, stat } from "node:fs/promises";
 import {
   type FamilyWorkOriginContext,
   type FamilyWorkStateV1,
@@ -10,7 +11,11 @@ import {
   type GoogleWorkspaceResult,
 } from "@florence/google";
 import { describe, expect, test } from "vitest";
-import type { FlorenceBrowserObservation, FlorenceBrowserOperation } from "./browser.js";
+import {
+  BrowserbaseBrowserClient,
+  type FlorenceBrowserObservation,
+  type FlorenceBrowserOperation,
+} from "./browser.js";
 import {
   type FlorenceDecision,
   type FlorenceGoogleChangesAssessmentInput,
@@ -888,9 +893,10 @@ describe("Florence reasoner capability cutover", () => {
     ]);
   });
 
-  test("durable work operates a family portal, pauses for sign-in, and resumes at review", async () => {
+  test("durable work uploads a camp form, follows review scope, then submits once", async () => {
     const portalUrl = "https://camp.example/register";
     const liveViewUrl = "https://www.browserbase.com/sessions/session-1";
+    const medicalFormId = "00000000-0000-4000-8000-000000000010";
     const modelRequests: Record<string, unknown>[] = [];
     const modelResponses = [
       {
@@ -927,6 +933,17 @@ describe("Florence reasoner capability cutover", () => {
       {
         status: "completed",
         output_parsed: null,
+        output: [
+          functionCall(
+            "upload-medical-form",
+            "browser_work",
+            browserArguments("upload", { ref: "e7", attachmentRef: medicalFormId }),
+          ),
+        ],
+      },
+      {
+        status: "completed",
+        output_parsed: null,
         output: [functionCall("inspect-registration", "browser_work", browserArguments("screenshot"))],
       },
       {
@@ -939,8 +956,23 @@ describe("Florence reasoner capability cutover", () => {
       {
         status: "completed",
         output_parsed: {
+          outcome: "waiting",
+          text: "Violet’s Adventure Camp registration for June 15–19, 2027 is ready, including her medical form. The fee is $425. Should I submit it?",
+        },
+        output: [],
+      },
+      {
+        status: "completed",
+        output_parsed: null,
+        output: [
+          functionCall("submit-registration", "browser_work", browserArguments("click", { ref: "e12" })),
+        ],
+      },
+      {
+        status: "completed",
+        output_parsed: {
           outcome: "succeeded",
-          text: "I filled Violet’s camp registration and reached the final review page. The Submit registration button is ready for your final check.",
+          text: "Violet is registered for Adventure Camp, June 15–19, 2027. The camp confirmed it as CAMP-20481.",
         },
         output: [],
       },
@@ -976,7 +1008,20 @@ describe("Florence reasoner capability cutover", () => {
       objective: "Fill out Violet’s camp registration and get it ready for my final review.",
       visibility: "private" as const,
       ownerAdultId: "adult-1",
-      origin: familyWorkOrigin("Fill out Violet’s camp registration and get it ready for my final review."),
+      origin: {
+        ...familyWorkOrigin("Fill out Violet’s camp registration and get it ready for my final review."),
+        currentDocuments: [
+          {
+            id: medicalFormId,
+            parentSourceId: "source-adult-1",
+            filename: "violet-medical-form.pdf",
+            mimeType: "application/pdf" as const,
+            contentDigest: "a".repeat(64),
+            contentEnvelope: Uint8Array.from([1]),
+            discardAfter: "2026-08-29T20:00:00.000Z",
+          },
+        ],
+      },
       household: {
         householdId: "household-1",
         familyLabel: "Test family",
@@ -990,6 +1035,12 @@ describe("Florence reasoner capability cutover", () => {
     };
     const browserOperations: FlorenceBrowserOperation[] = [];
     const reads = {
+      async readCurrentPdf() {
+        return {
+          mimeType: "application/pdf" as const,
+          bytes: Uint8Array.from([0x25, 0x50, 0x44, 0x46]),
+        };
+      },
       async runBrowser(operation: FlorenceBrowserOperation) {
         browserOperations.push(operation);
         switch (operation.kind) {
@@ -1012,7 +1063,16 @@ describe("Florence reasoner capability cutover", () => {
             return browserObservation({
               title: "Camp registration",
               url: portalUrl,
-              snapshot: '- textbox "Child name" [ref=e5] value="Violet Williams"\n- button Preview [ref=e9]',
+              snapshot:
+                '- textbox "Child name" [ref=e5] value="Violet Williams"\n- button "Upload medical form" [ref=e7]\n- button Preview [ref=e9]',
+            });
+          case "upload":
+            expect(operation.attachmentRef).toBe(medicalFormId);
+            return browserObservation({
+              title: "Camp registration",
+              url: portalUrl,
+              snapshot:
+                '- textbox "Child name" [ref=e5] value="Violet Williams"\n- text "violet-medical-form.pdf attached"\n- button Preview [ref=e9]',
             });
           case "screenshot":
             return browserObservation({
@@ -1024,12 +1084,28 @@ describe("Florence reasoner capability cutover", () => {
                 bytes: Uint8Array.from([0xff, 0xd8, 0xff, 0xd9]),
               },
             });
-          case "click":
-            return browserObservation({
-              title: "Review registration",
-              url: `${portalUrl}/review`,
-              snapshot: '- heading "Review registration"\n- button Submit registration [ref=e12]',
-            });
+          case "click": {
+            if (operation.ref === "e9") {
+              return browserObservation({
+                title: "Review registration",
+                url: `${portalUrl}/review`,
+                snapshot:
+                  '- heading "Review registration"\n- text "Violet Williams"\n- text "Adventure Camp, June 15–19, 2027"\n- text "Medical form attached"\n- text "Total $425"\n- button Submit registration [ref=e12]',
+              });
+            }
+            if (operation.ref === "e12") {
+              return browserObservation({
+                kind: "uncertain_effect",
+                reason:
+                  "The browser connection ended after the submit click, but the current provider page shows the result.",
+                title: "Registration confirmed",
+                url: `${portalUrl}/confirmation/CAMP-20481`,
+                snapshot:
+                  '- heading "Registration confirmed"\n- text "Confirmation CAMP-20481"\n- text "Violet Williams"\n- text "Adventure Camp, June 15–19, 2027"',
+              });
+            }
+            throw new Error(`Unexpected browser click ref ${operation.ref}`);
+          }
           default:
             throw new Error(`Unexpected browser operation ${String(operation.kind)}`);
         }
@@ -1065,7 +1141,12 @@ describe("Florence reasoner capability cutover", () => {
     const filled = await reasoner.continueFamilyWork({ ...input, state: fillPlanned.state }, reads);
     if (filled.kind !== "continue") throw new Error("Camp form fill did not settle");
 
-    const screenshotPlanned = await reasoner.continueFamilyWork({ ...input, state: filled.state }, reads);
+    const uploadPlanned = await reasoner.continueFamilyWork({ ...input, state: filled.state }, reads);
+    if (uploadPlanned.kind !== "continue") throw new Error("Camp attachment upload was not planned");
+    const uploaded = await reasoner.continueFamilyWork({ ...input, state: uploadPlanned.state }, reads);
+    if (uploaded.kind !== "continue") throw new Error("Camp attachment upload did not settle");
+
+    const screenshotPlanned = await reasoner.continueFamilyWork({ ...input, state: uploaded.state }, reads);
     if (screenshotPlanned.kind !== "continue") throw new Error("Camp form inspection was not planned");
     const inspected = await reasoner.continueFamilyWork({ ...input, state: screenshotPlanned.state }, reads);
     if (inspected.kind !== "continue") throw new Error("Camp form inspection did not settle");
@@ -1073,27 +1154,143 @@ describe("Florence reasoner capability cutover", () => {
 
     const reviewPlanned = await reasoner.continueFamilyWork({ ...input, state: inspected.state }, reads);
     if (reviewPlanned.kind !== "continue") throw new Error("Camp review was not planned");
-    expect(JSON.stringify(modelRequests[5]?.input)).toContain("input_image");
+    expect(JSON.stringify(modelRequests[6]?.input)).toContain("input_image");
     expect(JSON.stringify(reviewPlanned.state.continuationItems)).not.toContain("input_image");
     const reviewed = await reasoner.continueFamilyWork({ ...input, state: reviewPlanned.state }, reads);
     if (reviewed.kind !== "continue") throw new Error("Camp review did not settle");
-    const terminal = await reasoner.continueFamilyWork({ ...input, state: reviewed.state }, reads);
+    const awaitingApproval = await reasoner.continueFamilyWork({ ...input, state: reviewed.state }, reads);
+    expect(awaitingApproval).toMatchObject({
+      kind: "waiting",
+      question: expect.stringContaining("$425"),
+    });
+    if (awaitingApproval.kind !== "waiting") {
+      throw new Error("Camp registration did not wait for final authorization");
+    }
+
+    const submitSteeringState = steerFamilyWorkState(awaitingApproval.state, {
+      sourceId: "00000000-0000-4000-8000-000000000003",
+      text: "Yes—submit this exact registration now.",
+      occurredAt: "2026-08-27T20:04:00.000Z",
+    });
+    const submitPlanned = await reasoner.continueFamilyWork({ ...input, state: submitSteeringState }, reads);
+    if (submitPlanned.kind !== "continue") throw new Error("Camp submission was not planned");
+    const submitted = await reasoner.continueFamilyWork({ ...input, state: submitPlanned.state }, reads);
+    if (submitted.kind !== "continue") throw new Error("Camp submission did not settle");
+    const terminal = await reasoner.continueFamilyWork({ ...input, state: submitted.state }, reads);
 
     expect(browserOperations.map((operation) => operation.kind)).toEqual([
       "navigate",
       "owner_handoff",
       "type",
+      "upload",
       "screenshot",
       "click",
+      "click",
     ]);
+    expect(
+      browserOperations.filter((operation) => operation.kind === "click" && operation.ref === "e12"),
+    ).toHaveLength(1);
     expect(JSON.stringify(modelRequests[3]?.input)).toContain("I’m signed in—keep going.");
+    expect(awaitingApproval.question).toContain("June 15–19, 2027");
+    expect(JSON.stringify(modelRequests[8]?.input)).toContain("Yes—submit this exact registration now.");
+    expect(JSON.stringify(modelRequests[9]?.input)).toContain("uncertain_effect");
+    expect(JSON.stringify(modelRequests[9]?.input)).toContain("CAMP-20481");
+    expect(JSON.stringify(modelRequests[9]?.input)).toContain("Adventure Camp, June 15–19, 2027");
     expect(terminal).toMatchObject({
       kind: "terminal",
       outcome: "succeeded",
-      text: expect.stringContaining("final review page"),
+      text: expect.stringContaining("CAMP-20481"),
     });
     if (terminal.kind !== "terminal") throw new Error("Camp registration did not finish");
-    expect(terminal.text).toContain("Submit registration");
+    expect(terminal.text).toContain("Adventure Camp, June 15–19, 2027");
+  });
+
+  test("browser upload stages exact bytes once and observes an uncertain retry", async () => {
+    const sessionPayload = {
+      id: "browser-session-upload-1",
+      expiresAt: "2026-08-29T20:00:00.000Z",
+      connectUrl: "wss://connect.browserbase.example/session-1",
+      projectId: "project-1",
+      status: "RUNNING",
+    };
+    let uploadedPath: string | null = null;
+    let uploadedBytes: Uint8Array | null = null;
+    let uploadedMode: number | null = null;
+    let uploadCommands = 0;
+    const commandRunner = async (input: { readonly args: readonly string[] }) => {
+      const command = input.args[7];
+      let data: Record<string, unknown> = {};
+      if (command === "upload") {
+        uploadCommands += 1;
+        uploadedPath = input.args[9] ?? null;
+        if (!uploadedPath) throw new Error("Upload command omitted its temporary file");
+        uploadedBytes = new Uint8Array(await readFile(uploadedPath));
+        uploadedMode = (await stat(uploadedPath)).mode & 0o777;
+      } else if (command === "snapshot") {
+        data = {
+          snapshot: '- text "medical-form.pdf attached"\n- button Submit [ref=e12]',
+          refs: { e12: { role: "button", name: "Submit" } },
+        };
+      } else if (command === "get") {
+        data =
+          input.args[8] === "url" ? { url: "https://camp.example/register" } : { title: "Camp registration" };
+      }
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({ success: true, data }),
+        stderr: "",
+        timedOut: false,
+        cancelled: false,
+        stdoutTruncated: false,
+      };
+    };
+    const client = new BrowserbaseBrowserClient({
+      apiKey: "browserbase-test-key",
+      projectId: "project-1",
+      now: () => Date.parse(NOW),
+      fetch: (async () =>
+        new Response(JSON.stringify(sessionPayload), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        })) as typeof globalThis.fetch,
+      commandRunner: commandRunner as never,
+    });
+    const navigated = await client.run({
+      workId: "work-upload-1",
+      ownerAdultId: "adult-1",
+      callId: "navigate-1",
+      attempt: 1,
+      session: null,
+      operation: { kind: "navigate", url: "https://camp.example/register" },
+    });
+    const fileBytes = Uint8Array.from([0x25, 0x50, 0x44, 0x46, 0x2d, 0x31, 0x2e, 0x37]);
+    const uploaded = await client.run({
+      workId: "work-upload-1",
+      ownerAdultId: "adult-1",
+      callId: "upload-1",
+      attempt: 1,
+      session: navigated.session,
+      operation: { kind: "upload", ref: "e7", attachmentRef: "document-1" },
+      uploadFile: { filename: "medical-form.pdf", bytes: fileBytes },
+    });
+
+    expect(uploadCommands).toBe(1);
+    expect(uploadedBytes).toEqual(fileBytes);
+    expect(uploadedMode).toBe(0o600);
+    if (!uploadedPath) throw new Error("Upload path was not observed");
+    await expect(access(uploadedPath)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(uploaded.observation.snapshot).toContain("medical-form.pdf attached");
+
+    const retried = await client.run({
+      workId: "work-upload-1",
+      ownerAdultId: "adult-1",
+      callId: "upload-1",
+      attempt: 2,
+      session: uploaded.session,
+      operation: { kind: "upload", ref: "e7", attachmentRef: "document-1" },
+    });
+    expect(uploadCommands).toBe(1);
+    expect(retried.observation.kind).toBe("uncertain_effect");
   });
 
   test("ordinary route questions use the dedicated maps tools and start visible work once", async () => {
@@ -2883,6 +3080,7 @@ function browserArguments(operation: string, overrides: Record<string, unknown> 
     url: null,
     ref: null,
     text: null,
+    attachmentRef: null,
     values: [],
     checked: null,
     key: null,

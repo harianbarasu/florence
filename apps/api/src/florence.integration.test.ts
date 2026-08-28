@@ -40,6 +40,8 @@ import {
   FlorenceReasoner,
   FlorenceReasonerError,
   type FlorenceReasonerInput,
+  florenceGoogleChangesAssessmentInputSchema,
+  florenceReasonerInputSchema,
 } from "./reasoner.js";
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
@@ -1084,6 +1086,100 @@ release("Florence parent journeys", () => {
         )`,
     );
   }, 20_000);
+
+  test("keeps every active finite monitor available to Google review and parent control", async () => {
+    const objectives = Array.from({ length: 21 }, (_, index) => `Complete monitor ${index + 1}`);
+    let foregroundObjectives: readonly string[] = [];
+    const harness = await createHarness(async (input) => {
+      const requestedObjective = objectives.find(
+        (objective) => input.currentMessage.text === `Watch ${objective.toLocaleLowerCase()}`,
+      );
+      if (requestedObjective) {
+        return decision({
+          bubbles: [{ text: `I’ll watch ${requestedObjective.toLocaleLowerCase()}.`, delayMs: 0 }],
+          followUp: {
+            operation: "schedule",
+            followUpId: null,
+            objective: requestedObjective,
+            currentConclusion: `${requestedObjective} is still unresolved.`,
+            endCondition: `${requestedObjective} is resolved.`,
+            nextCheck: "2026-12-01T18:00:00.000Z",
+            why: "The parent asked Florence to keep watching.",
+            sourceIds: [input.currentMessage.sourceId],
+          },
+        });
+      }
+      if (input.currentMessage.text === "Stop watching complete monitor 21") {
+        const parsed = florenceReasonerInputSchema.parse(input);
+        foregroundObjectives = parsed.pendingFollowUps.map((followUp) => followUp.objective);
+        const target = parsed.pendingFollowUps.find((followUp) => followUp.objective === objectives.at(-1));
+        if (!target) throw new Error("The last active monitor was unavailable to the parent turn");
+        return decision({
+          bubbles: [{ text: "Okay—I stopped watching that.", delayMs: 0 }],
+          followUp: {
+            operation: "cancel",
+            followUpId: target.followUpId,
+            objective: null,
+            currentConclusion: null,
+            endCondition: null,
+            nextCheck: null,
+            why: null,
+            sourceIds: [input.currentMessage.sourceId],
+          },
+        });
+      }
+      return decision();
+    });
+    await harness.readyHousehold();
+
+    for (const [index, objective] of objectives.entries()) {
+      await harness.accept(
+        "private",
+        `complete-monitor-${index + 1}`,
+        `Watch ${objective.toLocaleLowerCase()}`,
+      );
+      await harness.drain();
+    }
+    await harness.assertDatabase(
+      "The household did not retain all active finite monitors",
+      `(select count(*)=21 from proactive_work
+        where kind='finite_monitor' and status='active'
+          and owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid
+          and objective like 'Complete monitor %')`,
+    );
+
+    const assessmentsBeforeChange = harness.state.googleAssessments.length;
+    harness.state.privateFactUpdatePending = true;
+    harness.state.now += 2 * 60_000;
+    await harness.drain();
+    const assessment = harness.state.googleAssessments
+      .slice(assessmentsBeforeChange)
+      .findLast((candidate) => candidate.adult.adultId === harness.founderAdultId);
+    if (!assessment) throw new Error("The incremental Google review did not run");
+    const parsedAssessment = florenceGoogleChangesAssessmentInputSchema.parse(assessment);
+    const reviewedObjectives = parsedAssessment.activeMonitors
+      .map((monitor) => monitor.objective)
+      .filter((objective) => objective.startsWith("Complete monitor "));
+    expect(new Set(reviewedObjectives)).toEqual(new Set(objectives));
+
+    await harness.accept("private", "cancel-complete-monitor-21", "Stop watching complete monitor 21");
+    await harness.drain();
+    expect(
+      new Set(foregroundObjectives.filter((objective) => objective.startsWith("Complete monitor "))),
+    ).toEqual(new Set(objectives));
+    await harness.assertDatabase(
+      "The parent could not cancel the active monitor beyond the former presentation boundary",
+      `not exists (
+          select 1 from proactive_work
+          where kind='finite_monitor' and status='active'
+            and owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid
+            and objective=${sqlLiteral(objectives.at(-1) ?? "")}
+        ) and (select count(*)=20 from proactive_work
+          where kind='finite_monitor' and status='active'
+            and owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid
+            and objective like 'Complete monitor %')`,
+    );
+  }, 30_000);
 
   test("keeps every parent's and family-calendar conflict in proactive availability", async () => {
     const researchReasoner = new FlorenceReasoner({ apiKey: "test-openai-key", model: "test-model" }, {

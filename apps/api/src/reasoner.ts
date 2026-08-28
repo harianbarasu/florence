@@ -462,21 +462,19 @@ export const florenceReasonerInputSchema = z
       )
       .max(24),
     visibleSources: z.array(florenceSourceSchema).max(1_000),
-    pendingFollowUps: z
-      .array(
-        z
-          .object({
-            followUpId: opaqueId,
-            objective: shortText,
-            currentConclusion: shortText,
-            endCondition: shortText,
-            nextCheck: timestamp,
-            why: shortText,
-            sourceIds,
-          })
-          .strict(),
-      )
-      .max(20),
+    pendingFollowUps: z.array(
+      z
+        .object({
+          followUpId: opaqueId,
+          objective: shortText,
+          currentConclusion: shortText,
+          endCondition: shortText,
+          nextCheck: timestamp,
+          why: shortText,
+          sourceIds,
+        })
+        .strict(),
+    ),
     householdDocket: z
       .object({
         totalItems: z.number().int().min(0).max(10_000),
@@ -1209,7 +1207,7 @@ export const florencePrivateGoogleBatchDecisionSchema = z
           .strict(),
       )
       .max(50),
-    facts: z.array(googleStableFactDecisionSchema).max(20),
+    facts: z.array(googleStableFactDecisionSchema),
     dismissedSourceIds: z.array(opaqueId).max(10),
   })
   .strict();
@@ -1376,7 +1374,7 @@ export const florenceGoogleChangesAssessmentInputSchema = privateGoogleContextSc
         kind: z.enum(["personal", "family"]),
       })
       .strict(),
-    activeMonitors: z.array(florenceFiniteMonitorSchema).max(20),
+    activeMonitors: z.array(florenceFiniteMonitorSchema),
     memory: householdMemoryContextSchema,
     currentFacts: z.array(stableFactContextSchema).max(100),
   })
@@ -1402,7 +1400,7 @@ export const florenceGoogleChangesAssessmentDecisionSchema = z
           .strict(),
       )
       .max(50),
-    facts: z.array(googleStableFactDecisionSchema).max(20),
+    facts: z.array(googleStableFactDecisionSchema),
     dismissedSourceIds: z.array(opaqueId).max(10),
     nextJob: z
       .object({
@@ -1841,7 +1839,7 @@ Each finding is one distinct actionable thread. actionAnchor is required: copy o
 
 Personal Calendar evidence remains owner-private. It may create a title-free conflict candidate only for an actual busy family conflict. A clearly shared family date may include a familyCalendar suggestion that cites exactly that Calendar source, copies its exact title and interval, sets location null, leaves candidate null, and leaves monitor null; the application will privately ask the owner before copying or describing it in the family group. Other personal Calendar evidence cannot create a familyCalendar proposal. Gmail may propose a clear official family date, automatic only when unambiguous and otherwise suggest. Any familyCalendar proposal is the finding's one durable resolution path and must not be paired with a finite monitor.
 
-Facts are quiet, durable, reusable household knowledge rather than messages. Keep recurring school, caregiver, activity, contact, and standing schedule context, and also family recipes, food or shopping preferences, routines, prior successful choices, and useful references that can make later action more specific. Every fact needs a concise retrieval statement plus the generic memory presentation envelope. Use memoryKind preference or routine for those meanings. Use memoryKind artifact for a reusable editable resource; artifactKind is a presentation facet, never a workflow route. An artifact needs a natural title and enough plain-text details to use or revise it later—for example, a recipe's ingredients, method, family substitutions, and source—and useful retrieval tags. For non-artifacts, artifactKind must be null. Do not retain one-off dates, deadlines, health or financial information, credentials, guesses, temporary choices, or detail that will not help later. slot is only a stable lowercase identity for reconciling the same fact across reviews; do not encode presentation facets or behavior in it. Gmail-derived eligible facts may become household-visible while raw provenance remains private; personal Calendar facts remain owner-private. If a source contains an action and a fact, return both. When reviewKind is initial, re-return every eligible currentFact that is still supported by a supplied source, even when its slot and statement are unchanged, and cite that current source; the complete scan uses this to refresh authoritative support. Only an incremental batch may omit a currentFact when both its statement and memory presentation are unchanged.
+Facts are quiet, durable, reusable household knowledge rather than messages. Keep recurring school, caregiver, activity, contact, and standing schedule context, and also family recipes, food or shopping preferences, routines, prior successful choices, and useful references that can make later action more specific. Return every eligible fact supported by this batch; never omit one merely to satisfy an output count. Every fact needs a concise retrieval statement plus the generic memory presentation envelope. Use memoryKind preference or routine for those meanings. Use memoryKind artifact for a reusable editable resource; artifactKind is a presentation facet, never a workflow route. An artifact needs a natural title and enough plain-text details to use or revise it later—for example, a recipe's ingredients, method, family substitutions, and source—and useful retrieval tags. For non-artifacts, artifactKind must be null. Do not retain one-off dates, deadlines, health or financial information, credentials, guesses, temporary choices, or detail that will not help later. slot is only a stable lowercase identity for reconciling the same fact across reviews; do not encode presentation facets or behavior in it. Gmail-derived eligible facts may become household-visible while raw provenance remains private; personal Calendar facts remain owner-private. If a source contains an action and a fact, return both. When reviewKind is initial, re-return every eligible currentFact that is still supported by a supplied source, even when its slot and statement are unchanged, and cite that current source; the complete scan uses this to refresh authoritative support. Only an incremental batch may omit a currentFact when both its statement and memory presentation are unchanged.
 
 currentTime is absolute. Resolve dates in familyProfile.timeZone. Cite only supplied sourceIds. Output only the strict decision schema.`;
 
@@ -1873,7 +1871,7 @@ Set dueAt to the action's exact absolute deadline or event start when the eviden
 
 For a material, clear official family date from Gmail, familyCalendar may request a create. A clearly shared family date already on this parent's personal Calendar may also request a create only when familyRelevance is not owner_private, householdConclusion category is family_date, and both the finding and familyCalendar cite the exact personal Calendar source. In that narrow personal-Calendar case, set householdConclusion null, use disposition suggest, copy the exact title and interval, and set location null; Florence will ask this Calendar's owner privately before anything is copied or described in the family group. No approval means it remains private. If the personal Calendar date is not clear enough to ask about, keep it private with no familyCalendar proposal. No other personal Calendar evidence authorizes a familyCalendar proposal. A Calendar proposal is already the durable resolution path, so monitor must be null for that finding; never create another reminder lifecycle for the same date. Use intervalKind timed only when the cited evidence supplies exact start and end instants plus a time zone. Use intervalKind all_day for a date without a time: copy the exact startDate and the exclusive endDate (the day after the final included date), and do not invent a time or time zone. For Gmail, choose automatic only when the source and event are unambiguous; otherwise choose suggest. Never propose an update or delete here, and never copy private email prose, sender, subject, attachment detail, or unrelated private context into event fields. The application enforces the approval boundary and shares only the allowed event after its required authority is confirmed.
 
-When googleConnection.kind is personal, currentFacts contains stable household memory visible to this parent. Independently of materialChange and findings, return every supported fact, up to twenty, for durable reusable household knowledge that will remain useful over time. This includes stable logistics as well as family recipes, preferences, routines, prior successful choices, and useful references. Every fact needs a concise retrieval statement plus the generic memory presentation envelope. Use memoryKind preference or routine for those meanings. Use memoryKind artifact for a reusable editable resource; artifactKind is a presentation facet, never a workflow route. An artifact needs a natural title and enough plain-text details to use or revise it later—for example, a recipe's ingredients, method, family substitutions, and source—and useful retrieval tags. For non-artifacts, artifactKind must be null. Set every retained fact's familyRelevance to household. Use the same stable lowercase slot for the same fact regardless of which enrolled parent supplied it. slot is identity only: do not encode presentation facets or behavior in it. Cite only sourceIds in the current bounded evidence. Florence may make an eligible Gmail-derived statement available to both enrolled parents while keeping its raw Gmail provenance private to the account owner; personal Calendar-derived facts remain private. Do not retain deadlines, one-off events, health or financial information, credentials, secrets, private adult matters, guesses, temporary choices, or anything that will not help later. Every supplied source is the authoritative current revision of that provider item: re-return every eligible currentFact that this revision still supports, even when its statement and memory presentation are unchanged, and cite that supplied source. Omitting the fact means this reviewed revision no longer supports it; support from sources outside this exact batch remains untouched. When googleConnection.kind is family, facts must be empty and currentFacts will be empty.
+When googleConnection.kind is personal, currentFacts contains stable household memory visible to this parent. Independently of materialChange and findings, return every supported fact for durable reusable household knowledge that will remain useful over time; never omit one merely to satisfy an output count. This includes stable logistics as well as family recipes, preferences, routines, prior successful choices, and useful references. Every fact needs a concise retrieval statement plus the generic memory presentation envelope. Use memoryKind preference or routine for those meanings. Use memoryKind artifact for a reusable editable resource; artifactKind is a presentation facet, never a workflow route. An artifact needs a natural title and enough plain-text details to use or revise it later—for example, a recipe's ingredients, method, family substitutions, and source—and useful retrieval tags. For non-artifacts, artifactKind must be null. Set every retained fact's familyRelevance to household. Use the same stable lowercase slot for the same fact regardless of which enrolled parent supplied it. slot is identity only: do not encode presentation facets or behavior in it. Cite only sourceIds in the current bounded evidence. Florence may make an eligible Gmail-derived statement available to both enrolled parents while keeping its raw Gmail provenance private to the account owner; personal Calendar-derived facts remain private. Do not retain deadlines, one-off events, health or financial information, credentials, secrets, private adult matters, guesses, temporary choices, or anything that will not help later. Every supplied source is the authoritative current revision of that provider item: re-return every eligible currentFact that this revision still supports, even when its statement and memory presentation are unchanged, and cite that supplied source. Omitting the fact means this reviewed revision no longer supports it; support from sources outside this exact batch remains untouched. When googleConnection.kind is family, facts must be empty and currentFacts will be empty.
 
 Apart from an explicit nextJob kickoff, do not schedule generic follow-ups, send messages, or claim any action happened. Output only the strict decision schema.`;
 
@@ -7466,9 +7464,6 @@ function validateActiveMonitors(monitors: readonly FlorenceFiniteMonitor[]): voi
   const monitorIds = monitors.map((monitor) => monitor.monitorId);
   if (new Set(monitorIds).size !== monitorIds.length) {
     throw invalidOutput("Active finite monitor IDs must be unique");
-  }
-  if (JSON.stringify(monitors).length > 100_000) {
-    throw invalidOutput("Active finite monitor state exceeded the safe context limit");
   }
 }
 

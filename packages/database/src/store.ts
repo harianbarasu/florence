@@ -12155,7 +12155,7 @@ async function activeFiniteMonitors(
     select * from proactive_work where household_id=${householdId} and kind='finite_monitor'
       and status='active' and visibility=${visibility}
       and owner_adult_id is not distinct from ${ownerAdultId}
-    order by next_check_at,id limit 20 for share
+    order by next_check_at,id for share
   `;
   return rows.map(activeFiniteMonitor);
 }

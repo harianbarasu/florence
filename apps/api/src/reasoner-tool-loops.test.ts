@@ -22,6 +22,8 @@ import {
   type FlorencePrivateGoogleBatchInput,
   FlorenceReasoner,
   type FlorenceReasonerInput,
+  florenceGoogleChangesAssessmentDecisionSchema,
+  florencePrivateGoogleBatchDecisionSchema,
 } from "./reasoner.js";
 import type { FlorenceTelephonyOperation, FlorenceTelephonyResult } from "./telephony.js";
 
@@ -3610,6 +3612,70 @@ Compare the useful family options.
       expect(serialized).toContain(gmail.sourceId);
       expect(serialized).toContain("input_file");
     }
+  });
+
+  test("keeps every durable fact supported by one Google transport batch", async () => {
+    const statements = Array.from(
+      { length: 21 },
+      (_, index) => `Durable family preference ${index + 1} is choice ${index + 1}.`,
+    );
+    const gmail = {
+      ...privateGmailSource(),
+      text: statements.join(" "),
+      attachments: [],
+    };
+    const facts = statements.map((statement, index) => ({
+      slot: `family:preference:${index + 1}`,
+      statement,
+      memory: {
+        memoryKind: "preference" as const,
+        artifactKind: null,
+        title: null,
+        details: null,
+        tags: [],
+      },
+      familyRelevance: "household" as const,
+      sourceIds: [gmail.sourceId],
+    }));
+    const privateBatchDecision = florencePrivateGoogleBatchDecisionSchema.parse({
+      findings: [],
+      facts,
+      dismissedSourceIds: [],
+    });
+    const changesDecision = florenceGoogleChangesAssessmentDecisionSchema.parse({
+      findings: [],
+      facts,
+      dismissedSourceIds: [],
+      nextJob: null,
+    });
+    const requests: Record<string, unknown>[] = [];
+    const responses = [privateBatchDecision, changesDecision];
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        parse: (request: Record<string, unknown>) => {
+          requests.push(request);
+          const output_parsed = responses.shift();
+          if (!output_parsed) throw new Error("Unexpected model request");
+          return { status: "completed", output_parsed, output: [] };
+        },
+      },
+    } as never);
+    const reads = {
+      async readGmailAttachment(): Promise<never> {
+        throw new Error("The source has no attachment");
+      },
+    };
+
+    const initial = await reasoner.classifyPrivateGoogleBatch(privateBatchInput(gmail), reads);
+    const incremental = await reasoner.assessGoogleChanges(privateAssessmentInput(gmail), reads);
+
+    expect(initial.facts).toEqual(facts);
+    expect(incremental.facts).toEqual(facts);
+    expect(String(requests[0]?.instructions)).toContain("Return every eligible fact supported by this batch");
+    expect(String(requests[1]?.instructions)).toContain("never omit one merely to satisfy an output count");
+    expect(requests.map((request) => String(request.instructions))).not.toEqual(
+      expect.arrayContaining([expect.stringContaining("up to twenty")]),
+    );
   });
 });
 

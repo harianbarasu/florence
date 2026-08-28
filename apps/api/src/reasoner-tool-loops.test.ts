@@ -756,7 +756,19 @@ describe("Florence reasoner capability cutover", () => {
     });
   });
 
-  test("durable work checkpoints a sent text until Twilio confirms delivery", async () => {
+  test("durable work sends once, waits for a reply, and resumes the same text task", async () => {
+    const firstDeferResult = {
+      outcome: "deferred",
+      text: null,
+      resumeAt: "2026-08-27T21:00:00.000Z",
+      progressText: "The text was delivered. I’ll check for their reply this afternoon.",
+    } as const;
+    const secondDeferResult = {
+      outcome: "deferred",
+      text: null,
+      resumeAt: "2026-08-27T22:00:00.000Z",
+      progressText: "I’m still waiting for the dentist’s reply.",
+    } as const;
     const modelResponses = [
       {
         status: "completed",
@@ -790,9 +802,51 @@ describe("Florence reasoner capability cutover", () => {
       },
       {
         status: "completed",
+        output_parsed: firstDeferResult,
+        output: [familyWorkResultMessage("dentist-defer-1", firstDeferResult)],
+      },
+      {
+        status: "completed",
+        output_parsed: null,
+        output: [
+          functionCall("read-dentist-replies-1", "sms_work", {
+            operation: "inbox",
+            to: null,
+            from: "+13105550144",
+            body: null,
+            mediaUrls: [],
+            messageSid: null,
+            limit: 20,
+          }),
+        ],
+      },
+      {
+        status: "completed",
+        output_parsed: secondDeferResult,
+        output: [familyWorkResultMessage("dentist-defer-2", secondDeferResult)],
+      },
+      {
+        status: "completed",
+        output_parsed: null,
+        output: [
+          functionCall("read-dentist-replies-2", "sms_work", {
+            operation: "inbox",
+            to: null,
+            from: "+13105550144",
+            body: null,
+            mediaUrls: [],
+            messageSid: null,
+            limit: 20,
+          }),
+        ],
+      },
+      {
+        status: "completed",
         output_parsed: {
           outcome: "succeeded",
-          text: "The dentist’s office received the confirmation text.",
+          text: "The dentist confirmed Violet’s Wednesday 3:30 PM cleaning.",
+          resumeAt: null,
+          progressText: null,
         },
         output: [],
       },
@@ -840,6 +894,7 @@ describe("Florence reasoner capability cutover", () => {
       currentTime: NOW,
     };
     const operations: FlorenceTelephonyOperation[] = [];
+    let inboxReads = 0;
     const reads = {
       telephonyProviders: ["twilio"] as const,
       async runTelephony(operation: FlorenceTelephonyOperation): Promise<FlorenceTelephonyResult> {
@@ -862,6 +917,31 @@ describe("Florence reasoner capability cutover", () => {
             providerStatus: "delivered",
           });
         }
+        if (operation.kind === "sms_inbox") {
+          inboxReads += 1;
+          return telephonyResult({
+            kind: "completed",
+            provider: "twilio",
+            operation: operation.kind,
+            providerId: null,
+            providerStatus: "read",
+            messages:
+              inboxReads === 1
+                ? []
+                : [
+                    {
+                      messageSid: "SM-dentist-reply-1",
+                      direction: "inbound",
+                      status: "received",
+                      fromPhoneNumber: "+13105550144",
+                      toPhoneNumber: "+13105550999",
+                      sentAt: "2026-08-27T21:45:00.000Z",
+                      body: "Yes, Violet is confirmed for Wednesday at 3:30 PM.",
+                      mediaCount: 0,
+                    },
+                  ],
+          });
+        }
         throw new Error(`Unexpected telephony operation ${operation.kind}`);
       },
     };
@@ -881,15 +961,62 @@ describe("Florence reasoner capability cutover", () => {
     if (delivered.kind !== "continue") throw new Error("Dentist text status did not settle");
     expect(delivered.state.activeTextMessage).toBeNull();
 
-    const terminal = await reasoner.continueFamilyWork({ ...input, state: delivered.state }, reads);
+    const deferred = await reasoner.continueFamilyWork({ ...input, state: delivered.state }, reads);
+    expect(deferred).toMatchObject({
+      kind: "deferred",
+      resumeAt: "2026-08-27T21:00:00.000Z",
+      progressText: "The text was delivered. I’ll check for their reply this afternoon.",
+      state: { phase: "ready" },
+    });
+    if (deferred.kind !== "deferred") throw new Error("Dentist reply check was not deferred");
+
+    const firstInboxPlanned = await reasoner.continueFamilyWork(
+      { ...input, currentTime: deferred.resumeAt, state: deferred.state },
+      reads,
+    );
+    if (firstInboxPlanned.kind !== "continue") throw new Error("First dentist inbox read was not planned");
+    const firstInboxRead = await reasoner.continueFamilyWork(
+      { ...input, currentTime: deferred.resumeAt, state: firstInboxPlanned.state },
+      reads,
+    );
+    if (firstInboxRead.kind !== "continue") throw new Error("First dentist inbox read did not settle");
+
+    const deferredAgain = await reasoner.continueFamilyWork(
+      { ...input, currentTime: deferred.resumeAt, state: firstInboxRead.state },
+      reads,
+    );
+    expect(deferredAgain).toMatchObject({
+      kind: "deferred",
+      resumeAt: "2026-08-27T22:00:00.000Z",
+      progressText: null,
+    });
+    if (deferredAgain.kind !== "deferred") throw new Error("Second dentist reply check was not deferred");
+
+    const secondInboxPlanned = await reasoner.continueFamilyWork(
+      { ...input, currentTime: deferredAgain.resumeAt, state: deferredAgain.state },
+      reads,
+    );
+    if (secondInboxPlanned.kind !== "continue") throw new Error("Second dentist inbox read was not planned");
+    const secondInboxRead = await reasoner.continueFamilyWork(
+      { ...input, currentTime: deferredAgain.resumeAt, state: secondInboxPlanned.state },
+      reads,
+    );
+    if (secondInboxRead.kind !== "continue") throw new Error("Second dentist inbox read did not settle");
+
+    const terminal = await reasoner.continueFamilyWork(
+      { ...input, currentTime: deferredAgain.resumeAt, state: secondInboxRead.state },
+      reads,
+    );
     expect(terminal).toMatchObject({
       kind: "terminal",
       outcome: "succeeded",
-      text: expect.stringContaining("received"),
+      text: expect.stringContaining("confirmed"),
     });
     expect(operations).toEqual([
       expect.objectContaining({ kind: "sms_send", to: "+13105550144" }),
       { kind: "sms_status", provider: "twilio", messageSid: "SM-dentist-1" },
+      { kind: "sms_inbox", provider: "twilio", from: "+13105550144", limit: 20 },
+      { kind: "sms_inbox", provider: "twilio", from: "+13105550144", limit: 20 },
     ]);
   });
 
@@ -3129,6 +3256,22 @@ function functionCall(callId: string, name: string, args: object) {
     name,
     arguments: JSON.stringify(args),
     status: "completed" as const,
+  };
+}
+
+function familyWorkResultMessage(id: string, result: object) {
+  return {
+    id: `message-${id}`,
+    type: "message" as const,
+    role: "assistant" as const,
+    status: "completed" as const,
+    content: [
+      {
+        type: "output_text" as const,
+        text: JSON.stringify(result),
+        annotations: [],
+      },
+    ],
   };
 }
 

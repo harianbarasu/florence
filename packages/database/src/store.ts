@@ -632,6 +632,7 @@ export type VisibleFamilyWork = {
   objective: string;
   currentProgress: string;
   status: "active" | "waiting" | "delivering" | "completed" | "cancelled";
+  nextAt: string | null;
   createdAt: string;
 };
 
@@ -6804,11 +6805,15 @@ export class PostgresFlorenceStore {
         objective: string;
         current_conclusion: string;
         status: "active" | "paused" | "delivering" | "completed" | "cancelled";
+        next_check_at: Date | null;
         created_at: Date;
       }[]
     >`
       with current_work as (
-        select id,objective,current_conclusion,status,created_at
+        select id,objective,current_conclusion,status,
+          case when status='active' and task_state->>'claim' is null then next_check_at else null end
+            as next_check_at,
+          created_at
         from proactive_work
         where household_id=${row.household_id} and kind='family_task'
           and status in ('active','paused','delivering')
@@ -6820,7 +6825,10 @@ export class PostgresFlorenceStore {
           )
         order by created_at,id limit 100
       ), recent_work as (
-        select id,objective,current_conclusion,status,created_at
+        select id,objective,current_conclusion,status,
+          case when status='active' and task_state->>'claim' is null then next_check_at else null end
+            as next_check_at,
+          created_at
         from proactive_work
         where household_id=${row.household_id} and kind='family_task'
           and status in ('completed','cancelled')
@@ -7031,6 +7039,7 @@ export class PostgresFlorenceStore {
         objective: work.objective,
         currentProgress: work.current_conclusion,
         status: work.status === "paused" ? "waiting" : work.status,
+        nextAt: work.next_check_at?.toISOString() ?? null,
         createdAt: work.created_at.toISOString(),
       })),
       visibleReminders: reminderRows.map((reminder) => ({

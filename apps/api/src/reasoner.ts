@@ -505,6 +505,7 @@ export const florenceReasonerInputSchema = z
           objective: shortText,
           currentProgress: shortText.nullable(),
           status: z.enum(["active", "waiting", "delivering", "completed", "cancelled"]),
+          nextAt: timestamp.nullable(),
           createdAt: timestamp,
         })
         .strict(),
@@ -1344,8 +1345,10 @@ type PublicRequestResearchDecision = z.infer<typeof publicRequestResearchDecisio
 
 const familyWorkTerminalDecisionSchema = z
   .object({
-    outcome: z.enum(["succeeded", "partial", "waiting", "failed"]),
-    text: z.string().trim().min(1).max(2_000),
+    outcome: z.enum(["succeeded", "partial", "waiting", "failed", "deferred"]),
+    text: z.string().trim().min(1).max(2_000).nullable().default(null),
+    resumeAt: calendarInstant.nullable().default(null),
+    progressText: z.string().trim().min(1).max(2_000).nullable().default(null),
   })
   .strict();
 
@@ -1382,6 +1385,12 @@ export type FlorenceFamilyWorkStep =
       state: FamilyWorkStateV1;
       progressText: string | null;
       nextCheckDelayMs: number;
+    }>
+  | Readonly<{
+      kind: "deferred";
+      state: FamilyWorkStateV1;
+      resumeAt: string;
+      progressText: string | null;
     }>
   | Readonly<{
       kind: "waiting";
@@ -1610,7 +1619,7 @@ The familyWork field is for a real multi-step task that should keep going after 
 
 householdDocket is the ranked household-safe backlog retained from the complete Google review. Treat it as current structured context, not a reason to volunteer every item. When a parent asks what is on the docket, what needs attention, or what the family is waiting on, reconcile it with visible reminders, active or waiting family work, pending follow-ups, pending Calendar offers, and a near-term family-Calendar read when timing could change the answer. Rank by consequence and time, not source or message count. Lead with at most three unfinished items. For each, say naturally what it is, why it matters now, and the next decision or action without inventing facts beyond the supplied summary, category, dueAt, and needsAnswer. If householdDocket.totalItems exceeds what you show, say how many lower-priority items remain instead of dumping them. Do not treat silence from another person as completion, and do not repeat an unchanged docket item unsolicited merely because it is still present. When the parent clearly says a supplied docket item is handled, finished, cancelled, or no longer relevant, put exactly that candidateId in docketCompletions and acknowledge it naturally. A reply or unambiguous recent referent may identify the item; if more than one supplied item plausibly matches, ask one focused question and return docketCompletions null. Return docketCompletions null when nothing was completed. Never infer completion from thanks, agreement, silence, or a reaction.
 
-Use visibleFamilyWork to answer status questions naturally and to resolve steering or cancellation. Steer only one supplied active or waiting workId when the current Message clearly adds or changes a constraint for that task; carry the parent's meaning faithfully in the concise instruction. Cancel only one supplied active, waiting, or delivering workId when the parent clearly wants that work stopped. A reply or an unambiguous recent referent can resolve “that”; if two tasks plausibly match, ask one focused question and return no familyWork mutation. An unrelated family Message must leave every task untouched. Never expose work IDs, phases, generations, claims, or other machinery in conversation.
+Use visibleFamilyWork to answer status questions naturally and to resolve steering or cancellation. When active work has a future nextAt, say naturally when Florence will check again rather than implying that work is happening continuously. Steer only one supplied active or waiting workId when the current Message clearly adds or changes a constraint for that task; carry the parent's meaning faithfully in the concise instruction. Cancel only one supplied active, waiting, or delivering workId when the parent clearly wants that work stopped. A reply or an unambiguous recent referent can resolve “that”; if two tasks plausibly match, ask one focused question and return no familyWork mutation. An unrelated family Message must leave every task untouched. Never expose work IDs, phases, generations, claims, or other machinery in conversation.
 
 The reminder field is Florence's complete reminder control. Interpret ordinary language into exactly one of create, list, update, pause, resume, run, or cancel. A private reminder belongs only to that adult and delivers in this thread; a group reminder belongs to the household and delivers in this group.
 
@@ -1724,7 +1733,11 @@ For a browser booking, registration, reservation, purchase, cancellation, or ser
 
 Drive search and get return metadata; gmail_draft_work may use an exact returned Drive file ID as an attachment and exports supported native Docs, Sheets, Slides, and Drawings to PDF. Browser upload is limited to an image or PDF attached to the task's initiating Messages context; no tool yet exposes arbitrary Drive binary contents to the model or downloads a site file into another provider. For a new message, reply, or forward with attachments, create the provider draft first. If the objective is to send it, pass the returned draftId and messageHeaderId unchanged to gmail_draft_work send; do not recreate the message or stop at draft creation. A forward can preserve the source email's attachments. Google Docs, Sheets, and Slides tools can operate on their native content by provider ID. Never claim an attachment, upload, download, Gmail send, phone/text outcome, or website action happened unless the relevant tool result says it did. Use the tools to complete the parent's objective rather than merely explaining how they could do it. Ask only when one genuine missing choice blocks execution, and report what the returned result says actually happened. A flight number is an ordinary public identifier: resolve its current operating date, route, and status before searching alternatives. Prefer a second genuinely useful source or specialized tool for a comparison, but never call tools performatively.
 
-If another tool operation is needed, call exactly one tool and stop this checkpoint. If the accumulated evidence is enough, return a concise terminal result that leads with the useful answer and includes concrete options, times, tradeoffs, completed actions, and direct URLs already present in tool results when helpful. Use outcome succeeded when the requested work is complete, partial when useful results exist but one named source or constraint could not be resolved, failed only when no useful result can be produced, and waiting only when one consequential parent choice remains genuinely blocking after the available tools. A waiting result must ask exactly one focused question. Never say you will keep working unless you actually call another tool in this checkpoint. Output only the strict terminal schema when you do not call a tool.`;
+If another tool operation is needed now, call exactly one tool and stop this checkpoint. If useful work genuinely depends on external state that cannot reasonably have changed yet—such as a reply, provider processing, a business opening, a flight update, or availability being released—return outcome deferred with a proportionate absolute future resumeAt. Deferred work remains the same task and will wake automatically at that instant. It is not a substitute for using an available tool now, asking a genuinely blocking parent question, or returning a finished result. Use progressText only the first time Florence has something useful to say about the wait; use null on unchanged later checks so the family does not receive repeated status messages.
+
+The result object always contains outcome, text, resumeAt, and progressText. For outcome deferred, text must be null, resumeAt must be the absolute future instant, and progressText may be useful text or null. For every other outcome, text must contain the result or question, and both resumeAt and progressText must be null.
+
+If the accumulated evidence is enough, return a concise terminal result that leads with the useful answer and includes concrete options, times, tradeoffs, completed actions, and direct URLs already present in tool results when helpful. Use outcome succeeded when the requested work is complete, partial when useful results exist but one named source or constraint could not be resolved, failed only when no useful result can be produced, and waiting only when one consequential parent choice remains genuinely blocking after the available tools. A waiting result must ask exactly one focused question. Never say you will keep working unless you actually call another tool in this checkpoint or return a deferred result with an exact resumeAt. Output only the strict result schema when you do not call a tool.`;
 
 const FAMILY_WORK_CHECKPOINT_MAX_BYTES = 240 * 1024;
 const FAMILY_WORK_CHECKPOINT_LIMIT_TEXT =
@@ -4663,6 +4676,24 @@ function compactConsumedFamilyWorkArtifacts(items: readonly unknown[]): JsonValu
   });
 }
 
+function familyWorkHasDeferredCheckpoint(items: readonly unknown[]): boolean {
+  for (const item of items) {
+    if (!isJsonRecord(item) || item.type !== "message" || item.role !== "assistant") continue;
+    const content = item.content;
+    if (!Array.isArray(content)) continue;
+    for (const part of content) {
+      if (!isJsonRecord(part) || part.type !== "output_text" || typeof part.text !== "string") continue;
+      try {
+        const result = JSON.parse(part.text) as unknown;
+        if (isJsonRecord(result) && result.outcome === "deferred") return true;
+      } catch {
+        // Ordinary assistant text is not a structured family-work checkpoint.
+      }
+    }
+  }
+  return false;
+}
+
 function familyWorkProgressText(
   capabilityName: string,
   terminal: CapabilityTerminalEnvelope,
@@ -5723,6 +5754,39 @@ export class FlorenceReasoner {
           "Durable family work cannot pause or finish while a provider call or text is still active; inspect or stop that exact provider effect first",
         );
       }
+      if (terminal.outcome === "deferred") {
+        if (terminal.resumeAt === null || terminal.text !== null) {
+          throw invalidOutput("Deferred family work needs a resume time instead of terminal text");
+        }
+        const resumeAtMs = Date.parse(terminal.resumeAt);
+        if (resumeAtMs <= Date.parse(input.currentTime)) {
+          throw invalidOutput("Deferred family work must resume at a future instant");
+        }
+        const progressText = familyWorkHasDeferredCheckpoint(input.state.continuationItems)
+          ? null
+          : terminal.progressText;
+        const state: FamilyWorkStateV1 = {
+          ...input.state,
+          phase: "ready",
+          claim: null,
+          continuationItems: [...consumedContinuationItems, ...appended],
+          pendingCall: null,
+          progressRevision: input.state.progressRevision + (progressText ? 1 : 0),
+        };
+        if (familyWorkCheckpointBytes(state) > FAMILY_WORK_CHECKPOINT_MAX_BYTES) {
+          return familyWorkCheckpointLimit(input.state, input.state.progressRevision + 1);
+        }
+        return {
+          kind: "deferred",
+          state,
+          resumeAt: new Date(resumeAtMs).toISOString(),
+          progressText,
+        };
+      }
+      if (terminal.text === null || terminal.resumeAt !== null || terminal.progressText !== null) {
+        throw invalidOutput("Finished or waiting family work returned an invalid result shape");
+      }
+      const terminalText = terminal.text;
       if (terminal.outcome === "waiting") {
         const state: FamilyWorkStateV1 = {
           ...input.state,
@@ -5738,7 +5802,7 @@ export class FlorenceReasoner {
         return {
           kind: "waiting",
           state,
-          question: terminal.text,
+          question: terminalText,
         };
       }
       return {
@@ -5751,10 +5815,10 @@ export class FlorenceReasoner {
           pendingCall: null,
           publicMapResearchContext: [],
           progressRevision: input.state.progressRevision + 1,
-          terminal: { outcome: terminal.outcome, text: terminal.text },
+          terminal: { outcome: terminal.outcome, text: terminalText },
         },
         outcome: terminal.outcome,
-        text: terminal.text,
+        text: terminalText,
       };
     } catch (error) {
       if (error instanceof APIUserAbortError || isAbortError(error)) throw error;

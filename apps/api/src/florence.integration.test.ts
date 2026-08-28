@@ -840,6 +840,7 @@ release("Durable family work store", () => {
         result: { type: "continue", state: plannedState, nextCheckAt: at(100) },
       }),
     ).toBe("settled");
+    expect(await store.readNextDueProactiveWork(at(99))).toBeNull();
 
     await store.close();
     store = new PostgresFlorenceStore(databaseUrl);

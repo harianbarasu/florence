@@ -1826,6 +1826,7 @@ export class Florence {
         objective: work.objective,
         currentProgress: work.currentProgress,
         status: work.status,
+        nextAt: work.nextAt,
         createdAt: work.createdAt,
       })),
       visibleInterests: turn.visibleInterests.map((interest) => ({
@@ -3990,6 +3991,29 @@ export class Florence {
           },
         });
         if (settlement === "stale") {
+          await closeUncheckpointedBrowserSession();
+          if (familyWorkWasExplicitlyCancelled(signal)) await stopUncheckpointedPhoneCall(true);
+          else await adoptOrStopUncheckpointedPhoneCall();
+          await adoptUncheckpointedTextMessage();
+        }
+      } else if (step.kind === "deferred") {
+        const deferredBrowserSession = browserSession;
+        const resumeAt = Date.parse(step.resumeAt) < Date.parse(settledAt) ? settledAt : step.resumeAt;
+        const settlement = await this.#store.settleFamilyWorkClaim({
+          workId: work.workId,
+          generation: work.generation,
+          claimId: work.claimId,
+          settledAt,
+          result: {
+            type: "continue",
+            state: { ...step.state, browserSession: null },
+            nextCheckAt: resumeAt,
+            ...(step.progressText ? { progressText: step.progressText } : {}),
+          },
+        });
+        if (settlement === "settled" && deferredBrowserSession) {
+          await closeBrowserSession(deferredBrowserSession);
+        } else if (settlement === "stale") {
           await closeUncheckpointedBrowserSession();
           if (familyWorkWasExplicitlyCancelled(signal)) await stopUncheckpointedPhoneCall(true);
           else await adoptOrStopUncheckpointedPhoneCall();

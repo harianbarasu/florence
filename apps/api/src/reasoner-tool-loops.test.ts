@@ -15,6 +15,8 @@ import {
   BrowserbaseBrowserClient,
   type FlorenceBrowserObservation,
   type FlorenceBrowserOperation,
+  KernelBrowserClient,
+  kernelProfileName,
 } from "./browser.js";
 import {
   type FlorenceDecision,
@@ -1112,7 +1114,10 @@ describe("Florence reasoner capability cutover", () => {
           functionCall(
             "fill-child-name",
             "browser_work",
-            browserArguments("type", { ref: "e5", text: "Violet Williams" }),
+            browserArguments("playwright", {
+              code: `await page.getByLabel("Child name").fill("Violet Williams"); return { childName: await page.getByLabel("Child name").inputValue() };`,
+              timeoutSeconds: 60,
+            }),
           ),
         ],
       },
@@ -1130,7 +1135,31 @@ describe("Florence reasoner capability cutover", () => {
       {
         status: "completed",
         output_parsed: null,
-        output: [functionCall("inspect-registration", "browser_work", browserArguments("screenshot"))],
+        output: [
+          functionCall(
+            "inspect-registration",
+            "browser_work",
+            browserArguments("computer", {
+              actions: [
+                {
+                  type: "move_mouse",
+                  x: 400,
+                  y: 300,
+                  button: null,
+                  clickType: null,
+                  numClicks: null,
+                  text: null,
+                  keys: [],
+                  deltaX: null,
+                  deltaY: null,
+                  path: [],
+                  milliseconds: null,
+                },
+              ],
+              screenshot: true,
+            }),
+          ),
+        ],
       },
       {
         status: "completed",
@@ -1244,7 +1273,8 @@ describe("Florence reasoner capability cutover", () => {
               liveViewUrl,
               reason: "The parent can sign in through the live browser.",
             });
-          case "type":
+          case "playwright":
+            expect(operation.code).toContain('getByLabel("Child name")');
             return browserObservation({
               title: "Camp registration",
               url: portalUrl,
@@ -1259,14 +1289,16 @@ describe("Florence reasoner capability cutover", () => {
               snapshot:
                 '- textbox "Child name" [ref=e5] value="Violet Williams"\n- text "violet-medical-form.pdf attached"\n- button Preview [ref=e9]',
             });
-          case "screenshot":
+          case "computer":
+            expect(operation.actions).toEqual([{ type: "move_mouse", x: 400, y: 300 }]);
+            expect(operation.screenshot).toBe(true);
             return browserObservation({
               title: "Camp registration",
               url: portalUrl,
               snapshot: '- textbox "Child name" [ref=e5] value="Violet Williams"\n- button Preview [ref=e9]',
               screenshot: {
-                mimeType: "image/jpeg" as const,
-                bytes: Uint8Array.from([0xff, 0xd8, 0xff, 0xd9]),
+                mimeType: "image/png" as const,
+                bytes: Uint8Array.from([0x89, 0x50, 0x4e, 0x47]),
               },
             });
           case "click": {
@@ -1366,9 +1398,9 @@ describe("Florence reasoner capability cutover", () => {
     expect(browserOperations.map((operation) => operation.kind)).toEqual([
       "navigate",
       "owner_handoff",
-      "type",
+      "playwright",
       "upload",
-      "screenshot",
+      "computer",
       "click",
       "click",
     ]);
@@ -1444,6 +1476,7 @@ describe("Florence reasoner capability cutover", () => {
       commandRunner: commandRunner as never,
     });
     const navigated = await client.run({
+      householdId: "household-1",
       workId: "work-upload-1",
       ownerAdultId: "adult-1",
       callId: "navigate-1",
@@ -1453,6 +1486,7 @@ describe("Florence reasoner capability cutover", () => {
     });
     const fileBytes = Uint8Array.from([0x25, 0x50, 0x44, 0x46, 0x2d, 0x31, 0x2e, 0x37]);
     const uploaded = await client.run({
+      householdId: "household-1",
       workId: "work-upload-1",
       ownerAdultId: "adult-1",
       callId: "upload-1",
@@ -1470,6 +1504,7 @@ describe("Florence reasoner capability cutover", () => {
     expect(uploaded.observation.snapshot).toContain("medical-form.pdf attached");
 
     const retried = await client.run({
+      householdId: "household-1",
       workId: "work-upload-1",
       ownerAdultId: "adult-1",
       callId: "upload-1",
@@ -1479,6 +1514,227 @@ describe("Florence reasoner capability cutover", () => {
     });
     expect(uploadCommands).toBe(1);
     expect(retried.observation.kind).toBe("uncertain_effect");
+  });
+
+  test("Kernel keeps one household profile, composes browser tactics, and saves owner sign-in", async () => {
+    const profileName = kernelProfileName("household-kernel-1");
+    expect(profileName).toMatch(/^florence-[a-f0-9]{40}$/u);
+    expect(profileName).not.toContain("household-kernel-1");
+
+    let profileExists = false;
+    const createdBrowsers: Record<string, unknown>[] = [];
+    const browserSessions = new Map<string, Record<string, unknown>>();
+    const deletedBrowsers: string[] = [];
+    const playwrightCalls: Record<string, unknown>[] = [];
+    const computerBatches: Record<string, unknown>[] = [];
+    let uploads = 0;
+    let uploadedBytes: Uint8Array | null = null;
+
+    const kernel = {
+      profiles: {
+        async retrieve(name: string) {
+          expect(name).toBe(profileName);
+          if (!profileExists) throw Object.assign(new Error("missing profile"), { status: 404 });
+          return { id: "profile-kernel-1", name };
+        },
+        async create(input: { readonly name: string }) {
+          expect(input).toEqual({ name: profileName });
+          profileExists = true;
+          throw Object.assign(new Error("profile created concurrently"), { status: 409 });
+        },
+      },
+      browsers: {
+        async *list() {
+          for (const session of browserSessions.values()) yield session;
+        },
+        async create(input: Record<string, unknown>) {
+          createdBrowsers.push(input);
+          const id = `kernel-session-${createdBrowsers.length}`;
+          const profile = input.profile as { readonly save_changes: boolean };
+          const session = {
+            session_id: id,
+            cdp_ws_url: `wss://kernel.example/${id}`,
+            browser_live_view_url: `https://kernel.example/live/${id}`,
+            profile: { id: "profile-kernel-1", name: profileName },
+            profile_save_changes: profile.save_changes,
+            timeout_seconds: 259_200,
+          };
+          browserSessions.set(id, session);
+          return session;
+        },
+        async retrieve(id: string) {
+          const session = browserSessions.get(id);
+          if (!session) throw Object.assign(new Error("missing browser"), { status: 404 });
+          return session;
+        },
+        async deleteByID(id: string) {
+          deletedBrowsers.push(id);
+          browserSessions.delete(id);
+        },
+        playwright: {
+          async execute(_id: string, input: Record<string, unknown>) {
+            playwrightCalls.push(input);
+            return { success: true, result: { route: "JFK to LAX", alternatives: 3 } };
+          },
+        },
+        computer: {
+          async batch(_id: string, input: Record<string, unknown>) {
+            computerBatches.push(input);
+          },
+          async captureScreenshot() {
+            return new Response(Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+          },
+        },
+      },
+    };
+    const commandRunner = async (input: { readonly args: readonly string[] }) => {
+      const commandIndex = input.args.findIndex((value) =>
+        ["open", "snapshot", "get", "upload", "close"].includes(value),
+      );
+      const command = input.args[commandIndex];
+      let data: Record<string, unknown> = {};
+      if (command === "snapshot") {
+        data = {
+          snapshot: '- textbox "Search" [ref=e1]\n- button "Continue" [ref=e2]',
+          refs: { e1: {}, e2: {} },
+        };
+      } else if (command === "get") {
+        data =
+          input.args[commandIndex + 1] === "url"
+            ? { url: "https://family.example/current" }
+            : { title: "Family account" };
+      } else if (command === "upload") {
+        uploads += 1;
+        const path = input.args[commandIndex + 2];
+        if (!path) throw new Error("Kernel upload omitted its temporary file");
+        uploadedBytes = new Uint8Array(await readFile(path));
+      }
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({ success: true, data }),
+        stderr: "",
+        timedOut: false,
+        cancelled: false,
+        stdoutTruncated: false,
+      };
+    };
+    const client = new KernelBrowserClient({
+      apiKey: "kernel-test-key",
+      client: kernel as never,
+      commandRunner: commandRunner as never,
+      now: () => Date.parse(NOW),
+    });
+
+    const navigated = await client.run({
+      householdId: "household-kernel-1",
+      workId: "kernel-work-1",
+      ownerAdultId: "adult-1",
+      callId: "navigate-kernel",
+      attempt: 1,
+      session: null,
+      operation: { kind: "navigate", url: "https://family.example/start" },
+    });
+    expect(createdBrowsers[0]).toMatchObject({
+      profile: { id: "profile-kernel-1", save_changes: false },
+      start_url: "https://family.example/start",
+      stealth: true,
+      timeout_seconds: 259_200,
+    });
+
+    const playwright = await client.run({
+      householdId: "household-kernel-1",
+      workId: "kernel-work-1",
+      ownerAdultId: "adult-1",
+      callId: "playwright-kernel",
+      attempt: 1,
+      session: navigated.session,
+      operation: {
+        kind: "playwright",
+        code: "return { route: await page.title(), alternatives: 3 };",
+        timeoutSeconds: 120,
+      },
+    });
+    expect(playwrightCalls).toEqual([
+      {
+        code: "return { route: await page.title(), alternatives: 3 };",
+        timeout_sec: 120,
+      },
+    ]);
+    expect(playwright.observation.snapshot).toContain('"alternatives":3');
+
+    const computerOperation = {
+      kind: "computer" as const,
+      actions: [
+        { type: "click_mouse" as const, x: 120, y: 240 },
+        { type: "type_text" as const, text: "Violet" },
+      ],
+      screenshot: true,
+    };
+    const computer = await client.run({
+      householdId: "household-kernel-1",
+      workId: "kernel-work-1",
+      ownerAdultId: "adult-1",
+      callId: "computer-kernel",
+      attempt: 1,
+      session: playwright.session,
+      operation: computerOperation,
+    });
+    expect(computerBatches).toEqual([
+      {
+        actions: [
+          { type: "click_mouse", click_mouse: { x: 120, y: 240 } },
+          { type: "type_text", type_text: { text: "Violet" } },
+        ],
+      },
+    ]);
+    expect(computer.observation.screenshot).toMatchObject({ mimeType: "image/png" });
+
+    const uncertainComputer = await client.run({
+      householdId: "household-kernel-1",
+      workId: "kernel-work-1",
+      ownerAdultId: "adult-1",
+      callId: "computer-kernel",
+      attempt: 2,
+      session: computer.session,
+      operation: computerOperation,
+    });
+    expect(computerBatches).toHaveLength(1);
+    expect(uncertainComputer.observation.kind).toBe("uncertain_effect");
+
+    const fileBytes = Uint8Array.from([0x25, 0x50, 0x44, 0x46]);
+    const uploaded = await client.run({
+      householdId: "household-kernel-1",
+      workId: "kernel-work-1",
+      ownerAdultId: "adult-1",
+      callId: "upload-kernel",
+      attempt: 1,
+      session: uncertainComputer.session,
+      operation: { kind: "upload", ref: "e1", attachmentRef: "document-1" },
+      uploadFile: { filename: "camp-form.pdf", bytes: fileBytes },
+    });
+    expect(uploads).toBe(1);
+    expect(uploadedBytes).toEqual(fileBytes);
+
+    const handoff = await client.run({
+      householdId: "household-kernel-1",
+      workId: "kernel-work-1",
+      ownerAdultId: "adult-1",
+      callId: "owner-handoff-kernel",
+      attempt: 1,
+      session: uploaded.session,
+      operation: { kind: "owner_handoff" },
+    });
+    expect(handoff.session.sessionId).toBe("kernel-session-2");
+    expect(handoff.observation.liveViewUrl).toBe("https://kernel.example/live/kernel-session-2");
+    expect(createdBrowsers[1]).toMatchObject({
+      profile: { id: "profile-kernel-1", save_changes: true },
+      start_url: "https://family.example/current",
+      stealth: true,
+    });
+    expect(deletedBrowsers).toEqual(["kernel-session-1"]);
+
+    await client.close(handoff.session);
+    expect(deletedBrowsers).toEqual(["kernel-session-1", "kernel-session-2"]);
   });
 
   test("ordinary route questions use the dedicated maps tools and start visible work once", async () => {
@@ -3787,6 +4043,10 @@ function browserArguments(operation: string, overrides: Record<string, unknown> 
     direction: null,
     milliseconds: null,
     compact: true,
+    code: null,
+    timeoutSeconds: null,
+    actions: [],
+    screenshot: false,
     ...overrides,
   };
 }

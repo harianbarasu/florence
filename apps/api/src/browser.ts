@@ -3,20 +3,23 @@ import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, open, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import Kernel from "@onkernel/sdk";
+import type { ComputerBatchParams } from "@onkernel/sdk/resources/browsers/computer";
 
 /**
- * Adapted port of Hermes Agent's Browserbase provider and agent-browser tool at
- * commit 6dcebea7fc5d0cc4f621eeaddf52b7d877a5f882
- * (`plugins/browser/browserbase/provider.py`, `tools/browser_tool.py`). Florence
- * keeps the Browserbase session lifecycle, task-scoped agent-browser sessions,
- * compact accessibility snapshots, ref-based actions, 500px scrolling,
- * bounded command execution, timeout generation recovery, and human live-view
- * handoff. It intentionally omits Hermes's provider registry, local-browser
- * fallback, terminal/eval/console tools, and generic policy machinery.
+ * Kernel-first browser execution is directly adapted from OpenInstinct commit
+ * 480045dbc63008e7f99313d1683858cd8657b35a (`manage_browsers.ts`,
+ * `execute_playwright_code.ts`, `computer_action.ts`, and
+ * `capture_browser_image.ts`). Florence keeps OpenInstinct's persistent profile,
+ * in-browser Playwright, native computer control, visual observation, and live
+ * handoff primitives inside Florence's existing durable PostgreSQL work loop.
  *
- * The exact CLI dependency is agent-browser 0.26.0. Its `--session` isolates
- * the local command daemon while `--cdp` attaches that daemon to the durable
- * Browserbase session.
+ * Existing ref-based operations remain an adapted port of Hermes Agent commit
+ * 6dcebea7fc5d0cc4f621eeaddf52b7d877a5f882. The exact CLI dependency is
+ * agent-browser 0.26.0; its task-scoped daemon attaches over CDP to either
+ * provider. Browserbase remains only as a rollout fallback when Kernel is not
+ * configured. Florence intentionally omits both upstreams' provider registries,
+ * second agent runtimes, and arbitrary total-task or tool-call ceilings.
  */
 
 const DEFAULT_BASE_URL = "https://api.browserbase.com";
@@ -36,6 +39,12 @@ const MAX_COMMAND_STDERR_BYTES = 64 * 1_024;
 const MAX_INPUT_CHARS = 20_000;
 const MAX_UPLOAD_BYTES = 20 * 1_024 * 1_024;
 const MAX_UPLOAD_FILENAME_BYTES = 255;
+const DEFAULT_KERNEL_SESSION_TIMEOUT_SECONDS = 259_200;
+const DEFAULT_KERNEL_PLAYWRIGHT_TIMEOUT_SECONDS = 60;
+const MAX_KERNEL_PLAYWRIGHT_TIMEOUT_SECONDS = 300;
+const MAX_PLAYWRIGHT_CODE_CHARS = 50_000;
+const MAX_COMPUTER_ACTIONS_PER_CALL = 50;
+const MAX_COMPUTER_SCREENSHOT_BYTES = 4 * 1_024 * 1_024;
 
 export interface FlorenceBrowserSession {
   readonly sessionId: string;
@@ -55,12 +64,48 @@ export type FlorenceBrowserOperation =
   | { readonly kind: "wait"; readonly milliseconds: number }
   | { readonly kind: "back" }
   | { readonly kind: "screenshot" }
+  | {
+      readonly kind: "playwright";
+      readonly code: string;
+      readonly timeoutSeconds?: number;
+    }
+  | {
+      readonly kind: "computer";
+      readonly actions: readonly FlorenceBrowserComputerAction[];
+      readonly screenshot: boolean;
+    }
   | { readonly kind: "owner_handoff" };
+
+export type FlorenceBrowserComputerAction =
+  | {
+      readonly type: "click_mouse";
+      readonly x: number;
+      readonly y: number;
+      readonly button?: "left" | "right" | "middle";
+      readonly clickType?: "down" | "up" | "click";
+      readonly numClicks?: number;
+    }
+  | { readonly type: "move_mouse"; readonly x: number; readonly y: number }
+  | { readonly type: "type_text"; readonly text: string }
+  | { readonly type: "press_key"; readonly keys: readonly string[] }
+  | {
+      readonly type: "scroll";
+      readonly x: number;
+      readonly y: number;
+      readonly deltaX?: number;
+      readonly deltaY?: number;
+    }
+  | {
+      readonly type: "drag_mouse";
+      readonly path: readonly { readonly x: number; readonly y: number }[];
+      readonly button?: "left" | "right" | "middle";
+    }
+  | { readonly type: "sleep"; readonly milliseconds: number };
 
 export type FlorenceBrowserObservationKind = "page" | "owner_handoff" | "uncertain_effect";
 
 export interface FlorenceBrowserScreenshot {
-  readonly mimeType: "image/jpeg";
+  readonly mimeType: "image/jpeg" | "image/png";
   readonly bytes: Uint8Array<ArrayBuffer>;
 }
 
@@ -77,6 +122,7 @@ export interface FlorenceBrowserObservation {
 }
 
 export interface FlorenceBrowserRunInput {
+  readonly householdId: string;
   readonly workId: string;
   readonly ownerAdultId: string;
   readonly callId: string;
@@ -147,6 +193,21 @@ export type FlorenceBrowserCommandRunner = (
   input: FlorenceBrowserCommandInput,
 ) => Promise<FlorenceBrowserCommandResult>;
 
+export interface KernelBrowserClientOptions {
+  readonly apiKey: string;
+  readonly projectId?: string;
+  readonly client?: Kernel;
+  readonly executable?: string;
+  readonly commandRunner?: FlorenceBrowserCommandRunner;
+  readonly now?: () => number;
+  readonly commandTimeoutMs?: number;
+  readonly openTimeoutMs?: number;
+  readonly sessionTimeoutSeconds?: number;
+  readonly maxWaitMs?: number;
+  readonly maxSnapshotChars?: number;
+  readonly maxScreenshotBytes?: number;
+}
+
 export interface BrowserbaseBrowserClientOptions {
   readonly apiKey: string;
   readonly projectId?: string;
@@ -187,13 +248,727 @@ interface PageMetadata {
   readonly title: string;
 }
 
+interface KernelSessionDetails {
+  readonly session: FlorenceBrowserSession;
+  readonly connectUrl: string;
+  readonly liveViewUrl: string | null;
+  readonly profileId: string;
+  readonly profileName: string;
+  readonly saveChanges: boolean;
+}
+
 const UNCERTAIN_RETRY_OPERATIONS = new Set<FlorenceBrowserOperation["kind"]>([
   "click",
   "upload",
   "press",
   "scroll",
   "back",
+  "playwright",
+  "computer",
 ]);
+
+export class KernelBrowserClient implements FlorenceBrowserClient {
+  readonly #kernel: Kernel;
+  readonly #executable: string;
+  readonly #commandRunner: FlorenceBrowserCommandRunner;
+  readonly #now: () => number;
+  readonly #commandTimeoutMs: number;
+  readonly #openTimeoutMs: number;
+  readonly #sessionTimeoutSeconds: number;
+  readonly #maxWaitMs: number;
+  readonly #maxSnapshotChars: number;
+  readonly #maxScreenshotBytes: number;
+  readonly #activeSessions = new Map<string, FlorenceBrowserSession>();
+  readonly #profileWriters = new Map<string, string>();
+  readonly #commandGenerations = new Map<string, number>();
+
+  constructor(options: KernelBrowserClientOptions) {
+    const apiKey = requireNonEmpty(options.apiKey, "Kernel API key", 10_000);
+    const projectId = optionalNonEmpty(options.projectId, "Kernel project ID", 500);
+    this.#kernel =
+      options.client ??
+      new Kernel({
+        apiKey,
+        ...(projectId ? { projectID: projectId } : {}),
+        maxRetries: 0,
+        timeout: DEFAULT_API_TIMEOUT_MS,
+      });
+    this.#executable = requireNonEmpty(
+      options.executable ?? "agent-browser",
+      "agent-browser executable",
+      4_096,
+    );
+    this.#commandRunner = options.commandRunner ?? runBrowserCommand;
+    this.#now = options.now ?? Date.now;
+    this.#commandTimeoutMs = boundedInteger(
+      options.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS,
+      1_000,
+      120_000,
+    );
+    this.#openTimeoutMs = boundedInteger(options.openTimeoutMs ?? DEFAULT_OPEN_TIMEOUT_MS, 1_000, 120_000);
+    this.#sessionTimeoutSeconds = boundedInteger(
+      options.sessionTimeoutSeconds ?? DEFAULT_KERNEL_SESSION_TIMEOUT_SECONDS,
+      60,
+      DEFAULT_KERNEL_SESSION_TIMEOUT_SECONDS,
+    );
+    this.#maxWaitMs = boundedInteger(options.maxWaitMs ?? DEFAULT_MAX_WAIT_MS, 250, 30_000);
+    this.#maxSnapshotChars = boundedInteger(
+      options.maxSnapshotChars ?? DEFAULT_SNAPSHOT_CHARS,
+      1_000,
+      AGENT_BROWSER_MAX_OUTPUT_CHARS,
+    );
+    this.#maxScreenshotBytes = boundedInteger(
+      options.maxScreenshotBytes ?? MAX_COMPUTER_SCREENSHOT_BYTES,
+      16 * 1_024,
+      16 * 1_024 * 1_024,
+    );
+  }
+
+  async run(input: FlorenceBrowserRunInput, signal?: AbortSignal): Promise<FlorenceBrowserRunResult> {
+    const localSignal = signal ?? new AbortController().signal;
+    throwIfAborted(localSignal);
+    validateRunInput(input);
+
+    let sessionDetails: KernelSessionDetails;
+    try {
+      sessionDetails = await this.#resolveSession(input, localSignal);
+      if (input.operation.kind === "owner_handoff") {
+        sessionDetails = await this.#writableHandoffSession(input, sessionDetails, localSignal);
+      }
+    } catch (error) {
+      throw asKernelBrowserError(error, localSignal);
+    }
+
+    const session = sessionDetails.session;
+    const createdThisRun = session.sessionId !== input.session?.sessionId;
+    this.#rememberSession(sessionDetails);
+
+    let actionMayHaveHappened = false;
+    try {
+      if (input.attempt > 1 && UNCERTAIN_RETRY_OPERATIONS.has(input.operation.kind)) {
+        try {
+          await this.#recycleCommandGeneration(session.sessionId);
+          const observation = await this.#observePage(
+            sessionDetails,
+            input.operation,
+            localSignal,
+            "uncertain_effect",
+            `Florence did not repeat ${input.operation.kind} because its earlier effect is uncertain; the current page was read again instead.`,
+          );
+          return { session, observation };
+        } catch (error) {
+          if (localSignal.aborted) throw asKernelBrowserError(error, localSignal);
+          return {
+            session,
+            observation: unreadableUncertainObservation(input.operation.kind, error),
+          };
+        }
+      }
+
+      let screenshot: FlorenceBrowserScreenshot | undefined;
+      let operationResult: string | undefined;
+      switch (input.operation.kind) {
+        case "snapshot":
+        case "owner_handoff":
+          break;
+        case "screenshot":
+          screenshot = await this.#captureScreenshot(sessionDetails, localSignal);
+          break;
+        case "playwright":
+          actionMayHaveHappened = true;
+          operationResult = await this.#executePlaywright(sessionDetails, input.operation, localSignal);
+          break;
+        case "computer":
+          actionMayHaveHappened = true;
+          await this.#executeComputer(sessionDetails, input.operation.actions, localSignal);
+          if (input.operation.screenshot) {
+            screenshot = await this.#captureScreenshot(sessionDetails, localSignal);
+          }
+          break;
+        default:
+          actionMayHaveHappened = UNCERTAIN_RETRY_OPERATIONS.has(input.operation.kind);
+          await this.#performLegacyOperation(sessionDetails, input.operation, input.uploadFile, localSignal);
+      }
+
+      const observationKind: FlorenceBrowserObservationKind =
+        input.operation.kind === "owner_handoff" ? "owner_handoff" : "page";
+      const observation = await this.#observePage(
+        sessionDetails,
+        input.operation,
+        localSignal,
+        observationKind,
+        input.operation.kind === "owner_handoff"
+          ? "The owner can take over this same live browser session, then tell Florence to continue. Sign-in changes will be available to later work."
+          : null,
+        screenshot,
+        operationResult,
+      );
+      return { session, observation };
+    } catch (error) {
+      const browserError = asKernelBrowserError(error, localSignal);
+      if (browserError.code === "invalid_input") {
+        if (createdThisRun) await this.#bestEffortClose(session);
+        throw browserError;
+      }
+      if (actionMayHaveHappened && !localSignal.aborted) {
+        try {
+          await this.#recycleCommandGeneration(session.sessionId);
+          const observation = await this.#observePage(
+            sessionDetails,
+            input.operation,
+            localSignal,
+            "uncertain_effect",
+            `The ${input.operation.kind} may already have happened; Florence read the current page instead of repeating it.`,
+          );
+          return { session, observation };
+        } catch (observationError) {
+          if (localSignal.aborted) throw asKernelBrowserError(observationError, localSignal);
+          return {
+            session,
+            observation: unreadableUncertainObservation(input.operation.kind, observationError),
+          };
+        }
+      }
+      if (createdThisRun) await this.#bestEffortClose(session);
+      throw browserError;
+    }
+  }
+
+  async close(session: FlorenceBrowserSession, signal?: AbortSignal): Promise<void> {
+    const localSignal = signal ?? new AbortController().signal;
+    validateSession(session);
+    throwIfAborted(localSignal);
+    await this.#stopAgentBrowserDaemon(session.sessionId, localSignal);
+    try {
+      await this.#kernel.browsers.deleteByID(session.sessionId, { signal: localSignal });
+    } catch (error) {
+      if (kernelErrorStatus(error) !== 404 && kernelErrorStatus(error) !== 410) {
+        throw asKernelBrowserError(error, localSignal);
+      }
+    } finally {
+      this.#forgetSession(session.sessionId);
+    }
+  }
+
+  async closeAll(signal?: AbortSignal): Promise<void> {
+    const sessions = [...this.#activeSessions.values()];
+    const results = await Promise.allSettled(sessions.map((session) => this.close(session, signal)));
+    const firstFailure = results.find((result) => result.status === "rejected");
+    if (firstFailure?.status === "rejected") throw firstFailure.reason;
+  }
+
+  async #resolveSession(input: FlorenceBrowserRunInput, signal: AbortSignal): Promise<KernelSessionDetails> {
+    if (!input.session) {
+      if (input.operation.kind !== "navigate") {
+        throw new FlorenceBrowserError("invalid_input", "Start this browser task by navigating to a page.");
+      }
+      return this.#createSession(input, false, input.operation.url, signal);
+    }
+
+    validateSession(input.session);
+    if (sessionExpired(input.session, this.#now())) {
+      if (input.operation.kind === "navigate") {
+        this.#forgetSession(input.session.sessionId);
+        return this.#createSession(input, false, input.operation.url, signal);
+      }
+      throw new FlorenceBrowserError(
+        "session_expired",
+        "That browser session expired. Navigate to the page again to continue.",
+      );
+    }
+
+    try {
+      const browser = await this.#kernel.browsers.retrieve(input.session.sessionId, {}, { signal });
+      return this.#sessionDetails(browser, input.householdId);
+    } catch (error) {
+      if (kernelErrorStatus(error) === 404 || kernelErrorStatus(error) === 410) {
+        if (input.operation.kind === "navigate") {
+          this.#forgetSession(input.session.sessionId);
+          return this.#createSession(input, false, input.operation.url, signal);
+        }
+        throw new FlorenceBrowserError(
+          "session_expired",
+          "That browser session is no longer running. Navigate to the page again to continue.",
+          { cause: error },
+        );
+      }
+      throw error;
+    }
+  }
+
+  async #createSession(
+    input: Pick<FlorenceBrowserRunInput, "householdId" | "ownerAdultId" | "workId">,
+    saveChanges: boolean,
+    startUrl: string,
+    signal: AbortSignal,
+  ): Promise<KernelSessionDetails> {
+    const profileName = kernelProfileName(input.householdId);
+    const activeWriter = this.#profileWriters.get(profileName);
+    if (saveChanges && activeWriter) {
+      throw new FlorenceBrowserError(
+        "transient",
+        "Another browser session is saving this household's sign-in state. Florence can continue after it finishes.",
+        { retryable: true },
+      );
+    }
+    const profile = await this.#ensureProfile(profileName, signal);
+    if (saveChanges) {
+      const providerWriter = await this.#findActiveProfileWriter(profile.id, signal);
+      if (providerWriter) {
+        throw new FlorenceBrowserError(
+          "transient",
+          "Another browser session is saving this household's sign-in state. Florence can continue after it finishes.",
+          { retryable: true },
+        );
+      }
+    }
+    const browser = await this.#kernel.browsers.create(
+      {
+        profile: { id: profile.id, save_changes: saveChanges },
+        start_url: validNavigationUrl(startUrl),
+        stealth: true,
+        timeout_seconds: this.#sessionTimeoutSeconds,
+        tags: {
+          florence_household: digest(input.householdId),
+          florence_owner: digest(input.ownerAdultId),
+          florence_work: digest(input.workId),
+        },
+      },
+      { signal },
+    );
+    const details = this.#sessionDetails(browser, input.householdId);
+    this.#commandGenerations.set(details.session.sessionId, 0);
+    this.#rememberSession(details);
+    return details;
+  }
+
+  async #ensureProfile(profileName: string, signal: AbortSignal): Promise<{ readonly id: string }> {
+    try {
+      return await this.#kernel.profiles.retrieve(profileName, { signal });
+    } catch (error) {
+      if (kernelErrorStatus(error) !== 404) throw error;
+    }
+    try {
+      return await this.#kernel.profiles.create({ name: profileName }, { signal });
+    } catch (error) {
+      if (kernelErrorStatus(error) !== 409) throw error;
+      return this.#kernel.profiles.retrieve(profileName, { signal });
+    }
+  }
+
+  async #findActiveProfileWriter(profileId: string, signal: AbortSignal): Promise<boolean> {
+    for await (const browser of this.#kernel.browsers.list(
+      { query: profileId, status: "active" },
+      { signal },
+    )) {
+      if (browser.profile?.id === profileId && browser.profile_save_changes) return true;
+    }
+    return false;
+  }
+
+  async #writableHandoffSession(
+    input: FlorenceBrowserRunInput,
+    current: KernelSessionDetails,
+    signal: AbortSignal,
+  ): Promise<KernelSessionDetails> {
+    if (current.saveChanges) return current;
+    const page = await this.#readPageMetadata(current, signal);
+    await this.close(current.session, signal);
+    return this.#createSession(input, true, page.url, signal);
+  }
+
+  #sessionDetails(
+    browser: {
+      readonly session_id: string;
+      readonly cdp_ws_url: string;
+      readonly browser_live_view_url?: string;
+      readonly profile?: { readonly id: string; readonly name?: string | null };
+      readonly profile_save_changes?: boolean;
+      readonly timeout_seconds: number;
+    },
+    householdId: string,
+  ): KernelSessionDetails {
+    const profileName = kernelProfileName(householdId);
+    if (!browser.profile?.id) {
+      throw invalidProviderResponse("Kernel returned a browser without its persistent profile.");
+    }
+    if (browser.profile.name && browser.profile.name !== profileName) {
+      throw invalidProviderResponse("Kernel returned a browser for a different household profile.");
+    }
+    const timeoutSeconds = boundedInteger(
+      browser.timeout_seconds,
+      60,
+      DEFAULT_KERNEL_SESSION_TIMEOUT_SECONDS,
+    );
+    return {
+      session: {
+        sessionId: requireNonEmpty(browser.session_id, "Kernel browser session ID", 500),
+        expiresAt: new Date(this.#now() + timeoutSeconds * 1_000).toISOString(),
+      },
+      connectUrl: validCdpUrl(browser.cdp_ws_url),
+      liveViewUrl: browser.browser_live_view_url
+        ? validHttpUrl(browser.browser_live_view_url, "Kernel returned an invalid live browser view.")
+        : null,
+      profileId: browser.profile.id,
+      profileName,
+      saveChanges: browser.profile_save_changes === true,
+    };
+  }
+
+  async #executePlaywright(
+    session: KernelSessionDetails,
+    operation: Extract<FlorenceBrowserOperation, { readonly kind: "playwright" }>,
+    signal: AbortSignal,
+  ): Promise<string> {
+    const code = boundedPlaywrightCode(operation.code);
+    const timeoutSeconds = boundedInteger(
+      operation.timeoutSeconds ?? DEFAULT_KERNEL_PLAYWRIGHT_TIMEOUT_SECONDS,
+      1,
+      MAX_KERNEL_PLAYWRIGHT_TIMEOUT_SECONDS,
+    );
+    const response = await this.#kernel.browsers.playwright.execute(
+      session.session.sessionId,
+      { code, timeout_sec: timeoutSeconds },
+      { signal },
+    );
+    if (!response.success) {
+      throw new FlorenceBrowserError(
+        "transient",
+        boundedString(
+          response.error ?? response.stderr ?? "The browser program did not finish.",
+          1_000,
+          "The browser program did not finish.",
+        ),
+        { retryable: true },
+      );
+    }
+    return boundedPlaywrightOutput(response.result, response.stdout);
+  }
+
+  async #executeComputer(
+    session: KernelSessionDetails,
+    actions: readonly FlorenceBrowserComputerAction[],
+    signal: AbortSignal,
+  ): Promise<void> {
+    const batches = computerActionBatches(actions);
+    for (const batch of batches) {
+      throwIfAborted(signal);
+      await this.#kernel.browsers.computer.batch(session.session.sessionId, { actions: batch }, { signal });
+    }
+  }
+
+  async #performLegacyOperation(
+    session: KernelSessionDetails,
+    operation: Exclude<
+      FlorenceBrowserOperation,
+      | { readonly kind: "snapshot" | "screenshot" | "owner_handoff" }
+      | { readonly kind: "playwright" | "computer" }
+    >,
+    uploadFile: FlorenceBrowserRunInput["uploadFile"],
+    signal: AbortSignal,
+  ): Promise<void> {
+    let command: string;
+    let args: readonly string[];
+    let timeoutMs = this.#commandTimeoutMs;
+
+    switch (operation.kind) {
+      case "navigate":
+        command = "open";
+        args = [validNavigationUrl(operation.url)];
+        timeoutMs = this.#openTimeoutMs;
+        break;
+      case "click":
+        command = "click";
+        args = [normalizeRef(operation.ref)];
+        break;
+      case "type":
+        command = "fill";
+        args = [normalizeRef(operation.ref), boundedInput(operation.text, "Browser text")];
+        break;
+      case "upload":
+        if (!uploadFile) {
+          throw new FlorenceBrowserError(
+            "invalid_input",
+            "Choose a parent-provided file before uploading it to this page.",
+          );
+        }
+        await this.#uploadFile(session, operation.ref, uploadFile, signal);
+        return;
+      case "select":
+        if (operation.values.length < 1 || operation.values.length > 20) {
+          throw new FlorenceBrowserError("invalid_input", "Choose between one and twenty dropdown values.");
+        }
+        command = "select";
+        args = [
+          normalizeRef(operation.ref),
+          ...operation.values.map((value) => boundedInput(value, "Dropdown value")),
+        ];
+        break;
+      case "check":
+        command = operation.checked ? "check" : "uncheck";
+        args = [normalizeRef(operation.ref)];
+        break;
+      case "press":
+        command = "press";
+        args = [boundedString(operation.key.trim(), 100, "Enter")];
+        break;
+      case "scroll":
+        command = "scroll";
+        args = [operation.direction, "500"];
+        break;
+      case "wait":
+        if (
+          !Number.isInteger(operation.milliseconds) ||
+          operation.milliseconds < 0 ||
+          operation.milliseconds > this.#maxWaitMs
+        ) {
+          throw new FlorenceBrowserError(
+            "invalid_input",
+            `Browser waits must be between 0 and ${this.#maxWaitMs} milliseconds.`,
+          );
+        }
+        command = "wait";
+        args = [String(operation.milliseconds)];
+        timeoutMs = Math.max(this.#commandTimeoutMs, operation.milliseconds + 5_000);
+        break;
+      case "back":
+        command = "back";
+        args = [];
+        break;
+    }
+    await this.#agentBrowser(session, command, args, signal, timeoutMs);
+  }
+
+  async #uploadFile(
+    session: KernelSessionDetails,
+    ref: string,
+    uploadFile: NonNullable<FlorenceBrowserRunInput["uploadFile"]>,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const filename = sanitizedUploadFilename(uploadFile.filename);
+    const bytes = boundedUploadBytes(uploadFile.bytes);
+    const directory = await mkdtemp(join(tmpdir(), "florence-browser-upload-"));
+    const path = join(directory, filename);
+    try {
+      const handle = await open(path, "wx", 0o600);
+      try {
+        await handle.writeFile(bytes);
+      } finally {
+        await handle.close();
+      }
+      await this.#agentBrowser(session, "upload", [normalizeRef(ref), path], signal, this.#commandTimeoutMs);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  }
+
+  async #observePage(
+    session: KernelSessionDetails,
+    operation: FlorenceBrowserOperation,
+    signal: AbortSignal,
+    kind: FlorenceBrowserObservationKind,
+    reason: string | null,
+    screenshot?: FlorenceBrowserScreenshot,
+    operationResult?: string,
+  ): Promise<FlorenceBrowserObservation> {
+    const snapshotArgs = operation.kind === "snapshot" && operation.compact === false ? [] : ["-c"];
+    const snapshotEnvelope = await this.#agentBrowser(
+      session,
+      "snapshot",
+      snapshotArgs,
+      signal,
+      this.#commandTimeoutMs,
+    );
+    const parsed = parseSnapshot(snapshotEnvelope.data, this.#maxSnapshotChars);
+    const merged = operationResult
+      ? truncateSnapshot(`${operationResult}\n\n${parsed.snapshot}`, this.#maxSnapshotChars)
+      : { value: parsed.snapshot, truncated: parsed.truncated };
+    const metadata = await this.#readPageMetadata(session, signal);
+    return {
+      kind,
+      reason,
+      url: metadata.url,
+      title: metadata.title,
+      snapshot: merged.value,
+      refCount: parsed.refCount,
+      truncated: merged.truncated,
+      ...(kind === "owner_handoff" && session.liveViewUrl ? { liveViewUrl: session.liveViewUrl } : {}),
+      ...(screenshot ? { screenshot } : {}),
+    };
+  }
+
+  async #readPageMetadata(session: KernelSessionDetails, signal: AbortSignal): Promise<PageMetadata> {
+    const urlResult = await this.#agentBrowser(session, "get", ["url"], signal, this.#commandTimeoutMs);
+    const titleResult = await this.#agentBrowser(session, "get", ["title"], signal, this.#commandTimeoutMs);
+    return {
+      url: readBoundedRecordString(urlResult.data, "url", 4_096),
+      title: readBoundedRecordString(titleResult.data, "title", 2_000),
+    };
+  }
+
+  async #captureScreenshot(
+    session: KernelSessionDetails,
+    signal: AbortSignal,
+  ): Promise<FlorenceBrowserScreenshot> {
+    const response = await this.#kernel.browsers.computer.captureScreenshot(
+      session.session.sessionId,
+      undefined,
+      { signal },
+    );
+    const bytes = await readBoundedResponseBytes(response, this.#maxScreenshotBytes);
+    if (
+      bytes.byteLength < 8 ||
+      bytes[0] !== 0x89 ||
+      bytes[1] !== 0x50 ||
+      bytes[2] !== 0x4e ||
+      bytes[3] !== 0x47
+    ) {
+      throw invalidProviderResponse("Kernel returned an unreadable browser screenshot.");
+    }
+    return { mimeType: "image/png", bytes };
+  }
+
+  async #agentBrowser(
+    session: KernelSessionDetails,
+    command: string,
+    commandArguments: readonly string[],
+    signal: AbortSignal,
+    timeoutMs: number,
+  ): Promise<CommandEnvelope> {
+    const sessionName = this.#commandSessionName(session.session.sessionId);
+    const socketDirectory = commandSocketDirectory();
+    await mkdir(socketDirectory, { recursive: true, mode: 0o700 });
+    const args = [
+      "--session",
+      sessionName,
+      "--cdp",
+      session.connectUrl,
+      "--json",
+      "--max-output",
+      String(AGENT_BROWSER_MAX_OUTPUT_CHARS),
+      command,
+      ...commandArguments,
+    ];
+    let result: FlorenceBrowserCommandResult;
+    try {
+      result = await this.#commandRunner({
+        executable: this.#executable,
+        args,
+        environment: {
+          ...process.env,
+          AGENT_BROWSER_SOCKET_DIR: socketDirectory,
+          AGENT_BROWSER_IDLE_TIMEOUT_MS: String(this.#sessionTimeoutSeconds * 1_000),
+        },
+        timeoutMs,
+        signal,
+      });
+    } catch (error) {
+      if (signal.aborted) {
+        throw new FlorenceBrowserError("cancelled", "Browser work was cancelled.", { cause: error });
+      }
+      await this.#recycleCommandGeneration(session.session.sessionId);
+      throw new FlorenceBrowserError("transient", "The browser command could not start. Please try again.", {
+        retryable: true,
+        cause: error,
+      });
+    }
+    if (result.cancelled || signal.aborted) {
+      throw new FlorenceBrowserError("cancelled", "Browser work was cancelled.");
+    }
+    if (result.timedOut) {
+      await this.#recycleCommandGeneration(session.session.sessionId);
+      throw new FlorenceBrowserError(
+        "transient",
+        "The browser took too long. Florence can reconnect and try again.",
+        { retryable: true },
+      );
+    }
+    if (result.stdoutTruncated) {
+      await this.#recycleCommandGeneration(session.session.sessionId);
+      throw invalidProviderResponse("The browser returned more command data than Florence could read.");
+    }
+    let envelope: ParsedCommandEnvelope;
+    try {
+      envelope = parseCommandEnvelope(result.stdout);
+    } catch (error) {
+      await this.#recycleCommandGeneration(session.session.sessionId);
+      throw error;
+    }
+    if (result.exitCode !== 0 || !envelope.success) {
+      const failure = commandFailure(envelope.error);
+      if (failure.code !== "invalid_input") {
+        await this.#recycleCommandGeneration(session.session.sessionId);
+      }
+      throw failure;
+    }
+    return { data: envelope.data };
+  }
+
+  async #stopAgentBrowserDaemon(sessionId: string, signal: AbortSignal): Promise<void> {
+    const sessionName = this.#commandSessionName(sessionId);
+    const socketDirectory = commandSocketDirectory();
+    let closed = false;
+    try {
+      const result = await this.#commandRunner({
+        executable: this.#executable,
+        args: [
+          "--session",
+          sessionName,
+          "--json",
+          "--max-output",
+          String(AGENT_BROWSER_MAX_OUTPUT_CHARS),
+          "close",
+        ],
+        environment: { ...process.env, AGENT_BROWSER_SOCKET_DIR: socketDirectory },
+        timeoutMs: Math.min(this.#commandTimeoutMs, 10_000),
+        signal,
+      });
+      if (!result.cancelled && !result.timedOut && !result.stdoutTruncated && result.exitCode === 0) {
+        closed = parseCommandEnvelope(result.stdout).success;
+      }
+    } catch {
+      // Deleting the Kernel browser below is authoritative; daemon cleanup is best effort.
+    }
+    if (closed) {
+      await Promise.allSettled(
+        ["pid", "stream", "engine", "version", "sock"].map((suffix) =>
+          rm(join(socketDirectory, `${sessionName}.${suffix}`), { force: true }),
+        ),
+      );
+    }
+  }
+
+  #commandSessionName(sessionId: string): string {
+    const generation = this.#commandGenerations.get(sessionId) ?? 0;
+    return `florence_${digest(sessionId)}_${generation}`;
+  }
+
+  async #recycleCommandGeneration(sessionId: string): Promise<void> {
+    await this.#stopAgentBrowserDaemon(sessionId, new AbortController().signal);
+    this.#commandGenerations.set(sessionId, (this.#commandGenerations.get(sessionId) ?? 0) + 1);
+  }
+
+  #rememberSession(details: KernelSessionDetails): void {
+    this.#activeSessions.set(details.session.sessionId, details.session);
+    if (details.saveChanges) this.#profileWriters.set(details.profileName, details.session.sessionId);
+  }
+
+  #forgetSession(sessionId: string): void {
+    this.#activeSessions.delete(sessionId);
+    this.#commandGenerations.delete(sessionId);
+    for (const [profileName, writerSessionId] of this.#profileWriters) {
+      if (writerSessionId === sessionId) this.#profileWriters.delete(profileName);
+    }
+  }
+
+  async #bestEffortClose(session: FlorenceBrowserSession): Promise<void> {
+    try {
+      await this.close(session);
+    } catch {
+      // Kernel's provider timeout remains the final cleanup bound when deletion fails.
+    }
+  }
+}
 
 export class BrowserbaseBrowserClient implements FlorenceBrowserClient {
   readonly #apiKey: string;
@@ -303,6 +1078,13 @@ export class BrowserbaseBrowserClient implements FlorenceBrowserClient {
 
       if (input.operation.kind !== "snapshot" && input.operation.kind !== "screenshot") {
         if (input.operation.kind !== "owner_handoff") {
+          if (input.operation.kind === "playwright" || input.operation.kind === "computer") {
+            throw new FlorenceBrowserError(
+              "unavailable",
+              "This browser provider does not support the deeper browser operator. Configure Kernel to use it.",
+              { retryable: false },
+            );
+          }
           actionMayHaveHappened = UNCERTAIN_RETRY_OPERATIONS.has(input.operation.kind);
           await this.#performOperation(sessionDetails, input.operation, input.uploadFile, localSignal);
         }
@@ -438,6 +1220,7 @@ export class BrowserbaseBrowserClient implements FlorenceBrowserClient {
       keepAlive: true,
       timeout: this.#sessionTimeoutSeconds,
       userMetadata: {
+        householdId: input.householdId,
         florenceWorkId: input.workId,
         ownerAdultId: input.ownerAdultId,
       },
@@ -567,6 +1350,13 @@ export class BrowserbaseBrowserClient implements FlorenceBrowserClient {
         command = "back";
         args = [];
         break;
+      case "playwright":
+      case "computer":
+        throw new FlorenceBrowserError(
+          "unavailable",
+          "This browser provider does not support the deeper browser operator. Configure Kernel to use it.",
+          { retryable: false },
+        );
     }
 
     await this.#agentBrowser(session, command, args, signal, timeoutMs);
@@ -862,6 +1652,206 @@ export class BrowserbaseBrowserClient implements FlorenceBrowserClient {
   }
 }
 
+export function kernelProfileName(householdId: string): string {
+  validateNonEmptyInput(householdId, "Browser household ID", 500);
+  return `florence-${createHash("sha256")
+    .update(`florence-kernel-profile\0${householdId}`)
+    .digest("hex")
+    .slice(0, 40)}`;
+}
+
+function boundedPlaywrightCode(value: string): string {
+  if (typeof value !== "string" || !value.trim() || value.length > MAX_PLAYWRIGHT_CODE_CHARS) {
+    throw new FlorenceBrowserError(
+      "invalid_input",
+      `A browser program is required and must be at most ${MAX_PLAYWRIGHT_CODE_CHARS} characters.`,
+    );
+  }
+  return value;
+}
+
+function boundedPlaywrightOutput(result: unknown, stdout: string | undefined): string {
+  const parts: string[] = [];
+  if (result !== undefined) {
+    let serialized: string;
+    try {
+      serialized = typeof result === "string" ? result : JSON.stringify(result);
+    } catch {
+      serialized = "[The browser program returned a value that could not be serialized.]";
+    }
+    parts.push(`Playwright result:\n${serialized}`);
+  }
+  if (stdout?.trim()) parts.push(`Playwright log:\n${stdout.trim()}`);
+  return truncateSnapshot(
+    parts.join("\n\n") || "Playwright completed successfully.",
+    AGENT_BROWSER_MAX_OUTPUT_CHARS,
+  ).value;
+}
+
+function computerActionBatches(
+  actions: readonly FlorenceBrowserComputerAction[],
+): readonly ComputerBatchParams.Action[][] {
+  if (!Array.isArray(actions) || actions.length < 1 || actions.length > MAX_COMPUTER_ACTIONS_PER_CALL) {
+    throw new FlorenceBrowserError(
+      "invalid_input",
+      `A computer action call must contain between 1 and ${MAX_COMPUTER_ACTIONS_PER_CALL} actions. Florence can continue with another call afterward.`,
+    );
+  }
+  return [actions.map(computerBatchAction)];
+}
+
+function computerBatchAction(action: FlorenceBrowserComputerAction): ComputerBatchParams.Action {
+  switch (action.type) {
+    case "click_mouse":
+      return {
+        type: action.type,
+        click_mouse: {
+          x: finiteCoordinate(action.x, "click x"),
+          y: finiteCoordinate(action.y, "click y"),
+          ...(action.button ? { button: action.button } : {}),
+          ...(action.clickType ? { click_type: action.clickType } : {}),
+          ...(action.numClicks === undefined ? {} : { num_clicks: boundedInteger(action.numClicks, 1, 10) }),
+        },
+      };
+    case "move_mouse":
+      return {
+        type: action.type,
+        move_mouse: {
+          x: finiteCoordinate(action.x, "move x"),
+          y: finiteCoordinate(action.y, "move y"),
+        },
+      };
+    case "type_text":
+      return {
+        type: action.type,
+        type_text: { text: boundedInput(action.text, "Computer text") },
+      };
+    case "press_key":
+      if (action.keys.length < 1 || action.keys.length > 20) {
+        throw new FlorenceBrowserError("invalid_input", "A computer key action needs one to twenty keys.");
+      }
+      return {
+        type: action.type,
+        press_key: {
+          keys: action.keys.map((key) => requireNonEmpty(key, "Computer key", 100)),
+        },
+      };
+    case "scroll":
+      return {
+        type: action.type,
+        scroll: {
+          x: finiteCoordinate(action.x, "scroll x"),
+          y: finiteCoordinate(action.y, "scroll y"),
+          ...(action.deltaX === undefined
+            ? {}
+            : { delta_x: finiteCoordinate(action.deltaX, "horizontal scroll") }),
+          ...(action.deltaY === undefined
+            ? {}
+            : { delta_y: finiteCoordinate(action.deltaY, "vertical scroll") }),
+        },
+      };
+    case "drag_mouse":
+      if (action.path.length < 2 || action.path.length > 100) {
+        throw new FlorenceBrowserError("invalid_input", "A computer drag needs between two and 100 points.");
+      }
+      return {
+        type: action.type,
+        drag_mouse: {
+          path: action.path.map(({ x, y }) => [finiteCoordinate(x, "drag x"), finiteCoordinate(y, "drag y")]),
+          ...(action.button ? { button: action.button } : {}),
+        },
+      };
+    case "sleep":
+      return {
+        type: action.type,
+        sleep: { duration_ms: boundedInteger(action.milliseconds, 0, DEFAULT_MAX_WAIT_MS) },
+      };
+  }
+}
+
+function finiteCoordinate(value: number, label: string): number {
+  if (!Number.isFinite(value)) {
+    throw new FlorenceBrowserError("invalid_input", `${label} must be a finite number.`);
+  }
+  return value;
+}
+
+async function readBoundedResponseBytes(
+  response: Response,
+  maximumBytes: number,
+): Promise<Uint8Array<ArrayBuffer>> {
+  if (!response.ok) {
+    throw invalidProviderResponse("Kernel could not capture the browser screenshot.");
+  }
+  const contentLength = Number(response.headers.get("content-length"));
+  if (Number.isFinite(contentLength) && contentLength > maximumBytes) {
+    throw invalidProviderResponse("The browser screenshot was too large to keep with this task.");
+  }
+  if (!response.body) {
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    if (bytes.byteLength < 1 || bytes.byteLength > maximumBytes) {
+      throw invalidProviderResponse("The browser screenshot was too large to keep with this task.");
+    }
+    return bytes;
+  }
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const result = await reader.read();
+      if (result.done) break;
+      total += result.value.byteLength;
+      if (total > maximumBytes) {
+        throw invalidProviderResponse("The browser screenshot was too large to keep with this task.");
+      }
+      chunks.push(result.value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
+}
+
+function kernelErrorStatus(error: unknown): number | null {
+  if (!isRecord(error)) return null;
+  if (typeof error.status === "number") return error.status;
+  if (typeof error.statusCode === "number") return error.statusCode;
+  return null;
+}
+
+function asKernelBrowserError(error: unknown, signal: AbortSignal): FlorenceBrowserError {
+  if (error instanceof FlorenceBrowserError) return error;
+  if (signal.aborted) {
+    return new FlorenceBrowserError("cancelled", "Browser work was cancelled.", { cause: error });
+  }
+  const status = kernelErrorStatus(error);
+  const transient =
+    status === 408 || status === 409 || status === 425 || status === 429 || (status ?? 0) >= 500;
+  if (transient) {
+    return new FlorenceBrowserError("transient", "The browser is temporarily unavailable.", {
+      retryable: true,
+      cause: error,
+    });
+  }
+  if (status === 401 || status === 403) {
+    return new FlorenceBrowserError("unavailable", "Kernel browser access is unavailable.", {
+      retryable: false,
+      cause: error,
+    });
+  }
+  return new FlorenceBrowserError("invalid_response", "Kernel returned an unreadable browser result.", {
+    retryable: true,
+    cause: error,
+  });
+}
+
 interface ParsedCommandEnvelope {
   readonly success: boolean;
   readonly data: Readonly<Record<string, unknown>>;
@@ -999,10 +1989,11 @@ function unreadableUncertainObservation(
 }
 
 function validateRunInput(input: FlorenceBrowserRunInput): void {
+  validateNonEmptyInput(input.householdId, "Browser household ID", 500);
   validateNonEmptyInput(input.workId, "Browser work ID", 500);
   validateNonEmptyInput(input.ownerAdultId, "Browser owner adult ID", 500);
   validateNonEmptyInput(input.callId, "Browser call ID", 500);
-  if (!Number.isInteger(input.attempt) || input.attempt < 1 || input.attempt > 100) {
+  if (!Number.isSafeInteger(input.attempt) || input.attempt < 1) {
     throw new FlorenceBrowserError("invalid_input", "Browser attempt must be a positive integer.");
   }
   if (input.operation.kind === "upload") {

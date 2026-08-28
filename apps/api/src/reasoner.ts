@@ -31,6 +31,7 @@ import type {
 import { z } from "zod";
 import { runAgentLoop } from "./agent-loop.js";
 import {
+  type FlorenceBrowserComputerAction,
   FlorenceBrowserError,
   type FlorenceBrowserObservation,
   type FlorenceBrowserOperation,
@@ -3524,6 +3525,50 @@ const telephonyResultOutputSchema = z
   })
   .strict();
 
+const browserComputerActionArguments = z
+  .object({
+    type: z.enum(["click_mouse", "move_mouse", "type_text", "press_key", "scroll", "drag_mouse", "sleep"]),
+    x: z.number().finite().nullable(),
+    y: z.number().finite().nullable(),
+    button: z.enum(["left", "right", "middle"]).nullable(),
+    clickType: z.enum(["down", "up", "click"]).nullable(),
+    numClicks: z.number().int().min(1).max(10).nullable(),
+    text: z.string().max(20_000).nullable(),
+    keys: z.array(z.string().trim().min(1).max(100)).max(20),
+    deltaX: z.number().finite().nullable(),
+    deltaY: z.number().finite().nullable(),
+    path: z.array(z.object({ x: z.number().finite(), y: z.number().finite() }).strict()).max(100),
+    milliseconds: z.number().int().min(0).max(10_000).nullable(),
+  })
+  .strict()
+  .superRefine((action, context) => {
+    const requireValue = (value: unknown, path: string): void => {
+      if (value === null || value === undefined || value === "") {
+        context.addIssue({
+          code: "custom",
+          path: [path],
+          message: `${path} is required for computer action ${action.type}`,
+        });
+      }
+    };
+    if (["click_mouse", "move_mouse", "scroll"].includes(action.type)) {
+      requireValue(action.x, "x");
+      requireValue(action.y, "y");
+    }
+    if (action.type === "type_text") requireValue(action.text, "text");
+    if (action.type === "press_key" && action.keys.length === 0) {
+      context.addIssue({ code: "custom", path: ["keys"], message: "keys are required for press_key" });
+    }
+    if (action.type === "drag_mouse" && action.path.length < 2) {
+      context.addIssue({
+        code: "custom",
+        path: ["path"],
+        message: "at least two path points are required for drag_mouse",
+      });
+    }
+    if (action.type === "sleep") requireValue(action.milliseconds, "milliseconds");
+  });
+
 const browserWorkArguments = z
   .object({
     operation: z.enum([
@@ -3539,6 +3584,8 @@ const browserWorkArguments = z
       "wait",
       "back",
       "screenshot",
+      "playwright",
+      "computer",
       "owner_handoff",
     ]),
     url: z.string().trim().url().max(4_096).nullable(),
@@ -3551,6 +3598,10 @@ const browserWorkArguments = z
     direction: z.enum(["up", "down"]).nullable(),
     milliseconds: z.number().int().min(0).max(10_000).nullable(),
     compact: z.boolean(),
+    code: z.string().min(1).max(50_000).nullable(),
+    timeoutSeconds: z.number().int().min(1).max(300).nullable(),
+    actions: z.array(browserComputerActionArguments).max(50),
+    screenshot: z.boolean(),
   })
   .strict()
   .superRefine((args, context) => {
@@ -3580,7 +3631,68 @@ const browserWorkArguments = z
     if (args.operation === "press") requireValue(args.key, "key");
     if (args.operation === "scroll") requireValue(args.direction, "direction");
     if (args.operation === "wait") requireValue(args.milliseconds, "milliseconds");
+    if (args.operation === "playwright") requireValue(args.code, "code");
+    if (args.operation === "computer" && args.actions.length === 0) {
+      context.addIssue({
+        code: "custom",
+        path: ["actions"],
+        message: "actions are required for browser computer",
+      });
+    }
   });
+
+const BROWSER_COMPUTER_ACTION_PARAMETERS = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    type: {
+      type: "string",
+      enum: ["click_mouse", "move_mouse", "type_text", "press_key", "scroll", "drag_mouse", "sleep"],
+    },
+    x: { anyOf: [{ type: "number" }, { type: "null" }] },
+    y: { anyOf: [{ type: "number" }, { type: "null" }] },
+    button: {
+      anyOf: [{ type: "string", enum: ["left", "right", "middle"] }, { type: "null" }],
+    },
+    clickType: {
+      anyOf: [{ type: "string", enum: ["down", "up", "click"] }, { type: "null" }],
+    },
+    numClicks: {
+      anyOf: [{ type: "integer", minimum: 1, maximum: 10 }, { type: "null" }],
+    },
+    text: { anyOf: [{ type: "string", maxLength: 20_000 }, { type: "null" }] },
+    keys: { type: "array", maxItems: 20, items: { type: "string", minLength: 1, maxLength: 100 } },
+    deltaX: { anyOf: [{ type: "number" }, { type: "null" }] },
+    deltaY: { anyOf: [{ type: "number" }, { type: "null" }] },
+    path: {
+      type: "array",
+      maxItems: 100,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: { x: { type: "number" }, y: { type: "number" } },
+        required: ["x", "y"],
+      },
+    },
+    milliseconds: {
+      anyOf: [{ type: "integer", minimum: 0, maximum: 10_000 }, { type: "null" }],
+    },
+  },
+  required: [
+    "type",
+    "x",
+    "y",
+    "button",
+    "clickType",
+    "numClicks",
+    "text",
+    "keys",
+    "deltaX",
+    "deltaY",
+    "path",
+    "milliseconds",
+  ],
+} as const;
 
 const BROWSER_WORK_PARAMETERS = {
   type: "object",
@@ -3601,6 +3713,8 @@ const BROWSER_WORK_PARAMETERS = {
         "wait",
         "back",
         "screenshot",
+        "playwright",
+        "computer",
         "owner_handoff",
       ],
     },
@@ -3618,6 +3732,12 @@ const BROWSER_WORK_PARAMETERS = {
       anyOf: [{ type: "integer", minimum: 0, maximum: 10_000 }, { type: "null" }],
     },
     compact: { type: "boolean" },
+    code: { anyOf: [{ type: "string", minLength: 1, maxLength: 50_000 }, { type: "null" }] },
+    timeoutSeconds: {
+      anyOf: [{ type: "integer", minimum: 1, maximum: 300 }, { type: "null" }],
+    },
+    actions: { type: "array", maxItems: 50, items: BROWSER_COMPUTER_ACTION_PARAMETERS },
+    screenshot: { type: "boolean" },
   },
   required: [
     "operation",
@@ -3631,6 +3751,10 @@ const BROWSER_WORK_PARAMETERS = {
     "direction",
     "milliseconds",
     "compact",
+    "code",
+    "timeoutSeconds",
+    "actions",
+    "screenshot",
   ],
 } as const;
 
@@ -4332,6 +4456,54 @@ function assertPhoneOperationMatchesActiveCall(
   }
 }
 
+function browserComputerAction(
+  action: z.infer<typeof browserComputerActionArguments>,
+): FlorenceBrowserComputerAction {
+  switch (action.type) {
+    case "click_mouse":
+      return {
+        type: action.type,
+        x: requiredWorkspaceValue(action.x, "computer action x"),
+        y: requiredWorkspaceValue(action.y, "computer action y"),
+        ...(action.button === null ? {} : { button: action.button }),
+        ...(action.clickType === null ? {} : { clickType: action.clickType }),
+        ...(action.numClicks === null ? {} : { numClicks: action.numClicks }),
+      };
+    case "move_mouse":
+      return {
+        type: action.type,
+        x: requiredWorkspaceValue(action.x, "computer action x"),
+        y: requiredWorkspaceValue(action.y, "computer action y"),
+      };
+    case "type_text":
+      return {
+        type: action.type,
+        text: requiredWorkspaceValue(action.text, "computer action text"),
+      };
+    case "press_key":
+      return { type: action.type, keys: action.keys };
+    case "scroll":
+      return {
+        type: action.type,
+        x: requiredWorkspaceValue(action.x, "computer action x"),
+        y: requiredWorkspaceValue(action.y, "computer action y"),
+        ...(action.deltaX === null ? {} : { deltaX: action.deltaX }),
+        ...(action.deltaY === null ? {} : { deltaY: action.deltaY }),
+      };
+    case "drag_mouse":
+      return {
+        type: action.type,
+        path: action.path,
+        ...(action.button === null ? {} : { button: action.button }),
+      };
+    case "sleep":
+      return {
+        type: action.type,
+        milliseconds: requiredWorkspaceValue(action.milliseconds, "computer action duration"),
+      };
+  }
+}
+
 function browserOperation(args: z.infer<typeof browserWorkArguments>): FlorenceBrowserOperation {
   switch (args.operation) {
     case "navigate":
@@ -4380,6 +4552,18 @@ function browserOperation(args: z.infer<typeof browserWorkArguments>): FlorenceB
       return { kind: "back" };
     case "screenshot":
       return { kind: "screenshot" };
+    case "playwright":
+      return {
+        kind: "playwright",
+        code: requiredWorkspaceValue(args.code, "browser Playwright code"),
+        ...(args.timeoutSeconds === null ? {} : { timeoutSeconds: args.timeoutSeconds }),
+      };
+    case "computer":
+      return {
+        kind: "computer",
+        actions: args.actions.map(browserComputerAction),
+        screenshot: args.screenshot,
+      };
     case "owner_handoff":
       return { kind: "owner_handoff" };
   }
@@ -4708,13 +4892,13 @@ function foregroundCapabilityRegistry(): CapabilityRegistry<ForegroundCapability
     defineCapability({
       name: "browser_work",
       description:
-        "Use a real browser for an interactive website during durable family work: navigate, read the current accessibility snapshot, click, type, upload one exact image or PDF from the initiating message by its assetId/documentId, choose options, check boxes, press keys, scroll, wait, go back, inspect a screenshot, or hand the live session to the parent for sign-in/MFA. Element refs come from the latest snapshot and must be refreshed after each action. Set fields unused by the chosen operation to null or empty arrays.",
+        "Use Florence's persistent real browser for any interactive website during durable family work. Prefer one bounded Playwright program to inspect the current DOM, perform related actions, and verify the resulting state. Use native computer actions with a final screenshot when visual or coordinate-level control is more reliable. The compatibility operations can navigate, read an accessibility snapshot, click, type, upload one exact image or PDF from the initiating message, choose options, check boxes, press keys, scroll, wait, go back, capture a screenshot, or hand the live session to the parent for sign-in/MFA. This is a general browser, not a task-specific workflow. Set fields unused by the chosen operation to null, false, or empty arrays.",
       modelSchema: BROWSER_WORK_PARAMETERS,
       inputSchema: browserWorkArguments,
       outputSchema: browserObservationOutputSchema,
       executionMode: "sequential",
       executionBoundary: "external",
-      timeoutMs: 90_000,
+      timeoutMs: 300_000,
       maxOutputBytes: 60_000,
       availability: (context) => context.mode === "family_work" && context.reads.runBrowser !== undefined,
       admit: ({ context }) => context.mode === "family_work",

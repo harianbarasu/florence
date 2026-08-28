@@ -47,6 +47,9 @@ importers:
       '@florence/linq':
         specifier: workspace:*
         version: link:../../packages/linq
+      '@onkernel/sdk':
+        specifier: 0.96.0
+        version: 0.96.0
       agent-browser:
         specifier: 0.26.0
         version: 0.26.0
@@ -500,6 +503,9 @@ packages:
   '@napi-rs/canvas@0.1.80':
     resolution: {integrity: sha512-DxuT1ClnIPts1kQx8FBmkk4BQDTfI5kIzywAaMjQSXfNnra5UFU9PwurXrl+Je3bJ6BGsp/zmshVVFbCmyI+ww==}
     engines: {node: '>= 10'}
+
+  '@onkernel/sdk@0.96.0':
+    resolution: {integrity: sha512-x23psMiKLsHA2CSuvvyHkcxVx/d5UN3PynloVWf4Fgy3Qt9pYotIXb7DEidXJBFYfIodNBMuHl9wPguK3r6Zow==}
 
   '@oxc-project/types@0.142.0':
     resolution: {integrity: sha512-7W+2q5AKQVU36fkaryontrHn3YDt1RyUYXatw9i5H8ocYe2sPKSFB6eS8WNPeRKiN1qAWWZUPm7gwFzJGrccqQ==}
@@ -1840,6 +1846,8 @@ snapshots:
       '@napi-rs/canvas-linux-x64-gnu': 0.1.80
       '@napi-rs/canvas-linux-x64-musl': 0.1.80
       '@napi-rs/canvas-win32-x64-msvc': 0.1.80
+
+  '@onkernel/sdk@0.96.0': {}
 
   '@oxc-project/types@0.142.0': {}
 

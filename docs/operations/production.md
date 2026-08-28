@@ -62,8 +62,10 @@ Optional browser provider:
 
 | Variable | Contract |
 | --- | --- |
-| `BROWSERBASE_API_KEY` | Enables Florence's authenticated browser work when non-empty; omit to start without browser tooling |
-| `BROWSERBASE_PROJECT_ID` | Optional Browserbase project ID used when creating and releasing sessions |
+| `KERNEL_API_KEY` | Enables Florence's primary persistent browser operator: in-browser Playwright, native computer control, screenshots, uploads, and owner live handoff |
+| `KERNEL_PROJECT_ID` | Optional Kernel project ID |
+| `BROWSERBASE_API_KEY` | Temporary rollout fallback used only when Kernel is not configured |
+| `BROWSERBASE_PROJECT_ID` | Optional Browserbase project ID for the temporary fallback |
 
 Optional phone providers:
 

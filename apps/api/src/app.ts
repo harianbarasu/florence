@@ -25,7 +25,7 @@ import { GoogleConnection, GoogleConnectionError } from "@florence/google";
 import { LinqClient } from "@florence/linq";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import { z } from "zod";
-import { BrowserbaseBrowserClient } from "./browser.js";
+import { BrowserbaseBrowserClient, KernelBrowserClient } from "./browser.js";
 import { EnrollmentCodes } from "./enrollment.js";
 import { KiwiFlightSearchClient } from "./flights.js";
 import { Florence } from "./florence.js";
@@ -79,15 +79,23 @@ export function createDefaultDependencies(env: NodeJS.ProcessEnv = process.env):
   });
   const google = createDefaultGoogleConnection(env, store);
   const setupOrigin = new URL(requiredEnv(env, "GOOGLE_OAUTH_REDIRECT_URI")).origin;
+  const kernelApiKey = env.KERNEL_API_KEY?.trim();
+  const kernelProjectId = env.KERNEL_PROJECT_ID?.trim();
   const browserbaseApiKey = env.BROWSERBASE_API_KEY?.trim();
   const browserbaseProjectId = env.BROWSERBASE_PROJECT_ID?.trim();
-  const browser = browserbaseApiKey
-    ? new BrowserbaseBrowserClient({
-        apiKey: browserbaseApiKey,
+  const browser = kernelApiKey
+    ? new KernelBrowserClient({
+        apiKey: kernelApiKey,
         executable: defaultAgentBrowserExecutable,
-        ...(browserbaseProjectId ? { projectId: browserbaseProjectId } : {}),
+        ...(kernelProjectId ? { projectId: kernelProjectId } : {}),
       })
-    : null;
+    : browserbaseApiKey
+      ? new BrowserbaseBrowserClient({
+          apiKey: browserbaseApiKey,
+          executable: defaultAgentBrowserExecutable,
+          ...(browserbaseProjectId ? { projectId: browserbaseProjectId } : {}),
+        })
+      : null;
   const blandApiKey = env.BLAND_API_KEY?.trim();
   const twilioConfigured = [env.TWILIO_ACCOUNT_SID, env.TWILIO_AUTH_TOKEN, env.TWILIO_PHONE_NUMBER].some(
     (value) => Boolean(value?.trim()),

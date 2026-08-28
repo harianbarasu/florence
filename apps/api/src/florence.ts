@@ -4496,6 +4496,7 @@ export class Florence {
                       : undefined;
                   const result = await browser.run(
                     {
+                      householdId: work.household.householdId,
                       workId: work.workId,
                       ownerAdultId: familyWorkExecutionAdultId,
                       callId: pendingCall.callId,

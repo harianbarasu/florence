@@ -4775,22 +4775,15 @@ export class Florence {
             }),
           ),
         ]);
-        const busyIntervals = [...personalCalendars, familyCalendar]
-          .flatMap((calendar) =>
+        const busyIntervals = unionBusyIntervals(
+          [...personalCalendars, familyCalendar].flatMap((calendar) =>
             !calendar || calendar.status === "unavailable"
               ? []
               : calendar.events
                   .map((event) => calendarWindowBounds(event, work.household.timeZone))
                   .filter((event) => event.endsAt > currentTime),
-          )
-          .filter(
-            (interval, index, intervals) =>
-              intervals.findIndex(
-                (candidate) =>
-                  candidate.startsAt === interval.startsAt && candidate.endsAt === interval.endsAt,
-              ) === index,
-          )
-          .slice(0, 50);
+          ),
+        );
         const result = await this.#reasoner.researchInterest({
           currentTime,
           timeZone: work.household.timeZone,
@@ -6234,7 +6227,7 @@ function proactiveMemoryContext(
         {
           slot: fact.slot,
           label: presentation.title ?? fact.label,
-          text: vaultMemoryText(fact, presentation).slice(0, 12_000),
+          text: vaultMemoryText(fact, presentation),
         },
       ];
     },
@@ -6287,7 +6280,7 @@ function memoryPresentationText(statement: string, presentation: MemoryPresentat
   if (presentation.title) parts.push(`Title: ${presentation.title}`);
   if (presentation.artifactKind) parts.push(`Artifact: ${presentation.artifactKind}`);
   if (presentation.details && presentation.details !== statement) {
-    parts.push(presentation.details.slice(0, 6_000));
+    parts.push(presentation.details);
   }
   if (presentation.tags.length > 0) parts.push(`Tags: ${presentation.tags.join(", ")}`);
   return parts.join("\n");
@@ -8189,6 +8182,27 @@ function calendarWindowBounds(
     startsAt: zonedCalendarDateStart(event.startDate, householdTimeZone).toISOString(),
     endsAt: zonedCalendarDateStart(event.endDate, householdTimeZone).toISOString(),
   };
+}
+
+function unionBusyIntervals(
+  intervals: readonly { startsAt: string; endsAt: string }[],
+): { startsAt: string; endsAt: string }[] {
+  const sorted = intervals
+    .map((interval) => ({ ...interval }))
+    .sort((left, right) => {
+      const startDifference = Date.parse(left.startsAt) - Date.parse(right.startsAt);
+      return startDifference === 0 ? Date.parse(left.endsAt) - Date.parse(right.endsAt) : startDifference;
+    });
+  const union: { startsAt: string; endsAt: string }[] = [];
+  for (const interval of sorted) {
+    const previous = union.at(-1);
+    if (!previous || Date.parse(interval.startsAt) > Date.parse(previous.endsAt)) {
+      union.push(interval);
+      continue;
+    }
+    if (Date.parse(interval.endsAt) > Date.parse(previous.endsAt)) previous.endsAt = interval.endsAt;
+  }
+  return union;
 }
 
 function familyCalendarMonthWindows(

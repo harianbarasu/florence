@@ -423,6 +423,8 @@ type HarnessState = {
   timeline: string[];
   finiteReviews: number;
   interestResearches: number;
+  interestResearchInputs: Parameters<FlorenceReasoner["researchInterest"]>[0][];
+  interestBusyUnionExercise: boolean;
   voiceTranscriptions: number;
   initialGoogleFailuresRemaining: number;
   initialClassifierFailuresRemaining: number;
@@ -1082,6 +1084,166 @@ release("Florence parent journeys", () => {
         )`,
     );
   }, 20_000);
+
+  test("keeps every parent's and family-calendar conflict in proactive availability", async () => {
+    const researchReasoner = new FlorenceReasoner({ apiKey: "test-openai-key", model: "test-model" }, {
+      responses: {
+        parse: () => ({
+          output_parsed: {
+            judgment: "recommend",
+            summary: INTEREST_RECOMMENDATION,
+            urls: [INTEREST_URL],
+          },
+          output: [
+            {
+              id: "interest-search",
+              type: "web_search_call",
+              status: "completed",
+              action: {
+                type: "search",
+                query: "family soccer match",
+                sources: [{ type: "url", url: INTEREST_URL }],
+              },
+            },
+          ],
+        }),
+      },
+    } as never);
+    const harness = await createHarness(
+      async (input) =>
+        input.currentMessage.text === INTEREST_REQUEST
+          ? decision({
+              bubbles: [
+                {
+                  text: "I’ll keep an eye out and only bring you something genuinely useful.",
+                  delayMs: 0,
+                },
+              ],
+              interest: {
+                operation: "create",
+                interestWorkId: null,
+                genericTerms: ["family soccer matches"],
+                objective: "Find a worthwhile local soccer outing for the family.",
+                why: "Maya likes soccer and the family asked Florence to keep watch.",
+                sourceIds: [input.currentMessage.sourceId],
+              },
+            })
+          : decision(),
+      { researchInterest: researchReasoner.researchInterest.bind(researchReasoner) },
+    );
+    await harness.readyHousehold();
+    await harness.accept("group", "busy-union-interest", INTEREST_REQUEST, "partner");
+    await harness.drain();
+
+    harness.state.interestBusyUnionExercise = true;
+    harness.state.now += 6 * 60_000;
+    await harness.drain();
+
+    expect(harness.state.interestResearchInputs).toHaveLength(1);
+    const researchInput = harness.state.interestResearchInputs[0];
+    if (!researchInput) throw new Error("The interest monitor did not receive family availability");
+    const currentTime = Date.parse(researchInput.currentTime);
+    expect(researchInput.busyIntervals).toHaveLength(52);
+    expect(researchInput.busyIntervals[0]).toEqual({
+      startsAt: new Date(currentTime + 60 * 60_000).toISOString(),
+      endsAt: new Date(currentTime + 4 * 60 * 60_000).toISOString(),
+    });
+    expect(researchInput.busyIntervals.at(-1)).toEqual({
+      startsAt: new Date(currentTime + 405 * 60 * 60_000).toISOString(),
+      endsAt: new Date(currentTime + 406 * 60 * 60_000).toISOString(),
+    });
+    expect(
+      researchInput.busyIntervals.every(
+        (interval, index) =>
+          index === 0 ||
+          Date.parse(researchInput.busyIntervals[index - 1]?.endsAt ?? "") < Date.parse(interval.startsAt),
+      ),
+    ).toBe(true);
+  }, 20_000);
+
+  test("keeps every visible Vault fact and the full tail of a stored artifact searchable", async () => {
+    const saveRequest = "Save our complete weeknight noodles recipe.";
+    const tailDetail = "Finish with preserved-lemon gremolata after plating.";
+    const recipeDetails =
+      "Preparation note: keep the sauce warm, the noodles loose, and reserve a little cooking water. ".repeat(
+        120,
+      ) + tailDetail;
+    const recallRequest = "What was the preserved-lemon gremolata finish in our noodles recipe?";
+    let fullArtifactWasSearchable = false;
+    const harness = await createHarness(async (input, reads) => {
+      if (input.currentMessage.text === saveRequest) {
+        return decision({
+          facts: [
+            {
+              operation: "remember",
+              factId: null,
+              statement: "The family has a complete weeknight noodles recipe.",
+              visibility: "household",
+              memory: {
+                memoryKind: "artifact",
+                artifactKind: "recipe",
+                title: "Complete weeknight noodles",
+                details: recipeDetails,
+                tags: ["recipe", "noodles"],
+              },
+              sourceIds: [input.currentMessage.sourceId],
+            },
+          ],
+        });
+      }
+      if (input.currentMessage.text === recallRequest) {
+        const matches = await reads.searchFamilyMemory?.({
+          query: "preserved lemon gremolata plating",
+          limit: 5,
+        });
+        fullArtifactWasSearchable =
+          matches?.some((source) => source.kind === "memory" && source.text.includes(tailDetail)) ?? false;
+        return decision({
+          bubbles: [{ text: "Finish it with preserved-lemon gremolata after plating.", delayMs: 0 }],
+        });
+      }
+      return decision();
+    });
+    await harness.readyHousehold();
+
+    await harness.accept("private", "save-complete-recipe", saveRequest);
+    await harness.drain();
+
+    const householdId = (await harness.store.listHouseholdIdsForAdult(harness.founderAdultId))[0];
+    if (!householdId) throw new Error("The founder household was unavailable");
+    await writeFile(
+      harness.assertionFile,
+      `insert into facts (id,household_id,kind,slot,label,value,visibility,owner_adult_id)
+       select ('70000000-0000-4000-8000-' || lpad(ordinal::text,12,'0'))::uuid,
+         ${sqlLiteral(householdId)}::uuid,'general','regression:visible-vault-fact:' || ordinal,
+         'Visible Vault fact ' || ordinal,
+         jsonb_build_object(
+           'statement','Visible Vault fact ' || ordinal,
+           'memoryKind','fact','artifactKind',null,'title',null,'details',null,'tags',jsonb_build_array()
+         ),'household',null
+       from generate_series(1,501) ordinal;`,
+    );
+    await migrateDatabase(harness.databaseUrl, harness.assertionFile);
+
+    const storedHousehold = await harness.store.readHousehold({
+      householdId,
+      viewerAdultId: harness.founderAdultId,
+    });
+    expect(
+      storedHousehold?.facts.filter((fact) => fact.slot.startsWith("regression:visible-vault-fact:")),
+    ).toHaveLength(501);
+    const workspace = await harness.florence.workspaceForAdult(harness.founderAdultId);
+    expect(
+      workspace.vault?.facts.filter((fact) => fact.statement.startsWith("Visible Vault fact ")),
+    ).toHaveLength(501);
+    expect(workspace.vault?.facts.find((fact) => fact.title === "Complete weeknight noodles")?.details).toBe(
+      recipeDetails,
+    );
+
+    await harness.accept("private", "recall-complete-recipe", recallRequest, "partner");
+    await harness.drain();
+    expect(fullArtifactWasSearchable).toBe(true);
+  }, 30_000);
 
   test("delivers model-selected native mention and poll moves through the persisted outbox", async () => {
     const request = "Can you ask Alex which dinner night works?";
@@ -6378,6 +6540,7 @@ async function createHarness(
     linqLedger?: FakeLinqLedger;
     browser?: FlorenceBrowserClient;
     continueFamilyWork?: FlorenceReasoner["continueFamilyWork"];
+    researchInterest?: FlorenceReasoner["researchInterest"];
   } = {},
 ): Promise<Harness> {
   if (!TEST_DATABASE_URL) throw new Error("TEST_DATABASE_URL is required");
@@ -6405,6 +6568,8 @@ async function createHarness(
     timeline: [],
     finiteReviews: 0,
     interestResearches: 0,
+    interestResearchInputs: [],
+    interestBusyUnionExercise: false,
     voiceTranscriptions: 0,
     initialGoogleFailuresRemaining: 0,
     initialClassifierFailuresRemaining: 0,
@@ -6466,7 +6631,7 @@ async function createHarness(
     encryptionKey: new Uint8Array(32).fill(7),
   });
   const enrollmentCodes = new EnrollmentCodes(ENROLLMENT_SECRET);
-  const reasoner = createReasoner(reason, state, options.continueFamilyWork);
+  const reasoner = createReasoner(reason, state, options.continueFamilyWork, options.researchInterest);
   const google = createGoogle(store, state);
   const florence = new Florence({
     store,
@@ -6496,6 +6661,7 @@ function createReasoner(
   reason: Reason,
   state: HarnessState,
   continueFamilyWork?: FlorenceReasoner["continueFamilyWork"],
+  researchInterest?: FlorenceReasoner["researchInterest"],
 ): FlorenceReasoner {
   return {
     decide: reason,
@@ -7354,8 +7520,10 @@ function createReasoner(
         why: input.monitor.why,
       };
     },
-    researchInterest: async () => {
+    researchInterest: async (input: Parameters<FlorenceReasoner["researchInterest"]>[0]) => {
       state.interestResearches += 1;
+      state.interestResearchInputs.push(input);
+      if (researchInterest) return researchInterest(input);
       return {
         judgment: "recommend" as const,
         summary: INTEREST_RECOMMENDATION,
@@ -7363,6 +7531,39 @@ function createReasoner(
       };
     },
   } as unknown as FlorenceReasoner;
+}
+
+function interestBusyUnionCalendarEvents(input: {
+  ownerAdultId: string;
+  calendarId?: string;
+  currentTime: string;
+}): GoogleCalendarWindowEvent[] {
+  const event = (providerEventId: string, startsAfterHours: number, endsAfterHours: number) => ({
+    providerEventId,
+    providerRevision: `${providerEventId}-revision`,
+    providerUpdatedAt: input.currentTime,
+    status: "confirmed" as const,
+    busy: true,
+    title: "Private calendar detail",
+    location: null,
+    intervalKind: "timed" as const,
+    startsAt: new Date(Date.parse(input.currentTime) + startsAfterHours * 60 * 60_000).toISOString(),
+    endsAt: new Date(Date.parse(input.currentTime) + endsAfterHours * 60 * 60_000).toISOString(),
+    timeZone: "America/Los_Angeles",
+  });
+  if (input.calendarId && input.calendarId !== "primary") {
+    return [event("busy-family", 3, 4)];
+  }
+  if (input.ownerAdultId === founderSetup().adultId) {
+    return [
+      event("busy-founder-first", 1, 2),
+      ...Array.from({ length: 51 }, (_, index) => {
+        const startsAfterHours = 5 + index * 8;
+        return event(`busy-founder-${index + 2}`, startsAfterHours, startsAfterHours + 1);
+      }),
+    ];
+  }
+  return [event("busy-partner", 2, 3)];
 }
 
 function createGoogle(store: PostgresFlorenceStore, state: HarnessState): GoogleConnection {
@@ -7396,8 +7597,9 @@ function createGoogle(store: PostgresFlorenceStore, state: HarnessState): Google
     currentTime: string;
   }) => {
     const familyEvents = [...state.calendarEvents.values()];
-    const events =
-      input.calendarId && input.calendarId !== "primary"
+    const events = state.interestBusyUnionExercise
+      ? interestBusyUnionCalendarEvents(input)
+      : input.calendarId && input.calendarId !== "primary"
         ? state.monitorCancellationActive
           ? familyEvents.slice(0, 1).map((event) => ({
               providerEventId: event.providerEventId,

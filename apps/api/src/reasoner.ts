@@ -1471,7 +1471,7 @@ export const florenceInterestResearchInputSchema = z
           .regex(/^[A-Z]{2}$/),
       })
       .strict(),
-    busyIntervals: z.array(titleFreeBusyIntervalSchema).max(50),
+    busyIntervals: z.array(titleFreeBusyIntervalSchema),
   })
   .strict();
 

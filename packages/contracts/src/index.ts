@@ -274,7 +274,7 @@ export const householdVaultSchema = z
     timeZone: nonempty(100),
     postalCode: postalCodeSchema.nullable(),
     members: z.array(familyMemberProfileSchema).max(100),
-    facts: z.array(vaultFactSchema).max(500),
+    facts: z.array(vaultFactSchema),
     watches: z.array(vaultWatchSchema).max(100),
   })
   .strict();

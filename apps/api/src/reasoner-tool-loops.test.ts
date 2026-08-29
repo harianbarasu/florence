@@ -261,9 +261,10 @@ describe("Florence reasoner capability cutover", () => {
     expect(instructions).toContain("states a stable interest in typed text or a verified voice note");
   });
 
-  test("reads parent-supplied and task-selected public pages", async () => {
+  test("keeps reading a long parent-supplied public page until the later answer", async () => {
     const pageUrl = "https://school.example/fall-fair";
     const selectedUrl = "https://school.example/fall-fair/faq";
+    const pageFingerprint = "a".repeat(64);
     const requests: Record<string, unknown>[] = [];
     const pageReads: unknown[] = [];
     let modelTurn = 0;
@@ -284,14 +285,26 @@ describe("Florence reasoner capability cutover", () => {
                     }),
                   ],
                 }
-              : {
-                  status: "completed",
-                  output_parsed: ordinaryDecision({
-                    bubbleText: "The fall-fair RSVP closes September 6 at 5 PM.",
-                    researchUrls: [pageUrl],
-                  }),
-                  output: [],
-                },
+              : modelTurn === 2
+                ? {
+                    status: "completed",
+                    output_parsed: null,
+                    output: [
+                      functionCall("continue-parent-page", "read_public_page", {
+                        url: pageUrl,
+                        offset: 15_000,
+                        contentFingerprint: pageFingerprint,
+                      }),
+                    ],
+                  }
+                : {
+                    status: "completed",
+                    output_parsed: ordinaryDecision({
+                      bubbleText: "The fall-fair RSVP closes September 6 at 5 PM.",
+                      researchUrls: [pageUrl],
+                    }),
+                    output: [],
+                  },
           );
         },
       },
@@ -304,25 +317,66 @@ describe("Florence reasoner capability cutover", () => {
       ...inertReads(),
       async runPublicPage(request) {
         pageReads.push(request);
-        return publicPageResult(request.url, "Fall Fair", "RSVP closes September 6 at 5 PM.");
+        if (request.url === pageUrl && request.offset === 15_000) {
+          return {
+            ...publicPageResult(request.url, "Fall Fair", "RSVP closes September 6 at 5 PM."),
+            offset: 15_000,
+            truncated: true,
+            totalCleanCharacters: 15_041,
+            totalCleanBytes: 15_041,
+            contentFingerprint: pageFingerprint,
+          };
+        }
+        if (request.url === pageUrl) {
+          return {
+            ...publicPageResult(
+              request.url,
+              "Fall Fair",
+              "Fall Fair information continues beyond this first section.",
+            ),
+            truncated: true,
+            totalCleanCharacters: 15_041,
+            totalCleanBytes: 15_041,
+            nextOffset: 15_000,
+            contentFingerprint: pageFingerprint,
+          };
+        }
+        return publicPageResult(
+          request.url,
+          "Fall Fair FAQ",
+          "General accessibility and parking information.",
+        );
       },
     });
 
     expect(pageReads).toEqual([
-      { url: pageUrl, charLimit: 15_000 },
-      { url: selectedUrl, charLimit: 15_000 },
+      { url: pageUrl, offset: 0, contentFingerprint: null, charLimit: 15_000 },
+      { url: selectedUrl, offset: 0, contentFingerprint: null, charLimit: 15_000 },
+      { url: pageUrl, offset: 15_000, contentFingerprint: pageFingerprint, charLimit: 15_000 },
     ]);
     expect(result.conversation.bubbles[0]?.text).toContain("September 6 at 5 PM");
     expect(result.researchUrls).toEqual([pageUrl]);
     const envelopes = functionOutputEnvelopes(requests[1]);
     expect(envelopes.find((envelope) => envelope.callId === "parent-page")).toMatchObject({
       outcome: "succeeded",
-      output: { title: "Fall Fair", text: expect.stringContaining("September 6") },
+      output: { title: "Fall Fair", text: expect.not.stringContaining("September 6") },
     });
     expect(envelopes.find((envelope) => envelope.callId === "selected-page")).toMatchObject({
       outcome: "succeeded",
-      output: { title: "Fall Fair", text: expect.stringContaining("September 6") },
+      output: { title: "Fall Fair FAQ", text: expect.not.stringContaining("September 6") },
     });
+    expect(
+      functionOutputEnvelopes(requests[2]).find((envelope) => envelope.callId === "continue-parent-page"),
+    ).toMatchObject({
+      outcome: "succeeded",
+      output: {
+        offset: 15_000,
+        nextOffset: null,
+        contentFingerprint: pageFingerprint,
+        text: expect.stringContaining("September 6"),
+      },
+    });
+    expect(JSON.stringify(requests[0]?.tools)).toContain("nextOffset");
   });
 
   test("follows a verified search result and reads the page before answering", async () => {
@@ -4865,6 +4919,9 @@ function publicPageResult(url: string, title: string, text: string) {
     title,
     filename: null,
     text,
+    offset: 0,
+    nextOffset: null,
+    contentFingerprint: "0".repeat(64),
     truncated: false,
     totalCleanCharacters: text.length,
     totalCleanBytes: Buffer.byteLength(text),

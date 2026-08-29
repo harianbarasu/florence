@@ -2517,6 +2517,17 @@ const PUBLIC_PAGE_PARAMETERS = {
   additionalProperties: false,
   properties: {
     url: { type: "string", minLength: 1, maxLength: 2_000 },
+    offset: {
+      type: "integer",
+      minimum: 0,
+      description:
+        "Exact character offset at which to continue the same public page or PDF; omit for the first chunk, then pass the preceding result's nextOffset unchanged.",
+    },
+    contentFingerprint: {
+      anyOf: [{ type: "string", pattern: "^[a-f0-9]{64}$" }, { type: "null" }],
+      description:
+        "Exact contentFingerprint returned by the first chunk. Pass it unchanged with every offset greater than zero; use null for the first chunk.",
+    },
   },
   required: ["url"],
 } as const;
@@ -5546,7 +5557,8 @@ function foregroundCapabilityRegistry(): CapabilityRegistry<ForegroundCapability
     }),
     defineCapability({
       name: "read_public_page",
-      description: "Read the clean text of one exact public HTML page or PDF relevant to the current task.",
+      description:
+        "Read one contiguous clean-text chunk of an exact public HTML page or PDF. Start without offset and with contentFingerprint null. If nextOffset is returned and omitted content could matter to the answer, call this tool again for the same URL with that exact nextOffset and contentFingerprint; keep reading until the answer is found or nextOffset is null. If the page changed, restart at offset 0.",
       modelSchema: PUBLIC_PAGE_PARAMETERS,
       inputSchema: publicPageRequestSchema,
       outputSchema: publicPageResultSchema,

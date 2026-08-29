@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { promises as dns } from "node:dns";
 import * as http from "node:http";
 import * as https from "node:https";
@@ -8,8 +9,8 @@ import { z } from "zod";
 
 /**
  * Concrete public-page reader adapted from Hermes Agent's URL normalization,
- * SSRF-safe connect, redirect revalidation, base64-image cleanup, head/tail
- * truncation, and successful-result cache at commit
+ * SSRF-safe connect, redirect revalidation, base64-image cleanup, contiguous
+ * continuation, and successful-result cache at commit
  * 6dcebea7fc5d0cc4f621eeaddf52b7d877a5f882 (`tools/url_safety.py`,
  * `tools/web_tools.py`, and `tools/web_result_cache.py`). Florence performs
  * the fetch and PDF extraction locally and intentionally omits Hermes's
@@ -23,6 +24,7 @@ const DEFAULT_MAX_HTML_BYTES = 4 * 1_024 * 1_024;
 const DEFAULT_MAX_PDF_BYTES = 16 * 1_024 * 1_024;
 const DEFAULT_CACHE_TTL_MS = 20 * 60_000;
 const DEFAULT_MAX_CACHE_ENTRIES = 64;
+const DEFAULT_MAX_CACHE_BYTES = 32 * 1_024 * 1_024;
 const USER_AGENT = "FlorenceFamilyAssistant/0.1 (+https://github.com/harianbarasu/florence)";
 
 const HTML_CONTENT_TYPES = new Set([
@@ -39,9 +41,24 @@ const BLOCKED_IPS = buildBlockedIpList();
 export const publicPageRequestSchema = z
   .object({
     url: z.string().trim().min(1).max(8_192),
+    offset: z.number().int().nonnegative().default(0),
+    contentFingerprint: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/)
+      .nullable()
+      .default(null),
     charLimit: z.number().int().min(1_000).max(500_000).default(DEFAULT_CHAR_LIMIT),
   })
-  .strict();
+  .strict()
+  .superRefine((request, context) => {
+    if (request.offset > 0 && request.contentFingerprint === null) {
+      context.addIssue({
+        code: "custom",
+        path: ["contentFingerprint"],
+        message: "Continuation requires the exact content fingerprint returned by the preceding chunk.",
+      });
+    }
+  });
 
 export const publicPageResultSchema = z
   .object({
@@ -51,6 +68,9 @@ export const publicPageResultSchema = z
     title: z.string().min(1).max(1_000).nullable(),
     filename: z.string().min(1).max(500).nullable(),
     text: z.string(),
+    offset: z.number().int().nonnegative().default(0),
+    nextOffset: z.number().int().nonnegative().nullable().default(null),
+    contentFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
     truncated: z.boolean(),
     totalCleanCharacters: z.number().int().nonnegative(),
     totalCleanBytes: z.number().int().nonnegative(),
@@ -141,14 +161,28 @@ export type PublicPageReaderOptions = {
   readonly maxPdfBytes?: number;
   readonly cacheTtlMs?: number;
   readonly maxCacheEntries?: number;
+  readonly maxCacheBytes?: number;
 };
 
 type CacheEntry = {
   readonly expiresAt: number;
-  readonly result: FlorencePublicPageResult;
+  readonly document: ExtractedPublicDocument;
 };
 
 type PageKind = "html" | "pdf";
+
+type ExtractedPublicDocument = {
+  readonly requestedUrl: string;
+  readonly finalUrl: string;
+  readonly kind: PageKind;
+  readonly title: string | null;
+  readonly filename: string | null;
+  readonly cleanText: string;
+  readonly contentFingerprint: string;
+  readonly totalCleanBytes: number;
+  readonly responseBytes: number;
+  readonly fetchedAt: string;
+};
 
 export class PublicPageReader implements FlorencePublicPageClient {
   readonly #network: PublicPageNetwork;
@@ -160,6 +194,8 @@ export class PublicPageReader implements FlorencePublicPageClient {
   readonly #maxPdfBytes: number;
   readonly #cacheTtlMs: number;
   readonly #maxCacheEntries: number;
+  readonly #maxCacheBytes: number;
+  #cachedBytes = 0;
   readonly #cache = new Map<string, CacheEntry>();
 
   constructor(options: PublicPageReaderOptions = {}) {
@@ -176,6 +212,11 @@ export class PublicPageReader implements FlorencePublicPageClient {
     this.#maxPdfBytes = clampInteger(options.maxPdfBytes ?? DEFAULT_MAX_PDF_BYTES, 1_024, 64 * 1_024 * 1_024);
     this.#cacheTtlMs = clampInteger(options.cacheTtlMs ?? DEFAULT_CACHE_TTL_MS, 1_000, 24 * 60 * 60_000);
     this.#maxCacheEntries = clampInteger(options.maxCacheEntries ?? DEFAULT_MAX_CACHE_ENTRIES, 1, 500);
+    this.#maxCacheBytes = clampInteger(
+      options.maxCacheBytes ?? DEFAULT_MAX_CACHE_BYTES,
+      1,
+      512 * 1_024 * 1_024,
+    );
   }
 
   async run(request: FlorencePublicPageRequest, signal?: AbortSignal): Promise<FlorencePublicPageResult> {
@@ -187,9 +228,16 @@ export class PublicPageReader implements FlorencePublicPageClient {
     }
 
     const requested = normalizePublicUrl(parsed.data.url);
-    const cacheKey = `${requested.toString()}\n${parsed.data.charLimit}`;
+    const cacheKey = requested.toString();
     const cached = this.#cacheGet(cacheKey);
-    if (cached) return cached;
+    if (cached) {
+      return windowPublicDocument(
+        cached,
+        parsed.data.offset,
+        parsed.data.charLimit,
+        parsed.data.contentFingerprint,
+      );
+    }
 
     const timeoutController = new AbortController();
     let timedOut = false;
@@ -224,29 +272,26 @@ export class PublicPageReader implements FlorencePublicPageClient {
           { url: fetched.url.toString() },
         );
       }
-      const bounded = truncateHeadTail(cleanText, parsed.data.charLimit);
-      const result = publicPageResultSchema.safeParse({
+      const document: ExtractedPublicDocument = {
         requestedUrl: requested.toString(),
         finalUrl: fetched.url.toString(),
         kind,
         title: extracted.title,
         filename: extracted.filename,
-        text: bounded.text,
-        truncated: bounded.truncated,
-        totalCleanCharacters: cleanText.length,
+        cleanText,
+        contentFingerprint: createHash("sha256").update(cleanText, "utf8").digest("hex"),
         totalCleanBytes: Buffer.byteLength(cleanText, "utf8"),
         responseBytes: fetched.response.body.byteLength,
         fetchedAt: new Date(this.#now()).toISOString(),
-      });
-      if (!result.success) {
-        throw new PublicPageError(
-          "invalid_response",
-          "The public page produced a result Florence could not use.",
-          { cause: result.error, url: fetched.url.toString() },
-        );
-      }
-      this.#cacheSet(cacheKey, result.data);
-      return result.data;
+      };
+      const result = windowPublicDocument(
+        document,
+        parsed.data.offset,
+        parsed.data.charLimit,
+        parsed.data.contentFingerprint,
+      );
+      this.#cacheSet(cacheKey, document);
+      return result;
     } catch (error) {
       if (error instanceof PublicPageError) throw error;
       if (combinedSignal.aborted) {
@@ -338,30 +383,39 @@ export class PublicPageReader implements FlorencePublicPageClient {
     }
   }
 
-  #cacheGet(key: string): FlorencePublicPageResult | undefined {
+  #cacheGet(key: string): ExtractedPublicDocument | undefined {
     const entry = this.#cache.get(key);
     if (!entry) return undefined;
     if (entry.expiresAt <= this.#now()) {
-      this.#cache.delete(key);
+      this.#cacheDelete(key);
       return undefined;
     }
     this.#cache.delete(key);
     this.#cache.set(key, entry);
-    return { ...entry.result };
+    return entry.document;
   }
 
-  #cacheSet(key: string, result: FlorencePublicPageResult): void {
+  #cacheSet(key: string, document: ExtractedPublicDocument): void {
     const now = this.#now();
     for (const [cacheKey, entry] of this.#cache) {
-      if (entry.expiresAt <= now) this.#cache.delete(cacheKey);
+      if (entry.expiresAt <= now) this.#cacheDelete(cacheKey);
     }
-    this.#cache.delete(key);
-    this.#cache.set(key, { expiresAt: now + this.#cacheTtlMs, result: { ...result } });
-    while (this.#cache.size > this.#maxCacheEntries) {
+    this.#cacheDelete(key);
+    if (document.totalCleanBytes > this.#maxCacheBytes) return;
+    this.#cache.set(key, { expiresAt: now + this.#cacheTtlMs, document });
+    this.#cachedBytes += document.totalCleanBytes;
+    while (this.#cache.size > this.#maxCacheEntries || this.#cachedBytes > this.#maxCacheBytes) {
       const oldest = this.#cache.keys().next().value;
       if (oldest === undefined) break;
-      this.#cache.delete(oldest);
+      this.#cacheDelete(oldest);
     }
+  }
+
+  #cacheDelete(key: string): void {
+    const entry = this.#cache.get(key);
+    if (!entry) return;
+    this.#cache.delete(key);
+    this.#cachedBytes -= entry.document.totalCleanBytes;
   }
 }
 
@@ -639,23 +693,57 @@ async function extractPdf(
   }
 }
 
-function truncateHeadTail(
-  content: string,
+/**
+ * Adapted port of Hermes Agent's full-text continuation at pinned commit
+ * 6dcebea7fc5d0cc4f621eeaddf52b7d877a5f882 (`tools/web_tools.py:630-660,
+ * 693-796`). Hermes stores omitted page text for later `read_file` calls;
+ * Florence intentionally has no arbitrary-filesystem tool, so the existing
+ * public-page call exposes the same continuation as exact character windows.
+ */
+function windowPublicDocument(
+  document: ExtractedPublicDocument,
+  offset: number,
   charLimit: number,
-): { readonly text: string; readonly truncated: boolean } {
-  if (content.length <= charLimit) return { text: content, truncated: false };
-  const headBudget = Math.floor(charLimit * 0.75);
-  const tailBudget = charLimit - headBudget;
-  let head = content.slice(0, headBudget);
-  let tail = content.slice(-tailBudget);
-  const headNewline = head.lastIndexOf("\n");
-  if (headNewline > headBudget * 0.5) head = head.slice(0, headNewline);
-  const tailNewline = tail.indexOf("\n");
-  if (tailNewline >= 0 && tailNewline < tailBudget * 0.5) tail = tail.slice(tailNewline + 1);
-  return {
-    text: `${head}\n\n──────── [TRUNCATED] ────────\nShowing the beginning and end of ${content.length.toLocaleString("en-US")} total clean characters.\n\n${tail}`,
-    truncated: true,
-  };
+  expectedFingerprint: string | null,
+): FlorencePublicPageResult {
+  if (offset > 0 && expectedFingerprint !== document.contentFingerprint) {
+    throw new PublicPageError(
+      "invalid_input",
+      "This public page changed since the previous chunk. Restart reading it at offset 0.",
+      { url: document.finalUrl },
+    );
+  }
+  if (offset > document.cleanText.length) {
+    throw new PublicPageError("invalid_input", "The public page offset was past the end of the text.", {
+      url: document.finalUrl,
+    });
+  }
+  const endOffset = Math.min(offset + charLimit, document.cleanText.length);
+  const nextOffset = endOffset < document.cleanText.length ? endOffset : null;
+  const result = publicPageResultSchema.safeParse({
+    requestedUrl: document.requestedUrl,
+    finalUrl: document.finalUrl,
+    kind: document.kind,
+    title: document.title,
+    filename: document.filename,
+    text: document.cleanText.slice(offset, endOffset),
+    offset,
+    nextOffset,
+    contentFingerprint: document.contentFingerprint,
+    truncated: offset > 0 || nextOffset !== null,
+    totalCleanCharacters: document.cleanText.length,
+    totalCleanBytes: document.totalCleanBytes,
+    responseBytes: document.responseBytes,
+    fetchedAt: document.fetchedAt,
+  });
+  if (!result.success) {
+    throw new PublicPageError(
+      "invalid_response",
+      "The public page produced a result Florence could not use.",
+      { cause: result.error, url: document.finalUrl },
+    );
+  }
+  return result.data;
 }
 
 function removeBase64Images(text: string): string {

@@ -55,6 +55,12 @@ In the group Florence:
 - gives prioritized next actions rather than raw source recaps; and
 - avoids duplicate or semantically repeated reminders.
 
+When shared work genuinely needs the other adult, Florence keeps one household task alive, asks
+that exact adult one focused question in their private thread, treats the answer as the next turn of
+the same task, and closes the loop back in the family group. The answer must not become an unrelated
+private conversation or a second task, and an ambiguous reply must never be attached to the wrong
+household objective.
+
 A clear private request to tell the household may become a concise group update. Otherwise, a personal source remains in that adult's private context until there is a useful shared conclusion or the owner asks to share it.
 
 ## Google review and household knowledge
@@ -144,6 +150,11 @@ The current useful reuse targets are:
 Ollie's public family-assistant examples are additional product evidence, summarized with first-party citations in `docs/research/ollie-product-capabilities.md`. Use them to test observable household behavior—cross-source judgment, reusable artifacts, ownership, proactive follow-through, and natural closure—not as evidence for Ollie's undocumented architecture or as a list of runtime categories.
 
 Primary-source evidence about parents' recurring coordination load is summarized in `docs/research/family-coordination-primary-source-brief.md`. Use its general notice → understand → reconcile → decide → act → confirm → remember loop and acceptance scenarios as product rehearsals, never as vertical routing categories or separate mini-products.
+
+The broader parent-app boundary review in `docs/research/parent-jobs-and-app-friction-2026-08-29.md`
+sharpens that bar to change-to-closure: Florence should keep one objective alive across notices,
+calendars, portals, people, purchases, and time until the household has a confirmed outcome. Its
+ranked scenarios are rehearsals for the same general agent, never runtime categories.
 
 Keep the small typed tool-execution kernel already ported from Pi/Hermes. Remove speculative registry versions, generic policy/evidence envelopes, fake facades, and framework-only tests. Progressive discovery or a connector catalog can be reconsidered only after the real tool set makes either one necessary.
 

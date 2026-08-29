@@ -1,0 +1,105 @@
+# Parent jobs and app-boundary friction
+
+_Research date: August 29, 2026_
+
+## Bottom line
+
+Florence should not compete with every school, childcare, sports, grocery, health, travel, or home-service app inside that app's own workflow. Those products already do many narrow jobs well. Florence's opportunity is the work that begins **between** them: notice a meaningful change, recover the relevant family context, reconcile conflicting or stale sources, decide who owns the next move, act through whatever surface is available, confirm the outside result, and remember what will matter next time.
+
+That is consistent with the current [Florence product contract](../../PLAN.md) and the prior [family-coordination brief](./family-coordination-primary-source-brief.md). The sharper product bar from this review is **change-to-closure**: when family reality changes, Florence should update the whole practical plan and stay responsible until the household has a confirmed outcome. A calendar summary, reminder, or new dashboard does not meet that bar.
+
+## Evidence boundary
+
+- Workload evidence below comes from government data or first-party institutional surveys.
+- Product facts come from official product pages and help centers. They establish what a vendor says its product does, not adoption, quality, or independent effectiveness.
+- No forum or app-review anecdotes are used in this brief. The earlier [parent-workflows review](./parent-workflows-and-app-friction.md) labels and collects that qualitative evidence separately.
+- The ranked scenarios are product rehearsals for one general agent. They are not proposed runtime categories.
+
+## Why a boundary-crossing agent matters
+
+- In the U.S. Surgeon General's published 2023 data, 33% of parents reported high stress in the prior month and 48% said their stress was completely overwhelming on most days; named stressors include time demands, finances, and children's health and safety. The advisory explicitly recommends practical help with household and everyday tasks. ([HHS](https://www.hhs.gov/surgeongeneral/reports-and-publications/parents/index.html))
+- The 2025 American Time Use Survey found that 81% of people did household activities on an average day for about two hours. Adults living with children under 13 also averaged 5.1 hours with a child in their care while doing something else. ([BLS](https://www.bls.gov/news.release/atus.htm))
+- Among different-sex couples with two full-time working parents, 52% said the mother did more day-to-day parenting. When unexpected childcare issues arise, 70% said work flexibility is a major factor in deciding who takes time off. ([Pew Research Center](https://www.pewresearch.org/social-trends/2026/06/16/how-working-parents-divide-family-responsibilities/))
+- Care extends beyond two adults: 44% of parents with children under 13 used unpaid childcare in 2025, including 28% who used grandparents. ([Federal Reserve](https://www.federalreserve.gov/publications/2026-economic-well-being-of-us-households-in-2025-living-arrangements-care-work.htm))
+
+**Product implication:** Florence removes mental load only when she absorbs noticing, reconciliation, delegation, and follow-through. Sending one adult another fact to manage merely relocates the work.
+
+## Where today's apps stop
+
+| Recurring parent job | What the first-party surface handles | The boundary Florence should own |
+| --- | --- | --- |
+| **Notice intake and school administration** | Parents reported school-wide newsletters, emails, memos, or notices for 90% of K–12 students, student-specific emails or notes for 66%, and phone calls for 41% in 2022–23. ([NCES](https://nces.ed.gov/pubs2024/2024113.pdf)) ParentSquare puts messages, forms, permission slips, RSVPs, appointments, volunteering, and payments in its school surface. ([ParentSquare](https://www.parentsquare.com/platform/parent-and-community-engagement/)) | Join duplicate notices and attachments into one source-linked obligation; identify the child, deadline, owner, and real next action; then complete the form, RSVP, payment preparation, calendar change, or communication instead of producing a digest. |
+| **Calendar truth and handoffs** | Google provides an editable family calendar, but does not notify members when another family member creates, edits, or deletes an event. ([Google Families](https://support.google.com/families/answer/7157782?co=GENIE.Platform%3DDesktop&hl=en)) Brightwheel supports check-in/out records and parent messages for absence and early or late pickup. ([activity feed](https://help.mybrightwheel.com/en/articles/942392-view-your-child-s-activity-feed), [messaging](https://help.mybrightwheel.com/en/articles/2098452-start-messaging-in-brightwheel)) | Treat a calendar as one source, not unquestioned truth. Reconcile the live change with both adults' constraints, travel time, and the actual caregiver; privately resolve a personal-calendar boundary when needed; update the shared plan once; confirm who is doing what. |
+| **Activities, transport, equipment, and volunteering** | TeamSnap supports schedules and combined team calendars, but warns that a subscribed personal calendar can take up to 24 hours to reflect schedule changes. ([TeamSnap](https://helpme.teamsnap.com/article/1245-subscribe-to-a-team-schedule)) More than half of parents in one national poll said their child normally traveled to and from school by car. ([C.S. Mott Children's Hospital](https://www.mottpoll.org/reports/parent-traffic-hazardous-student-safety)) | Read the live source, detect the changed venue or time, and recompute the consequential plan: route, pickup/drop-off, sibling conflict, equipment, fee, snack, or volunteer duty. Tell the family what changed and what Florence can do—not merely that an event exists. |
+| **Meals, recipes, and groceries** | AnyList connects imported recipes, a shared meal plan, calendar sync, and grocery-list generation. ([AnyList](https://www.anylist.com/features)) Instacart family accounts support shared carts; during an active order, family members can add items, change replacements, and message the shopper when collaboration is enabled. ([family accounts](https://www.instacart.com/help/article/family-account), [order collaboration](https://www.instacart.com/help/section/507104353/2469878137)) | Use the actual week, effort, leftovers, dietary needs, and retained family feedback to make a plan; preserve recipes as revisable artifacts; derive the list or cart; adapt after a schedule change; and carry substitutions or missing items through delivery. |
+| **Health, forms, medications, and follow-up** | The AAP tells parents to retain history, medications, specialists, insurance details, questions, visit notes, referrals, and follow-up actions. ([AAP](https://www.healthychildren.org/English/family-life/health-management/Pages/making-the-most-of-your-childs-health-appointments-parent-tips.aspx)) MyChart family access joins appointments, medications, results, immunizations, and school/daycare forms. ([MyChart](https://www.mychart.org/l/en-us/features/family/)) Apple distinguishes a medication alert from logging a dose as taken or skipped and can alert again when it remains unlogged. ([Apple](https://support.apple.com/en-au/105064)) | Prepare the appointment, reconcile schedules and travel, bring the right records or forms, retain the actual result, and advance prescriptions, tests, referrals, or school paperwork. A reminder or sent message is progress, never proof of completion. |
+| **Travel and evolving plans** | TripIt builds itineraries from confirmation emails, syncs and shares plans, stores documents, provides directions, monitors flights, and offers alternate-flight information. ([TripIt](https://www.tripit.com/web/free), [feature comparison](https://help.tripit.com/en/support/solutions/articles/103000063396-tripit-or-tripit-pro-)) | Turn confirmations into one family plan without asking for derivable details; connect transport, lodging, documents, activities, packing, weather, and time zones; monitor material changes; and replan the downstream household impact. |
+| **Household and care services** | Angi supports research, quote requests, quote comparison, messaging, scheduling, booking, and payment for home services. ([Angi](https://www.angi.com/landing/how-it-works)) Care.com exposes caregiver discovery, profiles, reviews, messaging, and interviews across child, adult, pet, tutoring, and household care. ([Care.com](https://www.care.com/)) | Gather the real requirements, search beyond one marketplace when useful, contact candidates, normalize replies, compare the consequential tradeoffs, schedule the chosen option, and retain provider context for next time. The unit is a solved household need, not a lead list. |
+| **Purchases, deliveries, returns, and subscriptions** | Shop can recover tracking numbers from connected email and monitor deliveries, but order issues and many returns still hand the customer to the merchant or carrier. ([tracking](https://help.shop.app/en/shop/delivery-tracking/track-orders), [returns](https://help.shop.app/en/shop/managing-orders/returns)) The FTC said recurring-subscription complaints averaged nearly 70 per day in 2024 and advises consumers to preserve cancellation records and verify later charges stopped. ([FTC rule announcement](https://www.ftc.gov/news-events/news/press-releases/2024/10/federal-trade-commission-announces-final-click-cancel-rule-making-it-easier-consumers-end-recurring), [consumer guidance](https://consumer.ftc.gov/articles/getting-and-out-free-trials-auto-renewals-and-negative-option-subscriptions)) | Keep the objective after checkout: monitor the right package, notice a missed delivery or return deadline, find the merchant-specific path, prepare or execute the return/cancellation, retain the receipt, and verify refund or stopped billing. Do not declare success at “request submitted.” |
+| **Family memory and reusable context** | Apple Shared Photo Library lets up to six people contribute to a shared collection whose content participates in everyone's memories; Google Photos supports shared albums and automatic partner sharing. ([Apple](https://support.apple.com/en-lamr/118229), [Google](https://support.google.com/photos/answer/7378858?co=GENIE.Platform%3DDesktop&hl=en)) **Product inference:** these products preserve shared media, but not the whole practical story around a family decision or successful plan. | Do not build another photo library. Preserve source-linked family artifacts and the useful context around them: the recipe and substitutions, the provider and what worked, the packing list and what was forgotten, the school policy, the decision and why. Retrieve and revise that context months later. |
+
+The recurring pattern is that each vertical product holds a useful slice of state. Florence should make the **household objective** the stable object that survives movement across those products.
+
+## Ranked acceptance scenarios
+
+Ranking reflects breadth of general-agent behavior and likely mental-load removal, not a proposal to implement scenario-specific handlers.
+
+1. **Unexpected sick-day replan.** A child is suddenly home. Florence reconciles both adults' calendars and work constraints, the care network, school/childcare communication, appointments, medication needs, transport, and downstream activities; asks one real choice if needed; executes the reachable changes; and confirms the new owner and plan. This is the strongest single test of notice → replan → act → close.
+2. **Duplicate school notice to completed action.** The same field-trip obligation arrives by email, attachment, calendar notice, and forwarded screenshot. Florence creates one item with the correct child, due date, source evidence, owner, form, and fee; completes everything possible and asks only for the final choice or credential she genuinely lacks.
+3. **Live activity change and handoff.** A team source moves a game while the subscribed calendar is stale. Florence uses the live source, recalculates travel and sibling conflicts, resolves pickup and volunteer/equipment obligations, updates the household plan, and speaks once unless something materially changes again.
+4. **Busy-week meals to delivered groceries.** Florence recalls detailed recipes and family-specific substitutions, reads the real week, proposes a realistic plan, derives one cart, handles a schedule change and shopper substitutions, and retains what the family liked. The result is dinner work removed, not a menu suggestion.
+5. **Appointment through follow-up.** A referral or school-health requirement becomes workable appointment options around both adults, the right records and questions, a calendar commitment, and durable follow-up. Florence distinguishes reminder, attendance, result, and completion as separate states.
+6. **Old family knowledge becomes newly useful.** More than 90 days after a recipe, provider, policy, packing lesson, size, allergy, or decision was first learned, a new situation makes it relevant. Florence retrieves the detailed source-linked artifact, applies later corrections, uses it in current work, and never treats the onboarding window as a memory expiry.
+7. **Purchase to refund or cancellation.** Florence finds the receipt and policy, tracks the delivery or renewal, reaches the merchant-specific workflow, prepares or executes the return/cancellation, preserves confirmation, and verifies the refund or stopped charge. A submitted request is not closure.
+8. **Household service to confirmed visit.** Given an ordinary outcome rather than a category—“the sink is leaking; please deal with it”—Florence gathers missing facts, finds and contacts suitable providers, compares normalized replies, books the chosen slot around the household, updates the plan, and remembers the successful provider and job details.
+9. **Travel disruption with household consequences.** A flight identifier or confirmation leads to route and live status without an avoidable question. Florence ranks alternatives, reconciles lodging, ground transport, calendars, and childcare, monitors only material changes, and continues the requested follow-through.
+10. **Backup-care handoff outside the parental unit.** When neither adult can cover pickup or care, Florence uses known relatives, caregivers, or services; contacts the appropriate people; shares the minimum practical brief; confirms acceptance; and updates the two adults without requiring the helper to become a Florence account.
+
+### Cross-scenario pass conditions
+
+Every scenario should pass the same observable contract:
+
+1. visible, natural acknowledgment now;
+2. available sources read before avoidable questions;
+3. duplicates and stale facts reconciled rather than repeated;
+4. one explicit objective with owner, next action, dependency, and completion condition;
+5. tools composed dynamically across sources and time;
+6. a useful result, useful partial result plus one real blocker, or an honest exhausted-path explanation;
+7. outside success reported only after the source confirms it;
+8. one natural closure, with no duplicate reminders; and
+9. durable facts and artifacts remembered until corrected or forgotten.
+
+## Comparison with Florence's current product contract
+
+The direction in `PLAN.md` is already substantially correct: general objective-driven execution, complete onboarding discovery, parental-unit knowledge, source visibility, durable work, a prioritized Docket, broad provider tools, browser reach, and native iMessage presence. The prior research also already rejects a new manually maintained family dashboard.
+
+The product implications worth making explicit in implementation and live testing are:
+
+1. **Prioritize change-to-closure over more ingestion.** Once broad intake and the Docket exist, the next bar is whether Florence replans the practical consequences of a change and finishes the work.
+2. **Keep an objective alive across app boundaries.** Email, calendar, portal, browser, call, text, and time are evidence or action surfaces for one household objective; none should become the workflow owner.
+3. **Treat ownership as dynamic household context.** Responsibility should follow availability, prior decisions, and explicit handoffs—not default to the sender, most active adult, or mother.
+4. **Add post-purchase and post-submission verification to the product bar.** Returns, refunds, cancellations, forms, referrals, and provider requests often fail after the first action; Florence should retain and verify them.
+5. **Make artifacts operational.** A recipe, provider record, packing list, policy, receipt, or decision is valuable when Florence can retrieve, transform, revise, and use it later—not merely display it in the Vault.
+6. **Coordinate the wider care network without widening the core account model.** Grandparents, sitters, teachers, coaches, clinicians, and providers can remain external parties reached through ordinary communication while the parental unit retains household truth.
+
+## Strict anti-hardcoding rule
+
+The scenarios above must **never** become a classifier, router, prompt branch, task type, scheduler, memory silo, or mini-runtime for “school,” “meals,” “travel,” “health,” “shopping,” or any other vertical. Those labels are evaluation coverage and optional Vault/UI facets only.
+
+Implementation should deepen reusable operations: source search/read, entity and household-context resolution, objective state, ownership and handoff, planning and replanning, tool composition, provider interaction, change monitoring, artifact retrieval/revision, and confirmed closure. Concrete provider adapters are appropriate; provider- or scenario-specific reasoning is not.
+
+For every acceptance rehearsal, vary the wording, source type, household member, provider, and desired outcome. A behavior passes only if Florence derives and executes the plan from the objective and evidence rather than recognizing the example.
+
+## Primary sources
+
+- [U.S. Surgeon General, Parental Mental Health & Well-Being](https://www.hhs.gov/surgeongeneral/reports-and-publications/parents/index.html)
+- [U.S. Bureau of Labor Statistics, American Time Use Survey—2025 Results](https://www.bls.gov/news.release/atus.htm)
+- [Pew Research Center, How working parents divide family responsibilities](https://www.pewresearch.org/social-trends/2026/06/16/how-working-parents-divide-family-responsibilities/)
+- [Federal Reserve, Living Arrangements and Care Work](https://www.federalreserve.gov/publications/2026-economic-well-being-of-us-households-in-2025-living-arrangements-care-work.htm)
+- [NCES, Parent and Family Involvement in Education: 2023](https://nces.ed.gov/pubs2024/2024113.pdf)
+- [Google Families](https://support.google.com/families/answer/7157782?co=GENIE.Platform%3DDesktop&hl=en), [ParentSquare](https://www.parentsquare.com/platform/parent-and-community-engagement/), [Brightwheel](https://help.mybrightwheel.com/en/articles/2098452-start-messaging-in-brightwheel), and [TeamSnap](https://helpme.teamsnap.com/article/1245-subscribe-to-a-team-schedule)
+- [AnyList](https://www.anylist.com/features) and [Instacart family collaboration](https://www.instacart.com/help/section/507104353/2469878137)
+- [American Academy of Pediatrics](https://www.healthychildren.org/English/family-life/health-management/Pages/making-the-most-of-your-childs-health-appointments-parent-tips.aspx), [MyChart](https://www.mychart.org/l/en-us/features/family/), and [Apple medication tracking](https://support.apple.com/en-au/105064)
+- [TripIt](https://help.tripit.com/en/support/solutions/articles/103000063396-tripit-or-tripit-pro-), [Angi](https://www.angi.com/landing/how-it-works), and [Care.com](https://www.care.com/)
+- [Shop order tracking](https://help.shop.app/en/shop/delivery-tracking/track-orders) and [FTC subscription guidance](https://consumer.ftc.gov/articles/getting-and-out-free-trials-auto-renewals-and-negative-option-subscriptions)
+- [Apple Shared Photo Library](https://support.apple.com/en-lamr/118229) and [Google Photos partner sharing](https://support.google.com/photos/answer/7378858?co=GENIE.Platform%3DDesktop&hl=en)

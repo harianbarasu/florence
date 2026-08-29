@@ -39,6 +39,62 @@ const EMPTY_FINAL_NUDGE =
   "Your previous turn produced no final response. Continue from the available context and tool results, then provide a useful final response.";
 const NO_CAPABILITIES: CapabilityCatalogSnapshot = Object.freeze({ tools: Object.freeze([]) });
 
+// Direct adaptation of Pi's provider overflow classifier
+// (pi 4e494929998d6bc4fccf75e0a233f727db4b70ee,
+// packages/ai/src/utils/overflow.ts). Keep the broad provider vocabulary, but
+// exclude throttling explicitly so a rate limit never destroys useful context.
+const CONTEXT_OVERFLOW_PATTERNS = [
+  /prompt is too long/i,
+  /request_too_large/i,
+  /input is too long for requested model/i,
+  /exceeds the context window/i,
+  /exceeds (?:the )?(?:model'?s )?maximum context length(?: of [\d,]+ tokens?|\s*\([\d,]+\))/i,
+  /input token count.*exceeds the maximum/i,
+  /maximum prompt length is \d+/i,
+  /reduce the length of the messages/i,
+  /maximum context length is \d+ tokens/i,
+  /exceeds (?:the )?maximum allowed input length of [\d,]+ tokens?/i,
+  /input \(\d+ tokens\) is longer than the model'?s context length \(\d+ tokens\)/i,
+  /exceeds the limit of \d+/i,
+  /exceeds the available context size/i,
+  /greater than the context length/i,
+  /context window exceeds limit/i,
+  /exceeded model token limit/i,
+  /too large for model with \d+ maximum context length/i,
+  /prompt has [\d,]+ tokens?, but the configured context size is [\d,]+ tokens?/i,
+  /model_context_window_exceeded/i,
+  /prompt too long; exceeded (?:max )?context length/i,
+  /range of input length should be/i,
+  /context[_ ]length[_ ]exceeded/i,
+  /too many tokens/i,
+  /token limit exceeded/i,
+  /^4(?:00|13)\s*(?:status code)?\s*\(no body\)/i,
+];
+const NON_CONTEXT_OVERFLOW_PATTERNS = [
+  /^(Throttling error|Service unavailable):/i,
+  /rate limit/i,
+  /too many requests/i,
+];
+
+export function isContextOverflowError(error: unknown): boolean {
+  const texts = modelErrorTexts(error);
+  return (
+    !NON_CONTEXT_OVERFLOW_PATTERNS.some((pattern) => texts.some((text) => pattern.test(text))) &&
+    CONTEXT_OVERFLOW_PATTERNS.some((pattern) => texts.some((text) => pattern.test(text)))
+  );
+}
+
+function modelErrorTexts(error: unknown): string[] {
+  if (error instanceof Error) {
+    const details = [error.message, `${error.name} ${error.message}`];
+    if ("code" in error && typeof error.code === "string") details.push(error.code);
+    if ("status" in error && typeof error.status === "number") details.push(String(error.status));
+    if (error.cause !== undefined) details.push(...modelErrorTexts(error.cause));
+    return details;
+  }
+  return typeof error === "string" ? [error] : [];
+}
+
 interface AgentLoopProgressStreak {
   readonly signature: string;
   readonly resultDigest: string;
@@ -152,6 +208,11 @@ export interface AgentLoopInput<TContext, TParsed = unknown, TSuspension = never
   /** Formats one terminal result; calls are made in assistant source order. */
   readonly formatToolResult?: AgentLoopToolResultFormatter<TContext>;
   readonly isUsableFinal?: (response: ParsedResponse<TParsed>) => boolean | Promise<boolean>;
+  /** One bounded chance to replace the transcript after a live provider model error. */
+  readonly recoverModelError?: (
+    error: unknown,
+    transcript: readonly ResponseInputItem[],
+  ) => ResponseInput | null | Promise<ResponseInput | null>;
 }
 
 export type AgentLoopResultKind = "completed" | "suspended" | "yielded" | "empty_final";
@@ -212,6 +273,7 @@ export async function runAgentLoop<TContext, const TRequest extends AgentLoopReq
   let emptyFinalRetries = 0;
   let progressStreak: AgentLoopProgressStreak | null = null;
   let synthesisOnly = false;
+  let modelErrorRecovered = false;
 
   throwIfAborted(input.signal);
   await emit({ type: "agent_start" });
@@ -278,17 +340,28 @@ export async function runAgentLoop<TContext, const TRequest extends AgentLoopReq
       parallel_tool_calls: synthesisOnly ? false : (input.parallelToolCalls ?? true),
     };
     let response: ParsedResponse<TParsed>;
-    if (input.modelCall) {
-      response = await input.modelCall(modelRequest, input.signal);
-    } else {
-      const stream = input.client.responses.stream(
-        modelRequest,
-        input.signal ? { signal: input.signal } : undefined,
-      );
-      for await (const event of stream) {
-        await emit({ type: "model_event", turn: turns, event });
+    try {
+      if (input.modelCall) {
+        response = await input.modelCall(modelRequest, input.signal);
+      } else {
+        const stream = input.client.responses.stream(
+          modelRequest,
+          input.signal ? { signal: input.signal } : undefined,
+        );
+        for await (const event of stream) {
+          await emit({ type: "model_event", turn: turns, event });
+        }
+        response = (await stream.finalResponse()) as ParsedResponse<TParsed>;
       }
-      response = (await stream.finalResponse()) as ParsedResponse<TParsed>;
+    } catch (error) {
+      if (modelErrorRecovered || !input.recoverModelError) throw error;
+      const recovered = await input.recoverModelError(error, transcript);
+      throwIfAborted(input.signal);
+      if (recovered === null) throw error;
+      transcript.splice(0, transcript.length, ...recovered);
+      modelErrorRecovered = true;
+      turns -= 1;
+      continue;
     }
     throwIfAborted(input.signal);
     await emit({ type: "response_end", turn: turns, response });

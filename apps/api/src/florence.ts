@@ -129,6 +129,8 @@ import {
   type FlorenceFamilyCalendarWorkResult,
   type FlorenceHouseholdAvailabilityRead,
   type FlorenceNarrowFamilyProfile,
+  type FlorenceParticipantRequest,
+  type FlorenceParticipantRequestResult,
   type FlorencePrivateCalendarEvent,
   type FlorencePrivateGmailSource,
   type FlorencePrivateGoogleBatchDecision,
@@ -637,10 +639,11 @@ export class Florence {
     let bubbles: readonly { text: string; delayMs: number }[];
     let idempotencyPrefix:
       | "founder-setup"
-      | "partner-setup-expired"
       | "partner-setup-link"
+      | "partner-setup-refresh"
       | "partner-setup-reply";
     let pendingPartnerEnrollment: {
+      operation: "issue" | "refresh";
       adultId: string;
       householdId: string;
       founderAdultId: string;
@@ -649,10 +652,19 @@ export class Florence {
       challengeDigest: string;
       expiresAt: string;
       linkBubbleIndex: number;
+      refreshProviderEventId?: string;
     } | null = null;
 
     if (invitation) {
       if (invitation.state === "declined") return true;
+      if (
+        (invitation.state === "issued" ||
+          invitation.state === "expired" ||
+          invitation.refreshProviderEventId !== undefined) &&
+        Date.parse(input.occurredAt) <= Date.parse(invitation.handshakeAt)
+      ) {
+        return true;
+      }
       if (input.carrierOptOut) {
         await this.#store.declinePartnerInvitation({
           adultId: invitation.adultId,
@@ -662,24 +674,78 @@ export class Florence {
         });
         return true;
       }
-      if (invitation.state === "expired") {
-        await this.#store.expirePartnerInvitations({ now: checkedAt });
-        bubbles = [
-          {
-            text: invitation.linkIssued
-              ? "That Florence setup link has expired. Ask your partner to send a fresh invitation."
-              : "I couldn’t confirm delivery of your Florence setup link before it expired. Ask your partner to send a fresh invitation.",
-            delayMs: 0,
-          },
-        ];
-        idempotencyPrefix = "partner-setup-expired";
-      } else {
-        if (
-          invitation.state === "issued" &&
-          Date.parse(input.occurredAt) <= Date.parse(invitation.handshakeAt)
-        ) {
+      if (
+        invitation.state === "expired" ||
+        (invitation.state === "awaiting_reply" && invitation.refreshProviderEventId !== undefined)
+      ) {
+        if (!this.#reasoner) {
+          throw new LinqError(
+            "provider_retryable",
+            "Florence setup interpretation is temporarily unavailable",
+            true,
+          );
+        }
+        let conversation: Awaited<ReturnType<FlorenceReasoner["converseDuringSetup"]>>;
+        try {
+          conversation = await this.#reasoner.converseDuringSetup({
+            stage: "partner_invited",
+            parentName: null,
+            currentMessage: { text: input.text, occurredAt: input.occurredAt },
+            recentMessages: [],
+            nextStep: "signed_link_will_follow",
+          });
+        } catch (error) {
+          throw new LinqError(
+            "provider_retryable",
+            `Florence could not interpret the invited partner reply: ${errorText(error)}`,
+            true,
+          );
+        }
+        if (conversation.stopMessaging || conversation.declineInvitation) {
+          await this.#store.declinePartnerInvitation({
+            adultId: invitation.adultId,
+            providerConversationId: input.providerConversationId,
+            identitySubjectDigest: input.identitySubjectDigest,
+            occurredAt: input.occurredAt,
+          });
           return true;
         }
+        if (!this.#setupOrigin || !this.#google) {
+          throw new LinqError(
+            "provider_retryable",
+            "Florence partner setup is temporarily unavailable",
+            true,
+          );
+        }
+        const setup = this.#enrollmentCodes.issuePartnerSetup({
+          providerConversationId: invitation.providerConversationId,
+          identitySubjectDigest: invitation.identitySubjectDigest,
+          householdId: invitation.householdId,
+          adultId: invitation.adultId,
+          occurredAt:
+            invitation.state === "awaiting_reply" ? (invitation.setupIssuedAt ?? checkedAt) : checkedAt,
+        });
+        const setupUrl = `${this.#setupOrigin}/#s=${encodeURIComponent(setup.token)}`;
+        bubbles = [
+          ...(conversation.requestsFreshLink
+            ? [{ text: "Of course—here’s a fresh private setup link.", delayMs: 0 }]
+            : conversation.bubbles),
+          { text: setupUrl, delayMs: 0 },
+        ];
+        pendingPartnerEnrollment = {
+          operation: "refresh",
+          adultId: invitation.adultId,
+          householdId: invitation.householdId,
+          founderAdultId: invitation.founderAdultId,
+          messagesAddress: invitation.messagesAddress,
+          initialProviderMessageId: invitation.initialProviderMessageId,
+          challengeDigest: this.#enrollmentCodes.digestPartnerSetup(setup.token),
+          expiresAt: setup.expiresAt,
+          linkBubbleIndex: bubbles.length - 1,
+          refreshProviderEventId: invitation.refreshProviderEventId ?? input.providerEventId,
+        };
+        idempotencyPrefix = "partner-setup-refresh";
+      } else {
         if (!this.#reasoner) {
           throw new LinqError(
             "provider_retryable",
@@ -734,6 +800,7 @@ export class Florence {
             { text: setupUrl, delayMs: 0 },
           ];
           pendingPartnerEnrollment = {
+            operation: "issue",
             adultId: invitation.adultId,
             householdId: invitation.householdId,
             founderAdultId: invitation.founderAdultId,
@@ -834,7 +901,7 @@ export class Florence {
     }
 
     if (pendingPartnerEnrollment) {
-      await this.#store.issueMessagesEnrollment({
+      const enrollment = {
         householdId: pendingPartnerEnrollment.householdId,
         actorAdultId: pendingPartnerEnrollment.founderAdultId,
         adultId: pendingPartnerEnrollment.adultId,
@@ -844,8 +911,16 @@ export class Florence {
         messagesAddress: pendingPartnerEnrollment.messagesAddress,
         providerMessageId: pendingPartnerEnrollment.initialProviderMessageId,
         expiresAt: pendingPartnerEnrollment.expiresAt,
-        issuedAt: input.occurredAt,
-      });
+        issuedAt: pendingPartnerEnrollment.operation === "refresh" ? checkedAt : input.occurredAt,
+        ...(pendingPartnerEnrollment.operation === "refresh"
+          ? { refreshProviderEventId: pendingPartnerEnrollment.refreshProviderEventId }
+          : {}),
+      };
+      if (pendingPartnerEnrollment.operation === "refresh") {
+        await this.#store.refreshMessagesEnrollment(enrollment);
+      } else {
+        await this.#store.issueMessagesEnrollment(enrollment);
+      }
     }
 
     void this.#setTyping({
@@ -856,10 +931,12 @@ export class Florence {
     try {
       for (const [index, bubble] of bubbles.entries()) {
         if (index > 0) await pause(Math.max(650, bubble.delayMs));
+        const enrollmentBasis =
+          pendingPartnerEnrollment?.operation === "refresh"
+            ? `${pendingPartnerEnrollment.initialProviderMessageId}\0${pendingPartnerEnrollment.refreshProviderEventId}`
+            : pendingPartnerEnrollment?.initialProviderMessageId;
         const idempotencyBasis = pendingPartnerEnrollment
-          ? `${pendingPartnerEnrollment.initialProviderMessageId}\0${
-              index === pendingPartnerEnrollment.linkBubbleIndex ? "link" : "ack"
-            }`
+          ? `${enrollmentBasis}\0${index === pendingPartnerEnrollment.linkBubbleIndex ? "link" : "ack"}`
           : `${input.providerEventId}\0${index}`;
         const baseIdempotencyKey = `${idempotencyPrefix}:${deterministicUuid(idempotencyBasis)}`;
         const idempotencyKey = pendingPartnerEnrollment
@@ -1199,9 +1276,6 @@ export class Florence {
     let inboundPresence: InboundPresence | null = null;
     await this.#settleInboundAccepts();
     await this.#purgeExpiredArtifacts();
-    if ((await this.#store.expirePartnerInvitations({ now: this.#now().toISOString() })) > 0) {
-      worked = true;
-    }
     const inbound = await this.#store.readNextInbound(this.#now().toISOString());
     if (inbound) {
       inboundPresence = await this.#handleInbound(inbound);
@@ -1289,6 +1363,57 @@ export class Florence {
         handledAt: this.#now().toISOString(),
       });
       return null;
+    }
+    const participantCandidate = await this.#store.readParticipantReplyCandidate({
+      sourceId: turn.message.sourceId,
+      readAt: this.#now().toISOString(),
+    });
+    if (participantCandidate) {
+      if (!this.#reasoner) {
+        await this.#retryInbound(
+          turn.message.sourceId,
+          "Florence participant-reply reasoning is not configured",
+        );
+        return null;
+      }
+      let participantDecision: Awaited<ReturnType<FlorenceReasoner["interpretParticipantReply"]>>;
+      try {
+        participantDecision = await this.#reasoner.interpretParticipantReply({
+          pendingRequest: {
+            targetAdultName: participantCandidate.targetAdultName,
+            question: participantCandidate.question,
+            askedAt: participantCandidate.askedAt,
+            taskObjective: participantCandidate.taskObjective,
+          },
+          currentMessage: {
+            text: turnText(turn.message),
+            occurredAt: turn.message.occurredAt,
+            explicitlyRepliesToQuestion: participantCandidate.explicitlyRepliesToQuestion,
+          },
+        });
+      } catch (error) {
+        await this.#retryInbound(turn.message.sourceId, errorText(error));
+        return null;
+      }
+      if (participantDecision.belongsToRequest) {
+        if (!participantDecision.acknowledgement) {
+          await this.#retryInbound(
+            turn.message.sourceId,
+            "Florence returned no participant-reply acknowledgement",
+          );
+          return null;
+        }
+        const participantReply = await this.#store.commitParticipantReply({
+          sourceId: turn.message.sourceId,
+          requestId: participantCandidate.requestId,
+          acknowledgement: participantDecision.acknowledgement,
+          handledAt: this.#now().toISOString(),
+        });
+        if (participantReply !== "not_participant") {
+          if (participantReply === "committed") this.#wake();
+          return null;
+        }
+      }
     }
     const presence =
       turn.message.moveKind === "reaction"
@@ -2649,7 +2774,12 @@ export class Florence {
         });
         return "sent_now";
       } else {
-        await this.#store.retryOutbound({ sourceId, retryAt: null, error: result.detail });
+        await this.#store.retryOutbound({
+          sourceId,
+          retryAt: null,
+          error: result.detail,
+          occurredAt: this.#now().toISOString(),
+        });
         return "failed";
       }
     } catch (error) {
@@ -2658,6 +2788,7 @@ export class Florence {
         retryAt:
           retryTransient && error instanceof LinqError && error.retryable ? later(this.#now(), 5_000) : null,
         error: errorText(error),
+        occurredAt: this.#now().toISOString(),
       });
       return retryTransient && error instanceof LinqError && error.retryable ? "claimed" : "failed";
     }
@@ -4535,6 +4666,25 @@ export class Florence {
         });
         return receipt.output as FlorenceReminderWorkResult;
       };
+      const runParticipantRequest = async (
+        request: FlorenceParticipantRequest,
+        taskSignal?: AbortSignal,
+      ): Promise<FlorenceParticipantRequestResult> => {
+        taskSignal?.throwIfAborted();
+        if (work.visibility !== "household") {
+          throw new Error("Only household work can ask another enrolled adult");
+        }
+        const identity = familyWorkPendingCapabilityIdentity("participant_request");
+        const receipt = await this.#store.runClaimedFamilyWorkDatabaseCapability({
+          ...identity,
+          capability: {
+            name: "participant_request",
+            targetAdultName: request.targetAdultName,
+            question: request.question,
+          },
+        });
+        return receipt.output as FlorenceParticipantRequestResult;
+      };
       const resolveFamilyWorkCalendarTarget = async (
         request: Exclude<FlorenceFamilyCalendarWorkRequest, { operation: "create" }>,
       ): Promise<CalendarEventTarget> => {
@@ -4775,6 +4925,7 @@ export class Florence {
         {
           runVaultWork,
           runReminderWork,
+          ...(work.visibility === "household" ? { runParticipantRequest } : {}),
           ...(google && familyWorkHousehold.familyCalendarId && familyWorkFamilyCalendarCredentials.length > 0
             ? { runFamilyCalendarWork }
             : {}),
@@ -5279,6 +5430,22 @@ export class Florence {
           else await adoptOrStopUncheckpointedPhoneCall();
           await adoptUncheckpointedTextMessage();
         }
+      } else if (step.kind === "participant_waiting") {
+        const settlement = await this.#store.settleFamilyWorkClaim({
+          workId: work.workId,
+          generation: work.generation,
+          claimId: work.claimId,
+          settledAt,
+          result: {
+            type: "participant_waiting",
+            state: { ...step.state, browserSession },
+          },
+        });
+        if (settlement === "stale") {
+          await closeUncheckpointedBrowserSession();
+          await adoptOrStopUncheckpointedPhoneCall();
+          await adoptUncheckpointedTextMessage();
+        }
       } else if (step.kind === "waiting") {
         const settlement = await this.#store.settleFamilyWorkClaim({
           workId: work.workId,
@@ -5389,7 +5556,13 @@ export class Florence {
         }
         return;
       }
-      const retryState = await latestClaimedFamilyWorkState();
+      const errorCheckpoint =
+        error instanceof FlorenceReasonerError &&
+        error.familyWorkCheckpoint?.generation === work.generation &&
+        error.familyWorkCheckpoint.claim?.claimId === work.claimId
+          ? error.familyWorkCheckpoint
+          : null;
+      const retryState = errorCheckpoint ?? (await latestClaimedFamilyWorkState());
       const settlement = await this.#store.settleFamilyWorkClaim({
         workId: work.workId,
         generation: work.generation,

@@ -94,8 +94,7 @@ const PARTNER_SETUP_REFUSAL = "I don’t want to join this.";
 const PARTNER_SETUP_EXPLANATION =
   "That link sets up your own private side of Florence. Use the setup link just above when you’re ready.";
 const PARTNER_SETUP_HANDSHAKE_ACK = "Thanks—here’s your private setup link.";
-const PARTNER_SETUP_EXPIRED_REPLY =
-  "That Florence setup link has expired. Ask your partner to send a fresh invitation.";
+const PARTNER_SETUP_REFRESH_ACK = "Of course—here’s a fresh private setup link.";
 const PARTNER_SETUP_EXPIRED_NOTICE =
   "Alex’s Florence setup link expired, so I stopped the invitation. I won’t message them again unless you ask me to send a fresh one.";
 const PARTNER_SETUP_DELIVERY_FAILURE_NOTICE =
@@ -2110,6 +2109,9 @@ release("Florence parent journeys", () => {
     const founderMessagesBeforeExpiry = harness.linq.messages.filter(
       (message) => message.providerConversationId === PRIVATE_FOUNDER,
     ).length;
+    const partnerSetupLinksBeforeRefresh = harness.linq.messages.filter(
+      (message) => message.providerConversationId === PRIVATE_PARTNER && message.text.includes("#s="),
+    ).length;
     await harness.receiveParts(
       "expired-partner-link-question",
       [{ type: "text", value: PARTNER_SETUP_QUESTION }],
@@ -2119,23 +2121,53 @@ release("Florence parent journeys", () => {
     expect(
       harness.linq.messages.filter(
         (message) =>
-          message.providerConversationId === PRIVATE_PARTNER && message.text === PARTNER_SETUP_EXPIRED_REPLY,
+          message.providerConversationId === PRIVATE_PARTNER && message.text === PARTNER_SETUP_REFRESH_ACK,
       ),
+    ).toHaveLength(1);
+    expect(harness.linq.partnerSetupLinkAttempts).toBe(linkAttemptsBeforeExpiry + 1);
+    const refreshedPartnerSetupToken = harness.setupTokenFor(PRIVATE_PARTNER);
+    expect(refreshedPartnerSetupToken).toMatch(/^ps1\./);
+    expect(refreshedPartnerSetupToken).not.toBe(expiringPartnerSetupToken);
+    await harness.assertDatabase(
+      "The confirmed refreshed link forgot its durable original expiry lineage",
+      `exists (
+        select 1 from people where adult_slot=2 and status='planned'
+          and nullif(preferences#>>'{partnerInvitationRefresh,messageId}','') is not null
+          and nullif(preferences#>>'{partnerInvitationRefresh,providerEventId}','') is not null
+          and preferences#>>'{partnerInvitationRefresh,messageId}'<>invitation_message_id
+      )`,
+    );
+    expect(
+      harness.linq.messages
+        .filter(
+          (message) => message.providerConversationId === PRIVATE_PARTNER && message.text.includes("#s="),
+        )
+        .slice(partnerSetupLinksBeforeRefresh),
     ).toHaveLength(1);
     await harness.drain();
     const expirationNotices = harness.linq.messages
       .filter((message) => message.providerConversationId === PRIVATE_FOUNDER)
       .slice(founderMessagesBeforeExpiry)
       .filter((message) => message.text === PARTNER_SETUP_EXPIRED_NOTICE);
-    expect(expirationNotices).toHaveLength(1);
-    expect(expirationNotices[0]?.text).toBe(PARTNER_SETUP_EXPIRED_NOTICE);
+    expect(expirationNotices).toHaveLength(0);
+    expect((await harness.florence.workspaceForAdult(harness.founderAdultId)).workspace.setup).toMatchObject({
+      partnerInvitation: "invited",
+    });
+    harness.state.now += 15_001;
+    await harness.drain();
+    expect(harness.linq.partnerSetupLinkAttempts).toBe(linkAttemptsBeforeExpiry + 1);
+
+    await harness.receiveParts(
+      "partner-declines-refreshed-link",
+      [{ type: "text", value: PARTNER_SETUP_REFUSAL }],
+      PRIVATE_PARTNER,
+      "partner",
+    );
+    await harness.drain();
     expect((await harness.florence.workspaceForAdult(harness.founderAdultId)).workspace.setup).toMatchObject({
       partnerInvitation: "ready",
     });
-    expect(harness.linq.partnerSetupLinkAttempts).toBe(linkAttemptsBeforeExpiry);
-    harness.state.now += 15_001;
-    await harness.drain();
-    expect(harness.linq.partnerSetupLinkAttempts).toBe(linkAttemptsBeforeExpiry);
+    const linkAttemptsBeforeReinvite = harness.linq.partnerSetupLinkAttempts;
 
     harness.linq.partnerInitialPromptAcceptedRemaining = 1;
     const partnerPromptVisible = harness.linq.pauseNextPartnerInitialPrompt();
@@ -2173,7 +2205,7 @@ release("Florence parent journeys", () => {
           (message) => message.providerConversationId === PRIVATE_PARTNER && message.text.includes("#s=fs2."),
         ),
       ).toBe(false);
-      expect(harness.linq.partnerSetupLinkAttempts).toBe(linkAttemptsBeforeExpiry);
+      expect(harness.linq.partnerSetupLinkAttempts).toBe(linkAttemptsBeforeReinvite);
     } finally {
       harness.linq.releasePartnerInitialPrompt();
     }
@@ -2190,7 +2222,7 @@ release("Florence parent journeys", () => {
       PRIVATE_PARTNER,
       "partner",
     );
-    expect(harness.linq.partnerSetupLinkAttempts).toBe(linkAttemptsBeforeExpiry + 1);
+    expect(harness.linq.partnerSetupLinkAttempts).toBe(linkAttemptsBeforeReinvite + 1);
     const finalPartnerSetupToken = harness.setupTokenFor(PRIVATE_PARTNER);
     expect(finalPartnerSetupToken).not.toBe(expiringPartnerSetupToken);
     expect(finalPartnerSetupToken).toMatch(/^ps1\./);
@@ -2891,6 +2923,196 @@ release("Florence parent journeys", () => {
     expect(
       harness.linq.messages.filter((message) => message.text === PROACTIVE_FAMILY_WORK_RESULT),
     ).toHaveLength(1);
+  }, 20_000);
+
+  test("asks the other parent privately, consumes one reply, and finishes in the family thread", async () => {
+    const request = "Can you confirm with Alex whether Maya can stay for the whole field-trip day?";
+    const objective = "Confirm with Alex whether Maya can stay for the whole field-trip day.";
+    const question = "Can Maya stay for the whole field-trip day on Friday?";
+    const answer = "No—she needs to come home right after lunch.";
+    const unrelated = "Also, can you add milk to the grocery list?";
+    const laterUnrelated = "And please add eggs too.";
+    const acknowledgement = "Got it—thanks for letting me know. I’ll update the plan.";
+    const unrelatedReply = "Sure—I’ll help with the grocery list separately.";
+    const terminalText = "Alex said Maya needs to come home right after lunch, so I updated the plan.";
+    let ordinaryReasonerSawParticipantReply = false;
+    let ordinaryReasonerUnrelatedMessages = 0;
+    let durableRuns = 0;
+    const harness = await createHarness(
+      async (input) => {
+        if (input.currentMessage.text === request) {
+          return decision({
+            bubbles: [{ text: "I’ll check with Alex and close the loop here.", delayMs: 0 }],
+            familyWork: {
+              operation: "create",
+              workId: null,
+              objective,
+              instruction: null,
+              schedule: null,
+              candidateIds: [],
+            },
+          });
+        }
+        if (input.currentMessage.text === answer) ordinaryReasonerSawParticipantReply = true;
+        if (input.currentMessage.text === unrelated || input.currentMessage.text === laterUnrelated) {
+          ordinaryReasonerUnrelatedMessages += 1;
+          return decision({ bubbles: [{ text: unrelatedReply, delayMs: 0 }] });
+        }
+        return decision();
+      },
+      {
+        interpretParticipantReply: async (input) => {
+          expect(input.pendingRequest).toMatchObject({
+            targetAdultName: "Alex Anbarasu",
+            question,
+            taskObjective: objective,
+          });
+          if (input.currentMessage.text === unrelated) {
+            return { belongsToRequest: false, acknowledgement: null };
+          }
+          expect(input.currentMessage).toMatchObject({
+            text: answer,
+            explicitlyRepliesToQuestion: false,
+          });
+          return {
+            belongsToRequest: true,
+            acknowledgement: { kind: "text", text: acknowledgement },
+          };
+        },
+        continueFamilyWork: async (input, reads) => {
+          durableRuns += 1;
+          expect(input.visibility).toBe("household");
+          expect(input.ownerAdultId).toBeNull();
+          if (input.state.steering.some((steering) => steering.text === answer)) {
+            return {
+              kind: "terminal",
+              state: {
+                ...input.state,
+                phase: "terminal",
+                claim: null,
+                pendingCall: null,
+                pendingParticipantRequest: null,
+                waitingDocket: null,
+                terminal: { outcome: "succeeded", text: terminalText },
+              },
+              outcome: "succeeded",
+              text: terminalText,
+            };
+          }
+          if (input.state.phase === "ready") {
+            return {
+              kind: "continue",
+              state: {
+                ...input.state,
+                phase: "tool_pending",
+                claim: null,
+                pendingCall: {
+                  callId: "ask-alex-about-field-trip",
+                  name: "participant_request",
+                  argumentsJson: JSON.stringify({
+                    targetAdultName: "Alex Anbarasu",
+                    question,
+                  }),
+                  attempt: 0,
+                },
+              },
+              progressText: null,
+              nextCheckDelayMs: 0,
+            };
+          }
+          if (!reads.runParticipantRequest) {
+            throw new Error("Household work did not receive private participant messaging");
+          }
+          const queued = await reads.runParticipantRequest({
+            targetAdultName: "Alex Anbarasu",
+            question,
+          });
+          return {
+            kind: "participant_waiting",
+            state: {
+              ...input.state,
+              phase: "waiting",
+              claim: null,
+              pendingCall: null,
+              pendingParticipantRequest: queued,
+              waitingDocket: {
+                owner: "Alex Anbarasu",
+                nextAction: "Answer Florence's private question.",
+                waitingOn: question,
+                needsAnswer: true,
+              },
+            },
+          };
+        },
+      },
+    );
+    await harness.readyHousehold();
+
+    await harness.accept("group", "participant-request-start", request);
+    await harness.drain();
+    expect(
+      harness.linq.messages.filter(
+        (message) => message.providerConversationId === PRIVATE_PARTNER && message.text === question,
+      ),
+    ).toHaveLength(1);
+    expect(
+      harness.linq.messages.filter(
+        (message) => message.providerConversationId === FAMILY_GROUP && message.text === question,
+      ),
+    ).toHaveLength(0);
+
+    await harness.accept("private", "participant-request-unrelated", unrelated, "partner");
+    await harness.drain();
+    expect(ordinaryReasonerUnrelatedMessages).toBe(1);
+    expect(durableRuns).toBe(2);
+
+    // The answer and a separate request arrive as one quick burst. The first
+    // Message must still resume the correlated task; the second stays an
+    // ordinary private turn rather than being swallowed by that request.
+    await harness.accept("private", "participant-request-answer", answer, "partner");
+    await harness.accept("private", "participant-request-later-unrelated", laterUnrelated, "partner");
+    await harness.drain();
+    expect(ordinaryReasonerSawParticipantReply).toBe(false);
+    expect(ordinaryReasonerUnrelatedMessages).toBe(2);
+    expect(
+      harness.linq.messages.filter(
+        (message) =>
+          message.providerConversationId === PRIVATE_PARTNER &&
+          message.replyTo?.providerMessageId === "message-participant-request-answer" &&
+          message.text === acknowledgement,
+      ),
+    ).toHaveLength(1);
+    expect(
+      harness.linq.reactions.filter(
+        (reaction) => reaction.targetProviderMessageId === "message-participant-request-answer",
+      ),
+    ).toHaveLength(0);
+    expect(
+      harness.linq.messages.filter(
+        (message) => message.providerConversationId === PRIVATE_PARTNER && message.text === unrelatedReply,
+      ),
+    ).toHaveLength(2);
+    expect(
+      harness.linq.messages.filter(
+        (message) => message.providerConversationId === FAMILY_GROUP && message.text === terminalText,
+      ),
+    ).toHaveLength(1);
+
+    await harness.accept("private", "participant-request-duplicate-answer", answer, "partner");
+    await harness.drain();
+    expect(ordinaryReasonerSawParticipantReply).toBe(true);
+    expect(durableRuns).toBe(3);
+    expect(
+      harness.linq.messages.filter(
+        (message) => message.providerConversationId === FAMILY_GROUP && message.text === terminalText,
+      ),
+    ).toHaveLength(1);
+    await harness.assertDatabase(
+      "A participant reply did not complete exactly one resumed household task",
+      `(select count(*)=1 from proactive_work
+        where kind='family_task' and visibility='household' and objective=${sqlLiteral(objective)}
+          and status='completed' and task_state->'pendingParticipantRequest'='null'::jsonb)`,
+    );
   }, 20_000);
 
   test("plans next week's dinners from fresh family context every Sunday until either parent stops it", async () => {
@@ -7939,6 +8161,7 @@ async function createHarness(
     linqLedger?: FakeLinqLedger;
     browser?: FlorenceBrowserClient;
     continueFamilyWork?: FlorenceReasoner["continueFamilyWork"];
+    interpretParticipantReply?: FlorenceReasoner["interpretParticipantReply"];
     researchInterest?: FlorenceReasoner["researchInterest"];
   } = {},
 ): Promise<Harness> {
@@ -8031,7 +8254,13 @@ async function createHarness(
     encryptionKey: new Uint8Array(32).fill(7),
   });
   const enrollmentCodes = new EnrollmentCodes(ENROLLMENT_SECRET);
-  const reasoner = createReasoner(reason, state, options.continueFamilyWork, options.researchInterest);
+  const reasoner = createReasoner(
+    reason,
+    state,
+    options.continueFamilyWork,
+    options.interpretParticipantReply,
+    options.researchInterest,
+  );
   const google = createGoogle(store, state);
   const florence = new Florence({
     store,
@@ -8061,11 +8290,15 @@ function createReasoner(
   reason: Reason,
   state: HarnessState,
   continueFamilyWork?: FlorenceReasoner["continueFamilyWork"],
+  interpretParticipantReply?: FlorenceReasoner["interpretParticipantReply"],
   researchInterest?: FlorenceReasoner["researchInterest"],
 ): FlorenceReasoner {
   return {
     decide: reason,
     ...(continueFamilyWork ? { continueFamilyWork } : {}),
+    interpretParticipantReply:
+      interpretParticipantReply ??
+      (async () => ({ belongsToRequest: false as const, acknowledgement: null })),
     transcribeVoiceNote: async (input: Parameters<FlorenceReasoner["transcribeVoiceNote"]>[0]) => {
       state.voiceTranscriptions += 1;
       expect(input).toMatchObject({ filename: "teacher-note.wav", mimeType: "audio/wav" });

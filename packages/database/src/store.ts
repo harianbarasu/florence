@@ -715,6 +715,20 @@ export type FamilyWorkStateV1 = {
     readonly provider: "twilio";
     readonly messageSid: string;
   } | null;
+  /**
+   * One correlated question sent from household work to an enrolled adult's
+   * private Florence thread. The exact adult reply atomically becomes steering
+   * for this same work before the request is cleared.
+   */
+  readonly pendingParticipantRequest: {
+    readonly requestId: string;
+    readonly targetAdultId: string;
+    readonly targetAdultName: string;
+    readonly channelId: string;
+    readonly questionSourceId: string;
+    readonly question: string;
+    readonly askedAt: string;
+  } | null;
   readonly continuationItems: readonly JsonValue[];
   readonly pendingCall: {
     readonly callId: string;
@@ -772,6 +786,7 @@ export type SettleFamilyWorkClaimInput = {
         nextCheckAt: string;
         progressText?: string | null;
       }
+    | { type: "participant_waiting"; state: FamilyWorkStateV1 }
     | { type: "waiting"; state: FamilyWorkStateV1; question: string }
     | { type: "terminal"; state: FamilyWorkStateV1; terminalText: string }
     | { type: "retry"; state: FamilyWorkStateV1; retryAt: string; error: string };
@@ -922,6 +937,7 @@ export type IssueMessagesEnrollmentInput = {
   providerMessageId: string;
   expiresAt: string;
   issuedAt: string;
+  refreshProviderEventId?: string;
 };
 
 export type RedeemMessagesEnrollmentInput = {
@@ -1224,28 +1240,32 @@ export type PendingPartnerInvitation = {
   phoneNumber: string;
 };
 
+type ReissuablePartnerInvitation = {
+  adultId: string;
+  householdId: string;
+  founderAdultId: string;
+  messagesAddress: string;
+  providerConversationId: string;
+  identitySubjectDigest: string;
+  initialProviderMessageId: string;
+  handshakeAt: string;
+  setupIssuedAt: string | null;
+  /** Present while a previously expired link refresh is awaiting provider confirmation. */
+  refreshProviderEventId?: string;
+};
+
 export type UnboundPartnerInvitation =
   | {
       adultId: string;
       state: "declined";
     }
-  | {
-      adultId: string;
+  | (ReissuablePartnerInvitation & {
       state: "expired";
       linkIssued: boolean;
-    }
-  | {
-      adultId: string;
+    })
+  | (ReissuablePartnerInvitation & {
       state: "awaiting_reply" | "issued";
-      householdId: string;
-      founderAdultId: string;
-      messagesAddress: string;
-      providerConversationId: string;
-      identitySubjectDigest: string;
-      initialProviderMessageId: string;
-      handshakeAt: string;
-      setupIssuedAt: string | null;
-    };
+    });
 
 export type InboundTurn = {
   message: ConversationTurn & { speaker: string };
@@ -1381,6 +1401,22 @@ export type OutboundDraft = {
   notBefore: string;
 };
 
+export type ParticipantReplyCandidate = {
+  requestId: string;
+  targetAdultName: string;
+  question: string;
+  askedAt: string;
+  taskObjective: string;
+  explicitlyRepliesToQuestion: boolean;
+};
+
+export type ParticipantReplyAcknowledgement =
+  | {
+      kind: "reaction";
+      reaction: "love" | "like" | "dislike" | "laugh" | "emphasize" | "question";
+    }
+  | { kind: "text"; text: string };
+
 export type CalendarEventDraft =
   | {
       intervalKind: "timed";
@@ -1452,14 +1488,19 @@ export type ClaimedFamilyWorkDatabaseCapability =
         | { operation: "remember" | "correct"; fact: FactDraft }
         | { operation: "forget"; factId: string };
     }
-  | { name: "reminder_work"; mutation: ReminderMutation };
+  | { name: "reminder_work"; mutation: ReminderMutation }
+  | {
+      name: "participant_request";
+      targetAdultName: string;
+      question: string;
+    };
 
 export type ClaimedFamilyWorkCapabilityIdentity = {
   workId: string;
   generation: number;
   claimId: string;
   callId: string;
-  name: "vault_work" | "reminder_work" | "family_calendar_work";
+  name: "vault_work" | "reminder_work" | "family_calendar_work" | "participant_request";
   argumentsJson: string;
   occurredAt: string;
 };
@@ -1689,6 +1730,7 @@ type IssuedPartnerInvitationRow = {
   link_issued: boolean;
   founder_adult_id: string;
   founder_channel_id: string;
+  lineage_message_id?: string;
 };
 
 type ChannelRow = {
@@ -1846,6 +1888,8 @@ type ProactiveWorkRow = {
 
 type LinqObservationRow = {
   source_id: string;
+  source_household_id: string;
+  source_metadata: JsonValue;
   status: "pending" | "sending" | "sent" | "failed";
   move_kind: "message" | "reply" | "reaction";
   provider_message_id: string | null;
@@ -3506,6 +3550,7 @@ export class PostgresFlorenceStore {
               phase: "terminal",
               claim: null,
               pendingCall: null,
+              pendingParticipantRequest: null,
               waitingDocket: null,
               progressRevision: incrementFamilyWorkCounter(
                 state.progressRevision,
@@ -3875,7 +3920,7 @@ export class PostgresFlorenceStore {
             statement: factStatement(mutation.fact.value),
           };
         }
-      } else {
+      } else if (input.capability.name === "reminder_work") {
         const reminderId = await applyConversationalReminderMutation(sql, {
           householdId: context.work.household_id,
           audience: context.channel.audience,
@@ -3907,6 +3952,77 @@ export class PostgresFlorenceStore {
           lastRunAt: reminder.lastRunAt,
           createdAt: reminder.createdAt,
           deliveryStatus: input.capability.mutation.operation === "run" ? "queued" : null,
+        };
+      } else {
+        if (context.work.visibility !== "household" || context.channel.audience !== "group") {
+          throw new FlorenceStoreUnauthorized(
+            "Only household work can ask an enrolled adult in their private thread",
+          );
+        }
+        const targetAdultName = limitedRequiredString(
+          input.capability.targetAdultName,
+          500,
+          "Family work participant name",
+        );
+        const question = limitedRequiredString(
+          input.capability.question,
+          2_000,
+          "Family work participant question",
+        );
+        const targets = await sql<
+          (ChannelRow & {
+            target_adult_id: string;
+            target_adult_name: string;
+            current_identity_digest: string | null;
+          })[]
+        >`
+          select channel.*,adult.id as target_adult_id,
+            adult.display_name as target_adult_name,
+            adult.identity_subject_digest as current_identity_digest
+          from people adult
+          join linq_channels channel on channel.household_id=adult.household_id
+            and channel.audience='private' and channel.adult_one_id=adult.id
+            and channel.adult_two_id is null and channel.revoked_at is null
+            and channel.stopped_at is null
+          where adult.household_id=${context.work.household_id}
+            and adult.kind='adult' and adult.role='steward' and adult.status='verified'
+            and adult.id<>${context.senderAdultId}
+            and (adult.id=${context.channel.adult_one_id} or adult.id=${context.channel.adult_two_id})
+            and adult.display_name=${targetAdultName}
+          order by channel.bound_at desc,channel.id desc limit 2
+          for share of channel,adult
+        `;
+        const target = targets[0];
+        if (
+          !target ||
+          targets.some((candidate) => candidate.target_adult_id !== target.target_adult_id) ||
+          !target.current_identity_digest ||
+          target.identity_one_digest !== target.current_identity_digest ||
+          target.identity_two_digest !== null ||
+          target.authority_digest !== digestStrings([target.target_adult_id, target.current_identity_digest])
+        ) {
+          throw new FlorenceStoreConflict(
+            "The named enrolled adult has no exact active private Florence thread",
+          );
+        }
+
+        // Direct lifecycle adaptation: Hermes 6dcebea7 tools/bot_mode_dm.py and
+        // tools/bot_relay.py correlate one async request to one exact target and
+        // make replay idempotent. Florence keeps that envelope in the existing
+        // PostgreSQL family-work checkpoint and Linq outbox rather than porting
+        // Hermes's bot/file transport.
+        const requestId = deterministicUuid(`participant-request\0${context.work.id}\0${input.callId}`);
+        const suffix = `participant-request:${requestId}`;
+        const questionSourceId = proactiveOutboundSourceId(context.work.id, suffix);
+        output = {
+          status: "queued",
+          requestId,
+          targetAdultId: target.target_adult_id,
+          targetAdultName: target.target_adult_name,
+          channelId: target.id,
+          questionSourceId,
+          question,
+          askedAt: occurredAt.toISOString(),
         };
       }
 
@@ -4014,7 +4130,11 @@ export class PostgresFlorenceStore {
         throw new FlorenceStoreConflict("A selected browser image belongs to another family task");
       }
       if (input.result.type === "continue") {
-        if (nextState.phase === "waiting" || nextState.phase === "terminal") {
+        if (
+          nextState.phase === "waiting" ||
+          nextState.phase === "terminal" ||
+          nextState.pendingParticipantRequest !== null
+        ) {
           throw new FlorenceStoreConflict("Continuing family work needs a runnable durable phase");
         }
         const nextCheckAt = instant(input.result.nextCheckAt);
@@ -4042,9 +4162,95 @@ export class PostgresFlorenceStore {
         return "settled";
       }
 
+      if (input.result.type === "participant_waiting") {
+        if (
+          currentState.pendingParticipantRequest !== null ||
+          nextState.phase !== "waiting" ||
+          nextState.pendingParticipantRequest === null ||
+          nextState.waitingDocket?.needsAnswer !== true ||
+          nextState.pendingCall !== null ||
+          nextState.terminal !== null
+        ) {
+          throw new FlorenceStoreConflict(
+            "Participant-waiting family work needs one exact correlated request",
+          );
+        }
+        const request = nextState.pendingParticipantRequest;
+        if (
+          nextState.waitingDocket.owner !== request.targetAdultName ||
+          nextState.waitingDocket.waitingOn !== request.question
+        ) {
+          throw new FlorenceStoreConflict(
+            "Participant-waiting docket coordination must match the exact private question",
+          );
+        }
+        const [target] = await sql<
+          (ChannelRow & {
+            target_adult_id: string;
+            target_adult_name: string;
+            current_identity_digest: string | null;
+          })[]
+        >`
+          select channel.*,adult.id as target_adult_id,
+            adult.display_name as target_adult_name,
+            adult.identity_subject_digest as current_identity_digest
+          from linq_channels channel
+          join people adult on adult.id=${request.targetAdultId}
+            and adult.household_id=channel.household_id
+            and adult.kind='adult' and adult.role='steward' and adult.status='verified'
+          where channel.id=${request.channelId} and channel.household_id=${work.household_id}
+            and channel.audience='private' and channel.adult_one_id=adult.id
+            and channel.adult_two_id is null and channel.revoked_at is null
+            and channel.stopped_at is null and adult.display_name=${request.targetAdultName}
+          for share of channel,adult
+        `;
+        const targetIdentityDigest = target?.current_identity_digest ?? null;
+        if (
+          !target ||
+          !targetIdentityDigest ||
+          target.identity_one_digest !== targetIdentityDigest ||
+          target.identity_two_digest !== null ||
+          target.authority_digest !== digestStrings([target.target_adult_id, targetIdentityDigest])
+        ) {
+          throw new FlorenceStoreConflict(
+            "The participant's private Florence thread changed before the question could be queued",
+          );
+        }
+        const updated = await sql`
+          update proactive_work set task_state=${sql.json(nextState)},status='paused',next_check_at=null,
+            current_conclusion=${`Waiting for ${request.targetAdultName}: ${request.question}`},
+            last_error=null
+          where id=${work.id} and kind='family_task' and status='active'
+            and task_state->>'generation'=${String(input.generation)}
+            and task_state->'claim'->>'claimId'=${input.claimId} returning id
+        `;
+        if (updated.length !== 1) return "stale";
+        await insertProactiveOutbound(sql, {
+          workId: work.id,
+          suffix: `participant-request:${request.requestId}`,
+          householdId: work.household_id,
+          channel: target,
+          visibility: "private",
+          ownerAdultId: request.targetAdultId,
+          text: request.question,
+          metadata: {
+            familyWorkId: work.id,
+            familyWorkGeneration: nextState.generation,
+            familyWorkProgressRevision: nextState.progressRevision,
+            familyWorkDeliveryKind: "participant_request",
+            participantRequestId: request.requestId,
+            participantTargetAdultId: request.targetAdultId,
+          },
+          notBefore: settledAt,
+          occurredAt: settledAt,
+        });
+        return "settled";
+      }
+
       if (input.result.type === "waiting") {
         if (
           nextState.phase !== "waiting" ||
+          nextState.pendingParticipantRequest !== null ||
           nextState.pendingCall !== null ||
           nextState.terminal !== null ||
           nextState.waitingDocket?.needsAnswer !== true
@@ -4071,6 +4277,7 @@ export class PostgresFlorenceStore {
         const terminalText = bounded(required(input.result.terminalText, "Family work result"), 10_000);
         if (
           nextState.phase !== "terminal" ||
+          nextState.pendingParticipantRequest !== null ||
           nextState.pendingCall !== null ||
           nextState.terminal?.text !== terminalText
         ) {
@@ -4094,7 +4301,11 @@ export class PostgresFlorenceStore {
         return "settled";
       }
 
-      if (nextState.phase === "waiting" || nextState.phase === "terminal") {
+      if (
+        nextState.phase === "waiting" ||
+        nextState.phase === "terminal" ||
+        nextState.pendingParticipantRequest !== null
+      ) {
         throw new FlorenceStoreConflict("Retrying family work needs a runnable durable phase");
       }
       const retryAt = instant(input.result.retryAt);
@@ -5629,24 +5840,30 @@ export class PostgresFlorenceStore {
       {
         adult_id: string;
         household_id: string;
-        founder_adult_id: string | null;
+        founder_adult_id: string;
         messages_address: string | null;
         invitation_conversation_id: string;
         invitation_identity_digest: string;
         invitation_message_id: string;
         invitation_issued_at: Date;
+        invitation_retry_at: Date | null;
         setup_issued_at: Date | null;
         link_issued: boolean;
+        has_active_approval: boolean;
+        preferences: JsonObject;
         state: "awaiting_reply" | "issued" | "expired" | "declined";
       }[]
     >`
       select partner.id as adult_id,partner.household_id,
-        approval.sender_adult_id as founder_adult_id,partner.messages_address,
+        founder.id as founder_adult_id,
+        coalesce(partner.messages_address,partner.profile->>'phoneNumber') as messages_address,
         partner.invitation_conversation_id,partner.invitation_identity_digest,
-        partner.invitation_message_id,partner.invitation_issued_at,
+        partner.invitation_message_id,partner.invitation_issued_at,partner.invitation_retry_at,
         case when partner.invitation_digest is not null
           then partner.invitation_retry_at else null end as setup_issued_at,
         (partner.invitation_digest is not null and partner.invitation_retry_at is null) as link_issued,
+        (partner.invitation_approval_source_id is not null) as has_active_approval,
+        partner.preferences,
         case
           when partner.invitation_consumed_at is not null then 'declined'
           when partner.invitation_digest is not null
@@ -5658,8 +5875,9 @@ export class PostgresFlorenceStore {
       from people partner
       left join messages approval on approval.source_id=partner.invitation_approval_source_id
       left join linq_channels channel on channel.id=approval.channel_id
-      left join people founder on founder.id=approval.sender_adult_id
-        and founder.household_id=partner.household_id
+      join people founder on founder.household_id=partner.household_id
+        and founder.kind='adult' and founder.role='steward' and founder.adult_slot=1
+        and founder.status='verified' and founder.identity_subject_digest is not null
       where partner.kind='adult' and partner.role='steward' and partner.adult_slot=2
         and partner.status='planned' and partner.identity_subject_digest is null
         and partner.invitation_conversation_id=${providerConversationId}
@@ -5671,8 +5889,6 @@ export class PostgresFlorenceStore {
             and partner.invitation_approval_source_id is not null
             and partner.invitation_approved_at is not null
             and (partner.invitation_digest is null or partner.invitation_expires_at is not null)
-            and founder.kind='adult' and founder.role='steward' and founder.adult_slot=1
-            and founder.status='verified' and founder.identity_subject_digest is not null
             and channel.household_id=partner.household_id and channel.audience='private'
             and channel.adult_one_id=founder.id and channel.adult_two_id is null
             and channel.identity_one_digest=founder.identity_subject_digest
@@ -5684,18 +5900,38 @@ export class PostgresFlorenceStore {
           (
             partner.invitation_digest is null and partner.invitation_expires_at is null
             and partner.invitation_consumed_at is not null and partner.messages_address is null
+            and partner.invitation_retry_at is null and partner.invitation_last_error is null
+          )
+          or
+          (
+            partner.invitation_consumed_at is null and partner.messages_address is not null
+            and partner.invitation_digest is not null and partner.invitation_expires_at is not null
             and partner.invitation_approval_source_id is null
             and partner.invitation_approved_at is null
-            and partner.invitation_retry_at is null and partner.invitation_last_error is null
           )
         )
       limit 1
     `;
     if (!row) return null;
-    if (row.state === "declined") {
+    const refreshLineage = partnerInvitationRefreshLineage(row.preferences);
+    const lineageMessageId = refreshLineage?.messageId ?? row.invitation_message_id;
+    if (row.state === "declined" || !row.has_active_approval) {
       const expiryNoticeSourceId = deterministicUuid(
-        `partner-invitation-expired\0${row.adult_id}\0${row.invitation_message_id}`,
+        `partner-invitation-expired\0${row.adult_id}\0${lineageMessageId}`,
       );
+      const declinedNoticeSourceId = deterministicUuid(
+        `partner-invitation-declined\0${row.adult_id}\0${lineageMessageId}`,
+      );
+      const failedNoticeSourceId = deterministicUuid(
+        `partner-invitation-delivery_failed\0${row.adult_id}\0${lineageMessageId}`,
+      );
+      const [terminalNotice] = await this.#sql<{ source_id: string }[]>`
+        select source_id from messages
+        where source_id in (${declinedNoticeSourceId},${failedNoticeSourceId})
+          and direction='outbound'
+        limit 1
+      `;
+      if (terminalNotice) return { adultId: row.adult_id, state: "declined" };
       const [expiryNotice] = await this.#sql<{ source_id: string; link_issued: boolean }[]>`
         select source_id,(text like '%setup link expired%') as link_issued
         from messages where source_id=${expiryNoticeSourceId}
@@ -5703,15 +5939,45 @@ export class PostgresFlorenceStore {
           and idempotency_key like ${`partner-invitation-expired:${expiryNoticeSourceId}:h:%`}
       `;
       if (expiryNotice) {
-        return {
+        const reissuable = {
           adultId: row.adult_id,
-          state: "expired",
-          linkIssued: expiryNotice.link_issued,
+          householdId: row.household_id,
+          founderAdultId: row.founder_adult_id,
+          messagesAddress: required(row.messages_address ?? "", "Partner invitation address"),
+          providerConversationId: row.invitation_conversation_id,
+          identitySubjectDigest: row.invitation_identity_digest,
+          initialProviderMessageId: lineageMessageId,
+          handshakeAt: row.invitation_issued_at.toISOString(),
+          setupIssuedAt: row.setup_issued_at?.toISOString() ?? null,
+          ...(row.invitation_retry_at !== null && refreshLineage
+            ? { refreshProviderEventId: refreshLineage.providerEventId }
+            : {}),
         };
+        if (row.state === "declined" || row.state === "expired") {
+          return {
+            ...reissuable,
+            state: "expired",
+            linkIssued: row.state === "expired" ? row.link_issued : expiryNotice.link_issued,
+          };
+        }
+        return { ...reissuable, state: row.state };
       }
+      if (!row.has_active_approval) return null;
     }
     if (row.state === "expired") {
-      return { adultId: row.adult_id, state: row.state, linkIssued: row.link_issued };
+      return {
+        adultId: row.adult_id,
+        state: row.state,
+        linkIssued: row.link_issued,
+        householdId: row.household_id,
+        founderAdultId: row.founder_adult_id,
+        messagesAddress: required(row.messages_address ?? "", "Partner invitation address"),
+        providerConversationId: row.invitation_conversation_id,
+        identitySubjectDigest: row.invitation_identity_digest,
+        initialProviderMessageId: lineageMessageId,
+        handshakeAt: row.invitation_issued_at.toISOString(),
+        setupIssuedAt: row.setup_issued_at?.toISOString() ?? null,
+      };
     }
     if (row.state === "declined") {
       return { adultId: row.adult_id, state: row.state };
@@ -5720,13 +5986,16 @@ export class PostgresFlorenceStore {
       adultId: row.adult_id,
       state: row.state,
       householdId: row.household_id,
-      founderAdultId: required(row.founder_adult_id ?? "", "Partner invitation founder"),
+      founderAdultId: row.founder_adult_id,
       messagesAddress: required(row.messages_address ?? "", "Partner invitation address"),
       providerConversationId: row.invitation_conversation_id,
       identitySubjectDigest: row.invitation_identity_digest,
-      initialProviderMessageId: row.invitation_message_id,
+      initialProviderMessageId: lineageMessageId,
       handshakeAt: row.invitation_issued_at.toISOString(),
       setupIssuedAt: row.setup_issued_at?.toISOString() ?? null,
+      ...(row.invitation_retry_at !== null && refreshLineage
+        ? { refreshProviderEventId: refreshLineage.providerEventId }
+        : {}),
     };
   }
 
@@ -5919,54 +6188,26 @@ export class PostgresFlorenceStore {
           and nullif(partner.profile->>'firstName','') is not null
         for update of partner
       `;
-      if (!invitation) return false;
-      return terminalizeIssuedPartnerInvitation(sql, invitation, occurredAt, "declined");
-    });
-  }
-
-  async expirePartnerInvitations(input: { now: string }): Promise<number> {
-    const expiredAt = instant(input.now);
-    return this.#sql.begin(async (sql) => {
-      const invitations = await sql<IssuedPartnerInvitationRow[]>`
-        select partner.id as adult_id,partner.household_id,
-          partner.profile->>'firstName' as first_name,
-          partner.invitation_message_id,
-          (partner.invitation_digest is not null and partner.invitation_retry_at is null) as link_issued,
-          founder.id as founder_adult_id,
-          channel.id as founder_channel_id
-        from people partner
-        join messages approval on approval.source_id=partner.invitation_approval_source_id
-        join linq_channels channel on channel.id=approval.channel_id
-        join people founder on founder.id=approval.sender_adult_id
-          and founder.household_id=partner.household_id
-        where partner.kind='adult' and partner.role='steward' and partner.adult_slot=2
-          and partner.status='planned' and partner.identity_subject_digest is null
-          and partner.invitation_digest is not null and partner.invitation_expires_at is not null
-          and partner.invitation_expires_at<=${expiredAt}
-          and partner.invitation_consumed_at is null and partner.messages_address is not null
-          and partner.invitation_conversation_id is not null
-          and partner.invitation_identity_digest is not null
-          and partner.invitation_message_id is not null and partner.invitation_issued_at is not null
-          and partner.invitation_approval_source_id is not null
-          and partner.invitation_approved_at is not null
-          and founder.kind='adult' and founder.role='steward' and founder.adult_slot=1
-          and founder.status='verified' and founder.identity_subject_digest is not null
-          and channel.household_id=partner.household_id and channel.audience='private'
-          and channel.adult_one_id=founder.id and channel.adult_two_id is null
-          and channel.identity_one_digest=founder.identity_subject_digest
-          and channel.revoked_at is null and channel.stopped_at is null
-          and approval.direction='inbound' and approval.sender_adult_id=founder.id
-          and nullif(partner.profile->>'firstName','') is not null
-        order by partner.invitation_expires_at,partner.id
-        for update of partner
-      `;
-      let expired = 0;
-      for (const invitation of invitations) {
-        if (await terminalizeIssuedPartnerInvitation(sql, invitation, expiredAt, "expired")) {
-          expired += 1;
-        }
+      if (invitation) {
+        return terminalizeIssuedPartnerInvitation(sql, invitation, occurredAt, "declined");
       }
-      return expired;
+      const recovered = await readRecoveredExpiredPartnerInvitation(sql, {
+        adultId: input.adultId,
+        providerConversationId,
+        identitySubjectDigest: input.identitySubjectDigest,
+      });
+      if (!recovered) return false;
+      if (recovered.invitation_consumed_at !== null) {
+        await stagePartnerInvitationTerminalNotice(sql, {
+          invitation: recovered,
+          reason: "declined",
+          linkIssued: recovered.link_issued,
+          occurredAt,
+          stableKey: recovered.lineage_message_id ?? recovered.invitation_message_id,
+        });
+        return true;
+      }
+      return terminalizeIssuedPartnerInvitation(sql, recovered, occurredAt, "declined");
     });
   }
 
@@ -6008,7 +6249,7 @@ export class PostgresFlorenceStore {
           adult_id: string;
           household_id: string;
           first_name: string;
-          approval_source_id: string;
+          approval_source_id: string | null;
           founder_adult_id: string;
           founder_channel_id: string;
           messages_address: string | null;
@@ -6016,8 +6257,10 @@ export class PostgresFlorenceStore {
           invitation_identity_digest: string | null;
           invitation_message_id: string | null;
           invitation_issued_at: Date | null;
+          invitation_consumed_at: Date | null;
           invitation_digest: string | null;
           invitation_retry_at: Date | null;
+          preferences: JsonObject;
         }[]
       >`
         select partner.id as adult_id,partner.household_id,
@@ -6026,7 +6269,8 @@ export class PostgresFlorenceStore {
           founder.id as founder_adult_id,channel.id as founder_channel_id,
           partner.messages_address,partner.invitation_conversation_id,
           partner.invitation_identity_digest,partner.invitation_message_id,
-          partner.invitation_issued_at,partner.invitation_digest,partner.invitation_retry_at
+          partner.invitation_issued_at,partner.invitation_consumed_at,
+          partner.invitation_digest,partner.invitation_retry_at,partner.preferences
         from people partner
         join messages approval on approval.source_id=partner.invitation_approval_source_id
         join linq_channels channel on channel.id=approval.channel_id
@@ -6063,22 +6307,26 @@ export class PostgresFlorenceStore {
           and nullif(partner.profile->>'firstName','') is not null
         for update of partner
       `;
-      if (!invitation) {
+      const recovered = invitation
+        ? null
+        : await readRecoveredExpiredPartnerInvitation(sql, { adultId: input.adultId });
+      const pendingInvitation = invitation ?? recovered;
+      if (!pendingInvitation || pendingInvitation.invitation_consumed_at !== null) {
         throw new FlorenceStoreConflict("The partner invitation is no longer pending");
       }
       if (suppliedDelivery) {
         if (
-          invitation.invitation_issued_at !== null &&
-          (invitation.messages_address === null ||
-            invitation.invitation_conversation_id !== suppliedDelivery.providerConversationId ||
-            invitation.invitation_identity_digest !== suppliedDelivery.identitySubjectDigest ||
-            invitation.invitation_message_id !== suppliedDelivery.providerMessageId ||
-            invitation.invitation_issued_at.getTime() !== suppliedDelivery.issuedAt.getTime())
+          pendingInvitation.invitation_issued_at !== null &&
+          (pendingInvitation.messages_address === null ||
+            pendingInvitation.invitation_conversation_id !== suppliedDelivery.providerConversationId ||
+            pendingInvitation.invitation_identity_digest !== suppliedDelivery.identitySubjectDigest ||
+            pendingInvitation.invitation_message_id !== suppliedDelivery.providerMessageId ||
+            pendingInvitation.invitation_issued_at.getTime() !== suppliedDelivery.issuedAt.getTime())
         ) {
           throw new FlorenceStoreConflict("The failed partner conversation does not match its handshake");
         }
         const [collision] = await sql<{ id: string }[]>`
-          select id from people where id<>${invitation.adult_id}
+          select id from people where id<>${pendingInvitation.adult_id}
             and invitation_conversation_id=${suppliedDelivery.providerConversationId}
           union all
           select id from linq_channels
@@ -6093,13 +6341,14 @@ export class PostgresFlorenceStore {
       const terminalized = await sql`
         update people set invitation_digest=null,invitation_expires_at=null,
           invitation_consumed_at=${occurredAt},messages_address=null,
-          invitation_conversation_id=${suppliedDelivery?.providerConversationId ?? invitation.invitation_conversation_id},
-          invitation_identity_digest=${suppliedDelivery?.identitySubjectDigest ?? invitation.invitation_identity_digest},
-          invitation_message_id=${suppliedDelivery?.providerMessageId ?? invitation.invitation_message_id},
-          invitation_issued_at=${suppliedDelivery?.issuedAt ?? invitation.invitation_issued_at},
+          invitation_conversation_id=${suppliedDelivery?.providerConversationId ?? pendingInvitation.invitation_conversation_id},
+          invitation_identity_digest=${suppliedDelivery?.identitySubjectDigest ?? pendingInvitation.invitation_identity_digest},
+          invitation_message_id=${suppliedDelivery?.providerMessageId ?? pendingInvitation.invitation_message_id},
+          invitation_issued_at=${suppliedDelivery?.issuedAt ?? pendingInvitation.invitation_issued_at},
           invitation_approval_source_id=null,invitation_approved_at=null,
           invitation_retry_at=null,invitation_last_error=null,updated_at=${occurredAt}
-        where id=${invitation.adult_id} and invitation_approval_source_id=${invitation.approval_source_id}
+        where id=${pendingInvitation.adult_id}
+          and invitation_approval_source_id is not distinct from ${pendingInvitation.approval_source_id}
           and invitation_consumed_at is null
           and (invitation_digest is null or invitation_retry_at is not null)
         returning id
@@ -6108,11 +6357,14 @@ export class PostgresFlorenceStore {
         throw new FlorenceStoreConflict("The partner invitation changed before it could be stopped");
       }
       await stagePartnerInvitationTerminalNotice(sql, {
-        invitation,
+        invitation: pendingInvitation,
         reason: "delivery_failed",
         linkIssued: false,
         occurredAt,
-        stableKey: invitation.approval_source_id,
+        stableKey:
+          partnerInvitationRefreshLineage(pendingInvitation.preferences)?.messageId ??
+          pendingInvitation.invitation_message_id ??
+          required(pendingInvitation.approval_source_id ?? "", "Partner invitation approval source"),
       });
     });
   }
@@ -6234,6 +6486,7 @@ export class PostgresFlorenceStore {
         const [reconciled] = await sql<PersonRow[]>`
           update people set invitation_expires_at=coalesce(invitation_expires_at,${expiresAt}),
             invitation_retry_at=${retryAt},invitation_last_error=${retryError},
+            preferences=preferences-'partnerInvitationRefresh',
             updated_at=greatest(updated_at,${retryAt ?? occurredAt})
           where id=${row.id} and invitation_digest is null
             and invitation_conversation_id=${providerConversationId}
@@ -6283,7 +6536,8 @@ export class PostgresFlorenceStore {
           invitation_conversation_id=${providerConversationId},
           invitation_identity_digest=${input.identitySubjectDigest},
           invitation_message_id=${providerMessageId},invitation_issued_at=${occurredAt},
-          invitation_retry_at=${retryAt},invitation_last_error=${retryError},updated_at=${occurredAt}
+          invitation_retry_at=${retryAt},invitation_last_error=${retryError},
+          preferences=preferences-'partnerInvitationRefresh',updated_at=${occurredAt}
         where id=${row.id} and invitation_approval_source_id=${input.approvalSourceId}
           and invitation_issued_at is null returning *
       `;
@@ -6417,6 +6671,131 @@ export class PostgresFlorenceStore {
       return updated;
     });
     if (!adult) throw new Error("The partner invitation was not stored");
+    return personRecord(adult);
+  }
+
+  async refreshMessagesEnrollment(input: IssueMessagesEnrollmentInput): Promise<FamilyMemberRecord> {
+    assertDigest(input.challengeDigest, "Messages enrollment challenge");
+    assertDigest(input.identitySubjectDigest, "Invited Messages identity");
+    const issuedAt = instant(input.issuedAt);
+    const expiresAt = instant(input.expiresAt);
+    if (expiresAt <= issuedAt) {
+      throw new FlorenceStoreConflict("A refreshed Messages invitation must expire after issue");
+    }
+    const providerConversationId = required(input.providerConversationId, "Invited Linq conversation ID");
+    const providerMessageId = required(input.providerMessageId, "Prior partner setup message ID");
+    const refreshProviderEventId = required(
+      input.refreshProviderEventId ?? "",
+      "Partner setup refresh provider event ID",
+    );
+    const messagesAddress = required(input.messagesAddress, "Invited Messages address");
+    if (!/^\+[1-9]\d{7,14}$/.test(messagesAddress)) {
+      throw new FlorenceStoreConflict("Invited Messages address must be E.164");
+    }
+    const adult = await this.#sql.begin(async (sql) => {
+      const [founder] = await sql<{ id: string }[]>`
+        select id from people where household_id=${input.householdId} and id=${input.actorAdultId}
+          and kind='adult' and role='steward' and adult_slot=1 and status='verified'
+        for share
+      `;
+      if (!founder) {
+        throw new FlorenceStoreUnauthorized("Only the verified founding adult can refresh the partner link");
+      }
+      const [row] = await sql<PersonRow[]>`
+        select * from people where household_id=${input.householdId} and id=${input.adultId}
+          and kind='adult' and role='steward' and adult_slot=2 for update
+      `;
+      const priorRefreshLineage = row ? partnerInvitationRefreshLineage(row.preferences) : null;
+      const lineageMessageId = priorRefreshLineage?.messageId ?? row?.invitation_message_id;
+      if (
+        row?.status !== "planned" ||
+        row.identity_subject_digest !== null ||
+        row.invitation_conversation_id !== providerConversationId ||
+        row.invitation_identity_digest !== input.identitySubjectDigest ||
+        lineageMessageId !== providerMessageId ||
+        row.invitation_issued_at === null ||
+        jsonRecord(row.profile).phoneNumber !== messagesAddress
+      ) {
+        throw new FlorenceStoreConflict("The expired partner link no longer belongs to this thread");
+      }
+      if (
+        row.invitation_digest === input.challengeDigest &&
+        row.invitation_expires_at?.getTime() === expiresAt.getTime() &&
+        row.invitation_consumed_at === null &&
+        row.messages_address === messagesAddress &&
+        row.invitation_retry_at !== null
+      ) {
+        return row;
+      }
+      const expiredInPlace =
+        row.invitation_digest !== null &&
+        row.invitation_expires_at !== null &&
+        row.invitation_expires_at <= issuedAt &&
+        row.invitation_consumed_at === null &&
+        row.messages_address === messagesAddress;
+      let terminalizedAsExpired = false;
+      if (
+        row.invitation_digest === null &&
+        row.invitation_expires_at === null &&
+        row.invitation_consumed_at !== null &&
+        row.messages_address === null &&
+        row.invitation_retry_at === null
+      ) {
+        const expiryNoticeSourceId = deterministicUuid(
+          `partner-invitation-expired\0${row.id}\0${lineageMessageId}`,
+        );
+        const [expiryNotice] = await sql<{ source_id: string }[]>`
+          select source_id from messages where source_id=${expiryNoticeSourceId}
+            and direction='outbound'
+            and idempotency_key like ${`partner-invitation-expired:${expiryNoticeSourceId}:h:%`}
+          limit 1
+        `;
+        terminalizedAsExpired = Boolean(expiryNotice);
+      }
+      if (!expiredInPlace && !terminalizedAsExpired) {
+        throw new FlorenceStoreConflict("The partner setup link has not expired in this thread");
+      }
+      const [collision] = await sql<{ id: string }[]>`
+        select p.id from people p where p.id<>${row.id} and (
+          p.invitation_digest=${input.challengeDigest}
+          or p.messages_address=${messagesAddress}
+          or p.invitation_conversation_id=${providerConversationId}
+          or p.invitation_message_id=${providerMessageId}
+          or p.identity_subject_digest=${input.identitySubjectDigest}
+          or p.invitation_identity_digest=${input.identitySubjectDigest}
+        )
+        union all
+        select c.id from linq_channels c where c.provider_conversation_id=${providerConversationId}
+          and c.revoked_at is null
+        limit 1
+      `;
+      if (collision) {
+        throw new FlorenceStoreConflict("The refreshed partner invitation is already bound elsewhere");
+      }
+      const [updated] = await sql<PersonRow[]>`
+        update people set invitation_digest=${input.challengeDigest},invitation_expires_at=${expiresAt},
+          invitation_consumed_at=null,messages_address=${messagesAddress},
+          invitation_retry_at=${issuedAt},invitation_last_error=null,
+          preferences=(preferences-'partnerInvitationRefresh')||${sql.json({
+            partnerInvitationRefresh: {
+              messageId: lineageMessageId,
+              providerEventId: refreshProviderEventId,
+            },
+          })},updated_at=${issuedAt}
+        where id=${row.id}
+          and invitation_conversation_id=${providerConversationId}
+          and invitation_identity_digest=${input.identitySubjectDigest}
+          and invitation_message_id=${row.invitation_message_id}
+          and invitation_digest is not distinct from ${row.invitation_digest}
+          and invitation_expires_at is not distinct from ${row.invitation_expires_at}
+          and invitation_consumed_at is not distinct from ${row.invitation_consumed_at}
+        returning *
+      `;
+      if (!updated) {
+        throw new FlorenceStoreConflict("The expired partner link changed before it could be refreshed");
+      }
+      return updated;
+    });
     return personRecord(adult);
   }
 
@@ -6609,7 +6988,7 @@ export class PostgresFlorenceStore {
           guardian_attested_at=${guardianAttestedAt},invitation_consumed_at=${occurredAt},
           invitation_retry_at=null,invitation_last_error=null,
           profile=profile||${sql.json({ firstName, lastName, relationship: "Partner" })},
-          preferences=preferences||${sql.json({
+          preferences=(preferences-'partnerInvitationRefresh')||${sql.json({
             proactiveUseAcceptedAt: proactiveUseAcceptedAt.toISOString(),
             privateConflictBusySharingEnabled: input.privateConflictBusySharingEnabled,
           })},updated_at=${occurredAt}
@@ -8164,6 +8543,257 @@ export class PostgresFlorenceStore {
     };
   }
 
+  /**
+   * Returns the one exact pending household question that this private Message
+   * could answer. This is intentionally only structural candidate selection;
+   * Florence still decides whether the Message actually belongs to it.
+   */
+  async readParticipantReplyCandidate(input: {
+    sourceId: string;
+    readAt: string;
+  }): Promise<ParticipantReplyCandidate | null> {
+    assertUuid(input.sourceId, "Participant reply source ID");
+    const readAt = instant(input.readAt);
+    const [turn] = await this.#sql<
+      (ChannelRow & {
+        source_id: string;
+        sender_adult_id: string;
+        move_kind: "message" | "reply" | "reaction";
+        text: string | null;
+        reply_to_source_id: string | null;
+        status: "received" | "handled";
+        visibility: Visibility;
+        occurred_at: Date;
+      })[]
+    >`
+      select channel.*,message.source_id,message.sender_adult_id,message.move_kind,
+        message.text,message.reply_to_source_id,message.status,source.visibility,
+        source.occurred_at
+      from messages message
+      join sources source on source.id=message.source_id
+      join linq_channels channel on channel.id=message.channel_id
+      where message.source_id=${input.sourceId} and message.direction='inbound'
+        and coalesce(message.retry_at,message.not_before)<=${readAt}
+    `;
+    if (
+      turn?.status !== "received" ||
+      turn.audience !== "private" ||
+      turn.visibility !== "private" ||
+      turn.move_kind === "reaction" ||
+      !turn.text?.trim() ||
+      turn.revoked_at !== null ||
+      turn.stopped_at !== null
+    ) {
+      return null;
+    }
+
+    const participantWorks = await this.#sql<ProactiveWorkRow[]>`
+      select work.*
+      from proactive_work work
+      join messages question
+        on question.source_id=(work.task_state->'pendingParticipantRequest'->>'questionSourceId')::uuid
+      join sources question_source on question_source.id=question.source_id
+      where work.household_id=${turn.household_id} and work.kind='family_task'
+        and work.visibility='household' and work.owner_adult_id is null
+        and work.status='paused' and work.task_state->>'phase'='waiting'
+        and work.task_state->'pendingParticipantRequest'->>'targetAdultId'=${turn.sender_adult_id}
+        and work.task_state->'pendingParticipantRequest'->>'channelId'=${turn.id}
+        and question.channel_id=${turn.id} and question.direction='outbound'
+        and question.move_kind in ('message','reply') and question.status='sent'
+        and question.provider_message_id is not null
+        and (question_source.occurred_at,question_source.id)
+          < (${turn.occurred_at},${turn.source_id}::uuid)
+        and (${turn.reply_to_source_id}::uuid is null
+          or question.source_id=${turn.reply_to_source_id}::uuid)
+      order by
+        (work.task_state->'pendingParticipantRequest'->>'askedAt')::timestamptz,
+        work.created_at,work.id
+      limit ${turn.reply_to_source_id === null ? 2 : 1}
+    `;
+    const participantWork =
+      turn.reply_to_source_id === null
+        ? participantWorks.length === 1
+          ? participantWorks[0]
+          : null
+        : (participantWorks[0] ?? null);
+    if (!participantWork) return null;
+    const request = familyWorkState(participantWork.task_state).pendingParticipantRequest;
+    if (
+      !request ||
+      request.targetAdultId !== turn.sender_adult_id ||
+      request.channelId !== turn.id ||
+      (turn.reply_to_source_id !== null && request.questionSourceId !== turn.reply_to_source_id)
+    ) {
+      return null;
+    }
+    return {
+      requestId: request.requestId,
+      targetAdultName: request.targetAdultName,
+      question: request.question,
+      askedAt: request.askedAt,
+      taskObjective: required(participantWork.objective ?? "", "Participant task objective"),
+      explicitlyRepliesToQuestion: turn.reply_to_source_id !== null,
+    };
+  }
+
+  /**
+   * Atomically revalidates and consumes the exact request Florence classified.
+   * An unrelated private turn never reaches this commit.
+   */
+  async commitParticipantReply(input: {
+    sourceId: string;
+    requestId: string;
+    acknowledgement: ParticipantReplyAcknowledgement;
+    handledAt: string;
+  }): Promise<"committed" | "not_participant" | "superseded"> {
+    assertUuid(input.sourceId, "Participant reply source ID");
+    assertUuid(input.requestId, "Participant request ID");
+    const handledAt = instant(input.handledAt);
+    const acknowledgement =
+      input.acknowledgement.kind === "text"
+        ? {
+            kind: "text" as const,
+            text: bounded(required(input.acknowledgement.text, "Participant acknowledgement"), 2_000),
+          }
+        : input.acknowledgement;
+    return this.#sql.begin(async (sql) => {
+      const [turn] = await sql<
+        (ChannelRow & {
+          source_id: string;
+          sender_adult_id: string;
+          move_kind: "message" | "reply" | "reaction";
+          text: string | null;
+          reply_to_source_id: string | null;
+          status: "received" | "handled";
+          visibility: Visibility;
+          occurred_at: Date;
+        })[]
+      >`
+        select channel.*,message.source_id,message.sender_adult_id,message.move_kind,
+          message.text,message.reply_to_source_id,message.status,source.visibility,
+          source.occurred_at
+        from messages message
+        join sources source on source.id=message.source_id
+        join linq_channels channel on channel.id=message.channel_id
+        where message.source_id=${input.sourceId} and message.direction='inbound'
+          and coalesce(message.retry_at,message.not_before)<=${handledAt}
+        for update of message,source
+      `;
+      if (turn?.status !== "received") return "superseded";
+      if (
+        turn.audience !== "private" ||
+        turn.visibility !== "private" ||
+        turn.move_kind === "reaction" ||
+        !turn.text?.trim() ||
+        turn.revoked_at !== null ||
+        turn.stopped_at !== null
+      ) {
+        return "not_participant";
+      }
+
+      const participantWorks = await sql<ProactiveWorkRow[]>`
+        select work.*
+        from proactive_work work
+        join messages question
+          on question.source_id=(work.task_state->'pendingParticipantRequest'->>'questionSourceId')::uuid
+        join sources question_source on question_source.id=question.source_id
+        where work.household_id=${turn.household_id} and work.kind='family_task'
+          and work.visibility='household' and work.owner_adult_id is null
+          and work.status='paused' and work.task_state->>'phase'='waiting'
+          and work.task_state->'pendingParticipantRequest'->>'targetAdultId'=${turn.sender_adult_id}
+          and work.task_state->'pendingParticipantRequest'->>'channelId'=${turn.id}
+          and question.channel_id=${turn.id} and question.direction='outbound'
+          and question.move_kind in ('message','reply') and question.status='sent'
+          and question.provider_message_id is not null
+          and (question_source.occurred_at,question_source.id)
+            < (${turn.occurred_at},${turn.source_id}::uuid)
+          and (${turn.reply_to_source_id}::uuid is null
+            or question.source_id=${turn.reply_to_source_id}::uuid)
+        order by
+          (work.task_state->'pendingParticipantRequest'->>'askedAt')::timestamptz,
+          work.created_at,work.id
+        limit ${turn.reply_to_source_id === null ? 2 : 1} for update of work
+      `;
+      const participantWork =
+        turn.reply_to_source_id === null
+          ? participantWorks.length === 1
+            ? participantWorks[0]
+            : null
+          : (participantWorks[0] ?? null);
+      if (!participantWork) return "not_participant";
+
+      const state = familyWorkState(participantWork.task_state);
+      const request = state.pendingParticipantRequest;
+      if (
+        !request ||
+        request.requestId !== input.requestId ||
+        request.targetAdultId !== turn.sender_adult_id ||
+        request.channelId !== turn.id ||
+        (turn.reply_to_source_id !== null && request.questionSourceId !== turn.reply_to_source_id)
+      ) {
+        return "not_participant";
+      }
+      const nextState = steerFamilyWorkState(state, {
+        sourceId: turn.source_id,
+        text: bounded(required(turn.text, "Participant reply"), 4_000),
+        occurredAt: turn.occurred_at.toISOString(),
+      });
+      await terminalizeUnsentFamilyWorkOutbounds(sql, participantWork.id, "steering");
+      await sql`
+        insert into proactive_work_sources (work_id,source_id)
+        values (${participantWork.id},${turn.source_id}) on conflict do nothing
+      `;
+      await sql`
+        update sources set metadata=metadata||${sql.json({
+          participantRequestId: request.requestId,
+          familyWorkSteeringForId: participantWork.id,
+        })}
+        where id=${turn.source_id} and household_id=${turn.household_id}
+      `;
+      const [resumed] = await sql`
+        update proactive_work set task_state=${sql.json(nextState)},status='active',
+          next_check_at=${handledAt},current_conclusion=${`Resuming after ${request.targetAdultName}'s reply.`},
+          last_error=null
+        where id=${participantWork.id} and status='paused'
+          and task_state->'pendingParticipantRequest'->>'requestId'=${request.requestId}
+        returning id
+      `;
+      if (!resumed) {
+        throw new FlorenceStoreConflict("The participant request changed before its reply was committed");
+      }
+
+      const acknowledgementTurnId = deterministicUuid(`participant-reply-ack-turn\0${turn.source_id}`);
+      await insertOutbound(sql, {
+        sourceId: deterministicUuid(`participant-reply-ack\0${turn.source_id}`),
+        idempotencyKey: `participant-reply-ack:${turn.source_id}`,
+        moveKind: acknowledgement.kind === "reaction" ? "reaction" : "reply",
+        text: acknowledgement.kind === "text" ? acknowledgement.text : null,
+        reaction: acknowledgement.kind === "reaction" ? acknowledgement.reaction : null,
+        replyToSourceId: turn.source_id,
+        turnId: acknowledgementTurnId,
+        turnPart: acknowledgement.kind === "reaction" ? -1 : 0,
+        notBefore: handledAt.toISOString(),
+        householdId: turn.household_id,
+        channelId: turn.id,
+        visibility: "private",
+        ownerAdultId: turn.sender_adult_id,
+        metadata: {
+          participantRequestId: request.requestId,
+          familyWorkSteeringForId: participantWork.id,
+        },
+        occurredAt: handledAt,
+      });
+      const handled = await sql`
+        update messages set status='handled',handled_at=${handledAt},retry_at=null,last_error=null
+        where source_id=${turn.source_id} and status='received' returning source_id
+      `;
+      if (handled.length !== 1) {
+        throw new FlorenceStoreConflict("The participant reply changed before commit");
+      }
+      return "committed";
+    });
+  }
+
   async commitTurn(input: CommitTurnInput): Promise<CommitTurnResult> {
     const handledAt = instant(input.handledAt);
     const completeDocketCandidateIds = input.completeDocketCandidateIds ?? [];
@@ -8185,6 +8815,7 @@ export class PostgresFlorenceStore {
           audience: Audience;
           visibility: Visibility;
           move_kind: "message" | "reply" | "reaction";
+          text: string | null;
           reply_to_source_id: string | null;
           status: "received" | "handled";
           occurred_at: Date;
@@ -8201,7 +8832,7 @@ export class PostgresFlorenceStore {
         }[]
       >`
         select m.source_id,s.household_id,m.channel_id,m.sender_adult_id,c.audience,s.visibility,
-          m.move_kind,m.reply_to_source_id,m.status,s.occurred_at,c.revoked_at,c.stopped_at,
+          m.move_kind,m.text,m.reply_to_source_id,m.status,s.occurred_at,c.revoked_at,c.stopped_at,
           c.provider_conversation_id,c.adult_one_id,c.identity_one_digest,c.adult_two_id,
           c.identity_two_digest,c.authority_digest,c.bound_at,s.metadata as source_metadata
         from messages m join sources s on s.id=m.source_id join linq_channels c on c.id=m.channel_id
@@ -9038,6 +9669,7 @@ export class PostgresFlorenceStore {
               phase: "terminal",
               claim: null,
               pendingCall: null,
+              pendingParticipantRequest: null,
               waitingDocket: null,
               progressRevision,
               terminal: { outcome: "cancelled", text: "Cancelled." },
@@ -9404,6 +10036,10 @@ export class PostgresFlorenceStore {
               and (
                 (source.metadata->>'familyWorkDeliveryKind'='progress' and work.status='active')
                 or (source.metadata->>'familyWorkDeliveryKind'='waiting' and work.status='paused')
+                or (source.metadata->>'familyWorkDeliveryKind'='participant_request'
+                  and work.status='paused'
+                  and work.task_state->'pendingParticipantRequest'->>'questionSourceId'=
+                    source.id::text)
                 or (source.metadata->>'familyWorkDeliveryKind'='terminal'
                   and work.status='delivering')
               )
@@ -9565,19 +10201,49 @@ export class PostgresFlorenceStore {
     });
   }
 
-  async retryOutbound(input: { sourceId: string; retryAt: string | null; error: string }): Promise<void> {
-    const [current] = await this.#sql<{ move_kind: "message" | "reply" | "reaction" }[]>`
-      select move_kind from messages where source_id=${input.sourceId}
-        and direction='outbound' and status='sending'
-    `;
-    if (!current) throw new FlorenceStoreConflict("The outbound message is no longer retryable");
-    const retryAt = input.retryAt;
-    const updated = await this.#sql`
-      update messages set status=${retryAt ? "pending" : "failed"},sending_at=null,
-        retry_at=${retryAt ? instant(retryAt) : null},last_error=${bounded(input.error, 2_000)}
-      where source_id=${input.sourceId} and direction='outbound' and status='sending' returning source_id
-    `;
-    if (updated.length !== 1) throw new FlorenceStoreConflict("The outbound message is no longer retryable");
+  async retryOutbound(input: {
+    sourceId: string;
+    retryAt: string | null;
+    error: string;
+    occurredAt: string;
+  }): Promise<void> {
+    const occurredAt = instant(input.occurredAt);
+    const error = bounded(input.error, 2_000);
+    await this.#sql.begin(async (sql) => {
+      const [current] = await sql<
+        {
+          move_kind: "message" | "reply" | "reaction";
+          household_id: string;
+          metadata: JsonValue;
+        }[]
+      >`
+        select message.move_kind,source.household_id,source.metadata
+        from messages message join sources source on source.id=message.source_id
+        where message.source_id=${input.sourceId}
+          and message.direction='outbound' and message.status='sending'
+        for update of message,source
+      `;
+      if (!current) throw new FlorenceStoreConflict("The outbound message is no longer retryable");
+      const retryAt = input.retryAt;
+      const updated = await sql`
+        update messages set status=${retryAt ? "pending" : "failed"},sending_at=null,
+          retry_at=${retryAt ? instant(retryAt) : null},last_error=${error}
+        where source_id=${input.sourceId} and direction='outbound' and status='sending'
+        returning source_id
+      `;
+      if (updated.length !== 1) {
+        throw new FlorenceStoreConflict("The outbound message is no longer retryable");
+      }
+      if (retryAt === null) {
+        await wakeFamilyWorkAfterParticipantDeliveryFailure(sql, {
+          sourceId: input.sourceId,
+          householdId: current.household_id,
+          metadata: current.metadata,
+          occurredAt,
+          error,
+        });
+      }
+    });
   }
 
   async recordLinqObservation(input: LinqOutboundObservation): Promise<LinqObservationResult> {
@@ -9596,7 +10262,8 @@ export class PostgresFlorenceStore {
         input.kind === "message_status"
           ? await sql<LinqObservationRow[]>`
               select m.source_id,m.status,m.move_kind,m.provider_message_id,m.sent_at,m.receipt_detail,
-                m.not_before,s.occurred_at as source_occurred_at
+                m.not_before,s.household_id as source_household_id,s.metadata as source_metadata,
+                s.occurred_at as source_occurred_at
               from messages m join linq_channels c on c.id=m.channel_id
               join sources s on s.id=m.source_id
               where m.direction='outbound' and m.move_kind in ('message','reply')
@@ -9608,6 +10275,7 @@ export class PostgresFlorenceStore {
           : await sql<LinqObservationRow[]>`
               select reaction.source_id,reaction.status,reaction.move_kind,reaction.provider_message_id,
                 reaction.sent_at,reaction.receipt_detail,reaction.not_before,
+                source.household_id as source_household_id,source.metadata as source_metadata,
                 source.occurred_at as source_occurred_at
               from messages reaction join linq_channels c on c.id=reaction.channel_id
               join sources source on source.id=reaction.source_id
@@ -9652,6 +10320,15 @@ export class PostgresFlorenceStore {
           last_error=${failed ? merged.lastError : null}
         where source_id=${current.source_id}
       `;
+      if (failed) {
+        await wakeFamilyWorkAfterParticipantDeliveryFailure(sql, {
+          sourceId: current.source_id,
+          householdId: current.source_household_id,
+          metadata: current.source_metadata,
+          occurredAt,
+          error: merged.lastError ?? "Messages could not deliver the private question.",
+        });
+      }
       return "applied";
     });
   }
@@ -11239,6 +11916,113 @@ function personRecord(row: PersonRow): FamilyMemberRecord {
   };
 }
 
+function partnerInvitationRefreshLineage(preferences: JsonObject): {
+  messageId: string;
+  providerEventId: string;
+} | null {
+  const value = preferences.partnerInvitationRefresh;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = jsonRecord(value);
+  const messageId = record.messageId;
+  const providerEventId = record.providerEventId;
+  return typeof messageId === "string" &&
+    messageId.length > 0 &&
+    typeof providerEventId === "string" &&
+    providerEventId.length > 0
+    ? { messageId, providerEventId }
+    : null;
+}
+
+type RecoveredExpiredPartnerInvitationRow = IssuedPartnerInvitationRow & {
+  approval_source_id: null;
+  messages_address: string;
+  invitation_conversation_id: string;
+  invitation_identity_digest: string;
+  invitation_issued_at: Date;
+  invitation_consumed_at: Date | null;
+  invitation_digest: string | null;
+  invitation_retry_at: Date | null;
+  preferences: JsonObject;
+};
+
+async function readRecoveredExpiredPartnerInvitation(
+  sql: postgres.TransactionSql,
+  input: {
+    adultId: string;
+    providerConversationId?: string;
+    identitySubjectDigest?: string;
+  },
+): Promise<RecoveredExpiredPartnerInvitationRow | null> {
+  const [partner] = await sql<
+    {
+      adult_id: string;
+      household_id: string;
+      first_name: string;
+      messages_address: string;
+      invitation_conversation_id: string;
+      invitation_identity_digest: string;
+      invitation_message_id: string;
+      invitation_issued_at: Date;
+      invitation_consumed_at: Date | null;
+      invitation_digest: string | null;
+      invitation_retry_at: Date | null;
+      preferences: JsonObject;
+    }[]
+  >`
+    select partner.id as adult_id,partner.household_id,
+      partner.profile->>'firstName' as first_name,
+      coalesce(partner.messages_address,partner.profile->>'phoneNumber') as messages_address,
+      partner.invitation_conversation_id,partner.invitation_identity_digest,
+      partner.invitation_message_id,partner.invitation_issued_at,
+      partner.invitation_consumed_at,partner.invitation_digest,partner.invitation_retry_at,
+      partner.preferences
+    from people partner
+    where partner.id=${input.adultId} and partner.kind='adult' and partner.role='steward'
+      and partner.adult_slot=2 and partner.status='planned'
+      and partner.identity_subject_digest is null
+      and partner.invitation_approval_source_id is null
+      and partner.invitation_approved_at is null
+      and partner.invitation_conversation_id is not null
+      and partner.invitation_identity_digest is not null
+      and partner.invitation_message_id is not null and partner.invitation_issued_at is not null
+      and nullif(partner.profile->>'phoneNumber','') is not null
+      and nullif(partner.profile->>'firstName','') is not null
+      ${input.providerConversationId ? sql`and partner.invitation_conversation_id=${input.providerConversationId}` : sql``}
+      ${input.identitySubjectDigest ? sql`and partner.invitation_identity_digest=${input.identitySubjectDigest}` : sql``}
+    for update of partner
+  `;
+  if (!partner) return null;
+  const refreshLineage = partnerInvitationRefreshLineage(partner.preferences);
+  const lineageMessageId = refreshLineage?.messageId ?? partner.invitation_message_id;
+  const expiryNoticeSourceId = deterministicUuid(
+    `partner-invitation-expired\0${partner.adult_id}\0${lineageMessageId}`,
+  );
+  const [lineage] = await sql<{ founder_adult_id: string; founder_channel_id: string }[]>`
+    select founder.id as founder_adult_id,channel.id as founder_channel_id
+    from messages notice
+    join linq_channels channel on channel.id=notice.channel_id
+    join people founder on founder.id=notice.owner_adult_id
+      and founder.household_id=${partner.household_id}
+    where notice.source_id=${expiryNoticeSourceId} and notice.direction='outbound'
+      and notice.idempotency_key like ${`partner-invitation-expired:${expiryNoticeSourceId}:h:%`}
+      and channel.household_id=${partner.household_id} and channel.audience='private'
+      and channel.adult_one_id=founder.id and channel.adult_two_id is null
+      and channel.revoked_at is null and channel.stopped_at is null
+      and founder.kind='adult' and founder.role='steward' and founder.adult_slot=1
+      and founder.status='verified' and founder.identity_subject_digest is not null
+    limit 1
+  `;
+  if (!lineage) return null;
+  return {
+    ...partner,
+    approval_source_id: null,
+    founder_adult_id: lineage.founder_adult_id,
+    founder_channel_id: lineage.founder_channel_id,
+    lineage_message_id: lineageMessageId,
+    link_issued: partner.invitation_digest !== null && partner.invitation_retry_at === null,
+  };
+}
+
 async function terminalizeIssuedPartnerInvitation(
   sql: postgres.TransactionSql,
   invitation: IssuedPartnerInvitationRow,
@@ -11248,7 +12032,10 @@ async function terminalizeIssuedPartnerInvitation(
   const invalidated = await sql`
     update people set invitation_digest=null,invitation_expires_at=null,
       invitation_consumed_at=${occurredAt},messages_address=null,
-      invitation_approval_source_id=null,invitation_approved_at=null,
+      invitation_approval_source_id=case when ${reason}='expired'
+        then invitation_approval_source_id else null end,
+      invitation_approved_at=case when ${reason}='expired'
+        then invitation_approved_at else null end,
       invitation_retry_at=null,invitation_last_error=null,updated_at=${occurredAt}
     where id=${invitation.adult_id} and invitation_consumed_at is null
       and messages_address is not null
@@ -11262,7 +12049,7 @@ async function terminalizeIssuedPartnerInvitation(
     reason,
     linkIssued: invitation.link_issued,
     occurredAt,
-    stableKey: invitation.invitation_message_id,
+    stableKey: invitation.lineage_message_id ?? invitation.invitation_message_id,
   });
   return true;
 }
@@ -17977,6 +18764,7 @@ const FAMILY_WORK_STATE_KEYS = [
   "generation",
   "kind",
   "pendingCall",
+  "pendingParticipantRequest",
   "phase",
   "progressBlocked",
   "progressRevision",
@@ -18001,6 +18789,7 @@ function initialFamilyWorkState(
     claim: null,
     activePhoneCall: null,
     activeTextMessage: null,
+    pendingParticipantRequest: null,
     browserImages: [],
     browserSession: null,
     continuationItems: [],
@@ -18080,6 +18869,7 @@ function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWor
   if (state.browserImages === undefined) state.browserImages = [];
   if (state.browserSession === undefined) state.browserSession = null;
   if (state.docketCandidateIds === undefined) state.docketCandidateIds = [];
+  if (state.pendingParticipantRequest === undefined) state.pendingParticipantRequest = null;
   if (state.progressBlocked === undefined) state.progressBlocked = false;
   if (state.waitingDocket === undefined) state.waitingDocket = null;
   assertExactJsonKeys(state, FAMILY_WORK_STATE_KEYS, "Family work state");
@@ -18219,6 +19009,62 @@ function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWor
         300,
         "Family work Twilio message SID",
       ),
+    };
+  }
+
+  let pendingParticipantRequest: FamilyWorkStateV1["pendingParticipantRequest"] = null;
+  if (state.pendingParticipantRequest !== null) {
+    const storedRequest = strictJsonRecord(
+      state.pendingParticipantRequest,
+      "Family work participant request",
+    );
+    assertExactJsonKeys(
+      storedRequest,
+      [
+        "askedAt",
+        "channelId",
+        "question",
+        "questionSourceId",
+        "requestId",
+        "targetAdultId",
+        "targetAdultName",
+      ],
+      "Family work participant request",
+    );
+    const requestId = requiredStringField(storedRequest, "requestId", "Family work participant request ID");
+    const targetAdultId = requiredStringField(
+      storedRequest,
+      "targetAdultId",
+      "Family work participant adult ID",
+    );
+    const channelId = requiredStringField(storedRequest, "channelId", "Family work participant channel ID");
+    const questionSourceId = requiredStringField(
+      storedRequest,
+      "questionSourceId",
+      "Family work participant question source ID",
+    );
+    assertUuid(requestId, "Family work participant request ID");
+    assertUuid(targetAdultId, "Family work participant adult ID");
+    assertUuid(channelId, "Family work participant channel ID");
+    assertUuid(questionSourceId, "Family work participant question source ID");
+    pendingParticipantRequest = {
+      requestId,
+      targetAdultId,
+      targetAdultName: limitedRequiredString(
+        requiredStringField(storedRequest, "targetAdultName", "Family work participant name"),
+        500,
+        "Family work participant name",
+      ),
+      channelId,
+      questionSourceId,
+      question: limitedRequiredString(
+        requiredStringField(storedRequest, "question", "Family work participant question"),
+        2_000,
+        "Family work participant question",
+      ),
+      askedAt: instant(
+        requiredStringField(storedRequest, "askedAt", "Family work participant request time"),
+      ).toISOString(),
     };
   }
 
@@ -18392,6 +19238,11 @@ function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWor
   if ((phase === "waiting" || phase === "terminal") && claim !== null) {
     throw new FlorenceStoreConflict("Waiting or terminal family work cannot remain claimed");
   }
+  if (pendingParticipantRequest !== null && (phase !== "waiting" || waitingDocket === null)) {
+    throw new FlorenceStoreConflict(
+      "A family-work participant request must be the task's waiting checkpoint",
+    );
+  }
 
   return {
     kind: "family_work_v1",
@@ -18404,6 +19255,7 @@ function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWor
     claim,
     activePhoneCall,
     activeTextMessage,
+    pendingParticipantRequest,
     browserImages,
     browserSession,
     continuationItems: [...continuationItems],
@@ -18499,6 +19351,7 @@ export function steerFamilyWorkState(
     claim: null,
     continuationItems: familyWorkContinuationWithoutPendingCall(state),
     pendingCall: null,
+    pendingParticipantRequest: null,
     steering: [...state.steering, steering],
     terminal: null,
     waitingDocket: null,
@@ -18671,7 +19524,49 @@ async function completeDeliveredOneShotReminder(
   `;
 }
 
-type FamilyWorkDeliveryKind = "progress" | "waiting" | "terminal";
+type FamilyWorkDeliveryKind = "progress" | "waiting" | "terminal" | "participant_request";
+
+async function wakeFamilyWorkAfterParticipantDeliveryFailure(
+  sql: postgres.TransactionSql,
+  input: {
+    sourceId: string;
+    householdId: string;
+    metadata: JsonValue;
+    occurredAt: Date;
+    error: string;
+  },
+): Promise<void> {
+  const metadata = jsonRecord(input.metadata);
+  if (metadata.familyWorkDeliveryKind !== "participant_request") return;
+  const familyWorkId = jsonString(metadata, "familyWorkId");
+  if (!familyWorkId) return;
+  assertUuid(familyWorkId, "Participant-request family work ID");
+  const [work] = await sql<ProactiveWorkRow[]>`
+    select * from proactive_work where id=${familyWorkId}
+      and household_id=${input.householdId} and kind='family_task'
+      and visibility='household' and owner_adult_id is null and status='paused'
+      and task_state->>'phase'='waiting'
+      and task_state->'pendingParticipantRequest'->>'questionSourceId'=${input.sourceId}
+    for update
+  `;
+  if (!work) return;
+  const state = familyWorkState(work.task_state);
+  const request = state.pendingParticipantRequest;
+  if (!request || request.questionSourceId !== input.sourceId) return;
+  const nextState = steerFamilyWorkState(state, {
+    sourceId: input.sourceId,
+    text: `Florence could not deliver the private question to ${request.targetAdultName}. Continue without assuming they saw it, and use another reasonable path if one is available.`,
+    occurredAt: input.occurredAt.toISOString(),
+  });
+  await sql`
+    update proactive_work set task_state=${sql.json(nextState)},status='active',
+      next_check_at=${input.occurredAt},
+      current_conclusion=${`Could not reach ${request.targetAdultName} privately. Resuming.`},
+      last_error=${bounded(input.error, 2_000)}
+    where id=${work.id} and status='paused'
+      and task_state->'pendingParticipantRequest'->>'requestId'=${request.requestId}
+  `;
+}
 
 async function terminalizeUnsentFamilyWorkOutbounds(
   sql: postgres.TransactionSql,

@@ -11,6 +11,7 @@ import {
   type GoogleWorkspaceResult,
 } from "@florence/google";
 import { describe, expect, test } from "vitest";
+import { isContextOverflowError } from "./agent-loop.js";
 import {
   BrowserbaseBrowserClient,
   type FlorenceBrowserObservation,
@@ -23,6 +24,7 @@ import {
   type FlorenceGoogleChangesAssessmentInput,
   type FlorencePrivateGoogleBatchInput,
   FlorenceReasoner,
+  FlorenceReasonerError,
   type FlorenceReasonerInput,
   florenceGoogleChangesAssessmentDecisionSchema,
   florenceHouseholdBriefingInputSchema,
@@ -650,6 +652,7 @@ describe("Florence reasoner capability cutover", () => {
       claim: null,
       activePhoneCall: null,
       activeTextMessage: null,
+      pendingParticipantRequest: null,
       browserSession: null,
       continuationItems: [],
       pendingCall: null,
@@ -803,6 +806,7 @@ describe("Florence reasoner capability cutover", () => {
       claim: null,
       activePhoneCall: null,
       activeTextMessage: null,
+      pendingParticipantRequest: null,
       browserSession: null,
       continuationItems: [],
       pendingCall: null,
@@ -878,6 +882,7 @@ describe("Florence reasoner capability cutover", () => {
       claim: null,
       activePhoneCall: null,
       activeTextMessage: null,
+      pendingParticipantRequest: null,
       browserSession: null,
       continuationItems: [],
       pendingCall: null,
@@ -1110,6 +1115,7 @@ describe("Florence reasoner capability cutover", () => {
         claim: null,
         activePhoneCall: null,
         activeTextMessage: null,
+        pendingParticipantRequest: null,
         browserSession: null,
         continuationItems: [],
         pendingCall: null,
@@ -1296,6 +1302,7 @@ describe("Florence reasoner capability cutover", () => {
         claim: null,
         activePhoneCall: null,
         activeTextMessage: null,
+        pendingParticipantRequest: null,
         browserSession: null,
         continuationItems: [functionCall("start-cancelled-call", "phone_agent_call", callArguments)],
         pendingCall: {
@@ -1392,6 +1399,7 @@ describe("Florence reasoner capability cutover", () => {
           providerCallId: pendingCallSid,
         },
         activeTextMessage: null,
+        pendingParticipantRequest: null,
         browserSession: null,
         continuationItems: [functionCall("check-pending-twilio-call", "phone_announcement", statusArguments)],
         pendingCall: {
@@ -1570,6 +1578,7 @@ describe("Florence reasoner capability cutover", () => {
         claim: null,
         activePhoneCall: null,
         activeTextMessage: null,
+        pendingParticipantRequest: null,
         browserSession: null,
         continuationItems: [],
         pendingCall: null,
@@ -1883,6 +1892,7 @@ describe("Florence reasoner capability cutover", () => {
       claim: null,
       activePhoneCall: null,
       activeTextMessage: null,
+      pendingParticipantRequest: null,
       browserSession: null,
       continuationItems: [],
       pendingCall: null,
@@ -2846,6 +2856,7 @@ describe("Florence reasoner capability cutover", () => {
       claim: null,
       activePhoneCall: null,
       activeTextMessage: null,
+      pendingParticipantRequest: null,
       browserSession: null,
       continuationItems: [],
       pendingCall: null,
@@ -3114,6 +3125,7 @@ describe("Florence reasoner capability cutover", () => {
         claim: null,
         activePhoneCall: null,
         activeTextMessage: null,
+        pendingParticipantRequest: null,
         browserSession: null,
         continuationItems: [],
         pendingCall: null,
@@ -3258,6 +3270,197 @@ describe("Florence reasoner capability cutover", () => {
     );
   });
 
+  test("household work privately asks one exact other adult and waits without polling the group", async () => {
+    const modelRequests: Record<string, unknown>[] = [];
+    const question = "Can Violet stay for the full field-trip day on Friday?";
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        parse(request: Record<string, unknown>) {
+          modelRequests.push(request);
+          return {
+            status: "completed",
+            output_parsed: null,
+            output: [
+              functionCall("ask-hari", "participant_request", {
+                targetAdultName: "Hari Anbarasu",
+                question,
+              }),
+            ],
+          };
+        },
+      },
+    } as never);
+    const input = {
+      workId: "family-work-field-trip",
+      scheduledOccurrence: null,
+      objective: "Confirm whether Violet can stay for the full field-trip day, then finish the plan.",
+      visibility: "household" as const,
+      ownerAdultId: null,
+      initiatingAdultId: "adult-2",
+      origin: familyWorkOrigin("Can you finish the field-trip plan?"),
+      household: {
+        householdId: "household-1",
+        familyLabel: "Test family",
+        timeZone: "America/Los_Angeles",
+        postalCode: "90045",
+        adults: [
+          { adultId: "adult-1", firstName: "Hari", displayName: "Hari Anbarasu" },
+          { adultId: "adult-2", firstName: "Jackson", displayName: "Jackson Williams" },
+        ],
+        children: [],
+      },
+      googleConnections: [],
+      state: {
+        kind: "family_work_v1" as const,
+        version: 1 as const,
+        generation: 0,
+        phase: "ready" as const,
+        claim: null,
+        activePhoneCall: null,
+        activeTextMessage: null,
+        pendingParticipantRequest: null,
+        browserSession: null,
+        continuationItems: [],
+        pendingCall: null,
+        steering: [],
+        progressRevision: 0,
+        terminal: null,
+      },
+      currentTime: NOW,
+    };
+    const queuedRequests: unknown[] = [];
+    const reads = {
+      async runParticipantRequest(request: unknown) {
+        queuedRequests.push(request);
+        return {
+          status: "queued" as const,
+          requestId: "participant-request-1",
+          targetAdultId: "adult-1",
+          targetAdultName: "Hari Anbarasu",
+          channelId: "private-channel-1",
+          questionSourceId: "private-question-1",
+          question,
+          askedAt: NOW,
+        };
+      },
+    };
+
+    const planned = await reasoner.continueFamilyWork(input, reads);
+    expect(planned).toMatchObject({
+      kind: "continue",
+      state: {
+        phase: "tool_pending",
+        pendingParticipantRequest: null,
+        pendingCall: { name: "participant_request" },
+      },
+    });
+    if (planned.kind !== "continue") throw new Error("Participant request was not planned");
+
+    const waiting = await reasoner.continueFamilyWork({ ...input, state: planned.state }, reads);
+
+    expect(waiting).toEqual(
+      expect.objectContaining({
+        kind: "participant_waiting",
+        state: expect.objectContaining({
+          phase: "waiting",
+          pendingCall: null,
+          pendingParticipantRequest: expect.objectContaining({
+            requestId: "participant-request-1",
+            targetAdultId: "adult-1",
+            targetAdultName: "Hari Anbarasu",
+            channelId: "private-channel-1",
+            questionSourceId: "private-question-1",
+            question,
+          }),
+          waitingDocket: {
+            owner: "Hari Anbarasu",
+            nextAction: "Answer Florence's private question.",
+            waitingOn: question,
+            needsAnswer: true,
+          },
+        }),
+      }),
+    );
+    expect(waiting).not.toHaveProperty("question");
+    expect(queuedRequests).toEqual([{ targetAdultName: "Hari Anbarasu", question }]);
+    expect(modelRequests).toHaveLength(1);
+    const [modelRequest] = modelRequests;
+    if (!modelRequest) throw new Error("Participant request was not presented to the model");
+    const participantTool = (modelRequest.tools as { name?: string; parameters?: unknown }[]).find(
+      (tool) => tool.name === "participant_request",
+    );
+    expect(participantTool).toMatchObject({
+      parameters: {
+        properties: {
+          targetAdultName: { enum: ["Hari Anbarasu"] },
+        },
+      },
+    });
+  });
+
+  test("participant replies are matched semantically and acknowledged for the actual moment", async () => {
+    const requests: Record<string, unknown>[] = [];
+    const outputs = [
+      {
+        belongsToRequest: false,
+        acknowledgement: null,
+      },
+      {
+        belongsToRequest: true,
+        acknowledgement: {
+          kind: "text" as const,
+          text: "Got it—thanks for letting me know. I’ll update the plan.",
+        },
+      },
+    ];
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        parse(request: Record<string, unknown>) {
+          requests.push(request);
+          return {
+            status: "completed",
+            output_parsed: outputs.shift() ?? null,
+            output: [],
+          };
+        },
+      },
+    } as never);
+    const pendingRequest = {
+      targetAdultName: "Alex Anbarasu",
+      question: "Can Maya stay for the whole field-trip day on Friday?",
+      askedAt: NOW,
+      taskObjective: "Finish the family field-trip plan.",
+    };
+
+    const unrelated = await reasoner.interpretParticipantReply({
+      pendingRequest,
+      currentMessage: {
+        text: "Can you add milk to the grocery list?",
+        occurredAt: "2026-08-27T20:05:00.000Z",
+        explicitlyRepliesToQuestion: false,
+      },
+    });
+    expect(unrelated).toEqual({ belongsToRequest: false, acknowledgement: null });
+
+    const refusal = await reasoner.interpretParticipantReply({
+      pendingRequest,
+      currentMessage: {
+        text: "No, she needs to come home right after lunch.",
+        occurredAt: "2026-08-27T20:06:00.000Z",
+        explicitlyRepliesToQuestion: true,
+      },
+    });
+    expect(refusal).toEqual({
+      belongsToRequest: true,
+      acknowledgement: {
+        kind: "text",
+        text: "Got it—thanks for letting me know. I’ll update the plan.",
+      },
+    });
+    expect(requests).toHaveLength(2);
+    expect(JSON.stringify(requests[0])).toContain("Can Maya stay for the whole field-trip day");
+  });
+
   test("durable work compacts complete history and preserves its recent tail before continuing", async () => {
     const oldResultUrl = "https://example.com/older-comparison";
     const recentResultUrl = "https://example.com/recent-comparison";
@@ -3320,6 +3523,7 @@ Compare the useful family options.
       claim: null,
       activePhoneCall: null,
       activeTextMessage: null,
+      pendingParticipantRequest: null,
       browserSession: null,
       continuationItems: [
         familyWorkResultMessage("older-comparison", {
@@ -3386,6 +3590,150 @@ Compare the useful family options.
         continuationItems: [],
         progressRevision: 5,
       },
+    });
+  });
+
+  test("provider context overflow compacts below the storage threshold once and retries with atomic tool history", async () => {
+    expect(
+      isContextOverflowError(
+        new Error("Throttling error: Too many tokens, please wait before trying again."),
+      ),
+    ).toBe(false);
+    const compactionRequests: Record<string, unknown>[] = [];
+    const continuationRequests: Record<string, unknown>[] = [];
+    let modelAttempt = 0;
+    const compactionSummary = `## Goal
+Compare the family options.
+
+## Constraints & Preferences
+- Preserve the useful evidence.
+
+## Progress
+### Done
+- [x] Reviewed the older option.
+
+### In Progress
+- [ ] Finish the comparison.
+
+### Blocked
+- (none)
+
+## Key Decisions
+- **Older evidence retained**: The older option was reviewed.
+
+## Next Steps
+1. Use the recent result to finish.
+
+## Critical Context
+- The older tool result was complete.`;
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        create(request: Record<string, unknown>) {
+          compactionRequests.push(request);
+          return { status: "completed", output_text: compactionSummary, output: [] };
+        },
+        parse(request: Record<string, unknown>) {
+          continuationRequests.push(request);
+          modelAttempt += 1;
+          throw new Error(
+            modelAttempt === 1
+              ? "Your input exceeds the context window of this model"
+              : "The model provider failed again after compaction",
+          );
+        },
+      },
+    } as never);
+    const recentCall = functionCall("recent-read", "read_public_page", {
+      url: "https://example.com/recent",
+      offset: 0,
+      contentFingerprint: null,
+    });
+    const recentOutput = {
+      type: "function_call_output" as const,
+      call_id: "recent-read",
+      output: JSON.stringify({ observation: "recent evidence", details: "y".repeat(4_000) }),
+    };
+    const state: FamilyWorkStateV1 = {
+      kind: "family_work_v1",
+      version: 1,
+      generation: 3,
+      phase: "ready",
+      claim: { claimId: "claim-overflow", leaseUntil: "2026-08-27T20:05:00.000Z" },
+      activePhoneCall: null,
+      activeTextMessage: null,
+      pendingParticipantRequest: null,
+      browserSession: null,
+      continuationItems: [
+        functionCall("older-read", "read_public_page", {
+          url: "https://example.com/older",
+          offset: 0,
+          contentFingerprint: null,
+        }),
+        {
+          type: "function_call_output",
+          call_id: "older-read",
+          output: JSON.stringify({ observation: "older evidence", details: "x".repeat(60_000) }),
+        },
+        recentCall,
+        recentOutput,
+      ],
+      pendingCall: null,
+      steering: [],
+      progressRevision: 0,
+      terminal: null,
+    };
+
+    const failure = await reasoner
+      .continueFamilyWork(
+        {
+          workId: "family-work-overflow",
+          scheduledOccurrence: null,
+          objective: "Compare the family options.",
+          visibility: "household",
+          ownerAdultId: null,
+          origin: familyWorkOrigin("Compare the family options."),
+          household: {
+            householdId: "household-1",
+            familyLabel: "Test family",
+            timeZone: "America/Los_Angeles",
+            postalCode: "90045",
+            adults: [{ adultId: "adult-1", firstName: "Hari", displayName: "Hari Anbarasu" }],
+            children: [],
+          },
+          state,
+          currentTime: NOW,
+        },
+        {},
+      )
+      .then(
+        () => null,
+        (error: unknown) => error,
+      );
+
+    expect(compactionRequests).toHaveLength(1);
+    expect(continuationRequests).toHaveLength(2);
+    const firstInput = JSON.stringify(continuationRequests[0]?.input);
+    const retryInput = JSON.stringify(continuationRequests[1]?.input);
+    expect(Buffer.byteLength(firstInput, "utf8")).toBeLessThan(240 * 1024);
+    expect(retryInput).toContain("The task history before this point was compacted");
+    expect(retryInput).toContain(recentCall.call_id);
+    const retryItems = continuationRequests[1]?.input as
+      | { type?: string; call_id?: string; output?: unknown }[]
+      | undefined;
+    expect(
+      retryItems?.find((item) => item.type === "function_call_output" && item.call_id === recentCall.call_id),
+    ).toEqual(recentOutput);
+    expect(retryInput).not.toContain("x".repeat(10_000));
+    expect(failure).toBeInstanceOf(FlorenceReasonerError);
+    if (!(failure instanceof FlorenceReasonerError)) throw new Error("Expected a reasoner failure");
+    expect(failure.familyWorkCheckpoint).toMatchObject({
+      generation: 3,
+      claim: { claimId: "claim-overflow" },
+      continuationItems: [
+        expect.objectContaining({ type: "message", role: "user" }),
+        expect.objectContaining({ type: "function_call", call_id: recentCall.call_id }),
+        expect.objectContaining({ type: "function_call_output", call_id: recentCall.call_id }),
+      ],
     });
   });
 
@@ -3561,6 +3909,7 @@ Compare the useful family options.
       claim: null,
       activePhoneCall: null,
       activeTextMessage: null,
+      pendingParticipantRequest: null,
       browserSession: null,
       continuationItems: [],
       pendingCall: null,
@@ -3820,6 +4169,7 @@ Compare the useful family options.
         claim: null,
         activePhoneCall: null,
         activeTextMessage: null,
+        pendingParticipantRequest: null,
         browserSession: null,
         continuationItems: [],
         pendingCall: null,
@@ -4049,6 +4399,7 @@ Compare the useful family options.
       claim: null,
       activePhoneCall: null,
       activeTextMessage: null,
+      pendingParticipantRequest: null,
       browserSession: null,
       continuationItems: [],
       pendingCall: null,
@@ -4506,6 +4857,7 @@ Compare the useful family options.
           claim: null,
           activePhoneCall: null,
           activeTextMessage: null,
+          pendingParticipantRequest: null,
           browserSession: null,
           continuationItems: [],
           pendingCall: null,

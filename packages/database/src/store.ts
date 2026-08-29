@@ -27,6 +27,9 @@ const CONVERSATION_HISTORY_PAGE_BYTE_BUDGET = 80_000;
 const CONVERSATION_HISTORY_FETCH_BATCH = 64;
 const CONVERSATION_HISTORY_TOKEN_VERSION = 1;
 const CONVERSATION_HISTORY_TOKEN_MAX_BYTES = 512;
+// This is a transport page, not a corpus limit. Every matching source remains reachable by cursor.
+const PRIVATE_GOOGLE_SOURCE_SEARCH_FETCH_BATCH = 64;
+const PRIVATE_GOOGLE_SOURCE_CURSOR_VERSION = 2;
 // Kept as an on-disk compatibility marker for replicas from before the reply gate stopped expiring.
 // New code only treats this timestamp as a deadline after a signed-link digest has been stored.
 const LEGACY_PARTNER_HANDSHAKE_WINDOW_MS = 24 * 60 * 60_000;
@@ -170,7 +173,37 @@ type GoogleEvidenceDraftBase = {
   label: string;
   metadata: JsonObject;
   occurredAt: string;
+  searchText: string;
 };
+
+export type PrivateGoogleSourceContent =
+  | {
+      kind: "gmail";
+      sender: string;
+      subject: string | null;
+      text: string;
+      textStatus: "complete" | "truncated" | "unavailable";
+      attachments: readonly {
+        filename: string;
+        mimeType: "application/pdf" | "image/jpeg" | "image/png" | "image/webp";
+        sizeBytes: number;
+      }[];
+      attachmentsStatus: "complete" | "truncated";
+    }
+  | {
+      kind: "calendar";
+      status: "confirmed" | "tentative" | "cancelled";
+      busy: boolean;
+      title: string | null;
+      location: string | null;
+      startsAt: string | null;
+      endsAt: string | null;
+      allDay: boolean | null;
+      intervalKind: "timed" | "all_day" | null;
+      timeZone: string | null;
+      startDate: string | null;
+      endDate: string | null;
+    };
 
 export type GmailEvidenceDraft = GoogleEvidenceDraftBase & {
   kind: "gmail";
@@ -182,6 +215,7 @@ export type GmailEvidenceDraft = GoogleEvidenceDraftBase & {
   from: string;
   subject: string | null;
   sentAt: string;
+  content: Extract<PrivateGoogleSourceContent, { kind: "gmail" }>;
 };
 
 export type CalendarEvidenceDraft = GoogleEvidenceDraftBase & {
@@ -196,6 +230,8 @@ export type CalendarEvidenceDraft = GoogleEvidenceDraftBase & {
   startsAt: string | null;
   endsAt: string | null;
   allDay: boolean | null;
+  locationObserved: boolean;
+  content: Extract<PrivateGoogleSourceContent, { kind: "calendar" }>;
 };
 
 export type GoogleEvidenceDraft = GmailEvidenceDraft | CalendarEvidenceDraft;
@@ -1042,6 +1078,84 @@ export type ClaimedFamilyWorkConversationHistoryReadInput = ClaimedFamilyWorkRea
     cursor: string | null;
   }>;
 
+export type PrivateGoogleSourceSearchResult = Readonly<{
+  sourceId: string;
+  kind: "gmail" | "calendar";
+  label: string;
+  occurredAt: string;
+  /** A short excerpt for choosing which exact source to read next. */
+  match: string;
+}>;
+
+export type PrivateGoogleSourceSearchPage = Readonly<{
+  /** Best textual matches first, with stable recent-first browsing when no query is supplied. */
+  sources: readonly PrivateGoogleSourceSearchResult[];
+  complete: boolean;
+  nextCursor: string | null;
+}>;
+
+export type PrivateGoogleSourceReadResult =
+  | Readonly<{
+      sourceId: string;
+      kind: "gmail";
+      ownerAdultId: string;
+      label: string;
+      occurredAt: string;
+      activeConnectionId: string | null;
+      sourceConnectionId: string;
+      accountLabel: string | null;
+      provider: Readonly<{
+        messageId: string;
+        threadId: string;
+        historyId: string;
+      }>;
+      content: Extract<PrivateGoogleSourceContent, { kind: "gmail" }>;
+    }>
+  | Readonly<{
+      sourceId: string;
+      kind: "calendar";
+      ownerAdultId: string;
+      label: string;
+      occurredAt: string;
+      activeConnectionId: string | null;
+      sourceConnectionId: string;
+      accountLabel: string | null;
+      provider: Readonly<{
+        calendarId: string;
+        eventId: string;
+        revision: string;
+        updatedAt: string;
+      }>;
+      content: Extract<PrivateGoogleSourceContent, { kind: "calendar" }>;
+    }>;
+
+export type PrivateGoogleSourceSearchInput = Readonly<{
+  authority: LinqAuthority;
+  currentSourceId: string;
+  observedAt: string;
+  /** Null or blank browses the corpus by most recently retained source. */
+  query: string | null;
+  cursor: string | null;
+}>;
+
+export type PrivateGoogleSourceReadInput = Readonly<{
+  authority: LinqAuthority;
+  currentSourceId: string;
+  observedAt: string;
+  sourceId: string;
+}>;
+
+export type ClaimedFamilyWorkPrivateGoogleSourceSearchInput = ClaimedFamilyWorkReadIdentity &
+  Readonly<{
+    query: string | null;
+    cursor: string | null;
+  }>;
+
+export type ClaimedFamilyWorkPrivateGoogleSourceReadInput = ClaimedFamilyWorkReadIdentity &
+  Readonly<{
+    sourceId: string;
+  }>;
+
 export type PendingFollowUp = {
   id: string;
   objective: string;
@@ -1524,6 +1638,33 @@ type SourceRow = {
   label: string;
   metadata: JsonObject;
   occurred_at: Date;
+};
+
+type PrivateGoogleSourceAccess = Readonly<{
+  householdId: string;
+  viewerAdultId: string;
+  snapshotAt: Date;
+}>;
+
+type PrivateGoogleSourcePosition = Readonly<{
+  relevanceRank: number;
+  createdAt: string;
+  sourceId: string;
+}>;
+
+type PrivateGoogleSourceSearchCursor = Readonly<{
+  scopeDigest: string;
+  snapshotAt: Date;
+  position: PrivateGoogleSourcePosition;
+}>;
+
+type PrivateGoogleSourceRow = SourceRow & {
+  source_connection_id: string;
+  active_connection_id: string | null;
+  account_label: string | null;
+  search_text: string;
+  relevance_rank: number;
+  created_at_cursor: string;
 };
 
 type ConversationHistoryRow = {
@@ -2273,7 +2414,7 @@ export class PostgresFlorenceStore {
         return;
       }
       await sql`
-        update proactive_work set briefing_candidates=${sql.json([scan])},last_error=null
+        update proactive_work set briefing_candidates=${sql.json([scan])},created_at=now(),last_error=null
         where id=${work.id}
       `;
     });
@@ -2328,49 +2469,19 @@ export class PostgresFlorenceStore {
         ...classifiedSourceIds,
         ...dismissedSourceIds,
       ]);
+      await reconcileRemovedGoogleSources(sql, {
+        householdId: work.household_id,
+        ownerAdultId: work.owner_adult_id,
+        sourceIds: removedSourceIds,
+      });
       await persistGoogleEvidenceDrafts(sql, {
         householdId: work.household_id,
         drafts: input.googleEvidence,
-        sourceIds: classifiedSourceIds,
+        sourceIds: draftSourceIds,
       });
-      if (classifiedSourceIds.length > 0) {
-        await assertProactiveSources(
-          sql,
-          work.household_id,
-          "private",
-          work.owner_adult_id,
-          classifiedSourceIds,
-        );
-        await linkProactiveWorkSources(sql, work.id, classifiedSourceIds);
-      }
-      const retainedSourceIds = unique([
-        ...nextScan.outcomes.findings.flatMap((finding) => [...finding.sourceIds]),
-        ...nextScan.outcomes.facts.flatMap((fact) => [...fact.sourceIds]),
-      ]);
-      const unlinked =
-        retainedSourceIds.length === 0
-          ? await sql<{ source_id: string }[]>`
-              delete from proactive_work_sources link using sources source
-              where link.work_id=${work.id} and source.id=link.source_id
-                and source.metadata->>'connectionId'=${nextScan.connectionId}
-              returning link.source_id
-            `
-          : await sql<{ source_id: string }[]>`
-              delete from proactive_work_sources link using sources source
-              where link.work_id=${work.id} and source.id=link.source_id
-                and source.metadata->>'connectionId'=${nextScan.connectionId}
-                and link.source_id not in ${sql(retainedSourceIds)} returning link.source_id
-            `;
-      if (unlinked.length > 0) {
-        const unlinkedSourceIds = unique(unlinked.map(({ source_id }) => source_id));
-        await sql`
-          delete from sources source where source.id in ${sql(unlinkedSourceIds)}
-            and source.household_id=${work.household_id}
-            and source.kind in ('gmail','calendar','google_file')
-            and not exists (select 1 from proactive_work_sources link where link.source_id=source.id)
-            and not exists (select 1 from fact_sources link where link.source_id=source.id)
-            and not exists (select 1 from calendar_actions action where action.basis_source_id=source.id)
-        `;
+      if (draftSourceIds.length > 0) {
+        await assertProactiveSources(sql, work.household_id, "private", work.owner_adult_id, draftSourceIds);
+        await linkProactiveWorkSources(sql, work.id, draftSourceIds);
       }
       await sql`
         update proactive_work set briefing_candidates=${sql.json([nextScan])},
@@ -2405,18 +2516,28 @@ export class PostgresFlorenceStore {
       ) {
         throw new FlorenceStoreConflict("The initial private Google scan restart is invalid");
       }
-      const linked = await sql<{ source_id: string }[]>`
-        delete from proactive_work_sources link using sources source
-        where link.work_id=${work.id} and source.id=link.source_id
+      // A restarted scan abandons only provider sources first inserted by this incomplete pass.
+      // Older sources may be linked to the same durable review from a completed import and are the
+      // parent's retained corpus, so leave those intact until the new authoritative pass can
+      // reconcile them by provider identity. beginInitialPrivateGoogleScan captures created_at
+      // and every source timestamp from the same database clock, avoiding application/DB skew.
+      const partialSources = await sql<{ id: string }[]>`
+        select source.id from proactive_work_sources link
+        join sources source on source.id=link.source_id
+        where link.work_id=${work.id}
+          and source.kind in ('gmail','calendar','google_file')
           and source.metadata->>'connectionId'=${current.connectionId}
-        returning link.source_id
+          and source.created_at>=${work.created_at}
+        order by source.id for update of source
       `;
-      if (linked.length > 0) {
-        const sourceIds = linked.map((row) => row.source_id);
+      const partialSourceIds = partialSources.map(({ id }) => id);
+      if (partialSourceIds.length > 0) {
         await sql`
-          delete from sources source where source.id in ${sql(sourceIds)}
-            and source.household_id=${work.household_id}
-            and source.kind in ('gmail','calendar','google_file')
+          delete from proactive_work_sources where work_id=${work.id}
+            and source_id in ${sql(partialSourceIds)}
+        `;
+        await sql`
+          delete from sources source where source.id in ${sql(partialSourceIds)}
             and not exists (select 1 from proactive_work_sources link where link.source_id=source.id)
             and not exists (select 1 from fact_sources link where link.source_id=source.id)
             and not exists (select 1 from calendar_actions action where action.basis_source_id=source.id)
@@ -2683,16 +2804,9 @@ export class PostgresFlorenceStore {
         calendarTimeMax: completedScan.calendarTimeMax,
         desiredActions: desiredMonitorActions,
       });
-      await reconcileAuthoritativeGoogleFactSupports(sql, {
-        householdId: work.household_id,
-        ownerAdultId: work.owner_adult_id,
-        connectionId: connection.id,
-        gmailAfter: completedScan.gmailAfter,
-        reviewedThrough: occurredAt,
-        calendarTimeMin: completedScan.calendarTimeMin,
-        calendarTimeMax: completedScan.calendarTimeMax,
-        facts,
-      });
+      // A rescan receives relevance-ranked memory context, not an exhaustive fact manifest.
+      // Omission therefore cannot mean deletion: explicit provider tombstones remove supports,
+      // while a newly supported value for the same slot is handled by the upsert below.
       await upsertGoogleStableFacts(sql, {
         householdId: work.household_id,
         ownerAdultId: work.owner_adult_id,
@@ -7137,6 +7251,44 @@ export class PostgresFlorenceStore {
     });
   }
 
+  async searchPrivateGoogleSources(
+    input: PrivateGoogleSourceSearchInput,
+  ): Promise<PrivateGoogleSourceSearchPage> {
+    const observedAt = instant(input.observedAt);
+    return this.#sql.begin(async (sql) => {
+      const access = await foregroundPrivateGoogleSourceAccess(sql, input, observedAt);
+      return searchPrivateGoogleSourcesOn(sql, access, input);
+    });
+  }
+
+  async readPrivateGoogleSource(input: PrivateGoogleSourceReadInput): Promise<PrivateGoogleSourceReadResult> {
+    const observedAt = instant(input.observedAt);
+    return this.#sql.begin(async (sql) => {
+      const access = await foregroundPrivateGoogleSourceAccess(sql, input, observedAt);
+      return readPrivateGoogleSourceOn(sql, access, input.sourceId);
+    });
+  }
+
+  async searchClaimedFamilyWorkPrivateGoogleSources(
+    input: ClaimedFamilyWorkPrivateGoogleSourceSearchInput,
+  ): Promise<PrivateGoogleSourceSearchPage> {
+    const occurredAt = instant(input.occurredAt);
+    return this.#sql.begin(async (sql) => {
+      const access = await claimedFamilyWorkPrivateGoogleSourceAccess(sql, input, occurredAt);
+      return searchPrivateGoogleSourcesOn(sql, access, input);
+    });
+  }
+
+  async readClaimedFamilyWorkPrivateGoogleSource(
+    input: ClaimedFamilyWorkPrivateGoogleSourceReadInput,
+  ): Promise<PrivateGoogleSourceReadResult> {
+    const occurredAt = instant(input.occurredAt);
+    return this.#sql.begin(async (sql) => {
+      const access = await claimedFamilyWorkPrivateGoogleSourceAccess(sql, input, occurredAt);
+      return readPrivateGoogleSourceOn(sql, access, input.sourceId);
+    });
+  }
+
   async stageRetryCue(input: { sourceId: string; occurredAt: string }): Promise<string | null> {
     assertUuid(input.sourceId, "Inbound source ID");
     const occurredAt = instant(input.occurredAt);
@@ -10179,6 +10331,14 @@ export function draftGmailEvidence(input: {
   from: string;
   subject: string | null;
   sentAt: string;
+  text: string;
+  textStatus: "complete" | "truncated" | "unavailable";
+  attachments: readonly {
+    filename: string;
+    mimeType: "application/pdf" | "image/jpeg" | "image/png" | "image/webp";
+    sizeBytes: number;
+  }[];
+  attachmentsStatus: "complete" | "truncated";
 }): GmailEvidenceDraft {
   const connectionId = required(input.connectionId, "Google connection ID");
   const messageId = required(input.messageId, "Gmail message ID");
@@ -10187,14 +10347,36 @@ export function draftGmailEvidence(input: {
   const from = required(input.from, "Gmail sender");
   const occurredAt = instant(input.sentAt).toISOString();
   const externalKey = `${connectionId}:${messageId}`;
+  const subject = input.subject === null ? null : bounded(required(input.subject, "Gmail subject"), 1_000);
+  const content = {
+    kind: "gmail" as const,
+    sender: bounded(from, 500),
+    subject,
+    text: bounded(input.text, 50_000),
+    textStatus: input.textStatus,
+    attachments: input.attachments.map((attachment) => ({
+      filename: bounded(required(attachment.filename, "Gmail attachment filename"), 500),
+      mimeType: attachment.mimeType,
+      sizeBytes: attachment.sizeBytes,
+    })),
+    attachmentsStatus: input.attachmentsStatus,
+  } satisfies Extract<PrivateGoogleSourceContent, { kind: "gmail" }>;
+  const searchText = bounded(
+    [content.sender, content.subject, content.text, ...content.attachments.map(({ filename }) => filename)]
+      .filter((value): value is string => typeof value === "string" && value.length > 0)
+      .join("\n"),
+    60_000,
+  );
   const metadata = {
     connectionId,
     messageId,
     threadId,
     historyId,
     from,
-    subject: input.subject,
+    subject,
     sentAt: occurredAt,
+    content,
+    searchText,
   } satisfies JsonObject;
   return {
     id: gmailEvidenceSourceId(input.householdId, connectionId, messageId),
@@ -10205,15 +10387,17 @@ export function draftGmailEvidence(input: {
     connectionOwnerAdultId: input.ownerAdultId,
     connectionId,
     externalKey,
-    label: bounded(input.subject ?? `Email from ${from}`, 500),
+    label: bounded(subject ?? `Email from ${from}`, 500),
     metadata,
     occurredAt,
+    searchText,
     messageId,
     threadId,
     historyId,
     from,
-    subject: input.subject,
+    subject,
     sentAt: occurredAt,
+    content,
   };
 }
 
@@ -10239,6 +10423,12 @@ export function draftCalendarEvidence(input: {
   startsAt: string | null;
   endsAt: string | null;
   allDay: boolean | null;
+  location?: string | null;
+  locationObserved?: boolean;
+  intervalKind?: "timed" | "all_day" | null;
+  timeZone?: string | null;
+  startDate?: string | null;
+  endDate?: string | null;
   visibility?: Visibility;
 }): CalendarEvidenceDraft {
   const connectionId = required(input.connectionId, "Google connection ID");
@@ -10272,6 +10462,26 @@ export function draftCalendarEvidence(input: {
   const visibility = input.visibility ?? "private";
   const sourceOwnerAdultId = visibility === "private" ? input.ownerAdultId : null;
   const externalKey = `${connectionId}:${calendarId}:${providerEventId}`;
+  const content = {
+    kind: "calendar" as const,
+    status: input.status,
+    busy: input.busy,
+    title: input.title === null ? null : bounded(input.title, 500),
+    location: input.location ? bounded(input.location, 500) : null,
+    startsAt,
+    endsAt,
+    allDay: input.allDay,
+    intervalKind: input.intervalKind ?? null,
+    timeZone: input.timeZone ?? null,
+    startDate: input.startDate ?? null,
+    endDate: input.endDate ?? null,
+  } satisfies Extract<PrivateGoogleSourceContent, { kind: "calendar" }>;
+  const searchText = bounded(
+    [content.title, content.location, content.startsAt, content.endsAt, content.startDate, content.endDate]
+      .filter((value): value is string => typeof value === "string" && value.length > 0)
+      .join("\n"),
+    4_000,
+  );
   const metadata = {
     connectionId,
     calendarId,
@@ -10280,10 +10490,12 @@ export function draftCalendarEvidence(input: {
     providerUpdatedAt,
     status: input.status,
     busy: input.busy,
-    title: input.title,
+    title: content.title,
     startsAt,
     endsAt,
     allDay: input.allDay,
+    content,
+    searchText,
   } satisfies JsonObject;
   return {
     id: calendarEvidenceSourceId(input.householdId, connectionId, calendarId, providerEventId),
@@ -10295,21 +10507,24 @@ export function draftCalendarEvidence(input: {
     connectionId,
     externalKey,
     label: bounded(
-      input.title ?? (input.status === "cancelled" ? "Cancelled calendar event" : "Private calendar event"),
+      content.title ?? (input.status === "cancelled" ? "Cancelled calendar event" : "Private calendar event"),
       500,
     ),
     metadata,
     occurredAt: startsAt ?? providerUpdatedAt,
+    searchText,
     calendarId,
     providerEventId,
     providerRevision,
     providerUpdatedAt,
     status: input.status,
     busy: input.busy,
-    title: input.title,
+    title: content.title,
     startsAt,
     endsAt,
     allDay: input.allDay,
+    locationObserved: input.locationObserved ?? true,
+    content,
   };
 }
 
@@ -11363,6 +11578,22 @@ async function persistGoogleEvidenceDrafts(
     const allDay = draft.allDay ?? recoveredAllDay;
     const title = draft.title ?? (draft.status === "cancelled" ? (priorEvidence?.title ?? null) : null);
     const occurredAt = startsAt ?? draft.providerUpdatedAt;
+    const content = {
+      ...draft.content,
+      title,
+      startsAt,
+      endsAt,
+      allDay,
+      location: draft.locationObserved
+        ? draft.content.location
+        : priorCalendarSourceLocation(priorEvidence?.metadata),
+    };
+    const searchText = bounded(
+      [content.title, content.location, content.startsAt, content.endsAt, content.startDate, content.endDate]
+        .filter((value): value is string => typeof value === "string" && value.length > 0)
+        .join("\n"),
+      4_000,
+    );
     await sql`
       insert into sources (
         id,household_id,kind,visibility,owner_adult_id,external_key,label,metadata,occurred_at
@@ -11381,12 +11612,21 @@ async function persistGoogleEvidenceDrafts(
           startsAt,
           endsAt,
           allDay,
+          content,
+          searchText,
         })},${instant(occurredAt)})
       on conflict (household_id,kind,external_key) do update set
         parent_source_id=null,label=excluded.label,metadata=excluded.metadata,occurred_at=excluded.occurred_at
     `;
     await assertStoredGoogleEvidence(sql, draft);
   }
+}
+
+function priorCalendarSourceLocation(metadata: JsonObject | undefined): string | null {
+  if (!metadata) return null;
+  const content = metadata.content;
+  if (content === undefined || !isRecord(content) || content.kind !== "calendar") return null;
+  return optionalStoredString(content.location, "Stored Calendar location");
 }
 
 function normalizedGoogleEvidenceDraft(draft: GoogleEvidenceDraft): GoogleEvidenceDraft {
@@ -11401,6 +11641,10 @@ function normalizedGoogleEvidenceDraft(draft: GoogleEvidenceDraft): GoogleEviden
         from: draft.from,
         subject: draft.subject,
         sentAt: draft.sentAt,
+        text: draft.content.text,
+        textStatus: draft.content.textStatus,
+        attachments: draft.content.attachments,
+        attachmentsStatus: draft.content.attachmentsStatus,
       })
     : draftCalendarEvidence({
         householdId: draft.householdId,
@@ -11416,6 +11660,12 @@ function normalizedGoogleEvidenceDraft(draft: GoogleEvidenceDraft): GoogleEviden
         startsAt: draft.startsAt,
         endsAt: draft.endsAt,
         allDay: draft.allDay,
+        location: draft.content.location,
+        locationObserved: draft.locationObserved,
+        intervalKind: draft.content.intervalKind,
+        timeZone: draft.content.timeZone,
+        startDate: draft.content.startDate,
+        endDate: draft.content.endDate,
         visibility: draft.visibility,
       });
 }
@@ -11731,13 +11981,69 @@ async function reconcileRemovedGoogleSources(
   const requested = unique(input.sourceIds);
   for (const sourceId of requested) assertUuid(sourceId, "Removed Google source ID");
   if (requested.length === 0) return;
-  const rows = await sql<{ id: string }[]>`
-    select id from sources where household_id=${input.householdId}
-      and id in ${sql(requested)} and kind in ('gmail','calendar','google_file')
-      and owner_adult_id is not distinct from ${input.ownerAdultId}
-    order by id for update
+  const requestedSet = new Set(requested);
+  // Source IDs include the OAuth connection so provider items can be proven against the exact
+  // credential that observed them. A reconnect creates a new connection ID for the same Google
+  // subject, however, so a provider tombstone must be expanded across that subject lineage or an
+  // older duplicate would become visible again after the newest copy is removed.
+  const candidates = await sql<
+    {
+      id: string;
+      kind: "gmail" | "calendar" | "google_file";
+      metadata: JsonValue;
+      active_connection_id: string | null;
+    }[]
+  >`
+    select source.id,source.kind,source.metadata,active.id as active_connection_id
+    from sources source
+    left join google_connections historical
+      on historical.id::text=source.metadata->>'connectionId'
+      and historical.household_id=source.household_id
+    left join google_connections active
+      on active.household_id=historical.household_id
+      and active.owner_adult_id=historical.owner_adult_id
+      and historical.google_subject_digest is not null
+      and active.google_subject_digest=historical.google_subject_digest
+      and active.status='active'
+    where source.household_id=${input.householdId}
+      and source.kind in ('gmail','calendar','google_file')
+      and source.owner_adult_id is not distinct from ${input.ownerAdultId}
+      and (source.id in ${sql(requested)} or active.id is not null)
+    order by source.id for update of source
   `;
-  const sourceIds = rows.map(({ id }) => id);
+  const sourceIds = unique(
+    candidates.flatMap((candidate) => {
+      if (requestedSet.has(candidate.id)) return [candidate.id];
+      if (!candidate.active_connection_id) return [];
+      const metadata = jsonRecord(candidate.metadata);
+      if (candidate.kind === "gmail") {
+        const messageId = jsonString(metadata, "messageId");
+        return messageId &&
+          requestedSet.has(
+            gmailEvidenceSourceId(input.householdId, candidate.active_connection_id, messageId),
+          )
+          ? [candidate.id]
+          : [];
+      }
+      if (candidate.kind === "calendar") {
+        const calendarId = jsonString(metadata, "calendarId");
+        const providerEventId = jsonString(metadata, "providerEventId");
+        return calendarId &&
+          providerEventId &&
+          requestedSet.has(
+            calendarEvidenceSourceId(
+              input.householdId,
+              candidate.active_connection_id,
+              calendarId,
+              providerEventId,
+            ),
+          )
+          ? [candidate.id]
+          : [];
+      }
+      return [];
+    }),
+  );
   if (sourceIds.length === 0) return;
   const removed = new Set(sourceIds);
   const completedPrivateReviews = await sql<ProactiveWorkRow[]>`
@@ -11862,6 +12168,13 @@ async function reconcileRemovedGoogleSources(
         )
     `;
   }
+  // Approved and committed Calendar actions are durable user history. Their schema intentionally
+  // retains the original basis FK, so mark removed provider evidence before collecting every
+  // unreferenced source; retained-source search/read exclude this marker.
+  await sql`
+    update sources set metadata=jsonb_set(metadata,'{providerRemoved}','true'::jsonb,true)
+    where id in ${sql(sourceIds)}
+  `;
   await sql`
     delete from sources source where source.id in ${sql(sourceIds)}
       and not exists (select 1 from fact_sources link where link.source_id=source.id)
@@ -12085,78 +12398,6 @@ async function reconcileReviewedGoogleSources(
         and not (
           status='pending' and last_error=${CALENDAR_ACTION_EXECUTION_MARKER} and retry_at>now()
         )
-    `;
-  }
-
-  await sql`
-    delete from sources source where source.id in ${sql(sourceIds)}
-      and source.household_id=${input.work.household_id}
-      and source.kind in ('gmail','calendar','google_file')
-      and not exists (select 1 from fact_sources link where link.source_id=source.id)
-      and not exists (select 1 from proactive_work_sources link where link.source_id=source.id)
-      and not exists (select 1 from calendar_actions action where action.basis_source_id=source.id)
-  `;
-}
-
-async function reconcileAuthoritativeGoogleFactSupports(
-  sql: postgres.TransactionSql,
-  input: {
-    householdId: string;
-    ownerAdultId: string;
-    connectionId: string;
-    gmailAfter: string;
-    reviewedThrough: Date;
-    calendarTimeMin: string;
-    calendarTimeMax: string;
-    facts: readonly GoogleStableFactDraft[];
-  },
-): Promise<void> {
-  const desiredBySlot = new Map(input.facts.map((fact) => [fact.slot, new Set(fact.sourceIds)] as const));
-  const supports = await sql<
-    {
-      fact_id: string;
-      slot: string;
-      source_id: string;
-      kind: "gmail" | "calendar" | "google_file";
-      metadata: JsonValue;
-      occurred_at: Date;
-    }[]
-  >`
-    select fact.id as fact_id,fact.slot,source.id as source_id,source.kind,source.metadata,
-      source.occurred_at
-    from facts fact join fact_sources link on link.fact_id=fact.id
-    join sources source on source.id=link.source_id
-    join google_connections historical
-      on historical.id::text=source.metadata->>'connectionId'
-      and historical.household_id=source.household_id
-      and historical.owner_adult_id=source.owner_adult_id
-    join google_connections current on current.id=${input.connectionId}
-      and current.household_id=historical.household_id
-      and current.owner_adult_id=historical.owner_adult_id and current.status='active'
-      and historical.google_subject_digest is not null
-      and current.google_subject_digest is not null
-      and current.google_subject_digest=historical.google_subject_digest
-    where fact.household_id=${input.householdId} and source.owner_adult_id=${input.ownerAdultId}
-      and source.kind in ('gmail','calendar','google_file')
-    order by fact.id,source.id for update of fact,source,historical,current
-  `;
-  const staleByFact = new Map<string, string[]>();
-  for (const support of supports) {
-    const retainedWindowSupport = googleSourceFallsInsideCompletedScan(support, input);
-    if (!retainedWindowSupport || desiredBySlot.get(support.slot)?.has(support.source_id)) continue;
-    const stale = staleByFact.get(support.fact_id) ?? [];
-    stale.push(support.source_id);
-    staleByFact.set(support.fact_id, stale);
-  }
-  for (const [factId, sourceIds] of staleByFact) {
-    await sql`
-      delete from fact_sources where fact_id=${factId} and source_id in ${sql(unique(sourceIds))}
-    `;
-  }
-  if (staleByFact.size > 0) {
-    await sql`
-      delete from facts fact where fact.id in ${sql([...staleByFact.keys()])}
-        and not exists (select 1 from fact_sources link where link.fact_id=fact.id)
     `;
   }
 }
@@ -15552,6 +15793,393 @@ async function claimedFamilyWorkContext(
   };
 }
 
+async function foregroundPrivateGoogleSourceAccess(
+  sql: postgres.TransactionSql,
+  input: Pick<PrivateGoogleSourceSearchInput, "authority" | "currentSourceId">,
+  observedAt: Date,
+): Promise<PrivateGoogleSourceAccess> {
+  if (input.authority.audience !== "private") {
+    throw new FlorenceStoreUnauthorized("Private Google sources require the parent's private conversation");
+  }
+  const conversation = await foregroundConversationHistoryAccess(sql, input, observedAt);
+  return {
+    householdId: conversation.householdId,
+    viewerAdultId: conversation.viewerAdultId,
+    snapshotAt: conversation.snapshotAt,
+  };
+}
+
+async function claimedFamilyWorkPrivateGoogleSourceAccess(
+  sql: postgres.TransactionSql,
+  input: ClaimedFamilyWorkReadIdentity,
+  occurredAt: Date,
+): Promise<PrivateGoogleSourceAccess> {
+  const context = await claimedFamilyWorkContext(sql, input, occurredAt);
+  if (
+    context.work.visibility !== "private" ||
+    context.channel.audience !== "private" ||
+    context.work.owner_adult_id !== context.senderAdultId
+  ) {
+    throw new FlorenceStoreUnauthorized("Private Google sources require private work for that parent");
+  }
+  return {
+    householdId: context.work.household_id,
+    viewerAdultId: context.senderAdultId,
+    snapshotAt: occurredAt,
+  };
+}
+
+async function searchPrivateGoogleSourcesOn(
+  sql: postgres.TransactionSql,
+  access: PrivateGoogleSourceAccess,
+  input: Readonly<{ query: string | null; cursor: string | null }>,
+): Promise<PrivateGoogleSourceSearchPage> {
+  const terms = privateGoogleSourceSearchTerms(input.query);
+  const normalizedQuery = terms.length > 0 ? terms.join(" ") : null;
+  const carriedCursor = input.cursor ? decodePrivateGoogleSourceSearchCursor(input.cursor) : null;
+  if (carriedCursor && carriedCursor.snapshotAt > access.snapshotAt) {
+    throw new FlorenceStoreUnauthorized("Private-source cursor is newer than this authorized turn");
+  }
+  const corpusAccess: PrivateGoogleSourceAccess = carriedCursor
+    ? { ...access, snapshotAt: carriedCursor.snapshotAt }
+    : access;
+  const scopeDigest = privateGoogleSourceSearchScopeDigest(corpusAccess, normalizedQuery);
+  if (carriedCursor && carriedCursor.scopeDigest !== scopeDigest) {
+    throw new FlorenceStoreConflict("Private-source cursor belongs to another search");
+  }
+  const rows = await fetchPrivateGoogleSourceSearchRows(sql, corpusAccess, {
+    terms,
+    position: carriedCursor?.position ?? null,
+  });
+  const complete = rows.length <= PRIVATE_GOOGLE_SOURCE_SEARCH_FETCH_BATCH;
+  const pageRows = complete ? rows : rows.slice(0, PRIVATE_GOOGLE_SOURCE_SEARCH_FETCH_BATCH);
+  const last = pageRows.at(-1);
+  return {
+    sources: pageRows.map((row) => privateGoogleSourceSearchResult(row, terms)),
+    complete,
+    nextCursor:
+      complete || !last
+        ? null
+        : encodePrivateGoogleSourceSearchCursor(
+            scopeDigest,
+            corpusAccess.snapshotAt,
+            privateGoogleSourcePosition(last),
+          ),
+  };
+}
+
+async function fetchPrivateGoogleSourceSearchRows(
+  sql: postgres.TransactionSql,
+  access: PrivateGoogleSourceAccess,
+  input: Readonly<{
+    terms: readonly string[];
+    position: PrivateGoogleSourcePosition | null;
+  }>,
+): Promise<readonly PrivateGoogleSourceRow[]> {
+  return sql<PrivateGoogleSourceRow[]>`
+    with eligible as (
+      select source.id,source.kind,source.visibility,source.owner_adult_id,source.label,
+        source.metadata,source.occurred_at,source.created_at,
+        source_connection.id as source_connection_id,
+        active_connection.id as active_connection_id,
+        coalesce(active_connection.email_label,source_connection.email_label) as account_label,
+        concat_ws(E'\n',source.label,source.metadata->>'searchText',source.metadata->>'from',
+          source.metadata->>'subject',source.metadata->>'title',source.metadata->>'location') as search_text,
+        row_number() over (
+          partition by coalesce(source_connection.google_subject_digest,source_connection.id::text),
+            source.kind,
+            case when source.kind='gmail'
+              then coalesce(nullif(source.metadata->>'messageId',''),source.id::text)
+              else coalesce(
+                nullif(concat_ws(chr(31),source.metadata->>'calendarId',source.metadata->>'providerEventId'),''),
+                source.id::text
+              ) end
+          order by (source_connection.id=active_connection.id) desc,
+            source_connection.created_at desc,source.created_at desc,source.id desc
+        ) as provider_rank
+      from sources source
+      join google_connections source_connection
+        on source_connection.id::text=source.metadata->>'connectionId'
+        and source_connection.household_id=source.household_id
+        and source_connection.owner_adult_id=source.owner_adult_id
+      left join google_connections active_connection
+        on active_connection.household_id=source_connection.household_id
+        and active_connection.owner_adult_id=source_connection.owner_adult_id
+        and source_connection.google_subject_digest is not null
+        and active_connection.google_subject_digest=source_connection.google_subject_digest
+        and active_connection.status='active'
+      where source.household_id=${access.householdId}
+        and source.visibility='private' and source.owner_adult_id=${access.viewerAdultId}
+        and source.kind in ('gmail','calendar') and source.created_at<=${access.snapshotAt}
+        and coalesce(source.metadata->>'providerRemoved','false')<>'true'
+    ), deduplicated as (
+      select * from eligible where provider_rank=1
+    ), ranked as (
+      select deduplicated.*,
+        case when ${input.terms.length === 0} then 0 else (
+          select (
+            coalesce(sum(case
+              when position(requested.term in lower(deduplicated.search_text))=0 then 0
+              when position(requested.term in lower(deduplicated.label))>0 then 4
+              else 1
+            end),0)
+            + case when count(*) filter (
+                where position(requested.term in lower(deduplicated.search_text))>0
+              )=${input.terms.length}
+              then ${input.terms.length * 4} else 0 end
+          )::integer
+          from unnest(${sql.array([...input.terms])}::text[]) as requested(term)
+        ) end as relevance_rank
+      from deduplicated
+    )
+    select id,kind,visibility,owner_adult_id,label,metadata,occurred_at,source_connection_id,
+      active_connection_id,account_label,search_text,relevance_rank,
+      to_char(created_at at time zone 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as created_at_cursor
+    from ranked where (${input.terms.length === 0} or relevance_rank>0)
+      and (${input.position?.createdAt ?? null}::timestamptz is null
+        or (relevance_rank,created_at,id)<(
+          ${input.position?.relevanceRank ?? null}::integer,
+          ${input.position?.createdAt ?? null}::timestamptz,
+          ${input.position?.sourceId ?? null}::uuid
+        ))
+    order by relevance_rank desc,created_at desc,id desc
+    limit ${PRIVATE_GOOGLE_SOURCE_SEARCH_FETCH_BATCH + 1}
+  `;
+}
+
+async function readPrivateGoogleSourceOn(
+  sql: postgres.TransactionSql,
+  access: PrivateGoogleSourceAccess,
+  sourceId: string,
+): Promise<PrivateGoogleSourceReadResult> {
+  assertUuid(sourceId, "Private Google source ID");
+  const [row] = await sql<PrivateGoogleSourceRow[]>`
+    select source.id,source.kind,source.visibility,source.owner_adult_id,source.label,
+      source.metadata,source.occurred_at,source_connection.id as source_connection_id,
+      active_connection.id as active_connection_id,
+      coalesce(active_connection.email_label,source_connection.email_label) as account_label,
+      concat_ws(E'\n',source.label,source.metadata->>'searchText',source.metadata->>'from',
+        source.metadata->>'subject',source.metadata->>'title',source.metadata->>'location') as search_text,
+      0::integer as relevance_rank,
+      to_char(source.created_at at time zone 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"')
+        as created_at_cursor
+    from sources source
+    join google_connections source_connection
+      on source_connection.id::text=source.metadata->>'connectionId'
+      and source_connection.household_id=source.household_id
+      and source_connection.owner_adult_id=source.owner_adult_id
+    left join google_connections active_connection
+      on active_connection.household_id=source_connection.household_id
+      and active_connection.owner_adult_id=source_connection.owner_adult_id
+      and source_connection.google_subject_digest is not null
+      and active_connection.google_subject_digest=source_connection.google_subject_digest
+      and active_connection.status='active'
+    where source.id=${sourceId} and source.household_id=${access.householdId}
+      and source.visibility='private' and source.owner_adult_id=${access.viewerAdultId}
+      and source.kind in ('gmail','calendar') and source.created_at<=${access.snapshotAt}
+      and coalesce(source.metadata->>'providerRemoved','false')<>'true'
+    limit 1
+    for share of source,source_connection
+  `;
+  if (!row) {
+    throw new FlorenceStoreConflict("That private Google source is no longer available");
+  }
+  return privateGoogleSourceReadResult(row);
+}
+
+function privateGoogleSourceSearchResult(
+  row: PrivateGoogleSourceRow,
+  terms: readonly string[],
+): PrivateGoogleSourceSearchResult {
+  if (row.kind !== "gmail" && row.kind !== "calendar") {
+    throw new FlorenceStoreConflict("A private Google search returned an unsupported source");
+  }
+  return {
+    sourceId: row.id,
+    kind: row.kind,
+    label: row.label,
+    occurredAt: row.occurred_at.toISOString(),
+    match: privateGoogleSourceMatch(row.search_text, terms),
+  };
+}
+
+function privateGoogleSourceReadResult(row: PrivateGoogleSourceRow): PrivateGoogleSourceReadResult {
+  const ownerAdultId = required(row.owner_adult_id ?? "", "Private Google source owner");
+  const metadata = jsonRecord(row.metadata);
+  const common = {
+    sourceId: row.id,
+    ownerAdultId,
+    label: row.label,
+    occurredAt: row.occurred_at.toISOString(),
+    activeConnectionId: row.active_connection_id,
+    sourceConnectionId: row.source_connection_id,
+    accountLabel: row.account_label,
+  };
+  if (row.kind === "gmail") {
+    return {
+      ...common,
+      kind: "gmail",
+      provider: {
+        messageId: required(jsonString(metadata, "messageId") ?? "", "Stored Gmail message ID"),
+        threadId: required(jsonString(metadata, "threadId") ?? "", "Stored Gmail thread ID"),
+        historyId: required(jsonString(metadata, "historyId") ?? "", "Stored Gmail history ID"),
+      },
+      content: storedPrivateGmailSourceContent(metadata, row.label),
+    };
+  }
+  if (row.kind === "calendar") {
+    return {
+      ...common,
+      kind: "calendar",
+      provider: {
+        calendarId: required(jsonString(metadata, "calendarId") ?? "", "Stored Calendar ID"),
+        eventId: required(jsonString(metadata, "providerEventId") ?? "", "Stored Calendar event ID"),
+        revision: required(jsonString(metadata, "providerRevision") ?? "", "Stored Calendar event revision"),
+        updatedAt: instant(
+          required(jsonString(metadata, "providerUpdatedAt") ?? "", "Stored Calendar event update time"),
+        ).toISOString(),
+      },
+      content: storedPrivateCalendarSourceContent(row),
+    };
+  }
+  throw new FlorenceStoreConflict("A private Google read returned an unsupported source");
+}
+
+function storedPrivateGmailSourceContent(
+  metadata: Record<string, JsonValue>,
+  fallbackLabel: string,
+): Extract<PrivateGoogleSourceContent, { kind: "gmail" }> {
+  const raw = metadata.content;
+  if (raw === undefined) {
+    return {
+      kind: "gmail",
+      sender: jsonString(metadata, "from") ?? fallbackLabel,
+      subject: optionalStoredString(metadata.subject, "Stored Gmail subject"),
+      text: "",
+      textStatus: "unavailable",
+      attachments: [],
+      attachmentsStatus: "truncated",
+    };
+  }
+  if (!isRecord(raw) || raw.kind !== "gmail") {
+    throw new FlorenceStoreConflict("Stored Gmail content is invalid");
+  }
+  const sender = requiredStoredString(raw.sender, "Stored Gmail sender");
+  const subject = optionalStoredString(raw.subject, "Stored Gmail subject");
+  const text = storedString(raw.text, "Stored Gmail text");
+  const textStatus = raw.textStatus;
+  if (textStatus !== "complete" && textStatus !== "truncated" && textStatus !== "unavailable") {
+    throw new FlorenceStoreConflict("Stored Gmail text status is invalid");
+  }
+  if (!Array.isArray(raw.attachments)) {
+    throw new FlorenceStoreConflict("Stored Gmail attachments are invalid");
+  }
+  const attachments = raw.attachments.map((value) => {
+    if (!isRecord(value)) throw new FlorenceStoreConflict("Stored Gmail attachment is invalid");
+    const filename = requiredStoredString(value.filename, "Stored Gmail attachment filename");
+    const mimeType = privateGoogleAttachmentMimeType(value.mimeType);
+    if (!Number.isSafeInteger(value.sizeBytes) || Number(value.sizeBytes) < 0) {
+      throw new FlorenceStoreConflict("Stored Gmail attachment size is invalid");
+    }
+    return { filename, mimeType, sizeBytes: Number(value.sizeBytes) };
+  });
+  const attachmentsStatus = raw.attachmentsStatus;
+  if (attachmentsStatus !== "complete" && attachmentsStatus !== "truncated") {
+    throw new FlorenceStoreConflict("Stored Gmail attachment status is invalid");
+  }
+  return { kind: "gmail", sender, subject, text, textStatus, attachments, attachmentsStatus };
+}
+
+function storedPrivateCalendarSourceContent(
+  row: PrivateGoogleSourceRow,
+): Extract<PrivateGoogleSourceContent, { kind: "calendar" }> {
+  const evidence = calendarEvidenceRecord(row);
+  const metadata = jsonRecord(row.metadata);
+  const raw = metadata.content;
+  if (raw !== undefined && (!isRecord(raw) || raw.kind !== "calendar")) {
+    throw new FlorenceStoreConflict("Stored Calendar content is invalid");
+  }
+  const content = raw === undefined ? null : raw;
+  const rawIntervalKind = content?.intervalKind;
+  const intervalKind =
+    rawIntervalKind === undefined || rawIntervalKind === null
+      ? evidence.allDay === null
+        ? null
+        : evidence.allDay
+          ? "all_day"
+          : "timed"
+      : rawIntervalKind === "timed" || rawIntervalKind === "all_day"
+        ? rawIntervalKind
+        : null;
+  if (rawIntervalKind !== undefined && rawIntervalKind !== null && intervalKind === null) {
+    throw new FlorenceStoreConflict("Stored Calendar interval kind is invalid");
+  }
+  return {
+    kind: "calendar",
+    status: evidence.status,
+    busy: evidence.busy,
+    title: evidence.title,
+    location: optionalStoredString(content?.location, "Stored Calendar location"),
+    startsAt: evidence.startsAt,
+    endsAt: evidence.endsAt,
+    allDay: evidence.allDay,
+    intervalKind,
+    timeZone: optionalStoredString(content?.timeZone, "Stored Calendar time zone"),
+    startDate: optionalStoredString(content?.startDate, "Stored Calendar start date"),
+    endDate: optionalStoredString(content?.endDate, "Stored Calendar end date"),
+  };
+}
+
+function requiredStoredString(value: JsonValue | undefined, name: string): string {
+  if (typeof value !== "string") throw new FlorenceStoreConflict(`${name} is invalid`);
+  return required(value, name);
+}
+
+function storedString(value: JsonValue | undefined, name: string): string {
+  if (typeof value !== "string") throw new FlorenceStoreConflict(`${name} is invalid`);
+  return value;
+}
+
+function privateGoogleAttachmentMimeType(
+  value: JsonValue | undefined,
+): "application/pdf" | "image/jpeg" | "image/png" | "image/webp" {
+  if (
+    value !== "application/pdf" &&
+    value !== "image/jpeg" &&
+    value !== "image/png" &&
+    value !== "image/webp"
+  ) {
+    throw new FlorenceStoreConflict("Stored Gmail attachment type is invalid");
+  }
+  return value;
+}
+
+function optionalStoredString(value: JsonValue | undefined, name: string): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string") throw new FlorenceStoreConflict(`${name} is invalid`);
+  return value;
+}
+
+function privateGoogleSourceSearchTerms(value: string | null): readonly string[] {
+  const normalized = value?.normalize("NFKC").toLocaleLowerCase("en-US") ?? "";
+  return unique(normalized.match(/[\p{L}\p{N}]+(?:[.@_+'’-][\p{L}\p{N}]+)*/gu) ?? []);
+}
+
+function privateGoogleSourceMatch(searchText: string, terms: readonly string[]): string {
+  const text = searchText.replace(/\s+/gu, " ").trim();
+  if (!text) return "";
+  const lower = text.toLocaleLowerCase("en-US");
+  const positions = terms.map((term) => lower.indexOf(term)).filter((position) => position >= 0);
+  const first = positions.length > 0 ? Math.min(...positions) : 0;
+  const start = Math.max(0, first - 90);
+  const end = Math.min(text.length, Math.max(first + 230, start + 320));
+  return `${start > 0 ? "…" : ""}${text.slice(start, end)}${end < text.length ? "…" : ""}`;
+}
+
+function privateGoogleSourcePosition(row: PrivateGoogleSourceRow): PrivateGoogleSourcePosition {
+  return { relevanceRank: row.relevance_rank, createdAt: row.created_at_cursor, sourceId: row.id };
+}
+
 async function searchConversationHistoryOn(
   sql: postgres.TransactionSql,
   access: ConversationHistoryAccess,
@@ -16198,6 +16826,78 @@ function conversationHistoryReadScopeDigest(anchor: ConversationHistoryAnchor): 
       ...anchor,
     })}`,
   );
+}
+
+function privateGoogleSourceSearchScopeDigest(
+  access: PrivateGoogleSourceAccess,
+  query: string | null,
+): string {
+  return sha256(
+    `florence-private-google-source-search-v1\0${canonicalConversationHistoryJson({
+      householdId: access.householdId,
+      viewerAdultId: access.viewerAdultId,
+      snapshotAt: access.snapshotAt.toISOString(),
+      query,
+    })}`,
+  );
+}
+
+function encodePrivateGoogleSourceSearchCursor(
+  scopeDigest: string,
+  snapshotAt: Date,
+  position: PrivateGoogleSourcePosition,
+): string {
+  assertDigest(scopeDigest, "Private-source search scope");
+  const canonicalPosition = canonicalPrivateGoogleSourcePosition(position);
+  return encodeConversationHistoryToken({
+    v: PRIVATE_GOOGLE_SOURCE_CURSOR_VERSION,
+    k: "g",
+    q: scopeDigest,
+    o: canonicalConversationHistorySnapshotAt(snapshotAt.toISOString()),
+    r: canonicalPosition.relevanceRank,
+    t: canonicalPosition.createdAt,
+    i: canonicalPosition.sourceId,
+  });
+}
+
+function decodePrivateGoogleSourceSearchCursor(token: string): PrivateGoogleSourceSearchCursor {
+  const value = decodeConversationHistoryToken(token);
+  assertConversationHistoryTokenKeys(value, ["i", "k", "o", "q", "r", "t", "v", "x"]);
+  if (value.v !== PRIVATE_GOOGLE_SOURCE_CURSOR_VERSION || value.k !== "g") {
+    throw new FlorenceStoreConflict("Private-source cursor is invalid");
+  }
+  const scopeDigest = historyTokenString(value.q, "Private-source search scope");
+  assertDigest(scopeDigest, "Private-source search scope");
+  const snapshotAt = historyTokenString(value.o, "Private-source snapshot timestamp");
+  const sourceId = historyTokenString(value.i, "Private-source position source ID");
+  const createdAt = historyTokenString(value.t, "Private-source position timestamp");
+  return {
+    scopeDigest,
+    snapshotAt: instant(canonicalConversationHistorySnapshotAt(snapshotAt)),
+    position: canonicalPrivateGoogleSourcePosition({
+      relevanceRank: privateGoogleSourceRelevanceRank(value.r),
+      createdAt,
+      sourceId,
+    }),
+  };
+}
+
+function canonicalPrivateGoogleSourcePosition(
+  position: PrivateGoogleSourcePosition,
+): PrivateGoogleSourcePosition {
+  assertUuid(position.sourceId, "Private-source position source ID");
+  return {
+    relevanceRank: privateGoogleSourceRelevanceRank(position.relevanceRank),
+    createdAt: canonicalConversationHistoryOccurredAt(position.createdAt),
+    sourceId: position.sourceId,
+  };
+}
+
+function privateGoogleSourceRelevanceRank(value: unknown): number {
+  if (!Number.isSafeInteger(value) || Number(value) < 0) {
+    throw new FlorenceStoreConflict("Private-source position relevance is invalid");
+  }
+  return Number(value);
 }
 
 function encodeConversationHistoryAnchor(anchor: ConversationHistoryAnchor): string {

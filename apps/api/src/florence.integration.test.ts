@@ -16,6 +16,8 @@ import {
   type GoogleFamilyCalendarRenameResult,
   GoogleFamilyCalendarTransientError,
   type GooglePersonalCalendarWindowEvent,
+  type GoogleWorkspaceOperation,
+  type GoogleWorkspaceResult,
 } from "@florence/google";
 import {
   type LinqClient,
@@ -377,6 +379,7 @@ type PersonalCalendarCatalogInput = Parameters<GoogleConnection["readPersonalCal
 type PersonalCalendarReadInput = Parameters<GoogleConnection["readPersonalCalendarWindow"]>[0];
 type ExactCalendarCatalogInput = Parameters<GoogleConnection["readExactCalendarCatalog"]>[0];
 type ExactCalendarReadInput = Parameters<GoogleConnection["readExactCalendarWindow"]>[0];
+type WorkspaceExecutionInput = Parameters<GoogleConnection["runWorkspace"]>[0];
 type TestPart =
   | { type: "text" | "link"; value: string }
   | {
@@ -467,6 +470,7 @@ type HarnessState = {
   googleDeletionSourceId: string | null;
   googleChangeReads: { ownerAdultId: string; kind: "gmail" | "calendar" }[];
   interactiveGoogleReads: number;
+  workspaceExecutions: WorkspaceExecutionInput[];
   providerRevocations: ("confirmed" | "unconfirmed" | "not-needed")[];
   setupConversations: Parameters<FlorenceReasoner["converseDuringSetup"]>[0][];
   initialNoAttentionReview: boolean;
@@ -2672,15 +2676,19 @@ release("Florence parent journeys", () => {
     );
     expect(resetHarness.state.briefings).toHaveLength(0);
     await resetHarness.assertDatabase(
-      "A quiet private review retained a finding or family fact",
+      "A quiet private review lost its private Google corpus or retained a family fact",
       `(select count(*)=2 from proactive_work
           where kind='initial_private_review' and status='completed'
             and briefing_candidates='[]'::jsonb)
-        and not exists (
-          select 1 from proactive_work_sources source
-          join proactive_work work on work.id=source.work_id
+        and (select count(*)=4 from sources
+          where kind in ('gmail','calendar') and visibility='private'
+            and owner_adult_id is not null)
+        and (select count(*)=4 from proactive_work_sources link
+          join proactive_work work on work.id=link.work_id
+          join sources source on source.id=link.source_id
           where work.kind='initial_private_review'
-        )
+            and work.owner_adult_id=source.owner_adult_id
+            and source.kind in ('gmail','calendar') and source.visibility='private')
         and not exists (select 1 from facts)`,
     );
     const quietActivationMessages = resetHarness.linq.messages.filter(
@@ -3311,6 +3319,131 @@ release("Florence parent journeys", () => {
     );
   }, 20_000);
 
+  test("uses the initiating partner's Google Workspace connection for durable work from the family thread", async () => {
+    const request =
+      "Add ‘Pack Maya’s camp permission slip’ to my Google Tasks, then tell us here when it’s done.";
+    const objective =
+      "Add Pack Maya’s camp permission slip to the initiating parent's Google Tasks and confirm completion in the family thread.";
+    const taskTitle = "Pack Maya’s camp permission slip";
+    const terminalText = "Done—I added “Pack Maya’s camp permission slip” to Alex’s Google Tasks.";
+    const operation = {
+      operation: "tasks_create",
+      title: taskTitle,
+      notes: "Requested in the family thread.",
+    } satisfies GoogleWorkspaceOperation;
+    let providerReceipt: GoogleWorkspaceResult | null = null;
+    const harness = await createHarness(
+      async (input) =>
+        input.currentMessage.text === request
+          ? decision({
+              familyWork: {
+                operation: "create",
+                workId: null,
+                objective,
+                schedule: null,
+                instruction: null,
+              },
+            })
+          : decision(),
+      {
+        continueFamilyWork: async (input, reads) => {
+          expect(input.visibility).toBe("household");
+          expect(input.ownerAdultId).toBeNull();
+          expect(input.initiatingAdultId).toBe(harness.partnerAdultId);
+          if (input.state.phase === "ready") {
+            return {
+              kind: "continue",
+              state: {
+                ...input.state,
+                phase: "tool_pending",
+                claim: null,
+                pendingCall: {
+                  callId: "partner-google-task-create",
+                  name: "tasks_work",
+                  argumentsJson: JSON.stringify(operation),
+                  attempt: 0,
+                },
+              },
+              progressText: null,
+              nextCheckDelayMs: 0,
+            };
+          }
+
+          if (!reads.runGoogleWorkspace) {
+            throw new Error(
+              "The group-originated task did not receive the initiating partner's Workspace adapter",
+            );
+          }
+          providerReceipt = await reads.runGoogleWorkspace(operation);
+          expect(providerReceipt).toEqual({
+            operation: "tasks_create",
+            result: {
+              status: "created",
+              taskId: "google-task-1",
+              title: taskTitle,
+            },
+          });
+          return {
+            kind: "terminal",
+            state: {
+              ...input.state,
+              phase: "terminal",
+              claim: null,
+              pendingCall: null,
+              terminal: { outcome: "succeeded", text: terminalText },
+            },
+            outcome: "succeeded",
+            text: terminalText,
+          };
+        },
+      },
+    );
+    await harness.readyHousehold();
+
+    const messagesBeforeRequest = harness.linq.messages.length;
+    await harness.accept("group", "partner-google-task", request, "partner");
+    await harness.drain();
+    harness.state.now += 1_001;
+    await harness.drain();
+
+    expect(providerReceipt).not.toBeNull();
+    expect(harness.state.workspaceExecutions).toEqual([
+      {
+        householdId: expect.any(String),
+        ownerAdultId: harness.partnerAdultId,
+        connectionId: PARTNER_GOOGLE,
+        operation,
+      },
+    ]);
+    const taskMessages = harness.linq.messages.slice(messagesBeforeRequest);
+    expect(
+      taskMessages.filter(
+        (message) => message.providerConversationId === FAMILY_GROUP && message.text === terminalText,
+      ),
+    ).toHaveLength(1);
+    expect(
+      taskMessages.filter(
+        (message) =>
+          (message.providerConversationId === PRIVATE_FOUNDER ||
+            message.providerConversationId === PRIVATE_PARTNER) &&
+          message.text === terminalText,
+      ),
+    ).toHaveLength(0);
+    await harness.assertDatabase(
+      "Group-originated Workspace work did not complete once in the household thread",
+      `(select count(*)=1 from proactive_work
+          where kind='family_task' and objective=${sqlLiteral(objective)}
+            and visibility='household' and owner_adult_id is null and status='completed')
+        and (select count(*)=1 from messages terminal
+          join linq_channels channel on channel.id=terminal.channel_id
+          join sources source on source.id=terminal.source_id
+          where terminal.direction='outbound' and terminal.status='sent'
+            and terminal.text=${sqlLiteral(terminalText)}
+            and channel.audience='group'
+            and source.visibility='shared' and source.owner_adult_id is null)`,
+    );
+  }, 20_000);
+
   test("runs authenticated browser work from the initiating parent in the family thread", async () => {
     const browserRuns: Parameters<FlorenceBrowserClient["run"]>[0][] = [];
     const closedSessions: Parameters<FlorenceBrowserClient["close"]>[0][] = [];
@@ -3420,12 +3553,20 @@ release("Florence parent journeys", () => {
   }, 20_000);
 
   test("gets ahead from both parents’ context, native inputs, a monitor, and the read-only calendar", async () => {
+    const retainedSourceRecallRequest = "What did that archived account notice with code 123456 say?";
+    const retainedSourceRecallReply =
+      "The archived notice said the account needed attention and included confirmation code 123456.";
+    const groupRetainedSourceRequest = "Search Hari’s old Google notices for code 123456.";
+    const groupRetainedSourceReply =
+      "That history stays in Hari’s private thread—ask me there and I can look it up.";
     let nativeInputWasRead = false;
     let ordinaryUnusedSourceId: string | null = null;
     let conversationalGoogleSourceId: string | null = null;
     let retainedGoogleMemorySourceId: string | null = null;
     let googleRecipeSearchReturnedUsableDetails = false;
     let groupHouseholdFactWasVisible = false;
+    let retainedPrivateSourceWasRead = false;
+    let groupSourceSearchWasHidden = false;
     const observedHouseholdDocket: {
       value: FlorenceReasonerInput["householdDocket"] | null;
     } = { value: null };
@@ -3567,6 +3708,33 @@ release("Florence parent journeys", () => {
       }
       if (input.currentMessage.text === CLARIFICATION_ONLY_REQUEST) {
         return clarificationReasoner.decide(input, reads, signal, hooks);
+      }
+      if (input.currentMessage.text === retainedSourceRecallRequest) {
+        if (!reads.searchSources) {
+          throw new Error("The private turn did not receive retained-source search");
+        }
+        const search = await reads.searchSources({ query: "code 123456", cursor: null });
+        const result = search.results.find((candidate) => candidate.kind === "gmail");
+        if (!result?.match.includes("123456")) {
+          throw new Error("The retained Gmail source was not discoverable by its exact contents");
+        }
+        const source = await reads.readSource({ sourceId: result.sourceId });
+        retainedPrivateSourceWasRead =
+          source?.kind === "gmail" &&
+          source.visibility === "adult_private" &&
+          source.text.includes("Archived owner-private account notice") &&
+          source.text.includes("Code 123456");
+        if (!retainedPrivateSourceWasRead) {
+          throw new Error("The retained Gmail search hit could not be read with its private content");
+        }
+        return decision({ bubbles: [{ text: retainedSourceRecallReply, delayMs: 0 }] });
+      }
+      if (input.currentMessage.text === groupRetainedSourceRequest) {
+        groupSourceSearchWasHidden = reads.searchSources === undefined;
+        if (!groupSourceSearchWasHidden) {
+          throw new Error("A group turn received private retained-source search");
+        }
+        return decision({ bubbles: [{ text: groupRetainedSourceReply, delayMs: 0 }] });
       }
       if (input.currentMessage.text === GOOGLE_MEMORY_REPLY_QUESTION) {
         const retained = input.visibleSources.find(
@@ -4187,6 +4355,16 @@ release("Florence parent journeys", () => {
     expect(harness.linq.reactions).toHaveLength(reactionsAfterPublicResearch);
     expect(harness.linq.messages.some((message) => message.text === CLARIFICATION_ONLY_REPLY)).toBe(true);
 
+    await harness.accept("private", "retained-private-google-source", retainedSourceRecallRequest);
+    await harness.drain();
+    expect(retainedPrivateSourceWasRead).toBe(true);
+    expect(harness.linq.messages.some((message) => message.text === retainedSourceRecallReply)).toBe(true);
+
+    await harness.accept("group", "group-private-google-source", groupRetainedSourceRequest, "partner");
+    await harness.drain();
+    expect(groupSourceSearchWasHidden).toBe(true);
+    expect(harness.linq.messages.some((message) => message.text === groupRetainedSourceReply)).toBe(true);
+
     await harness.accept("private", "ordinary-unused-email", ORDINARY_UNUSED_GMAIL_QUESTION);
     await harness.drain();
     if (!ordinaryUnusedSourceId) throw new Error("The ordinary Gmail source was not observed");
@@ -4325,14 +4503,18 @@ release("Florence parent journeys", () => {
     expect(harness.state.overlapGmailAssessments).toBe(1);
     if (!harness.state.overlapGmailSourceId) throw new Error("The overlap Gmail source was not observed");
     await harness.assertDatabase(
-      "An uncited incremental Gmail overlap was retained or linked as assessed",
-      `not exists (
-        select 1 from sources where id=${sqlLiteral(harness.state.overlapGmailSourceId)}::uuid
+      "A dismissed incremental Gmail overlap was lost or linked to the poll",
+      `exists (
+        select 1 from sources
+        where id=${sqlLiteral(harness.state.overlapGmailSourceId)}::uuid
+          and kind='gmail' and visibility='private'
+          and owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid
       ) and not exists (
         select 1 from proactive_work_sources link
         join proactive_work work on work.id=link.work_id
         where work.kind='personal_google_poll'
           and work.owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid
+          and link.source_id=${sqlLiteral(harness.state.overlapGmailSourceId)}::uuid
       ) and exists (
         select 1 from proactive_work
         where kind='personal_google_poll'
@@ -5463,10 +5645,20 @@ release("Florence parent journeys", () => {
       ),
     ).toBe(true);
     await initialFactOnlyBoundaryHarness.assertDatabase(
-      "An owner-private fact-only initial review crossed Florence's family relevance boundary",
-      `not exists (
+      "An owner-private fact-only initial review lost its source or crossed the fact boundary",
+      `exists (
         select 1 from sources
-        where kind='gmail' and metadata->>'messageId'='gmail-initial-unrelated-retail-account-alert'
+        where kind='gmail' and visibility='private'
+          and owner_adult_id=${sqlLiteral(initialFactOnlyBoundaryHarness.founderAdultId)}::uuid
+          and metadata->>'messageId'='gmail-initial-unrelated-retail-account-alert'
+      ) and exists (
+        select 1 from proactive_work_sources link
+        join proactive_work work on work.id=link.work_id
+        join sources source on source.id=link.source_id
+        where work.kind='initial_private_review'
+          and work.owner_adult_id=${sqlLiteral(initialFactOnlyBoundaryHarness.founderAdultId)}::uuid
+          and source.owner_adult_id=work.owner_adult_id
+          and source.metadata->>'messageId'='gmail-initial-unrelated-retail-account-alert'
       ) and not exists (
         select 1 from facts where slot=${sqlLiteral(UNRELATED_ACCOUNT_FACT_SLOT)}
       )`,
@@ -7095,6 +7287,7 @@ async function createHarness(
     googleDeletionSourceId: null,
     googleChangeReads: [],
     interactiveGoogleReads: 0,
+    workspaceExecutions: [],
     providerRevocations: [],
     setupConversations: [],
     initialNoAttentionReview: false,
@@ -8148,6 +8341,25 @@ function createGoogle(store: PostgresFlorenceStore, state: HarnessState): Google
   };
   return {
     status: (input: { householdId: string; ownerAdultId: string }) => store.listActive(input),
+    runWorkspace: async (
+      input: WorkspaceExecutionInput,
+      signal?: AbortSignal,
+    ): Promise<GoogleWorkspaceResult> => {
+      await activeCredential(input);
+      signal?.throwIfAborted();
+      state.workspaceExecutions.push(input);
+      if (input.operation.operation === "tasks_create") {
+        return {
+          operation: input.operation.operation,
+          result: {
+            status: "created",
+            taskId: `google-task-${state.workspaceExecutions.length}`,
+            title: input.operation.title,
+          },
+        };
+      }
+      return { operation: input.operation.operation, result: { status: "completed" } };
+    },
     disconnect: async (input: {
       connectionId: string;
       householdId: string;

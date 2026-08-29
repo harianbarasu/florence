@@ -199,6 +199,7 @@ export type GoogleCalendarChange = {
   status: "confirmed" | "tentative" | "cancelled";
   busy: boolean;
   title: string | null;
+  location?: string | null;
   startsAt: string | null;
   endsAt: string | null;
   allDay: boolean | null;
@@ -3826,6 +3827,8 @@ function calendarChangedEvent(
   const status = calendarEventStatus(event.status);
   const summary = optionalStringField(event, "summary");
   const title = summary === null ? null : bounded(summary, 500);
+  const locationValue = optionalStringField(event, "location");
+  const location = locationValue === null ? null : bounded(locationValue, 500);
   if (status === "cancelled") {
     return {
       providerEventId,
@@ -3834,6 +3837,7 @@ function calendarChangedEvent(
       status,
       busy: false,
       title,
+      location,
       startsAt: null,
       endsAt: null,
       allDay: null,
@@ -3879,6 +3883,7 @@ function calendarChangedEvent(
     status,
     busy,
     title,
+    location,
     startsAt: startInstant.toISOString(),
     endsAt: endInstant.toISOString(),
     allDay,

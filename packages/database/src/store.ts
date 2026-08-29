@@ -22325,6 +22325,8 @@ async function insertFamilyWorkOutbound(
       : null;
   const selectedFiles = deliveryKind === "terminal" ? (state.terminal?.selectedFiles ?? []) : [];
   const selectedImages = deliveryKind === "terminal" ? (state.terminal?.selectedImages ?? []) : [];
+  const completionReceipt =
+    deliveryKind === "terminal" ? familyWorkCompletionReceipt(state) : null;
   const suffix = `family-work:${deliveryKind}:${state.generation}:${state.progressRevision}`;
   await insertProactiveOutbound(sql, {
     workId: work.id,
@@ -22365,11 +22367,40 @@ async function insertFamilyWorkOutbound(
             ),
           }
         : {}),
+      ...(completionReceipt ? { familyWorkCompletionReceipt: completionReceipt } : {}),
       ...(resolutionMetadata ?? {}),
     },
     notBefore: occurredAt,
     occurredAt,
   });
+}
+
+function familyWorkCompletionReceipt(state: FamilyWorkStateV1): JsonObject | null {
+  const basis = state.terminal?.completionBasis;
+  if (!basis || basis.evidenceCallIds.length === 0) return null;
+  const evidenceByCallId = new Map(
+    (state.completionEvidence ?? []).map((evidence) => [evidence.callId, evidence] as const),
+  );
+  return {
+    condition: basis.condition,
+    summary: basis.summary,
+    evidence: basis.evidenceCallIds.map((callId) => {
+      const evidence = evidenceByCallId.get(callId);
+      if (!evidence) {
+        throw new FlorenceStoreConflict(
+          "Family-work terminal source lost its selected completion evidence",
+        );
+      }
+      return {
+        callId: evidence.callId,
+        capabilityName: evidence.capabilityName,
+        arguments: evidence.arguments,
+        recordedAt: evidence.recordedAt,
+        outputDigest: evidence.outputDigest,
+        facts: evidence.facts.map((fact) => ({ pointer: fact.pointer, value: fact.value })),
+      };
+    }),
+  };
 }
 
 function proactiveFamilyWorkActionOwners(metadata: JsonValue): ProactiveFamilyWorkActionOwner[] {

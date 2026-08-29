@@ -1183,6 +1183,20 @@ release("Durable family work store", () => {
     );
     const terminalDue = await store.readNextOutbound(at(120_300));
     if (!terminalDue) throw new Error("Transactional terminal outbound was not staged");
+    await assertDatabase(
+      "Terminal source did not preserve its selected provider receipt facts",
+      `exists (
+        select 1 from sources source where source.id='${terminalDue.sourceId}'
+          and source.metadata->'familyWorkCompletionReceipt'->>'condition'=
+            'The camp registration is filled through the final review page.'
+          and source.metadata->'familyWorkCompletionReceipt'->'evidence'->0->>'capabilityName'=
+            'browser_work'
+          and source.metadata->'familyWorkCompletionReceipt'->'evidence'->0->'facts'->0->>'pointer'=
+            '/title'
+          and source.metadata->'familyWorkCompletionReceipt'->'evidence'->0->'facts'->0->>'value'=
+            'Camp registration'
+      )`,
+    );
     const terminal = await store.beginOutbound({ sourceId: terminalDue.sourceId, now: at(120_300) });
     if (!terminal || !(await store.outboundSendIsCurrent(terminal.sourceId))) {
       throw new Error("Terminal outbound was not current");

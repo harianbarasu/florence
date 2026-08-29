@@ -181,6 +181,57 @@ describe("Florence reasoner capability cutover", () => {
     });
   });
 
+  test("a docket change needs a spoken acknowledgement and cannot duplicate tracked work", async () => {
+    const reactionOnly = ordinaryDecision();
+    reactionOnly.conversation.bubbles = [];
+    reactionOnly.conversation.reaction = "like";
+    reactionOnly.docketUpsert = {
+      operation: "create",
+      candidateId: null,
+      candidate: {
+        category: "deadline",
+        summary: "The field-trip form still needs a signature.",
+        urgency: "soon",
+        dueAt: "2026-08-29T20:00:00.000Z",
+        needsAnswer: true,
+      },
+      sourceIds: ["turn-1"],
+    };
+    const reactionReasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        stream: () => fakeStream({ status: "completed", output_parsed: reactionOnly, output: [] }),
+      },
+    } as never);
+
+    await expect(reactionReasoner.decide(foregroundInput(), inertReads())).rejects.toMatchObject({
+      code: "invalid_output",
+      message: expect.stringContaining("spoken acknowledgement bubble"),
+    });
+
+    const duplicateTracking = ordinaryDecision();
+    duplicateTracking.docketUpsert = reactionOnly.docketUpsert;
+    duplicateTracking.followUp = {
+      operation: "schedule",
+      followUpId: null,
+      objective: "Watch for confirmation that the field-trip form was signed.",
+      currentConclusion: "The signature is still outstanding.",
+      endCondition: "A parent confirms the form was signed.",
+      nextCheck: "2026-08-28T21:00:00.000Z",
+      why: "The form has a deadline.",
+      sourceIds: ["turn-1"],
+    };
+    const duplicateReasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        stream: () => fakeStream({ status: "completed", output_parsed: duplicateTracking, output: [] }),
+      },
+    } as never);
+
+    await expect(duplicateReasoner.decide(foregroundInput(), inertReads())).rejects.toMatchObject({
+      code: "invalid_output",
+      message: expect.stringContaining("already doing or tracking"),
+    });
+  });
+
   test("a natural text mention can acknowledge work Florence starts in the family group", async () => {
     const decision = ordinaryDecision();
     decision.conversation.bubbles = [];
@@ -4747,6 +4798,7 @@ function ordinaryDecision(input: { bubbleText?: string; researchUrls?: string[] 
     followUp: null,
     reminder: null,
     familyWork: null,
+    docketUpsert: null,
     docketCompletions: null,
     interest: null,
     calendar: null,

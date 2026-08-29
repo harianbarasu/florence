@@ -1,5 +1,5 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID } from "node:crypto";
-import { chmod, link, mkdir, readdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
+import { chmod, link, mkdir, readdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import path from "node:path";
 import type { ImageReference } from "@florence/contracts";
@@ -102,6 +102,8 @@ type ImageMetadata = SourceIdentity & {
   mimeType: StoredMimeType;
   byteLength: number;
   expiresAt: string;
+  retained?: boolean;
+  retentionClaims?: string[];
 };
 
 type PdfMetadata = {
@@ -114,7 +116,8 @@ type PdfMetadata = {
   mimeType: "application/pdf";
   sourceDigest: string;
   byteLength: number;
-  discardAfter: string;
+  discardAfter: string | null;
+  retained?: boolean;
 };
 
 export function decodeImageVaultKey(value: string): Uint8Array {
@@ -133,6 +136,7 @@ export class EncryptedImageVault {
   readonly #rootDirectory: string;
   readonly #key: Buffer;
   readonly #normalizeHeic: HeicNormalizer | undefined;
+  readonly #retentionQueues = new Map<string, Promise<void>>();
 
   constructor(options: EncryptedImageVaultOptions) {
     if (!path.isAbsolute(options.rootDirectory)) {
@@ -226,11 +230,60 @@ export class EncryptedImageVault {
     image: ImageReference;
   }): Promise<{ mimeType: StoredMimeType; bytes: Uint8Array }> {
     const loaded = await this.#loadAuthorized(input);
-    if (Date.parse(loaded.metadata.expiresAt) <= Date.now()) {
+    if (loaded.metadata.retained !== true && Date.parse(loaded.metadata.expiresAt) <= Date.now()) {
       await unlink(this.#assetPath(input.image.assetId)).catch(() => undefined);
       throw new ImageVaultError("expired", "Image retention has expired");
     }
     return { mimeType: loaded.metadata.mimeType, bytes: loaded.bytes };
+  }
+
+  /** Keeps one unexpired, already-authorized exact Message image available for durable family work. */
+  async retain(input: {
+    householdId: string;
+    signalId: string;
+    image: ImageReference;
+    claimId: string;
+    now?: Date;
+  }): Promise<void> {
+    requireUuid(input.claimId);
+    await this.#withRetentionLock(input.image.assetId, async () => {
+      const loaded = await this.#loadAuthorized(input);
+      if (loaded.metadata.retained === true && loaded.metadata.retentionClaims === undefined) return;
+      if (Date.parse(loaded.metadata.expiresAt) <= (input.now ?? new Date()).getTime()) {
+        await unlink(this.#assetPath(input.image.assetId)).catch(() => undefined);
+        throw new ImageVaultError("expired", "Image retention has expired");
+      }
+      const retentionClaims = [...new Set([...(loaded.metadata.retentionClaims ?? []), input.claimId])];
+      const retainedEnvelope = encryptEnvelope(
+        this.#key,
+        { ...loaded.metadata, retained: true, retentionClaims },
+        loaded.bytes,
+      );
+      await this.#replaceAtomically(input.image.assetId, retainedEnvelope);
+    });
+  }
+
+  /** Releases only this turn's claim; another committed or concurrent claimant keeps the image. */
+  async releaseRetention(input: {
+    householdId: string;
+    signalId: string;
+    image: ImageReference;
+    claimId: string;
+  }): Promise<boolean> {
+    requireUuid(input.claimId);
+    return this.#withRetentionLock(input.image.assetId, async () => {
+      const loaded = await this.#loadAuthorized(input);
+      const claims = loaded.metadata.retentionClaims;
+      if (claims === undefined || !claims.includes(input.claimId)) return false;
+      const retentionClaims = claims.filter((claimId) => claimId !== input.claimId);
+      const retainedEnvelope = encryptEnvelope(
+        this.#key,
+        { ...loaded.metadata, retained: retentionClaims.length > 0, retentionClaims },
+        loaded.bytes,
+      );
+      await this.#replaceAtomically(input.image.assetId, retainedEnvelope);
+      return true;
+    });
   }
 
   sealPdf(input: {
@@ -269,6 +322,7 @@ export class EncryptedImageVault {
       sourceDigest: contentDigest,
       byteLength: bytes.length,
       discardAfter,
+      retained: false,
     };
     return {
       documentId: input.documentId,
@@ -289,14 +343,15 @@ export class EncryptedImageVault {
     mimeType: string;
     contentDigest: string;
     contentEnvelope: Uint8Array;
-    discardAfter: string;
+    discardAfter: string | null;
     now?: Date;
   }): { mimeType: "application/pdf"; bytes: Uint8Array } {
     requirePdfUuid(input.documentId, "PDF document");
     requirePdfUuid(input.householdId, "PDF household");
     requirePdfUuid(input.signalId, "PDF source message");
     const filename = requirePdfFilename(input.filename);
-    const discardAfter = requireTimestamp(input.discardAfter, "PDF discard time");
+    const discardAfter =
+      input.discardAfter === null ? null : requireTimestamp(input.discardAfter, "PDF discard time");
     if (input.mimeType !== "application/pdf" || !/^[0-9a-f]{64}$/.test(input.contentDigest)) {
       throw new ImageVaultError("invalid_document", "PDF provenance is invalid");
     }
@@ -308,14 +363,46 @@ export class EncryptedImageVault {
       loaded.metadata.filename === filename &&
       loaded.metadata.mimeType === input.mimeType &&
       loaded.metadata.sourceDigest === input.contentDigest &&
-      loaded.metadata.discardAfter === discardAfter;
+      loaded.metadata.discardAfter === discardAfter &&
+      (loaded.metadata.retained === true) === (discardAfter === null);
     if (!authorized) {
       throw new ImageVaultError("unauthorized_or_missing", "PDF is unavailable");
     }
-    if (Date.parse(discardAfter) <= (input.now ?? new Date()).getTime()) {
+    if (discardAfter !== null && Date.parse(discardAfter) <= (input.now ?? new Date()).getTime()) {
       throw new ImageVaultError("expired", "PDF retention has expired");
     }
     return { mimeType: "application/pdf", bytes: loaded.bytes };
+  }
+
+  /** Reauthorizes one exact sealed Message PDF for the durable record that cited it. */
+  retainPdf(input: {
+    documentId: string;
+    householdId: string;
+    signalId: string;
+    filename: string;
+    mimeType: string;
+    contentDigest: string;
+    contentEnvelope: Uint8Array;
+    discardAfter: string;
+    now?: Date;
+  }): { contentEnvelope: Uint8Array } {
+    const opened = this.openPdf(input);
+    const metadata: PdfMetadata = {
+      version: 1,
+      kind: "pdf",
+      documentId: input.documentId,
+      householdId: input.householdId,
+      sourceSignalId: input.signalId,
+      filename: input.filename,
+      mimeType: "application/pdf",
+      sourceDigest: input.contentDigest,
+      byteLength: opened.bytes.byteLength,
+      discardAfter: null,
+      retained: true,
+    };
+    return {
+      contentEnvelope: encryptAuthenticatedEnvelope(this.#key, pdfEnvelopeMagic, metadata, opened.bytes),
+    };
   }
 
   async delete(input: { householdId: string; signalId: string; image: ImageReference }): Promise<void> {
@@ -340,7 +427,7 @@ export class EncryptedImageVault {
         try {
           const envelope = await readBounded(assetPath);
           const { metadata } = decryptEnvelope(this.#key, envelope);
-          expired = Date.parse(metadata.expiresAt) <= now.getTime();
+          expired = metadata.retained !== true && Date.parse(metadata.expiresAt) <= now.getTime();
         } catch {
           const file = await stat(assetPath);
           expired = file.mtimeMs + imageRetentionMs <= now.getTime();
@@ -512,6 +599,38 @@ export class EncryptedImageVault {
       throw error;
     }
   }
+
+  async #replaceAtomically(assetId: string, envelope: Uint8Array): Promise<void> {
+    const directory = path.dirname(this.#assetPath(assetId));
+    await mkdir(this.#rootDirectory, { recursive: true, mode: 0o700 });
+    await chmod(this.#rootDirectory, 0o700);
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    await chmod(directory, 0o700);
+    const temporary = path.join(directory, `.${assetId}.${randomUUID()}.tmp`);
+    try {
+      await writeFile(temporary, envelope, { flag: "wx", mode: 0o600 });
+      await rename(temporary, this.#assetPath(assetId));
+    } finally {
+      await unlink(temporary).catch(() => undefined);
+    }
+  }
+
+  async #withRetentionLock<T>(assetId: string, operation: () => Promise<T>): Promise<T> {
+    const prior = this.#retentionQueues.get(assetId) ?? Promise.resolve();
+    let release = () => {};
+    const current = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const queued = prior.catch(() => undefined).then(() => current);
+    this.#retentionQueues.set(assetId, queued);
+    await prior.catch(() => undefined);
+    try {
+      return await operation();
+    } finally {
+      release();
+      if (this.#retentionQueues.get(assetId) === queued) this.#retentionQueues.delete(assetId);
+    }
+  }
 }
 
 function existingStoreResult(
@@ -534,7 +653,7 @@ function existingStoreResult(
   };
 }
 
-function encryptEnvelope(key: Buffer, metadata: ImageMetadata, bytes: Buffer): Buffer {
+function encryptEnvelope(key: Buffer, metadata: ImageMetadata, bytes: Uint8Array): Buffer {
   return encryptAuthenticatedEnvelope(key, imageEnvelopeMagic, metadata, bytes);
 }
 
@@ -688,7 +807,15 @@ function requireImageMetadata(value: unknown): asserts value is ImageMetadata {
     (metadata.byteLength ?? 0) < 1 ||
     (metadata.byteLength ?? 0) > MAX_IMAGE_BYTES ||
     typeof metadata.expiresAt !== "string" ||
-    !Number.isFinite(Date.parse(metadata.expiresAt))
+    !Number.isFinite(Date.parse(metadata.expiresAt)) ||
+    (metadata.retained !== undefined && typeof metadata.retained !== "boolean") ||
+    (metadata.retentionClaims !== undefined &&
+      (!Array.isArray(metadata.retentionClaims) ||
+        metadata.retentionClaims.some(
+          (claimId) => typeof claimId !== "string" || !uuidPattern.test(claimId),
+        ) ||
+        new Set(metadata.retentionClaims).size !== metadata.retentionClaims.length ||
+        (metadata.retained === true) !== metadata.retentionClaims.length > 0))
   ) {
     throw new ImageVaultError("corrupt", "Image metadata is invalid");
   }
@@ -717,8 +844,10 @@ function requirePdfMetadata(value: unknown): asserts value is PdfMetadata {
     !Number.isSafeInteger(metadata.byteLength) ||
     (metadata.byteLength ?? 0) < 1 ||
     (metadata.byteLength ?? 0) > MAX_PDF_BYTES ||
-    typeof metadata.discardAfter !== "string" ||
-    !Number.isFinite(Date.parse(metadata.discardAfter))
+    (metadata.retained !== undefined && typeof metadata.retained !== "boolean") ||
+    (metadata.retained === true
+      ? metadata.discardAfter !== null
+      : typeof metadata.discardAfter !== "string" || !Number.isFinite(Date.parse(metadata.discardAfter)))
   ) {
     throw new ImageVaultError("corrupt", "PDF metadata is invalid");
   }

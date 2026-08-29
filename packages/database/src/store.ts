@@ -274,8 +274,23 @@ export type CurrentMessageDocument = {
   mimeType: "application/pdf";
   contentDigest: string;
   contentEnvelope: Uint8Array;
-  discardAfter: string;
+  discardAfter: string | null;
 };
+
+export type FamilyWorkLinkedSource =
+  | Readonly<{ sourceId: string; kind: "gmail" | "calendar" }>
+  | Readonly<{
+      sourceId: string;
+      kind: "message";
+      visibility: "shared" | "adult_private";
+      message: ConversationTurn & { speaker: string };
+    }>
+  | Readonly<{
+      sourceId: string;
+      kind: "document";
+      visibility: "shared" | "adult_private";
+      document: CurrentMessageDocument;
+    }>;
 
 export type FamilyWorkOriginContext = {
   message: ConversationTurn & { speaker: string };
@@ -353,7 +368,7 @@ export type SharedBriefingCandidate = {
 
 export type HouseholdDocket = {
   totalItems: number;
-  items: readonly SharedBriefingCandidate[];
+  items: readonly (SharedBriefingCandidate & { visibility: Visibility })[];
 };
 
 export type PrivateReviewFinding = {
@@ -665,6 +680,7 @@ export type FamilyWorkStateV1 = {
   readonly version: 1;
   readonly generation: number;
   readonly acknowledgementText?: string | null;
+  readonly docketCandidateIds?: readonly string[];
   readonly phase: "ready" | "tool_pending" | "waiting" | "terminal";
   readonly claim: { readonly claimId: string; readonly leaseUntil: string } | null;
   readonly browserSession: {
@@ -757,7 +773,7 @@ export type DueProactiveWork =
       initiatingAdultId: string;
       origin: FamilyWorkOriginContext;
       objective: string;
-      linkedSources: readonly Readonly<{ sourceId: string; kind: "gmail" | "calendar" }>[];
+      linkedSources: readonly FamilyWorkLinkedSource[];
       lastDeliveredProgress: string | null;
       state: FamilyWorkStateV1;
       claimId: string;
@@ -1010,7 +1026,7 @@ export type ConversationTurn = {
   authoredText: string | null;
   voiceTranscriptPresent: boolean;
   reaction: string | null;
-  images: readonly ImageReference[];
+  images: readonly (ImageReference & { signalId?: string })[];
   replyToSourceId: string | null;
   occurredAt: string;
 };
@@ -1215,6 +1231,7 @@ export type InboundTurn = {
   message: ConversationTurn & { speaker: string };
   supersededMessages: readonly (ConversationTurn & { speaker: string })[];
   replyTarget: ConversationTurn | null;
+  replyTargetSupersededMessages: readonly (ConversationTurn & { speaker: string })[];
   authority: LinqAuthority;
   household: {
     id: string;
@@ -1460,6 +1477,36 @@ export type FamilyWorkMutation =
   | { operation: "run"; workId: string; acknowledgementText?: string }
   | { operation: "pause" | "resume" | "cancel"; workId: string };
 
+export type DocketMutation =
+  | Readonly<{
+      operation: "create";
+      candidateId: null;
+      candidate: Omit<SharedBriefingCandidate, "candidateId">;
+      sourceIds: readonly string[];
+      retainedDocuments: readonly Readonly<{
+        documentId: string;
+        contentDigest: string;
+        contentEnvelope: Uint8Array;
+      }>[];
+    }>
+  | Readonly<{
+      operation: "update";
+      candidateId: string;
+      candidate: Omit<SharedBriefingCandidate, "candidateId">;
+      sourceIds: readonly string[];
+      retainedDocuments: readonly Readonly<{
+        documentId: string;
+        contentDigest: string;
+        contentEnvelope: Uint8Array;
+      }>[];
+    }>;
+
+export type RetainedMessageDocument = Readonly<{
+  documentId: string;
+  contentDigest: string;
+  contentEnvelope: Uint8Array;
+}>;
+
 export type ApprovedPartnerInvitation = {
   householdId: string;
   founderAdultId: string;
@@ -1490,6 +1537,8 @@ export type CommitTurnInput = {
   interestMutation?: DurableInterestMutation | null;
   reminderMutation?: ReminderMutation | null;
   familyWorkMutation?: FamilyWorkMutation | null;
+  familyWorkRetainedDocuments?: readonly RetainedMessageDocument[];
+  docketMutation?: DocketMutation | null;
   completeDocketCandidateIds?: readonly string[];
   outbound?: readonly OutboundDraft[];
   calendarOffers?: readonly CalendarOfferDraft[];
@@ -2084,9 +2133,9 @@ export class PostgresFlorenceStore {
     assertUuid(input.householdId, "Household ID");
     if (input.viewerAdultId) assertUuid(input.viewerAdultId, "Household docket viewer ID");
     const now = instant(input.now ?? new Date().toISOString());
-    const limit = input.limit === undefined ? 20 : input.limit;
-    if (limit !== null && (!Number.isSafeInteger(limit) || limit < 1 || limit > 100)) {
-      throw new FlorenceStoreConflict("A household docket limit must be between one and one hundred");
+    const limit = input.limit ?? null;
+    if (limit !== null && (!Number.isSafeInteger(limit) || limit < 1)) {
+      throw new FlorenceStoreConflict("A household docket limit must be a positive whole number");
     }
     const [household] = await this.#sql<{ time_zone: string }[]>`
       select time_zone from households where id=${input.householdId}
@@ -2129,9 +2178,15 @@ export class PostgresFlorenceStore {
           .filter((finding) => !finding.actionKey || !resolvedActionKeys.has(finding.actionKey))
           .map(privateFindingAsDocketCandidate)
       : [];
-    const ranked = [...groups.map(({ candidate }) => candidate), ...privateItems].sort(
-      compareBriefingCandidates,
-    );
+    const conversationItems = await readConversationDocketItems(this.#sql, {
+      householdId: input.householdId,
+      viewerAdultId: input.viewerAdultId ?? null,
+    });
+    const ranked = [
+      ...groups.map(({ candidate }) => ({ ...candidate, visibility: "household" as const })),
+      ...privateItems.map((candidate) => ({ ...candidate, visibility: "private" as const })),
+      ...conversationItems.map(({ candidate, visibility }) => ({ ...candidate, visibility })),
+    ].sort(compareBriefingCandidates);
     return {
       totalItems: ranked.length,
       items: (limit === null ? ranked : ranked.slice(0, limit)).map(
@@ -3455,7 +3510,12 @@ export class PostgresFlorenceStore {
             initiatingAdultId: resolvedOrigin.initiatingAdultId,
             origin: resolvedOrigin.origin,
             objective: required(familyTask.objective ?? "", "Family work objective"),
-            linkedSources: await familyWorkLinkedGoogleSources(sql, familyTask, now),
+            linkedSources: await familyWorkLinkedSources(
+              sql,
+              familyTask,
+              now,
+              resolvedOrigin.origin.message.sourceId,
+            ),
             lastDeliveredProgress: claimedState.progressRevision > 0 ? familyTask.current_conclusion : null,
             state: claimedState,
             claimId,
@@ -7443,7 +7503,7 @@ export class PostgresFlorenceStore {
         join sources prior_source on prior_source.id::text=superseded.metadata->>'supersedesSourceId'
         join messages prior_message on prior_message.source_id=prior_source.id
         where prior_message.channel_id=${row.channel_id} and prior_message.direction='inbound'
-          and not prior_source.id=any(superseded.path) and superseded.depth<100
+          and not prior_source.id=any(superseded.path)
       )
       select source_id,sender_adult_id,move_kind,text,reaction,images,reply_to_source_id,
         metadata,occurred_at,depth
@@ -7458,7 +7518,7 @@ export class PostgresFlorenceStore {
         mime_type: string;
         content_digest: string;
         content_envelope: Uint8Array;
-        discard_after: Date;
+        discard_after: Date | null;
       }[]
     >`
       select s.id,s.parent_source_id,d.filename,d.mime_type,d.content_digest,d.content_envelope,d.discard_after
@@ -7466,8 +7526,8 @@ export class PostgresFlorenceStore {
       join documents d on d.source_id=s.id
       where s.household_id=${row.household_id} and s.parent_source_id in ${this.#sql(activeSourceIds)}
         and s.visibility=parent.visibility and s.owner_adult_id is not distinct from parent.owner_adult_id
-        and s.kind='document' and d.mime_type='application/pdf' and d.retained=false
-        and d.content_envelope is not null and d.discard_after>${current}
+        and s.kind='document' and d.mime_type='application/pdf' and d.content_envelope is not null
+        and (d.retained=true or d.discard_after>${current})
       order by parent.occurred_at,s.id
     `;
     const privateViewer = channel.audience === "private" ? row.sender_adult_id : null;
@@ -7491,7 +7551,7 @@ export class PostgresFlorenceStore {
       where m.channel_id=${row.channel_id} and m.source_id not in ${this.#sql(activeSourceIds)}
         and m.status in ('handled','sent')
         and s.metadata->>'presentationCue' is distinct from 'true'
-      order by s.occurred_at desc,m.turn_part desc,m.source_id desc limit 100
+      order by s.occurred_at desc,m.turn_part desc,m.source_id desc
     `;
     const [replyTargetRow] = row.reply_to_source_id
       ? await this.#sql<
@@ -7516,6 +7576,82 @@ export class PostgresFlorenceStore {
           limit 1
         `
       : [];
+    const replyTargetSupersededRows = replyTargetRow
+      ? await this.#sql<
+          {
+            source_id: string;
+            sender_adult_id: string | null;
+            direction: "inbound" | "outbound";
+            move_kind: "message" | "reply" | "reaction";
+            text: string | null;
+            reaction: string | null;
+            images: JsonValue;
+            reply_to_source_id: string | null;
+            metadata: JsonValue;
+            occurred_at: Date;
+            depth: number;
+          }[]
+        >`
+          with recursive superseded as (
+            select prior_message.source_id,prior_message.sender_adult_id,prior_message.direction,
+              prior_message.move_kind,prior_message.text,prior_message.reaction,prior_message.images,
+              prior_message.reply_to_source_id,prior_source.occurred_at,prior_source.metadata,1 as depth,
+              array[target_source.id,prior_source.id] as path
+            from sources target_source
+            join sources prior_source
+              on prior_source.id::text=target_source.metadata->>'supersedesSourceId'
+            join messages prior_message on prior_message.source_id=prior_source.id
+            where target_source.id=${replyTargetRow.source_id}
+              and prior_message.channel_id=${row.channel_id}
+            union all
+            select prior_message.source_id,prior_message.sender_adult_id,prior_message.direction,
+              prior_message.move_kind,prior_message.text,prior_message.reaction,prior_message.images,
+              prior_message.reply_to_source_id,prior_source.occurred_at,prior_source.metadata,
+              superseded.depth+1,superseded.path||prior_source.id
+            from superseded
+            join sources prior_source
+              on prior_source.id::text=superseded.metadata->>'supersedesSourceId'
+            join messages prior_message on prior_message.source_id=prior_source.id
+            where prior_message.channel_id=${row.channel_id}
+              and not prior_source.id=any(superseded.path)
+          )
+          select source_id,sender_adult_id,direction,move_kind,text,reaction,images,
+            reply_to_source_id,metadata,occurred_at,depth
+          from superseded order by depth desc,occurred_at,source_id
+        `
+      : [];
+    const replyEvidenceSourceIds = replyTargetRow
+      ? [...replyTargetSupersededRows.map((message) => message.source_id), replyTargetRow.source_id].filter(
+          (sourceId) => !activeSourceIds.includes(sourceId),
+        )
+      : [];
+    const replyDocumentRows =
+      replyEvidenceSourceIds.length > 0
+        ? await this.#sql<
+            {
+              id: string;
+              parent_source_id: string;
+              filename: string;
+              mime_type: string;
+              content_digest: string;
+              content_envelope: Uint8Array;
+              discard_after: Date | null;
+            }[]
+          >`
+            select s.id,s.parent_source_id,d.filename,d.mime_type,d.content_digest,
+              d.content_envelope,d.discard_after
+            from sources s join sources parent on parent.id=s.parent_source_id
+            join documents d on d.source_id=s.id
+            where s.household_id=${row.household_id}
+              and s.parent_source_id in ${this.#sql(replyEvidenceSourceIds)}
+              and s.visibility=parent.visibility
+              and s.owner_adult_id is not distinct from parent.owner_adult_id
+              and s.kind='document' and d.mime_type='application/pdf'
+              and d.content_envelope is not null
+              and (d.retained=true or d.discard_after>${current})
+            order by parent.occurred_at,s.id
+          `
+        : [];
     const [groupCalendarAuthority] =
       channel.audience === "group"
         ? await this.#sql<FamilyCalendarAuthorityRow[]>`
@@ -7803,7 +7939,7 @@ export class PostgresFlorenceStore {
         text: row.text,
         ...conversationAuthorship(row.metadata),
         reaction: row.reaction,
-        images: imageReferences(row.images),
+        images: conversationImageReferences(row.images, row.metadata, row.source_id),
         replyToSourceId: row.reply_to_source_id,
         occurredAt: row.occurred_at.toISOString(),
       },
@@ -7814,7 +7950,7 @@ export class PostgresFlorenceStore {
         text: message.text,
         ...conversationAuthorship(message.metadata),
         reaction: message.reaction,
-        images: imageReferences(message.images),
+        images: conversationImageReferences(message.images, message.metadata, message.source_id),
         replyToSourceId: message.reply_to_source_id,
         occurredAt: message.occurred_at.toISOString(),
       })),
@@ -7829,11 +7965,26 @@ export class PostgresFlorenceStore {
             text: replyTargetRow.text,
             ...conversationAuthorship(replyTargetRow.metadata),
             reaction: replyTargetRow.reaction,
-            images: imageReferences(replyTargetRow.images),
+            images: conversationImageReferences(
+              replyTargetRow.images,
+              replyTargetRow.metadata,
+              replyTargetRow.source_id,
+            ),
             replyToSourceId: replyTargetRow.reply_to_source_id,
             occurredAt: replyTargetRow.occurred_at.toISOString(),
           }
         : null,
+      replyTargetSupersededMessages: replyTargetSupersededRows.map((message) => ({
+        sourceId: message.source_id,
+        speaker: message.direction === "outbound" ? "florence" : (message.sender_adult_id as string),
+        moveKind: message.move_kind,
+        text: message.text,
+        ...conversationAuthorship(message.metadata),
+        reaction: message.reaction,
+        images: conversationImageReferences(message.images, message.metadata, message.source_id),
+        replyToSourceId: message.reply_to_source_id,
+        occurredAt: message.occurred_at.toISOString(),
+      })),
       authority,
       household: {
         id: household.id,
@@ -7847,14 +7998,14 @@ export class PostgresFlorenceStore {
         members: members.map(personRecord),
       },
       facts: await this.#readFacts(row.household_id, privateViewer, channel.audience === "group"),
-      currentDocuments: currentDocumentRows.map((document) => ({
+      currentDocuments: [...currentDocumentRows, ...replyDocumentRows].map((document) => ({
         id: document.id,
         parentSourceId: document.parent_source_id,
         filename: document.filename,
         mimeType: pdfMimeType(document.mime_type),
         contentDigest: document.content_digest,
         contentEnvelope: document.content_envelope,
-        discardAfter: document.discard_after.toISOString(),
+        discardAfter: document.discard_after?.toISOString() ?? null,
       })),
       recentMessages: recentRows.reverse().map((turn) => ({
         sourceId: turn.source_id,
@@ -7863,7 +8014,7 @@ export class PostgresFlorenceStore {
         text: turn.text,
         ...conversationAuthorship(turn.metadata),
         reaction: turn.reaction,
-        images: imageReferences(turn.images),
+        images: conversationImageReferences(turn.images, turn.metadata, turn.source_id),
         replyToSourceId: turn.reply_to_source_id,
         occurredAt: turn.occurred_at.toISOString(),
       })),
@@ -7914,12 +8065,9 @@ export class PostgresFlorenceStore {
   async commitTurn(input: CommitTurnInput): Promise<CommitTurnResult> {
     const handledAt = instant(input.handledAt);
     const completeDocketCandidateIds = input.completeDocketCandidateIds ?? [];
-    if (
-      completeDocketCandidateIds.length > 20 ||
-      new Set(completeDocketCandidateIds).size !== completeDocketCandidateIds.length
-    ) {
+    if (new Set(completeDocketCandidateIds).size !== completeDocketCandidateIds.length) {
       throw new FlorenceStoreConflict(
-        "A conversation cannot complete repeated or excessive household docket items",
+        "A conversation cannot complete a household docket item more than once",
       );
     }
     for (const candidateId of completeDocketCandidateIds) {
@@ -7935,6 +8083,7 @@ export class PostgresFlorenceStore {
           audience: Audience;
           visibility: Visibility;
           move_kind: "message" | "reply" | "reaction";
+          reply_to_source_id: string | null;
           status: "received" | "handled";
           occurred_at: Date;
           revoked_at: Date | null;
@@ -7950,7 +8099,7 @@ export class PostgresFlorenceStore {
         }[]
       >`
         select m.source_id,s.household_id,m.channel_id,m.sender_adult_id,c.audience,s.visibility,
-          m.move_kind,m.status,s.occurred_at,c.revoked_at,c.stopped_at,
+          m.move_kind,m.reply_to_source_id,m.status,s.occurred_at,c.revoked_at,c.stopped_at,
           c.provider_conversation_id,c.adult_one_id,c.identity_one_digest,c.adult_two_id,
           c.identity_two_digest,c.authority_digest,c.bound_at,s.metadata as source_metadata
         from messages m join sources s on s.id=m.source_id join linq_channels c on c.id=m.channel_id
@@ -7991,6 +8140,7 @@ export class PostgresFlorenceStore {
           input.interestMutation != null ||
           input.reminderMutation != null ||
           input.familyWorkMutation != null ||
+          input.docketMutation != null ||
           (input.completeDocketCandidateIds?.length ?? 0) > 0 ||
           (input.outbound?.length ?? 0) > 0 ||
           (input.calendarOffers?.length ?? 0) > 0 ||
@@ -8013,7 +8163,7 @@ export class PostgresFlorenceStore {
       if (turn.audience !== "private" && input.partnerInvitationApproval !== undefined) {
         throw new FlorenceStoreUnauthorized("Partner invitations require a private adult thread");
       }
-      if (completeDocketCandidateIds.length > 0) {
+      if (completeDocketCandidateIds.length > 0 || input.docketMutation != null) {
         // A Google poll takes its work row before reconciling sources, monitors, Calendar actions,
         // and the review. Take that same leading lock before this turn mutates Google-backed state.
         await lockHouseholdGooglePolls(sql, turn.household_id);
@@ -8175,6 +8325,7 @@ export class PostgresFlorenceStore {
           ...(input.facts ?? []).flatMap((fact) => [...fact.sourceIds]),
           ...(input.finiteMonitors ?? []).flatMap((monitor) => [...monitor.sourceIds]),
           ...(input.finiteMonitorUpdates ?? []).flatMap((monitor) => [...monitor.sourceIds]),
+          ...(input.docketMutation ? [...input.docketMutation.sourceIds] : []),
         ]),
       });
 
@@ -8373,6 +8524,20 @@ export class PostgresFlorenceStore {
         });
       }
 
+      if (input.docketMutation) {
+        if (turn.move_kind === "reaction") {
+          throw new FlorenceStoreUnauthorized("A reaction cannot change the household docket");
+        }
+        await applyConversationalDocketMutation(sql, {
+          householdId: turn.household_id,
+          audience: turn.audience,
+          senderAdultId: turn.sender_adult_id,
+          currentSourceId: turn.source_id,
+          mutation: input.docketMutation,
+          occurredAt: handledAt,
+        });
+      }
+
       if (input.familyWorkMutation) {
         const mutation = input.familyWorkMutation;
         if (turn.move_kind === "reaction") {
@@ -8391,6 +8556,7 @@ export class PostgresFlorenceStore {
             assertUuid(candidateId, "Family work docket candidate ID");
           }
           let selectedDocketSourceIds: readonly string[] = [];
+          let selectedDocketActionOwners: readonly ProactiveFamilyWorkActionOwner[] = [];
           if (mutation.candidateIds.length > 0) {
             await lockHouseholdGooglePolls(sql, turn.household_id);
             const docketState = await currentHouseholdDocketState(sql, {
@@ -8417,7 +8583,15 @@ export class PostgresFlorenceStore {
                     where household_id=${turn.household_id} and id in ${sql(candidateSourceIds)}
                     order by id for share
                   `;
-            if (selectedSources.length !== candidateSourceIds.length) {
+            const selectedSourceIds = new Set(selectedSources.map((source) => source.id));
+            const optionalMissingSourceIds = new Set(
+              selection.conversationItems.flatMap((item) => [...item.record.optionalProviderSourceIds]),
+            );
+            if (
+              candidateSourceIds.some(
+                (sourceId) => !selectedSourceIds.has(sourceId) && !optionalMissingSourceIds.has(sourceId),
+              )
+            ) {
               throw new FlorenceStoreConflict(
                 "A household docket source changed before Florence could start the work",
               );
@@ -8429,13 +8603,57 @@ export class PostgresFlorenceStore {
                 ? [source.id]
                 : [],
             );
+            const selectedGoogleCandidates = [
+              ...selection.groups.flatMap((group) => [...group.members]),
+              ...selection.privateFindings.map(privateFindingAsDocketCandidate),
+            ];
+            const sourceDigests = await readStableGoogleSourceDigestMap(
+              sql,
+              turn.household_id,
+              unique(selectedGoogleCandidates.flatMap((candidate) => [...candidate.sourceIds])),
+            );
+            const actionOwners: ProactiveFamilyWorkActionOwner[] = [];
+            for (const group of selection.groups) {
+              for (const candidate of group.members) {
+                const actionKey = googleActionKeyForCandidate(candidate, sourceDigests);
+                if (!actionKey) {
+                  throw new FlorenceStoreConflict(
+                    "A selected household docket item lost its provider identity",
+                  );
+                }
+                const ownerAdultIds = docketCandidateOwnerAdultIds(
+                  docketState.reviews,
+                  candidate.candidateId,
+                );
+                for (const ownerAdultId of ownerAdultIds) actionOwners.push({ key: actionKey, ownerAdultId });
+              }
+            }
+            for (const finding of selection.privateFindings) {
+              const candidate = privateFindingAsDocketCandidate(finding);
+              const actionKey = googleActionKeyForCandidate(candidate, sourceDigests);
+              if (!actionKey) {
+                throw new FlorenceStoreConflict("A selected private docket item lost its provider identity");
+              }
+              actionOwners.push({ key: actionKey, ownerAdultId: turn.sender_adult_id });
+            }
+            selectedDocketActionOwners = uniqueProactiveFamilyWorkActionOwners(actionOwners);
           }
+          const familyWorkEvidenceSourceIds = await retainFamilyWorkMessageEvidence(sql, {
+            householdId: turn.household_id,
+            channelId: turn.channel_id,
+            currentSourceId: turn.source_id,
+            replyToSourceId: turn.reply_to_source_id,
+            visibility: expectedVisibility,
+            ownerAdultId: expectedOwnerAdultId,
+            retainedDocuments: input.familyWorkRetainedDocuments ?? [],
+            occurredAt: handledAt,
+          });
           const objective = bounded(required(mutation.objective, "Family work objective"), 4_000);
           const [sameId] = await sql<ProactiveWorkRow[]>`
             select * from proactive_work where id=${mutation.workId} for update
           `;
           if (sameId) throw new FlorenceStoreConflict("A family work ID was already used");
-          const state = initialFamilyWorkState(mutation.acknowledgementText ?? null);
+          const state = initialFamilyWorkState(mutation.acknowledgementText ?? null, mutation.candidateIds);
           const scheduled = mutation.schedule ? newScheduledFamilyWork(mutation.schedule) : null;
           let nextCheckAt = new Date(handledAt.getTime() + FAMILY_WORK_INITIAL_DELAY_MS);
           if (scheduled) {
@@ -8463,16 +8681,39 @@ export class PostgresFlorenceStore {
               ${scheduled ? "Scheduled." : "Starting now."},
               ${scheduled ? sql.json(scheduled) : null},${sql.json(state)},'active',${nextCheckAt},${handledAt})
           `;
+          for (const sourceId of familyWorkEvidenceSourceIds) {
+            await sql`
+              insert into proactive_work_sources (work_id,source_id)
+              values (${mutation.workId},${sourceId}) on conflict do nothing
+            `;
+          }
+          const actionOwners: Record<string, JsonValue> = {};
+          for (const { key, ownerAdultId } of selectedDocketActionOwners) {
+            const owners = actionOwners[key];
+            actionOwners[key] = unique([
+              ...(Array.isArray(owners)
+                ? owners.filter((value): value is string => typeof value === "string")
+                : []),
+              ownerAdultId,
+            ]).sort();
+          }
+          const familyWorkOriginMetadata: JsonObject =
+            selectedDocketActionOwners.length > 0
+              ? {
+                  familyWorkOriginId: mutation.workId,
+                  proactiveFamilyWorkActionOwners: actionOwners,
+                }
+              : { familyWorkOriginId: mutation.workId };
           await sql`
-            insert into proactive_work_sources (work_id,source_id)
-            values (${mutation.workId},${turn.source_id})
+            update sources set metadata=metadata||${sql.json(familyWorkOriginMetadata)}
+            where id=${turn.source_id} and household_id=${turn.household_id}
           `;
-          // Adapted port: Hermes 6dcebea7 cron/jobs.py:1959-2150 and
-          // cron/scheduler.py:4611-4677 persist context IDs separately and resolve them when work
-          // executes; Pi 4e494929 packages/agent/src/types.ts:360-369,
-          // packages/ai/src/types.ts:449-465, and packages/agent/src/agent-loop.ts:218-232,777-790
-          // keep structured tool provenance beside model content; OpenInstinct 480045db
-          // agent/instructions.md:66-79 passes complete relevant context plus exact targets.
+          // Adapted port: Hermes 6dcebea7 hermes_cli/kanban_db.py:1052-1136,3502-3568 keeps
+          // durable task identity and parent links; Pi 4e494929
+          // packages/agent/src/harness/session/types.ts:87-112,150-160 and
+          // packages/agent/src/harness/reducer.ts:505-585 replay explicit lineage; OpenInstinct
+          // 480045db agent/instructions.md:66-79 carries the complete relevant context and exact
+          // targets into resumed work.
           // Florence keeps the objective natural-language while linking the selected docket's
           // current provider lineage transactionally in the existing durable-work row.
           for (const sourceId of selectedDocketSourceIds) {
@@ -15482,12 +15723,13 @@ type FamilyWorkOriginMessageRow = {
   occurred_at: Date;
 };
 
-async function familyWorkLinkedGoogleSources(
+async function familyWorkLinkedSources(
   sql: postgres.TransactionSql,
   work: ProactiveWorkRow,
   snapshotAt: Date,
-): Promise<readonly Readonly<{ sourceId: string; kind: "gmail" | "calendar" }>[]> {
-  const sources = await sql<{ id: string; kind: "gmail" | "calendar" }[]>`
+  originSourceId: string,
+): Promise<readonly FamilyWorkLinkedSource[]> {
+  const googleSources = await sql<{ id: string; kind: "gmail" | "calendar" }[]>`
     select source.id,source.kind from proactive_work_sources work_source
     join sources source on source.id=work_source.source_id
     where work_source.work_id=${work.id} and source.household_id=${work.household_id}
@@ -15502,7 +15744,108 @@ async function familyWorkLinkedGoogleSources(
     order by source.occurred_at,source.id
     for share of source
   `;
-  return sources.map((source) => ({ sourceId: source.id, kind: source.kind }));
+  const messageSources = await sql<(FamilyWorkOriginMessageRow & { visibility: Visibility })[]>`
+    select message.source_id,message.channel_id,message.sender_adult_id,message.direction,
+      message.move_kind,message.text,message.reaction,message.images,message.reply_to_source_id,
+      source.metadata,source.occurred_at,source.visibility
+    from proactive_work_sources work_source
+    join sources source on source.id=work_source.source_id
+    join messages message on message.source_id=source.id
+    where work_source.work_id=${work.id} and source.household_id=${work.household_id}
+      and source.id<>${originSourceId} and source.kind='linq_message'
+      and source.created_at<=${snapshotAt}
+      and source.metadata->>'presentationCue' is distinct from 'true'
+      and (
+        (${work.visibility}='household' and source.visibility='household'
+          and source.owner_adult_id is null)
+        or (${work.visibility}='private' and (
+          (source.visibility='private' and source.owner_adult_id=${work.owner_adult_id})
+          or (source.visibility='household' and source.owner_adult_id is null)
+        ))
+      )
+    order by source.occurred_at,source.id
+    for share of source,message
+  `;
+  const documentSources = await sql<
+    {
+      id: string;
+      parent_source_id: string;
+      filename: string;
+      mime_type: string;
+      content_digest: string;
+      content_envelope: Uint8Array;
+      visibility: Visibility;
+    }[]
+  >`
+    select source.id,source.parent_source_id,document.filename,document.mime_type,
+      document.content_digest,document.content_envelope,source.visibility
+    from proactive_work_sources work_source
+    join sources source on source.id=work_source.source_id
+    join documents document on document.source_id=source.id
+    where work_source.work_id=${work.id} and source.household_id=${work.household_id}
+      and source.kind='document' and source.created_at<=${snapshotAt}
+      and document.mime_type='application/pdf' and document.retained=true
+      and document.content_envelope is not null and document.discard_after is null
+      and (
+        (${work.visibility}='household' and source.visibility='household'
+          and source.owner_adult_id is null)
+        or (${work.visibility}='private' and (
+          (source.visibility='private' and source.owner_adult_id=${work.owner_adult_id})
+          or (source.visibility='household' and source.owner_adult_id is null)
+        ))
+      )
+    order by source.occurred_at,source.id
+    for share of source,document
+  `;
+  return [
+    ...googleSources.map((source) => ({ sourceId: source.id, kind: source.kind }) as const),
+    ...messageSources.map(
+      (source): FamilyWorkLinkedSource => ({
+        sourceId: source.source_id,
+        kind: "message",
+        visibility: source.visibility === "household" ? "shared" : "adult_private",
+        message: familyWorkConversationTurn(
+          source,
+          source.direction === "outbound"
+            ? "florence"
+            : required(source.sender_adult_id ?? "", "Linked Message sender"),
+        ),
+      }),
+    ),
+    ...documentSources.map(
+      (source): FamilyWorkLinkedSource => ({
+        sourceId: source.id,
+        kind: "document",
+        visibility: source.visibility === "household" ? "shared" : "adult_private",
+        document: {
+          id: source.id,
+          parentSourceId: source.parent_source_id,
+          filename: source.filename,
+          mimeType: pdfMimeType(source.mime_type),
+          contentDigest: source.content_digest,
+          contentEnvelope: source.content_envelope,
+          discardAfter: null,
+        },
+      }),
+    ),
+  ];
+}
+
+function familyWorkConversationTurn(
+  row: FamilyWorkOriginMessageRow,
+  speaker: string,
+): ConversationTurn & { speaker: string } {
+  return {
+    sourceId: row.source_id,
+    speaker,
+    moveKind: row.move_kind,
+    text: row.text,
+    ...conversationAuthorship(row.metadata),
+    reaction: row.reaction,
+    images: conversationImageReferences(row.images, row.metadata, row.source_id),
+    replyToSourceId: row.reply_to_source_id,
+    occurredAt: row.occurred_at.toISOString(),
+  };
 }
 
 async function familyWorkOriginContext(
@@ -15520,12 +15863,17 @@ async function familyWorkOriginContext(
     where work_source.work_id=${work.id} and source.household_id=${work.household_id}
       and source.kind='linq_message' and source.visibility=${work.visibility}
       and source.owner_adult_id is not distinct from ${work.owner_adult_id}
+      and source.occurred_at<=${work.created_at}
       and ((message.direction='inbound' and message.sender_adult_id is not null)
         or (message.direction='outbound'
           and message.status='sent'
           and source.metadata->>'proactiveFamilyWorkId'=${work.id}::text
           and nullif(source.metadata->>'proactiveFamilyWorkExecutionAdultId','') is not null))
-    order by source.occurred_at,source.id
+    order by case
+        when source.metadata->>'familyWorkOriginId'=${work.id}::text then 0
+        when source.metadata->>'proactiveFamilyWorkId'=${work.id}::text then 0
+        else 1
+      end,source.occurred_at desc,source.id desc
     limit 1
   `;
   if (!message) {
@@ -15568,7 +15916,7 @@ async function familyWorkOriginContext(
         and prior_source.household_id=${work.household_id}
         and prior_source.visibility=${work.visibility}
         and prior_source.owner_adult_id is not distinct from ${work.owner_adult_id}
-        and not prior_source.id=any(superseded.path) and superseded.depth<100
+        and not prior_source.id=any(superseded.path)
     )
     select source_id,channel_id,sender_adult_id,direction,move_kind,text,reaction,images,
       reply_to_source_id,metadata,occurred_at,depth
@@ -15588,7 +15936,7 @@ async function familyWorkOriginContext(
       mime_type: string;
       content_digest: string;
       content_envelope: Uint8Array;
-      discard_after: Date;
+      discard_after: Date | null;
     }[]
   >`
     select source.id,source.parent_source_id,document.filename,document.mime_type,
@@ -15603,8 +15951,8 @@ async function familyWorkOriginContext(
       and source.visibility=${work.visibility}
       and source.owner_adult_id is not distinct from ${work.owner_adult_id}
       and source.kind='document' and document.mime_type='application/pdf'
-      and document.retained=false and document.content_envelope is not null
-      and document.discard_after>${now}
+      and document.content_envelope is not null
+      and (document.retained=true or document.discard_after>${now})
     order by parent.occurred_at,source.id
   `;
   const [replyTarget] = message.reply_to_source_id
@@ -15630,7 +15978,7 @@ async function familyWorkOriginContext(
           mime_type: string;
           content_digest: string;
           content_envelope: Uint8Array;
-          discard_after: Date;
+          discard_after: Date | null;
         }[]
       >`
         select source.id,source.parent_source_id,document.filename,document.mime_type,
@@ -15645,36 +15993,25 @@ async function familyWorkOriginContext(
           and source.visibility=parent.visibility
           and source.owner_adult_id is not distinct from parent.owner_adult_id
           and source.kind='document' and document.mime_type='application/pdf'
-          and document.retained=false and document.content_envelope is not null
-          and document.discard_after>${now}
+          and document.content_envelope is not null
+          and (document.retained=true or document.discard_after>${now})
         order by source.id
       `
     : [];
   const documents = [...messageDocuments, ...replyDocuments];
 
-  const turn = (row: FamilyWorkOriginMessageRow, speaker: string): ConversationTurn => ({
-    sourceId: row.source_id,
-    speaker,
-    moveKind: row.move_kind,
-    text: row.text,
-    ...conversationAuthorship(row.metadata),
-    reaction: row.reaction,
-    images: imageReferences(row.images),
-    replyToSourceId: row.reply_to_source_id,
-    occurredAt: row.occurred_at.toISOString(),
-  });
   return {
     initiatingAdultId,
     origin: {
-      message: turn(
+      message: familyWorkConversationTurn(
         message,
         message.direction === "outbound" ? "florence" : initiatingAdultId,
-      ) as ConversationTurn & { speaker: string },
-      supersededMessages: superseded.map(
-        (prior) => turn(prior, prior.sender_adult_id as string) as ConversationTurn & { speaker: string },
+      ),
+      supersededMessages: superseded.map((prior) =>
+        familyWorkConversationTurn(prior, prior.sender_adult_id as string),
       ),
       replyTarget: replyTarget
-        ? turn(
+        ? familyWorkConversationTurn(
             replyTarget,
             replyTarget.direction === "outbound"
               ? "florence"
@@ -15688,7 +16025,7 @@ async function familyWorkOriginContext(
         mimeType: pdfMimeType(document.mime_type),
         contentDigest: document.content_digest,
         contentEnvelope: document.content_envelope,
-        discardAfter: document.discard_after.toISOString(),
+        discardAfter: document.discard_after?.toISOString() ?? null,
       })),
     },
   };
@@ -17362,6 +17699,7 @@ const FAMILY_WORK_STATE_KEYS = [
   "browserSession",
   "claim",
   "continuationItems",
+  "docketCandidateIds",
   "generation",
   "kind",
   "pendingCall",
@@ -17373,12 +17711,16 @@ const FAMILY_WORK_STATE_KEYS = [
   "version",
 ] as const;
 
-function initialFamilyWorkState(acknowledgementText: string | null = null): FamilyWorkStateV1 {
+function initialFamilyWorkState(
+  acknowledgementText: string | null = null,
+  docketCandidateIds: readonly string[] = [],
+): FamilyWorkStateV1 {
   return {
     kind: "family_work_v1",
     version: 1,
     generation: 0,
     acknowledgementText,
+    docketCandidateIds: [...docketCandidateIds],
     phase: "ready",
     claim: null,
     activePhoneCall: null,
@@ -17461,6 +17803,7 @@ function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWor
   if (state.acknowledgementText === undefined) state.acknowledgementText = null;
   if (state.browserImages === undefined) state.browserImages = [];
   if (state.browserSession === undefined) state.browserSession = null;
+  if (state.docketCandidateIds === undefined) state.docketCandidateIds = [];
   if (state.progressBlocked === undefined) state.progressBlocked = false;
   assertExactJsonKeys(state, FAMILY_WORK_STATE_KEYS, "Family work state");
   if (state.kind !== "family_work_v1" || state.version !== 1) {
@@ -17471,6 +17814,18 @@ function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWor
     state.acknowledgementText === null
       ? null
       : requiredStringField(state, "acknowledgementText", "Family work acknowledgement");
+  const docketCandidateIds = jsonArrayField(state, "docketCandidateIds", "Family work docket candidates").map(
+    (candidateId) => {
+      if (typeof candidateId !== "string") {
+        throw new FlorenceStoreConflict("Family work docket candidate ID is invalid");
+      }
+      assertUuid(candidateId, "Family work docket candidate ID");
+      return candidateId;
+    },
+  );
+  if (unique(docketCandidateIds).length !== docketCandidateIds.length) {
+    throw new FlorenceStoreConflict("Family work docket candidates contain a duplicate");
+  }
   const progressRevision = familyWorkCounter(state.progressRevision, "Family work progress revision");
   if (typeof state.progressBlocked !== "boolean") {
     throw new FlorenceStoreConflict("Family work progress gate is invalid");
@@ -17701,6 +18056,7 @@ function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWor
     version: 1,
     generation,
     acknowledgementText,
+    docketCandidateIds,
     phase,
     claim,
     activePhoneCall,
@@ -18053,12 +18409,67 @@ async function completeDeliveredFamilyWorkTerminal(
     `;
     if (updated.length !== 1) return;
   }
+  if (state.terminal.outcome === "succeeded" && (state.docketCandidateIds?.length ?? 0) > 0) {
+    await resolveConversationDocketItemsCompletedByFamilyWork(sql, {
+      householdId: delivery.household_id,
+      visibility: delivery.visibility,
+      ownerAdultId: delivery.owner_adult_id,
+      candidateIds: state.docketCandidateIds ?? [],
+      resolutionSourceId: sourceId,
+      resolvedAt: delivery.sent_at,
+    });
+  }
   for (const { key, ownerAdultId } of proactiveFamilyWorkActionOwners(delivery.source_metadata)) {
     await removeHouseholdDocketCandidateForGoogleAction(sql, {
       householdId: delivery.household_id,
       ownerAdultId,
       actionKey: key,
     });
+  }
+}
+
+async function resolveConversationDocketItemsCompletedByFamilyWork(
+  sql: postgres.TransactionSql,
+  input: {
+    householdId: string;
+    visibility: Visibility;
+    ownerAdultId: string | null;
+    candidateIds: readonly string[];
+    resolutionSourceId: string;
+    resolvedAt: Date;
+  },
+): Promise<void> {
+  const candidateIds = unique(input.candidateIds);
+  if (candidateIds.length === 0) return;
+  for (const candidateId of candidateIds) assertUuid(candidateId, "Family work docket candidate ID");
+  assertUuid(input.resolutionSourceId, "Family work docket resolution source ID");
+  const rows = await sql<{ id: string; metadata: JsonValue }[]>`
+    select id,metadata from sources
+    where household_id=${input.householdId} and kind='linq_message'
+      and (
+        (${input.visibility}='household' and visibility='household' and owner_adult_id is null)
+        or (${input.visibility}='private' and (
+          (visibility='household' and owner_adult_id is null)
+          or (visibility='private' and owner_adult_id=${input.ownerAdultId})
+        ))
+      )
+      and metadata->'conversationDocketItem'->>'candidateId' in ${sql(candidateIds)}
+    order by id for update
+  `;
+  for (const row of rows) {
+    const record = storedConversationDocketRecord(row.metadata);
+    if (record?.status !== "unresolved" || !candidateIds.includes(record.candidateId)) continue;
+    const resolved: StoredConversationDocketRecord = {
+      ...record,
+      status: "resolved",
+      updatedAt: input.resolvedAt.toISOString(),
+      resolvedAt: input.resolvedAt.toISOString(),
+      resolutionSourceId: input.resolutionSourceId,
+    };
+    await sql`
+      update sources set metadata=metadata||${sql.json({ conversationDocketItem: resolved })}
+      where id=${row.id} and household_id=${input.householdId}
+    `;
   }
 }
 
@@ -18074,8 +18485,10 @@ async function familyWorkReplySourceId(
 ): Promise<string | null> {
   if (work.reminder_schedule !== null) return null;
   const latestSteeringSourceId = state.steering.at(-1)?.sourceId ?? null;
-  const candidates = await sql<{ source_id: string }[]>`
-    select message.source_id
+  const candidates = await sql<{ source_id: string; explicit_origin: boolean }[]>`
+    select message.source_id,
+      (source.metadata->>'familyWorkOriginId'=${work.id}::text
+        or source.metadata->>'proactiveFamilyWorkId'=${work.id}::text) as explicit_origin
     from proactive_work_sources work_source
     join sources source on source.id=work_source.source_id
     join messages message on message.source_id=source.id
@@ -18085,14 +18498,21 @@ async function familyWorkReplySourceId(
       and message.channel_id=${channel.id} and message.direction='inbound'
       and message.move_kind in ('message','reply') and message.sender_adult_id is not null
       and message.provider_message_id is not null
-    order by source.occurred_at,source.id
+    order by source.occurred_at desc,source.id desc
   `;
   const latestSteering = latestSteeringSourceId
     ? candidates.find(({ source_id: sourceId }) => sourceId === latestSteeringSourceId)
     : undefined;
   if (latestSteering) return latestSteering.source_id;
   const steeringSourceIds = new Set(state.steering.map(({ sourceId }) => sourceId));
-  return candidates.find(({ source_id: sourceId }) => !steeringSourceIds.has(sourceId))?.source_id ?? null;
+  return (
+    candidates.find(
+      ({ source_id: sourceId, explicit_origin: explicitOrigin }) =>
+        explicitOrigin && !steeringSourceIds.has(sourceId),
+    )?.source_id ??
+    candidates.find(({ source_id: sourceId }) => !steeringSourceIds.has(sourceId))?.source_id ??
+    null
+  );
 }
 
 async function insertFamilyWorkOutbound(
@@ -18179,7 +18599,8 @@ async function proactiveFamilyWorkResolutionMetadata(
     select source.metadata from proactive_work_sources link
     join sources source on source.id=link.source_id
     where link.work_id=${workId}
-      and source.metadata->>'proactiveFamilyWorkId'=${workId}::text
+      and (source.metadata->>'proactiveFamilyWorkId'=${workId}::text
+        or source.metadata->>'familyWorkOriginId'=${workId}::text)
     order by source.occurred_at,source.id limit 1
   `;
   if (!kickoff) return null;
@@ -18203,6 +18624,29 @@ async function proactiveFamilyWorkResolutionMetadata(
 }
 
 type ProactiveFamilyWorkActionOwner = { key: string; ownerAdultId: string };
+
+function uniqueProactiveFamilyWorkActionOwners(
+  owners: readonly ProactiveFamilyWorkActionOwner[],
+): ProactiveFamilyWorkActionOwner[] {
+  const uniqueOwners = new Map<string, ProactiveFamilyWorkActionOwner>();
+  for (const owner of owners) uniqueOwners.set(`${owner.key}\0${owner.ownerAdultId}`, owner);
+  return [...uniqueOwners.values()].sort(
+    (left, right) => left.key.localeCompare(right.key) || left.ownerAdultId.localeCompare(right.ownerAdultId),
+  );
+}
+
+function docketCandidateOwnerAdultIds(reviews: readonly ProactiveWorkRow[], candidateId: string): string[] {
+  return unique(
+    reviews.flatMap((review) =>
+      review.owner_adult_id &&
+      storedBriefingCandidates(review.briefing_candidates).some(
+        (candidate) => candidate.candidateId === candidateId,
+      )
+        ? [review.owner_adult_id]
+        : [],
+    ),
+  ).sort();
+}
 
 async function stageProactiveFamilyWork(
   sql: postgres.TransactionSql,
@@ -18379,6 +18823,26 @@ type StoredBriefingCandidate = SharedBriefingCandidate & {
   actionKey: string | null;
 };
 
+type StoredConversationDocketRecord = StoredBriefingCandidate & {
+  kind: "conversation_docket_item_v1";
+  status: "unresolved" | "resolved";
+  /** Provider evidence retained when a Google finding is reconciled through Messages. */
+  optionalProviderSourceIds: readonly string[];
+  createdAt: string;
+  updatedAt: string;
+  resolvedAt: string | null;
+  resolutionSourceId: string | null;
+};
+
+type StoredConversationDocketItem = {
+  originSourceId: string;
+  visibility: Visibility;
+  ownerAdultId: string | null;
+  candidate: StoredBriefingCandidate;
+  record: StoredConversationDocketRecord;
+  metadata: JsonValue;
+};
+
 /**
  * An active owner-only item from the complete private Google review. It shares the review's
  * source-backed lifecycle with household docket candidates, but is decoded separately so it can
@@ -18400,6 +18864,139 @@ type StoredBriefingCandidateGroup = {
   members: readonly StoredBriefingCandidate[];
   ownerAdultIds: readonly string[];
 };
+
+function storedConversationDocketRecord(metadata: JsonValue): StoredConversationDocketRecord | null {
+  const raw = jsonRecord(metadata).conversationDocketItem;
+  if (raw === undefined || raw === null) return null;
+  const record = jsonRecord(raw);
+  if (record.kind !== "conversation_docket_item_v1") {
+    throw new FlorenceStoreConflict("Stored conversation docket state is invalid");
+  }
+  const status = record.status;
+  if (status !== "unresolved" && status !== "resolved") {
+    throw new FlorenceStoreConflict("Stored conversation docket status is invalid");
+  }
+  const sourceIds = record.sourceIds;
+  if (!Array.isArray(sourceIds) || sourceIds.some((sourceId) => typeof sourceId !== "string")) {
+    throw new FlorenceStoreConflict("Stored conversation docket sources are invalid");
+  }
+  const optionalProviderSourceIds = record.optionalProviderSourceIds ?? [];
+  if (
+    !Array.isArray(optionalProviderSourceIds) ||
+    optionalProviderSourceIds.some(
+      (sourceId) => typeof sourceId !== "string" || !sourceIds.includes(sourceId),
+    )
+  ) {
+    throw new FlorenceStoreConflict("Stored conversation docket provider sources are invalid");
+  }
+  const dueAt = record.dueAt;
+  if (dueAt !== null && typeof dueAt !== "string") {
+    throw new FlorenceStoreConflict("Stored conversation docket due date is invalid");
+  }
+  const needsAnswer = record.needsAnswer;
+  if (typeof needsAnswer !== "boolean") {
+    throw new FlorenceStoreConflict("Stored conversation docket answer state is invalid");
+  }
+  const createdAt = instant(requiredStringField(record, "createdAt", "Conversation docket creation time"));
+  const updatedAt = instant(requiredStringField(record, "updatedAt", "Conversation docket update time"));
+  if (updatedAt < createdAt) {
+    throw new FlorenceStoreConflict("Stored conversation docket time ordering is invalid");
+  }
+  const resolvedAtValue = record.resolvedAt;
+  const resolvedAt =
+    resolvedAtValue === null
+      ? null
+      : instant(requiredStringField(record, "resolvedAt", "Docket resolution time"));
+  const resolutionSourceIdValue = record.resolutionSourceId;
+  const resolutionSourceId =
+    resolutionSourceIdValue === null
+      ? null
+      : requiredStringField(record, "resolutionSourceId", "Docket resolution source");
+  if ((status === "resolved") !== (resolvedAt !== null && resolutionSourceId !== null)) {
+    throw new FlorenceStoreConflict("Stored conversation docket resolution is invalid");
+  }
+  if (resolutionSourceId) assertUuid(resolutionSourceId, "Conversation docket resolution source ID");
+  const candidate = privateReviewCandidate(
+    requiredStringField(record, "candidateId", "Conversation docket candidate ID"),
+    {
+      category: briefingCategory(record.category),
+      summary: requiredStringField(record, "summary", "Conversation docket summary"),
+      urgency: briefingUrgency(record.urgency),
+      dueAt,
+      needsAnswer,
+    },
+    sourceIds as string[],
+    requiredStringField(record, "actionAnchorDigest", "Conversation docket action anchor"),
+    requiredStringField(record, "actionKey", "Conversation docket action key"),
+  );
+  return {
+    kind: "conversation_docket_item_v1",
+    status,
+    ...candidate,
+    optionalProviderSourceIds: optionalProviderSourceIds as string[],
+    createdAt: createdAt.toISOString(),
+    updatedAt: updatedAt.toISOString(),
+    resolvedAt: resolvedAt?.toISOString() ?? null,
+    resolutionSourceId,
+  };
+}
+
+async function readConversationDocketItems(
+  sql: postgres.Sql | postgres.TransactionSql,
+  input: {
+    householdId: string;
+    viewerAdultId: string | null;
+    lock?: boolean;
+  },
+): Promise<StoredConversationDocketItem[]> {
+  const rows = await sql<
+    { id: string; visibility: Visibility; owner_adult_id: string | null; metadata: JsonValue }[]
+  >`
+    select source.id,source.visibility,source.owner_adult_id,source.metadata
+    from sources source
+    where source.household_id=${input.householdId} and source.kind='linq_message'
+      and jsonb_typeof(source.metadata->'conversationDocketItem')='object'
+      and (
+        source.visibility='household'
+        or (${input.viewerAdultId}::uuid is not null and source.visibility='private'
+          and source.owner_adult_id=${input.viewerAdultId})
+      )
+    order by source.occurred_at,source.id
+    ${input.lock ? sql`for update of source` : sql``}
+  `;
+  return rows.flatMap((row) => {
+    const record = storedConversationDocketRecord(row.metadata);
+    if (record?.status !== "unresolved") {
+      return [];
+    }
+    if (
+      (row.visibility === "household" && row.owner_adult_id !== null) ||
+      (row.visibility === "private" && row.owner_adult_id === null)
+    ) {
+      throw new FlorenceStoreConflict("Stored conversation docket visibility is invalid");
+    }
+    return [
+      {
+        originSourceId: row.id,
+        visibility: row.visibility,
+        ownerAdultId: row.owner_adult_id,
+        candidate: {
+          candidateId: record.candidateId,
+          category: record.category,
+          summary: record.summary,
+          urgency: record.urgency,
+          dueAt: record.dueAt,
+          needsAnswer: record.needsAnswer,
+          sourceIds: record.sourceIds,
+          actionAnchorDigest: record.actionAnchorDigest,
+          actionKey: record.actionKey,
+        },
+        record,
+        metadata: row.metadata,
+      },
+    ];
+  });
+}
 
 async function lockHouseholdGooglePolls(sql: postgres.TransactionSql, householdId: string): Promise<void> {
   await sql`
@@ -18427,6 +19024,7 @@ type CurrentHouseholdDocketState = {
   reviews: readonly (ProactiveWorkRow & { private_conflict_busy_sharing_enabled: boolean })[];
   groups: readonly StoredBriefingCandidateGroup[];
   visiblePrivateFindings: readonly StoredPrivateReviewFinding[];
+  conversationItems: readonly StoredConversationDocketItem[];
 };
 
 async function currentHouseholdDocketState(
@@ -18478,7 +19076,12 @@ async function currentHouseholdDocketState(
           .flatMap((review) => storedPrivateReviewFindings(review.briefing_candidates))
           .filter((finding) => !finding.actionKey || !resolvedActionKeys.has(finding.actionKey))
       : [];
-  return { reviews, groups, visiblePrivateFindings };
+  const conversationItems = await readConversationDocketItems(sql, {
+    householdId: input.householdId,
+    viewerAdultId: input.audience === "private" ? input.requestingAdultId : null,
+    lock: true,
+  });
+  return { reviews, groups, visiblePrivateFindings, conversationItems };
 }
 
 function selectCurrentHouseholdDocketCandidates(
@@ -18487,6 +19090,7 @@ function selectCurrentHouseholdDocketCandidates(
 ): {
   groups: readonly StoredBriefingCandidateGroup[];
   privateFindings: readonly StoredPrivateReviewFinding[];
+  conversationItems: readonly StoredConversationDocketItem[];
   candidates: readonly StoredBriefingCandidate[];
 } {
   if (new Set(candidateIds).size !== candidateIds.length) {
@@ -18502,17 +19106,382 @@ function selectCurrentHouseholdDocketCandidates(
     const finding = state.visiblePrivateFindings.find((candidate) => candidate.candidateId === candidateId);
     return finding ? [finding] : [];
   });
-  if (groups.length + privateFindings.length !== candidateIds.length) {
+  const conversationItems = candidateIds.flatMap((candidateId) => {
+    const item = state.conversationItems.find((candidate) => candidate.candidate.candidateId === candidateId);
+    return item ? [item] : [];
+  });
+  if (groups.length + privateFindings.length + conversationItems.length !== candidateIds.length) {
     throw new FlorenceStoreConflict("A household docket item changed before it was used");
   }
   return {
     groups,
     privateFindings,
+    conversationItems,
     candidates: [
       ...groups.flatMap((group) => [...group.members]),
       ...privateFindings.map(privateFindingAsDocketCandidate),
+      ...conversationItems.map((item) => item.candidate),
     ],
   };
+}
+
+async function retainFamilyWorkMessageEvidence(
+  sql: postgres.TransactionSql,
+  input: {
+    householdId: string;
+    channelId: string;
+    currentSourceId: string;
+    replyToSourceId: string | null;
+    visibility: Visibility;
+    ownerAdultId: string | null;
+    retainedDocuments: readonly RetainedMessageDocument[];
+    occurredAt: Date;
+  },
+): Promise<readonly string[]> {
+  const messageRows = await sql<{ id: string }[]>`
+    with recursive message_chain as (
+      select source.id,source.metadata,array[source.id] as path
+      from sources source join messages message on message.source_id=source.id
+      where source.household_id=${input.householdId} and source.kind='linq_message'
+        and source.id in ${sql([
+          input.currentSourceId,
+          ...(input.replyToSourceId ? [input.replyToSourceId] : []),
+        ])}
+        and source.visibility=${input.visibility}
+        and source.owner_adult_id is not distinct from ${input.ownerAdultId}
+        and message.channel_id=${input.channelId}
+      union all
+      select prior.id,prior.metadata,message_chain.path||prior.id
+      from message_chain join sources prior
+        on prior.id::text=message_chain.metadata->>'supersedesSourceId'
+      join messages prior_message on prior_message.source_id=prior.id
+      where prior.household_id=${input.householdId} and prior.kind='linq_message'
+        and prior.visibility=${input.visibility}
+        and prior.owner_adult_id is not distinct from ${input.ownerAdultId}
+        and prior_message.channel_id=${input.channelId}
+        and not prior.id=any(message_chain.path)
+    )
+    select source.id from message_chain join sources source on source.id=message_chain.id
+    order by source.id for update of source
+  `;
+  const messageSourceIds = unique(messageRows.map((row) => row.id));
+  if (!messageSourceIds.includes(input.currentSourceId)) {
+    throw new FlorenceStoreConflict("Family work lost its current Message evidence");
+  }
+  if (input.replyToSourceId && !messageSourceIds.includes(input.replyToSourceId)) {
+    throw new FlorenceStoreConflict("Family work lost its exact replied Message evidence");
+  }
+  const documents = await sql<
+    {
+      id: string;
+      content_digest: string;
+      retained: boolean;
+      discard_after: Date | null;
+    }[]
+  >`
+    select source.id,document.content_digest,document.retained,document.discard_after
+    from sources source join documents document on document.source_id=source.id
+    where source.household_id=${input.householdId}
+      and source.parent_source_id in ${sql(messageSourceIds)}
+      and source.kind='document' and source.visibility=${input.visibility}
+      and source.owner_adult_id is not distinct from ${input.ownerAdultId}
+      and document.mime_type='application/pdf' and document.content_envelope is not null
+      and (document.retained=true or document.discard_after>${input.occurredAt})
+    order by source.id for update of source,document
+  `;
+  const retainedDocuments = new Map(
+    input.retainedDocuments.map((document) => [document.documentId, document] as const),
+  );
+  if (
+    retainedDocuments.size !== input.retainedDocuments.length ||
+    documents.some((document) => {
+      if (document.retained) return document.discard_after !== null;
+      const retained = retainedDocuments.get(document.id);
+      return (
+        !retained ||
+        retained.contentDigest !== document.content_digest ||
+        retained.contentEnvelope.byteLength < 1
+      );
+    }) ||
+    [...retainedDocuments.keys()].some(
+      (documentId) => !documents.some((document) => document.id === documentId),
+    )
+  ) {
+    throw new FlorenceStoreConflict("The PDFs retained for family work no longer match its Messages");
+  }
+  for (const document of documents) {
+    if (document.retained) continue;
+    const retained = retainedDocuments.get(document.id);
+    if (!retained) throw new FlorenceStoreConflict("A current family-work PDF was not retained");
+    await sql`
+      update documents set retained=true,content_envelope=${Buffer.from(retained.contentEnvelope)},
+        discard_after=null
+      where source_id=${document.id} and content_digest=${document.content_digest}
+    `;
+  }
+  return unique([...messageSourceIds, ...documents.map((document) => document.id)]).sort();
+}
+
+async function applyConversationalDocketMutation(
+  sql: postgres.TransactionSql,
+  input: {
+    householdId: string;
+    audience: Audience;
+    senderAdultId: string;
+    currentSourceId: string;
+    mutation: DocketMutation;
+    occurredAt: Date;
+  },
+): Promise<void> {
+  assertUuid(input.senderAdultId, "Conversation docket adult ID");
+  assertUuid(input.currentSourceId, "Conversation docket source ID");
+  const expectedVisibility: Visibility = input.audience === "group" ? "household" : "private";
+  const expectedOwnerAdultId = expectedVisibility === "private" ? input.senderAdultId : null;
+  const [currentSource] = await sql<
+    {
+      id: string;
+      visibility: Visibility;
+      owner_adult_id: string | null;
+      metadata: JsonValue;
+      channel_id: string;
+      reply_to_source_id: string | null;
+    }[]
+  >`
+    select source.id,source.visibility,source.owner_adult_id,source.metadata,
+      message.channel_id,message.reply_to_source_id
+    from sources source join messages message on message.source_id=source.id
+    where source.id=${input.currentSourceId} and source.household_id=${input.householdId}
+      and source.kind='linq_message' and message.direction='inbound'
+      and message.sender_adult_id=${input.senderAdultId}
+    for update of source
+  `;
+  if (
+    !currentSource ||
+    currentSource.visibility !== expectedVisibility ||
+    currentSource.owner_adult_id !== expectedOwnerAdultId
+  ) {
+    throw new FlorenceStoreUnauthorized(
+      "A conversation docket item must stay inside the current parent conversation",
+    );
+  }
+
+  const requestedEvidenceSourceIds = unique(input.mutation.sourceIds);
+  if (
+    requestedEvidenceSourceIds.length !== input.mutation.sourceIds.length ||
+    !requestedEvidenceSourceIds.includes(input.currentSourceId) ||
+    requestedEvidenceSourceIds.some(
+      (sourceId) => sourceId !== input.currentSourceId && sourceId !== currentSource.reply_to_source_id,
+    )
+  ) {
+    throw new FlorenceStoreConflict(
+      "A conversation docket change may cite only its current Message and exact reply target",
+    );
+  }
+
+  const currentMessageChain = await sql<{ id: string }[]>`
+    with recursive message_chain as (
+      select source.id,source.metadata,array[source.id] as path
+      from sources source join messages message on message.source_id=source.id
+      where source.id in ${sql(requestedEvidenceSourceIds)}
+        and source.household_id=${input.householdId} and source.kind='linq_message'
+        and source.visibility=${expectedVisibility}
+        and source.owner_adult_id is not distinct from ${expectedOwnerAdultId}
+        and message.channel_id=${currentSource.channel_id}
+      union all
+      select prior.id,prior.metadata,message_chain.path||prior.id
+      from message_chain join sources prior
+        on prior.id::text=message_chain.metadata->>'supersedesSourceId'
+      join messages prior_message on prior_message.source_id=prior.id
+      where prior.household_id=${input.householdId} and prior.kind='linq_message'
+        and prior.visibility=${expectedVisibility}
+        and prior.owner_adult_id is not distinct from ${expectedOwnerAdultId}
+        and prior_message.channel_id=${currentSource.channel_id}
+        and not prior.id=any(message_chain.path)
+    )
+    select source.id from message_chain join sources source on source.id=message_chain.id
+    order by source.occurred_at,source.id for update of source
+  `;
+  const currentMessageSourceIds = currentMessageChain.map(({ id }) => id);
+  if (requestedEvidenceSourceIds.some((sourceId) => !currentMessageSourceIds.includes(sourceId))) {
+    throw new FlorenceStoreConflict("The replied Message is no longer available in this conversation");
+  }
+  const currentDocuments = await sql<
+    {
+      id: string;
+      parent_source_id: string;
+      content_digest: string;
+      retained: boolean;
+      discard_after: Date | null;
+    }[]
+  >`
+    select source.id,source.parent_source_id,document.content_digest,
+      document.retained,document.discard_after
+    from sources source join documents document on document.source_id=source.id
+    where source.household_id=${input.householdId}
+      and source.parent_source_id in ${sql(currentMessageSourceIds)}
+      and source.kind='document' and source.visibility=${expectedVisibility}
+      and source.owner_adult_id is not distinct from ${expectedOwnerAdultId}
+      and document.mime_type='application/pdf'
+      and document.content_envelope is not null
+      and (document.retained=true or document.discard_after>${input.occurredAt})
+    order by source.occurred_at,source.id for update of source,document
+  `;
+  const retainedDocuments = new Map(
+    input.mutation.retainedDocuments.map((document) => [document.documentId, document] as const),
+  );
+  if (
+    retainedDocuments.size !== input.mutation.retainedDocuments.length ||
+    currentDocuments.some((document) => {
+      if (document.retained) return document.discard_after !== null;
+      const retained = retainedDocuments.get(document.id);
+      return (
+        !retained ||
+        retained.contentDigest !== document.content_digest ||
+        retained.contentEnvelope.byteLength < 1
+      );
+    }) ||
+    [...retainedDocuments.keys()].some(
+      (documentId) => !currentDocuments.some((document) => document.id === documentId),
+    )
+  ) {
+    throw new FlorenceStoreConflict(
+      "The PDFs retained for this docket item no longer match the current Message",
+    );
+  }
+  for (const document of currentDocuments) {
+    if (document.retained) continue;
+    const retained = retainedDocuments.get(document.id);
+    if (!retained) {
+      throw new FlorenceStoreConflict("A current docket PDF was not retained");
+    }
+    await sql`
+      update documents set retained=true,content_envelope=${Buffer.from(retained.contentEnvelope)},
+        discard_after=null
+      where source_id=${document.id} and content_digest=${document.content_digest}
+    `;
+  }
+
+  const currentEvidenceSourceIds = unique([
+    ...currentMessageSourceIds,
+    ...currentDocuments.map((document) => document.id),
+  ]).sort();
+  await assertSourcesVisible(
+    sql,
+    input.householdId,
+    input.audience,
+    input.senderAdultId,
+    currentEvidenceSourceIds,
+  );
+
+  let originSourceId = input.currentSourceId;
+  let candidateId: string;
+  let actionKey: string;
+  let actionAnchorDigest: string;
+  let createdAt = input.occurredAt.toISOString();
+  let sourceIds = currentEvidenceSourceIds;
+  let optionalProviderSourceIds: readonly string[] = [];
+
+  if (input.mutation.operation === "create") {
+    if (storedConversationDocketRecord(currentSource.metadata)) {
+      throw new FlorenceStoreConflict("The current Message already created a docket item");
+    }
+    candidateId = deterministicUuid(`conversation-docket\0${input.currentSourceId}`);
+    actionKey = sha256(`conversation-docket-action-v1\0${candidateId}`);
+    actionAnchorDigest = actionKey;
+  } else {
+    assertUuid(input.mutation.candidateId, "Conversation docket candidate ID");
+    const state = await currentHouseholdDocketState(sql, {
+      householdId: input.householdId,
+      audience: input.audience,
+      requestingAdultId: input.senderAdultId,
+      handledAt: input.occurredAt,
+    });
+    const conversationItem = state.conversationItems.find(
+      (item) =>
+        item.candidate.candidateId === input.mutation.candidateId &&
+        item.visibility === expectedVisibility &&
+        item.ownerAdultId === expectedOwnerAdultId,
+    );
+    const group =
+      input.audience === "group"
+        ? state.groups.find((candidateGroup) =>
+            candidateGroup.members.some((candidate) => candidate.candidateId === input.mutation.candidateId),
+          )
+        : undefined;
+    const privateFinding =
+      input.audience === "private"
+        ? state.visiblePrivateFindings.find((finding) => finding.candidateId === input.mutation.candidateId)
+        : undefined;
+    if (Number(Boolean(conversationItem)) + Number(Boolean(group)) + Number(Boolean(privateFinding)) !== 1) {
+      throw new FlorenceStoreConflict(
+        "That unresolved docket item cannot be reconciled from this conversation",
+      );
+    }
+    if (conversationItem) {
+      originSourceId = conversationItem.originSourceId;
+      candidateId = conversationItem.candidate.candidateId;
+      actionKey = required(conversationItem.candidate.actionKey ?? "", "Conversation docket action key");
+      actionAnchorDigest = required(
+        conversationItem.candidate.actionAnchorDigest ?? "",
+        "Conversation docket action anchor",
+      );
+      createdAt = conversationItem.record.createdAt;
+      sourceIds = unique([...conversationItem.candidate.sourceIds, ...currentEvidenceSourceIds]).sort();
+      optionalProviderSourceIds = conversationItem.record.optionalProviderSourceIds;
+    } else {
+      const selected =
+        group?.candidate ?? (privateFinding ? privateFindingAsDocketCandidate(privateFinding) : null);
+      if (!selected) {
+        throw new FlorenceStoreConflict("The selected docket item disappeared before reconciliation");
+      }
+      candidateId = input.mutation.candidateId;
+      actionKey = selected.actionKey ?? sha256(`conversation-docket-migration-v1\0${candidateId}`);
+      actionAnchorDigest = selected.actionAnchorDigest ?? actionKey;
+      optionalProviderSourceIds = [...selected.sourceIds];
+      sourceIds = unique([...selected.sourceIds, ...currentEvidenceSourceIds]).sort();
+      // Converting a Google-lifecycle item to a conversation-owned item also records its old
+      // provider action as settled, so the next poll cannot recreate an obsolete duplicate.
+      await completeHouseholdDocketCandidates(sql, {
+        householdId: input.householdId,
+        audience: input.audience,
+        requestingAdultId: input.senderAdultId,
+        candidateIds: [input.mutation.candidateId],
+        basisSourceId: input.currentSourceId,
+        handledAt: input.occurredAt,
+      });
+    }
+  }
+
+  const candidate = privateReviewCandidate(
+    candidateId,
+    input.mutation.candidate,
+    sourceIds,
+    actionAnchorDigest,
+    actionKey,
+  );
+  const [origin] = await sql<{ metadata: JsonValue }[]>`
+    select metadata from sources where id=${originSourceId} and household_id=${input.householdId}
+      and kind='linq_message' and visibility=${expectedVisibility}
+      and owner_adult_id is not distinct from ${expectedOwnerAdultId}
+    for update
+  `;
+  if (!origin) {
+    throw new FlorenceStoreConflict("The conversation docket origin is no longer available");
+  }
+  const record: StoredConversationDocketRecord = {
+    kind: "conversation_docket_item_v1",
+    status: "unresolved",
+    ...candidate,
+    optionalProviderSourceIds,
+    createdAt,
+    updatedAt: input.occurredAt.toISOString(),
+    resolvedAt: null,
+    resolutionSourceId: null,
+  };
+  await sql`
+    update sources set metadata=metadata||${sql.json({ conversationDocketItem: record })}
+    where id=${originSourceId} and household_id=${input.householdId}
+  `;
 }
 
 async function completeHouseholdDocketCandidates(
@@ -18532,10 +19501,32 @@ async function completeHouseholdDocketCandidates(
   const linkedMonitors = await lockHouseholdDocketMonitors(sql, input.householdId);
   const state = await currentHouseholdDocketState(sql, input);
   const selection = selectCurrentHouseholdDocketCandidates(state, input.candidateIds);
+  for (const item of selection.conversationItems) {
+    const current = storedConversationDocketRecord(item.metadata);
+    if (current?.status !== "unresolved" || current.candidateId !== item.candidate.candidateId) {
+      throw new FlorenceStoreConflict("A conversation docket item changed before it was completed");
+    }
+    const resolved: StoredConversationDocketRecord = {
+      ...current,
+      status: "resolved",
+      updatedAt: input.handledAt.toISOString(),
+      resolvedAt: input.handledAt.toISOString(),
+      resolutionSourceId: input.basisSourceId,
+    };
+    await sql`
+      update sources set metadata=metadata||${sql.json({ conversationDocketItem: resolved })}
+      where id=${item.originSourceId} and household_id=${input.householdId}
+        and kind='linq_message'
+    `;
+  }
   const reviews = state.reviews;
   const completedGroups = selection.groups;
   const completedPrivateFindings = selection.privateFindings;
-  const completedCandidates = selection.candidates;
+  const completedCandidates = [
+    ...completedGroups.flatMap((group) => [...group.members]),
+    ...completedPrivateFindings.map(privateFindingAsDocketCandidate),
+  ];
+  if (completedCandidates.length === 0) return;
   const completedCandidateSourceDigests = await readStableGoogleSourceDigestMap(
     sql,
     input.householdId,
@@ -18791,8 +19782,8 @@ function privateReviewCandidate(
     throw new FlorenceStoreConflict("A briefing summary must be one visible line");
   }
   const cited = unique(sourceIds);
-  if (cited.length < 1 || cited.length > 20) {
-    throw new FlorenceStoreConflict("A briefing candidate needs one to twenty private sources");
+  if (cited.length < 1) {
+    throw new FlorenceStoreConflict("A briefing candidate needs at least one source");
   }
   for (const sourceId of cited) assertUuid(sourceId, "Briefing source ID");
   if (actionAnchorDigest !== null) assertDigest(actionAnchorDigest, "Briefing action anchor");
@@ -19689,7 +20680,7 @@ async function supersessionRoot(
   const seen = new Set([currentSourceId]);
   let rootSourceId = currentSourceId;
   let metadata = currentMetadata;
-  for (let depth = 0; depth < 100; depth += 1) {
+  for (;;) {
     const priorSourceId = supersedesSourceId(metadata);
     if (!priorSourceId) return rootSourceId;
     if (seen.has(priorSourceId)) {
@@ -19705,7 +20696,6 @@ async function supersessionRoot(
     rootSourceId = prior.source_id;
     metadata = prior.metadata;
   }
-  throw new FlorenceStoreConflict("An inbound supersession chain is too long");
 }
 
 async function markInboundSuperseded(
@@ -20283,6 +21273,31 @@ function imageReferences(value: JsonValue): ImageReference[] {
   );
 }
 
+function conversationImageReferences(
+  value: JsonValue,
+  metadata: JsonValue,
+  defaultSignalId: string,
+): (ImageReference & { signalId: string })[] {
+  const references = imageReferences(value).map((image) => ({ ...image, signalId: defaultSignalId }));
+  const nativeMove = outboundNativeMoveFromMetadata(metadata);
+  const nativeArtifacts =
+    nativeMove?.type === "message"
+      ? nativeMove.parts.flatMap((part) =>
+          part.type === "media" && part.source.type === "florence_artifact"
+            ? [
+                {
+                  assetId: part.source.assetId,
+                  mimeType: part.source.mimeType,
+                  signalId: part.source.signalId,
+                },
+              ]
+            : [],
+        )
+      : [];
+  const byAssetId = new Map([...references, ...nativeArtifacts].map((image) => [image.assetId, image]));
+  return [...byAssetId.values()];
+}
+
 function validateImageReferences(values: readonly ImageReference[]): ImageReference[] {
   if (values.length > 10) throw new FlorenceStoreConflict("A message can contain at most ten images");
   const result: ImageReference[] = [];
@@ -20377,8 +21392,8 @@ function sameInboundDocuments(
         document.filename === candidate.filename &&
         document.mime_type === candidate.mimeType &&
         document.content_digest === candidate.contentDigest &&
-        document.retained === false &&
-        document.discard_after?.toISOString() === candidate.discardAfter
+        ((document.retained === false && document.discard_after?.toISOString() === candidate.discardAfter) ||
+          (document.retained === true && document.discard_after === null))
       );
     })
   );

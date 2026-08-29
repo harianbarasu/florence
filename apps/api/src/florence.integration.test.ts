@@ -106,6 +106,20 @@ const FOUNDER_SETUP_COMPLETE_ACK = "Your side is ready, Hari.";
 const NATIVE_TEXT = "Forwarded from school: Maya’s field-trip form is due Tuesday.";
 const NATIVE_LINK = "https://school.example/fall-field-trip";
 const VOICE_TRANSCRIPT = "The teacher said the form still needs one parent signature.";
+const NATIVE_DOCKET_SUMMARY = "Maya’s field-trip form needs one parent signature by Tuesday.";
+const NATIVE_DOCKET_CORRECTION =
+  "Correction: Maya’s field-trip form needs one parent signature by Wednesday, not Tuesday.";
+const NATIVE_DOCKET_UPDATED_SUMMARY = "Maya’s field-trip form needs one parent signature by Wednesday.";
+const NATIVE_DOCKET_WORK_REQUEST = "Please handle that updated field-trip form from the docket.";
+const NATIVE_DOCKET_WORK_OBJECTIVE =
+  "Use the exact family Message and its photo, link, voice note, and PDF to handle Maya’s updated field-trip form.";
+const NATIVE_DOCKET_WORK_ACK = "I’m on it—I’ll use the exact school update already on the docket.";
+const NATIVE_DOCKET_WORK_RESULT = "I handled the updated field-trip form from the exact school materials.";
+const PRIVATE_CONVERSATION_DOCKET_REQUEST =
+  "Keep this private: I still need to decide whether I can volunteer at Maya’s school.";
+const PRIVATE_CONVERSATION_DOCKET_SUMMARY = "Decide whether to volunteer at Maya’s school.";
+const PRIVATE_CONVERSATION_DOCKET_HANDLED = "I decided about the private school volunteer note.";
+const PRIVATE_CONVERSATION_DOCKET_HANDLED_ACK = "Got it—I’ll take that private decision off your docket.";
 const INTEREST_REQUEST = "Maya likes soccer. Keep an eye out for a good family match we could attend.";
 const INTEREST_RECOMMENDATION =
   "The Bay City women’s match this Saturday fits the family calendar and looks worth considering.";
@@ -3727,6 +3741,8 @@ release("Florence parent journeys", () => {
     const docketWorkAcknowledgement = "I’m on it—I’ll work from the form already on the docket.";
     const docketWorkResult = "I opened the exact school-form source and worked from that family deadline.";
     let docketWorkReadExactLinkedSource = false;
+    let nativeDocketWorkReadExactEvidence = false;
+    let nativeDocketWorkOriginStayedCurrent = false;
     const observedHouseholdDocket: {
       value: FlorenceReasonerInput["householdDocket"] | null;
     } = { value: null };
@@ -3873,6 +3889,78 @@ release("Florence parent journeys", () => {
           docketCompletions: [candidate.candidateId],
         });
       }
+      if (input.currentMessage.text === NATIVE_DOCKET_CORRECTION) {
+        const candidate = input.householdDocket.items.find((item) => item.summary === NATIVE_DOCKET_SUMMARY);
+        if (
+          candidate?.visibility !== "household" ||
+          input.currentMessage.replyTo?.sourceId !== inboundSourceId("event-native-school-update")
+        ) {
+          throw new Error("The ordinary Message docket item was not available to reconcile");
+        }
+        return decision({
+          bubbles: [{ text: "Got it—I updated the field-trip deadline on the docket.", delayMs: 0 }],
+          docketUpsert: {
+            operation: "update",
+            candidateId: candidate.candidateId,
+            candidate: {
+              category: "deadline",
+              summary: NATIVE_DOCKET_UPDATED_SUMMARY,
+              urgency: "soon",
+              dueAt: new Date(Date.parse(input.currentMessage.occurredAt) + 60 * 60_000).toISOString(),
+              needsAnswer: true,
+            },
+            sourceIds: [input.currentMessage.sourceId, input.currentMessage.replyTo.sourceId],
+          },
+        });
+      }
+      if (input.currentMessage.text === NATIVE_DOCKET_WORK_REQUEST) {
+        const candidate = input.householdDocket.items.find(
+          (item) => item.summary === NATIVE_DOCKET_UPDATED_SUMMARY,
+        );
+        if (candidate?.visibility !== "household") {
+          throw new Error("The reconciled Message docket item was not available for family work");
+        }
+        return decision({
+          bubbles: [{ text: NATIVE_DOCKET_WORK_ACK, delayMs: 0 }],
+          familyWork: {
+            operation: "create",
+            workId: null,
+            objective: NATIVE_DOCKET_WORK_OBJECTIVE,
+            schedule: null,
+            instruction: null,
+            candidateIds: [candidate.candidateId],
+          },
+        });
+      }
+      if (input.currentMessage.text === PRIVATE_CONVERSATION_DOCKET_REQUEST) {
+        return decision({
+          bubbles: [{ text: "I’ll keep that decision on your private docket.", delayMs: 0 }],
+          docketUpsert: {
+            operation: "create",
+            candidateId: null,
+            candidate: {
+              category: "loose_end",
+              summary: PRIVATE_CONVERSATION_DOCKET_SUMMARY,
+              urgency: "watch",
+              dueAt: null,
+              needsAnswer: true,
+            },
+            sourceIds: [input.currentMessage.sourceId],
+          },
+        });
+      }
+      if (input.currentMessage.text === PRIVATE_CONVERSATION_DOCKET_HANDLED) {
+        const candidate = input.householdDocket.items.find(
+          (item) => item.summary === PRIVATE_CONVERSATION_DOCKET_SUMMARY,
+        );
+        if (candidate?.visibility !== "private") {
+          throw new Error("The owner-private Message docket item was not available to resolve");
+        }
+        return decision({
+          bubbles: [{ text: PRIVATE_CONVERSATION_DOCKET_HANDLED_ACK, delayMs: 0 }],
+          docketCompletions: [candidate.candidateId],
+        });
+      }
       if (
         input.currentMessage.text === PUBLIC_RESEARCH_REQUEST ||
         input.currentMessage.text === PUBLIC_NO_RESULT_REQUEST ||
@@ -4013,7 +4101,7 @@ release("Florence parent journeys", () => {
       nativeObservation.imageBytes = image.bytes;
       nativeObservation.pdfBytes = pdf.bytes;
       return decision({
-        bubbles: [{ text: "I found the deadline and I’ll keep an eye on it.", delayMs: 0 }],
+        bubbles: [{ text: "I found the deadline and added the unsigned form to the docket.", delayMs: 0 }],
         facts: [
           remember(
             "Maya’s field-trip form is due Tuesday",
@@ -4021,20 +4109,86 @@ release("Florence parent journeys", () => {
             input.audience === "group" ? "household" : "private",
           ),
         ],
-        followUp: {
-          operation: "schedule",
-          followUpId: null,
-          objective: "Watch for confirmation that Maya’s field-trip form is signed.",
-          currentConclusion: "The form still needs a parent signature.",
-          endCondition: "A parent or the school confirms the form is signed.",
-          nextCheck: new Date(Date.parse(input.currentMessage.occurredAt) + 60 * 60_000).toISOString(),
-          why: "The forwarded school message has a live deadline.",
+        docketUpsert: {
+          operation: "create",
+          candidateId: null,
+          candidate: {
+            category: "deadline",
+            summary: NATIVE_DOCKET_SUMMARY,
+            urgency: "soon",
+            dueAt: new Date(Date.parse(input.currentMessage.occurredAt) + 60 * 60_000).toISOString(),
+            needsAnswer: true,
+          },
           sourceIds: [input.currentMessage.sourceId],
         },
       });
     };
     const harness = await createHarness(householdReasoner, {
       continueFamilyWork: async (input, reads) => {
+        if (input.objective === NATIVE_DOCKET_WORK_OBJECTIVE) {
+          expect(input.visibility).toBe("household");
+          expect(input.ownerAdultId).toBeNull();
+          expect(input.initiatingAdultId).toBe(harness.partnerAdultId);
+          nativeDocketWorkOriginStayedCurrent =
+            input.origin.message.speaker === harness.partnerAdultId &&
+            input.origin.message.text === NATIVE_DOCKET_WORK_REQUEST;
+          if (!nativeDocketWorkOriginStayedCurrent) {
+            throw new Error("Older docket evidence replaced the current work-request origin");
+          }
+          const linkedMessages = input.linkedSources?.filter((source) => source.kind === "message") ?? [];
+          const linkedDocuments = input.linkedSources?.filter((source) => source.kind === "document") ?? [];
+          const schoolMessage = linkedMessages.find((source) => source.message.text?.includes(NATIVE_TEXT));
+          const correctionMessage = linkedMessages.find(
+            (source) => source.message.text === NATIVE_DOCKET_CORRECTION,
+          );
+          const schoolPdf = linkedDocuments.find(
+            (source) => source.document.filename === "field-trip-form.pdf",
+          );
+          if (!schoolMessage || !correctionMessage || !schoolPdf || !reads.readSource) {
+            throw new Error("The reconciled docket did not preserve its exact Message/PDF lineage");
+          }
+          const openedMessage = await reads.readSource({ sourceId: schoolMessage.sourceId });
+          const imageReference = schoolMessage.message.images[0];
+          if (!imageReference || !reads.readCurrentImage || !reads.readCurrentPdf) {
+            throw new Error("The durable worker lost the school photo or PDF reader");
+          }
+          if (imageReference.mimeType === "image/heic") {
+            throw new Error("The retained school photo was not normalized");
+          }
+          const image = await reads.readCurrentImage({
+            assetId: imageReference.assetId,
+            mimeType: imageReference.mimeType,
+          });
+          const pdf = await reads.readCurrentPdf({
+            documentId: schoolPdf.document.id,
+            filename: schoolPdf.document.filename,
+            mimeType: schoolPdf.document.mimeType,
+            contentDigest: schoolPdf.document.contentDigest,
+          });
+          nativeDocketWorkReadExactEvidence =
+            openedMessage?.kind === "message" &&
+            openedMessage.text.includes(NATIVE_TEXT) &&
+            openedMessage.text.includes(NATIVE_LINK) &&
+            openedMessage.text.includes(VOICE_TRANSCRIPT) &&
+            Buffer.from(image.bytes).equals(Buffer.from(JPEG_BYTES)) &&
+            Buffer.from(pdf.bytes).equals(Buffer.from(PDF_BYTES));
+          if (!nativeDocketWorkReadExactEvidence) {
+            throw new Error("The durable worker could not reopen the exact retained family evidence");
+          }
+          return {
+            kind: "terminal",
+            state: {
+              ...input.state,
+              progressRevision: input.state.progressRevision + 1,
+              phase: "terminal",
+              claim: null,
+              pendingCall: null,
+              terminal: { outcome: "succeeded", text: NATIVE_DOCKET_WORK_RESULT },
+            },
+            outcome: "succeeded",
+            text: NATIVE_DOCKET_WORK_RESULT,
+          };
+        }
         if (input.objective !== docketWorkObjective) {
           throw new Error(`Unexpected family work in docket narrative: ${input.objective}`);
         }
@@ -4891,15 +5045,178 @@ release("Florence parent journeys", () => {
         }),
       ]),
     );
-    expect(workspace.vault?.watches).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          kind: "monitor",
-          objective: "Watch for confirmation that Maya’s field-trip form is signed.",
-          status: "active",
-        }),
-      ]),
+    expect(
+      workspace.vault?.watches.some(
+        (watch) => watch.objective === "Watch for confirmation that Maya’s field-trip form is signed.",
+      ),
+    ).toBe(false);
+
+    const nativeDocketAfterCreate = await harness.store.readHouseholdDocket({
+      householdId: incompleteWork.household.householdId,
+      limit: null,
+      now: harness.iso(),
+    });
+    const nativeCreatedItems = nativeDocketAfterCreate.items.filter(
+      (candidate) => candidate.summary === NATIVE_DOCKET_SUMMARY,
     );
+    expect(nativeCreatedItems).toHaveLength(1);
+    expect(nativeCreatedItems[0]).toMatchObject({ visibility: "household" });
+    const nativeDocketCandidateId = nativeCreatedItems[0]?.candidateId;
+    if (!nativeDocketCandidateId) throw new Error("The native Message created no durable docket identity");
+    expect(await harness.vault.purgeExpired(new Date(Date.now() + 48 * 60 * 60_000))).toBe(0);
+    await harness.assertDatabase(
+      "The native Message docket item did not retain its exact PDF and source-backed identity",
+      `exists (
+        select 1 from sources source
+        where source.id=${sqlLiteral(inboundSourceId("event-native-school-update"))}::uuid
+          and source.kind='linq_message' and source.visibility='household'
+          and source.metadata->'conversationDocketItem'->>'kind'='conversation_docket_item_v1'
+          and source.metadata->'conversationDocketItem'->>'status'='unresolved'
+          and source.metadata->'conversationDocketItem'->>'candidateId'=${sqlLiteral(nativeDocketCandidateId)}
+          and length(source.metadata->'conversationDocketItem'->>'actionKey')=64
+      ) and exists (
+        select 1 from sources source join documents document on document.source_id=source.id
+        where source.parent_source_id=${sqlLiteral(inboundSourceId("event-native-school-update"))}::uuid
+          and document.filename='field-trip-form.pdf' and document.retained=true
+          and document.discard_after is null and document.content_envelope is not null
+      )`,
+    );
+
+    await harness.florence.acceptInbound({
+      ...harness.inbound("group", "native-school-correction", NATIVE_DOCKET_CORRECTION),
+      replyToProviderMessageId: "message-native-school-update",
+    });
+    await harness.drain();
+    const nativeDocketAfterCorrection = await harness.store.readHouseholdDocket({
+      householdId: incompleteWork.household.householdId,
+      limit: null,
+      now: harness.iso(),
+    });
+    expect(
+      nativeDocketAfterCorrection.items.filter(
+        (candidate) =>
+          candidate.summary === NATIVE_DOCKET_SUMMARY || candidate.summary === NATIVE_DOCKET_UPDATED_SUMMARY,
+      ),
+    ).toEqual([
+      expect.objectContaining({
+        candidateId: nativeDocketCandidateId,
+        summary: NATIVE_DOCKET_UPDATED_SUMMARY,
+        visibility: "household",
+      }),
+    ]);
+    await harness.assertDatabase(
+      "The semantic correction forked the Message docket item or lost its exact evidence lineage",
+      `(
+        select count(*)=1 from sources source
+        where source.metadata->'conversationDocketItem'->>'candidateId'=${sqlLiteral(nativeDocketCandidateId)}
+      ) and exists (
+        select 1 from sources source
+        where source.id=${sqlLiteral(inboundSourceId("event-native-school-update"))}::uuid
+          and source.metadata->'conversationDocketItem'->>'summary'=${sqlLiteral(NATIVE_DOCKET_UPDATED_SUMMARY)}
+          and source.metadata->'conversationDocketItem'->'sourceIds'
+            @> ${sqlLiteral(
+              JSON.stringify([
+                inboundSourceId("event-native-school-update"),
+                inboundSourceId("event-native-school-correction"),
+              ]),
+            )}::jsonb
+      )`,
+    );
+
+    await harness.accept("group", "native-docket-work", NATIVE_DOCKET_WORK_REQUEST, "partner");
+    await harness.drain();
+    expect(harness.linq.messages.some((message) => message.text === NATIVE_DOCKET_WORK_ACK)).toBe(true);
+    harness.state.now += 24 * 60 * 60_000 + 1_001;
+    await harness.drain();
+    expect(nativeDocketWorkOriginStayedCurrent).toBe(true);
+    expect(nativeDocketWorkReadExactEvidence).toBe(true);
+    expect(harness.linq.messages.some((message) => message.text === NATIVE_DOCKET_WORK_RESULT)).toBe(true);
+    expect(
+      (
+        await harness.store.readHouseholdDocket({
+          householdId: incompleteWork.household.householdId,
+          limit: null,
+          now: harness.iso(),
+        })
+      ).items.some((candidate) => candidate.candidateId === nativeDocketCandidateId),
+    ).toBe(false);
+    await harness.assertDatabase(
+      "Docket work changed the requesting adult or lost/replaced the exact Message, link, photo, or PDF lineage",
+      `exists (
+        select 1 from proactive_work work
+        where work.kind='family_task' and work.objective=${sqlLiteral(NATIVE_DOCKET_WORK_OBJECTIVE)}
+          and work.visibility='household' and work.owner_adult_id is null and work.status='completed'
+      ) and (
+        select count(*)=4 from proactive_work work
+        join proactive_work_sources link on link.work_id=work.id
+        where work.kind='family_task' and work.objective=${sqlLiteral(NATIVE_DOCKET_WORK_OBJECTIVE)}
+      ) and (
+        select count(*)=3 from proactive_work work
+        join proactive_work_sources link on link.work_id=work.id
+        join messages message on message.source_id=link.source_id
+        where work.kind='family_task' and work.objective=${sqlLiteral(NATIVE_DOCKET_WORK_OBJECTIVE)}
+          and message.provider_message_id in (
+            'message-native-school-update','message-native-school-correction','message-native-docket-work'
+          )
+      ) and exists (
+        select 1 from proactive_work work
+        join proactive_work_sources link on link.work_id=work.id
+        join documents document on document.source_id=link.source_id
+        where work.kind='family_task' and work.objective=${sqlLiteral(NATIVE_DOCKET_WORK_OBJECTIVE)}
+          and document.filename='field-trip-form.pdf' and document.retained=true
+          and document.discard_after is null
+      ) and exists (
+        select 1 from messages outbound
+        where outbound.direction='outbound' and outbound.text=${sqlLiteral(NATIVE_DOCKET_WORK_RESULT)}
+          and outbound.reply_to_source_id=${sqlLiteral(inboundSourceId("event-native-docket-work"))}::uuid
+      )`,
+    );
+
+    await harness.assertDatabase(
+      "Successful family work did not resolve its conversation-origin docket item",
+      `exists (
+        select 1 from sources source
+        where source.id=${sqlLiteral(inboundSourceId("event-native-school-update"))}::uuid
+          and source.metadata->'conversationDocketItem'->>'candidateId'=${sqlLiteral(nativeDocketCandidateId)}
+          and source.metadata->'conversationDocketItem'->>'status'='resolved'
+          and exists (
+            select 1 from messages resolution
+            where resolution.source_id=(source.metadata->'conversationDocketItem'->>'resolutionSourceId')::uuid
+              and resolution.direction='outbound' and resolution.text=${sqlLiteral(NATIVE_DOCKET_WORK_RESULT)}
+          )
+      )`,
+    );
+
+    await harness.accept("private", "private-conversation-docket", PRIVATE_CONVERSATION_DOCKET_REQUEST);
+    await harness.drain();
+    const founderConversationDocket = (await harness.florence.workspaceForAdult(harness.founderAdultId)).vault
+      ?.docket.items;
+    const partnerConversationDocket = (await harness.florence.workspaceForAdult(harness.partnerAdultId)).vault
+      ?.docket.items;
+    expect(
+      founderConversationDocket?.find(
+        (candidate) => candidate.summary === PRIVATE_CONVERSATION_DOCKET_SUMMARY,
+      ),
+    ).toMatchObject({ visibility: "private" });
+    expect(
+      partnerConversationDocket?.some(
+        (candidate) => candidate.summary === PRIVATE_CONVERSATION_DOCKET_SUMMARY,
+      ),
+    ).toBe(false);
+    await harness.accept(
+      "private",
+      "private-conversation-docket-handled",
+      PRIVATE_CONVERSATION_DOCKET_HANDLED,
+    );
+    await harness.drain();
+    expect(
+      harness.linq.messages.some((message) => message.text === PRIVATE_CONVERSATION_DOCKET_HANDLED_ACK),
+    ).toBe(true);
+    expect(
+      (await harness.florence.workspaceForAdult(harness.founderAdultId)).vault?.docket.items.some(
+        (candidate) => candidate.summary === PRIVATE_CONVERSATION_DOCKET_SUMMARY,
+      ),
+    ).toBe(false);
 
     const voicedInterest = await harness.florence.acceptInbound({
       ...harness.inbound("group", "soccer-interest", INTEREST_REQUEST, "partner"),
@@ -9709,6 +10026,7 @@ function decision(
     followUp?: FlorenceDecision["followUp"];
     reminder?: FlorenceDecision["reminder"];
     familyWork?: FlorenceDecision["familyWork"];
+    docketUpsert?: FlorenceDecision["docketUpsert"];
     docketCompletions?: FlorenceDecision["docketCompletions"];
     interest?: FlorenceDecision["interest"];
     calendar?: FlorenceDecision["calendar"];
@@ -9729,6 +10047,7 @@ function decision(
     followUp: input.followUp ?? null,
     reminder: input.reminder ?? null,
     familyWork: input.familyWork ?? null,
+    docketUpsert: input.docketUpsert ?? null,
     docketCompletions: input.docketCompletions ?? null,
     interest: input.interest ?? null,
     calendar: input.calendar ?? null,

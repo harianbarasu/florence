@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { EncryptedImageVault } from "@florence/artifacts";
+import { type EncryptedImageVault, ImageVaultError } from "@florence/artifacts";
 import {
   type CompleteFamilyOnboardingInput,
   calendarMonthSchema,
@@ -1372,6 +1372,7 @@ export class Florence {
               followUp: null,
               reminder: null,
               familyWork: null,
+              docketUpsert: null,
               docketCompletions: null,
               calendar: null,
               householdUpdate: null,
@@ -1485,8 +1486,28 @@ export class Florence {
       const attachmentJob =
         turn.message.images.length > 0 ||
         (turn.currentDocuments?.length ?? 0) > 0 ||
-        turn.supersededMessages.some((message) => message.images.length > 0);
+        turn.supersededMessages.some((message) => message.images.length > 0) ||
+        (turn.replyTarget?.images.length ?? 0) > 0 ||
+        turn.replyTargetSupersededMessages.some((message) => message.images.length > 0);
       let substantiveWorkStarted = false;
+      let turnCommitted = false;
+      const retainedImageClaims: Array<{
+        householdId: string;
+        signalId: string;
+        image: InboundTurn["message"]["images"][number];
+      }> = [];
+      const releaseUncommittedImageClaims = async () => {
+        const claims = retainedImageClaims.splice(0).reverse();
+        if (!this.#imageVault) return;
+        await Promise.allSettled(
+          claims.map((claim) =>
+            this.#imageVault?.releaseRetention({
+              ...claim,
+              claimId: turn.message.sourceId,
+            }),
+          ),
+        );
+      };
       const startWork = () => {
         substantiveWorkStarted = true;
       };
@@ -1508,20 +1529,102 @@ export class Florence {
                 ...requested,
                 policy: { ...requested.policy, schedule: true, stopMessaging: false },
                 conversation: approvedActionConversation(approval, partnerApproval),
+                docketUpsert: null,
                 calendar: null,
                 householdUpdate: null,
                 webAccessPath: null,
               }
             : requested;
+        const retainedMessageDocuments: Array<{
+          documentId: string;
+          contentDigest: string;
+          contentEnvelope: Uint8Array;
+        }> = [];
+        const createsFamilyWork = committedDecision.familyWork?.operation === "create";
+        if (committedDecision.docketUpsert || createsFamilyWork) {
+          const replyEvidenceMessages =
+            turn.replyTarget &&
+            (createsFamilyWork ||
+              committedDecision.docketUpsert?.sourceIds.includes(turn.replyTarget.sourceId))
+              ? [...turn.replyTargetSupersededMessages, turn.replyTarget]
+              : [];
+          const evidenceMessages = [...turn.supersededMessages, turn.message, ...replyEvidenceMessages];
+          const evidenceMessageIds = new Set(evidenceMessages.map((message) => message.sourceId));
+          const currentDocuments = (turn.currentDocuments ?? []).filter((document) =>
+            evidenceMessageIds.has(document.parentSourceId),
+          );
+          if (
+            (evidenceMessages.some((message) => message.images.length > 0) || currentDocuments.length > 0) &&
+            !this.#imageVault
+          ) {
+            throw new Error("Florence attachment retention is not configured");
+          }
+          if (this.#imageVault) {
+            for (const message of evidenceMessages) {
+              for (const image of message.images) {
+                const retainInput = {
+                  householdId: turn.household.id,
+                  signalId: image.signalId ?? message.sourceId,
+                  image,
+                  now: this.#now(),
+                };
+                try {
+                  await this.#imageVault.retain({
+                    ...retainInput,
+                    claimId: turn.message.sourceId,
+                  });
+                  retainedImageClaims.push({
+                    householdId: retainInput.householdId,
+                    signalId: retainInput.signalId,
+                    image,
+                  });
+                } catch (error) {
+                  if (
+                    error instanceof ImageVaultError &&
+                    (error.code === "expired" || error.code === "unauthorized_or_missing")
+                  ) {
+                    continue;
+                  }
+                  throw error;
+                }
+              }
+            }
+            for (const document of currentDocuments) {
+              if (document.discardAfter === null) {
+                continue;
+              }
+              const retained = this.#imageVault.retainPdf({
+                documentId: document.id,
+                householdId: turn.household.id,
+                signalId: document.parentSourceId,
+                filename: document.filename,
+                mimeType: document.mimeType,
+                contentDigest: document.contentDigest,
+                contentEnvelope: document.contentEnvelope,
+                discardAfter: document.discardAfter,
+                now: this.#now(),
+              });
+              retainedMessageDocuments.push({
+                documentId: document.id,
+                contentDigest: document.contentDigest,
+                contentEnvelope: retained.contentEnvelope,
+              });
+            }
+          }
+        }
         const committed = await this.#store.commitTurn(
           decisionCommit(turn, committedDecision, this.#now(), {
             approveCalendarOffer: approval,
             approvePartnerInvitation: partnerApproval,
             googleEvidence: context.googleEvidence(),
             googleConnectionIdsUsed: context.googleConnectionIdsUsed(),
+            retainedDocketDocuments: committedDecision.docketUpsert ? retainedMessageDocuments : [],
+            retainedFamilyWorkDocuments: createsFamilyWork ? retainedMessageDocuments : [],
             resolveCalendarEventTarget: context.resolveCalendarEventTarget,
           }),
         );
+        turnCommitted = committed === "committed";
+        if (!turnCommitted) await releaseUncommittedImageClaims();
         if (committed === "committed" && committedDecision.familyWork?.operation === "cancel") {
           this.#activeFamilyWork
             .get(committedDecision.familyWork.workId)
@@ -1550,6 +1653,7 @@ export class Florence {
           }
         }
       } catch (error) {
+        if (!turnCommitted) await releaseUncommittedImageClaims();
         if (controller.signal.aborted) return;
         if (error instanceof FlorenceReasonerError && !error.retryable) {
           if (approvedCalendarOffer || approvedPartnerInvitation) {
@@ -1563,6 +1667,7 @@ export class Florence {
                   followUp: null,
                   reminder: null,
                   familyWork: null,
+                  docketUpsert: null,
                   docketCompletions: null,
                   calendar: null,
                   householdUpdate: null,
@@ -1596,6 +1701,7 @@ export class Florence {
                       followUp: null,
                       reminder: null,
                       familyWork: null,
+                      docketUpsert: null,
                       docketCompletions: null,
                       calendar: null,
                       householdUpdate: null,
@@ -1623,6 +1729,7 @@ export class Florence {
                         followUp: null,
                         reminder: null,
                         familyWork: null,
+                        docketUpsert: null,
                         docketCompletions: null,
                         calendar: null,
                         householdUpdate: null,
@@ -1667,11 +1774,48 @@ export class Florence {
     const calendarEventTargets = new Map<string, CalendarEventTarget>();
     const visibility = turn.authority.audience === "group" ? "shared" : "adult_private";
     const conversationHistoryObservedAt = this.#now().toISOString();
-    const currentDocuments = (turn.currentDocuments ?? []).slice(-3);
-    const jobMessages = [...turn.supersededMessages, turn.message];
-    const currentImages = jobMessages
-      .flatMap((message) => message.images.map((image) => ({ ...image, sourceId: message.sourceId })))
-      .slice(-10);
+    const currentDocuments = turn.currentDocuments ?? [];
+    const jobMessages = [
+      ...turn.supersededMessages,
+      turn.message,
+      ...turn.replyTargetSupersededMessages,
+      ...(turn.replyTarget ? [turn.replyTarget] : []),
+    ];
+    const candidateImages = jobMessages.flatMap((message) =>
+      message.images.map((image) => ({
+        ...image,
+        sourceId: message.sourceId,
+        signalId: image.signalId ?? message.sourceId,
+      })),
+    );
+    const currentImageReads = new Map<
+      string,
+      { mimeType: "image/jpeg" | "image/png" | "image/webp"; bytes: Uint8Array }
+    >();
+    const currentImages = [] as typeof candidateImages;
+    for (const image of candidateImages) {
+      if (!this.#imageVault) {
+        currentImages.push(image);
+        continue;
+      }
+      try {
+        const read = await this.#imageVault.read({
+          householdId: turn.household.id,
+          signalId: image.signalId,
+          image,
+        });
+        currentImages.push(image);
+        currentImageReads.set(image.assetId, read);
+      } catch (error) {
+        if (
+          error instanceof ImageVaultError &&
+          (error.code === "expired" || error.code === "unauthorized_or_missing")
+        ) {
+          continue;
+        }
+        throw error;
+      }
+    }
     const repliedMessage = turn.replyTarget;
     const indexMessage = (message: InboundTurn["message"] | InboundTurn["recentMessages"][number]) => {
       const text = turnText(message);
@@ -1690,6 +1834,7 @@ export class Florence {
     if (repliedMessage) indexMessage(repliedMessage);
     for (const message of turn.recentMessages) indexMessage(message);
     for (const message of turn.supersededMessages) indexMessage(message);
+    for (const message of turn.replyTargetSupersededMessages) indexMessage(message);
     for (const document of currentDocuments) {
       sourceIndex.set(document.id, {
         sourceId: document.id,
@@ -1780,9 +1925,12 @@ export class Florence {
             }
           : null,
       },
-      recentMessages: [...turn.recentMessages, ...turn.supersededMessages]
+      recentMessages: [
+        ...turn.recentMessages,
+        ...turn.supersededMessages,
+        ...turn.replyTargetSupersededMessages,
+      ]
         .sort((left, right) => left.occurredAt.localeCompare(right.occurredAt))
-        .slice(-24)
         .map((message) => ({
           sourceId: message.sourceId,
           senderName:
@@ -2327,10 +2475,12 @@ export class Florence {
         if (!image) {
           throw new Error("The image is not attached to the current message");
         }
+        const cached = currentImageReads.get(assetId);
+        if (cached?.mimeType === mimeType) return cached;
         if (!this.#imageVault) throw new Error("Florence image reading is not configured");
         return this.#imageVault.read({
           householdId: turn.household.id,
-          signalId: image.sourceId,
+          signalId: image.signalId,
           image: { assetId, mimeType },
         });
       },
@@ -3657,14 +3807,25 @@ export class Florence {
       throw new Error("Private family work lost its adult owner");
     }
     const browser = this.#browser && familyWorkExecutionAdultId ? this.#browser : null;
+    const familyWorkLinkedMessages = work.linkedSources.flatMap((source) =>
+      source.kind === "message" ? [source] : [],
+    );
+    const familyWorkLinkedDocuments = work.linkedSources.flatMap((source) =>
+      source.kind === "document" ? [source.document] : [],
+    );
     const familyWorkOriginImages = [
       ...(work.origin.replyTarget ? [work.origin.replyTarget] : []),
       ...work.origin.supersededMessages,
       work.origin.message,
-    ]
-      .flatMap((message) => message.images.map((image) => ({ ...image, sourceId: message.sourceId })))
-      .slice(-10);
-    const familyWorkOriginDocuments = work.origin.currentDocuments.slice(-3);
+      ...familyWorkLinkedMessages.map((source) => source.message),
+    ].flatMap((message) =>
+      message.images.map((image) => ({
+        ...image,
+        sourceId: message.sourceId,
+        signalId: image.signalId ?? message.sourceId,
+      })),
+    );
+    const familyWorkOriginDocuments = [...work.origin.currentDocuments, ...familyWorkLinkedDocuments];
     const claimedBrowserSession = work.state.browserSession;
     let browserSession = claimedBrowserSession;
     let uncheckpointedPhoneCall: FamilyWorkStateV1["activePhoneCall"] = null;
@@ -3769,7 +3930,38 @@ export class Florence {
       const familyWorkSourceIndex = new Map(
         familyWorkMemoryCorpus.map((source) => [source.sourceId, source] as const),
       );
-      const familyWorkLinkedSourceIds = new Set(work.linkedSources.map((source) => source.sourceId));
+      const familyWorkLinkedGoogleSourceIds = new Set(
+        work.linkedSources.flatMap((source) =>
+          source.kind === "gmail" || source.kind === "calendar" ? [source.sourceId] : [],
+        ),
+      );
+      for (const source of work.linkedSources) {
+        if (source.kind === "message") {
+          familyWorkSourceIndex.set(source.sourceId, {
+            sourceId: source.sourceId,
+            recordId: null,
+            kind: "message",
+            visibility: source.visibility,
+            label:
+              source.message.speaker === "florence"
+                ? "Florence"
+                : (familyWorkHousehold.members.find((member) => member.id === source.message.speaker)
+                    ?.displayName ?? "Family message"),
+            occurredAt: source.message.occurredAt,
+            text: turnText(source.message),
+          });
+        } else if (source.kind === "document") {
+          familyWorkSourceIndex.set(source.sourceId, {
+            sourceId: source.sourceId,
+            recordId: null,
+            kind: "document",
+            visibility: source.visibility,
+            label: source.document.filename,
+            occurredAt: null,
+            text: `Attached PDF: ${source.document.filename}. Its exact contents are attached to this task.`,
+          });
+        }
+      }
       const familyWorkConversationHistoryObservedAt = this.#now().toISOString();
       const familyWorkGoogleConnections =
         google && familyWorkGoogleAdultId
@@ -4643,7 +4835,9 @@ export class Florence {
           searchFamilyMemory: async ({ query, limit }) =>
             searchMemorySources(familyWorkSearchableMemory, query).slice(0, limit),
           readSource: async ({ sourceId }) => {
-            if (familyWorkLinkedSourceIds.has(sourceId)) {
+            const indexed = familyWorkSourceIndex.get(sourceId);
+            if (indexed) return indexed;
+            if (familyWorkLinkedGoogleSourceIds.has(sourceId)) {
               const retained = await this.#store.readClaimedFamilyWorkLinkedGoogleSource({
                 workId: work.workId,
                 generation: work.generation,
@@ -4655,8 +4849,6 @@ export class Florence {
               familyWorkSourceIndex.set(source.sourceId, source);
               return source;
             }
-            const indexed = familyWorkSourceIndex.get(sourceId);
-            if (indexed) return indexed;
             const retained =
               work.visibility === "private"
                 ? await this.#store.readClaimedFamilyWorkPrivateGoogleSource({
@@ -4842,7 +5034,7 @@ export class Florence {
                           if (image) {
                             const read = await this.#imageVault.read({
                               householdId: work.household.householdId,
-                              signalId: image.sourceId,
+                              signalId: image.signalId,
                               image: { assetId: image.assetId, mimeType: image.mimeType },
                             });
                             return {
@@ -4948,6 +5140,13 @@ export class Florence {
                     declaredMimeType: result.observation.screenshot.mimeType,
                     bytes: result.observation.screenshot.bytes,
                   });
+                  await this.#imageVault.retain({
+                    householdId: work.household.householdId,
+                    signalId: work.workId,
+                    image: stored.image,
+                    claimId: work.workId,
+                    now: this.#now(),
+                  });
                   const selectedImage: FamilyWorkSelectedImage = {
                     assetId: stored.image.assetId,
                     signalId: work.workId,
@@ -4977,7 +5176,7 @@ export class Florence {
             if (!this.#imageVault) throw new Error("Florence image reading is not configured");
             return this.#imageVault.read({
               householdId: work.household.householdId,
-              signalId: image.sourceId,
+              signalId: image.signalId,
               image: { assetId, mimeType },
             });
           },
@@ -7186,6 +7385,7 @@ function enforcePolicy(decision: FlorenceDecision): FlorenceDecision {
       followUp: null,
       reminder: null,
       familyWork: null,
+      docketUpsert: null,
       docketCompletions: null,
       interest: null,
       calendar: null,
@@ -7209,6 +7409,7 @@ function enforcePolicy(decision: FlorenceDecision): FlorenceDecision {
     followUp: schedule ? decision.followUp : null,
     reminder: decision.reminder,
     familyWork: decision.familyWork,
+    docketUpsert: retain ? decision.docketUpsert : null,
     docketCompletions: decision.docketCompletions,
     interest,
     calendar,
@@ -7245,6 +7446,8 @@ function decisionCommit(
     approvePartnerInvitation?: InboundTurn["pendingPartnerInvitation"];
     googleEvidence?: readonly GoogleEvidenceDraft[];
     googleConnectionIdsUsed?: readonly string[];
+    retainedDocketDocuments?: NonNullable<CommitTurnInput["docketMutation"]>["retainedDocuments"];
+    retainedFamilyWorkDocuments?: NonNullable<CommitTurnInput["familyWorkRetainedDocuments"]>;
     resolveCalendarEventTarget?: (eventRef: string) => CalendarEventTarget | null;
   } = {},
 ): CommitTurnInput {
@@ -7261,6 +7464,7 @@ function decisionCommit(
       decision.followUp !== null ||
       decision.reminder !== null ||
       decision.familyWork !== null ||
+      decision.docketUpsert !== null ||
       (decision.docketCompletions?.length ?? 0) > 0 ||
       decision.interest != null ||
       decision.calendar !== null ||
@@ -7619,6 +7823,23 @@ function decisionCommit(
                   workId: decision.familyWork.workId as string,
                 }
               : null;
+  const docketMutation: NonNullable<CommitTurnInput["docketMutation"]> | null = decision.docketUpsert
+    ? decision.docketUpsert.operation === "create"
+      ? {
+          operation: "create",
+          candidateId: null,
+          candidate: { ...decision.docketUpsert.candidate },
+          sourceIds: [...new Set([turn.message.sourceId, ...decision.docketUpsert.sourceIds])],
+          retainedDocuments: [...(options.retainedDocketDocuments ?? [])],
+        }
+      : {
+          operation: "update",
+          candidateId: decision.docketUpsert.candidateId,
+          candidate: { ...decision.docketUpsert.candidate },
+          sourceIds: [...new Set([turn.message.sourceId, ...decision.docketUpsert.sourceIds])],
+          retainedDocuments: [...(options.retainedDocketDocuments ?? [])],
+        }
+    : null;
   const calendar = calendarCommit(turn, decision, options.resolveCalendarEventTarget);
   const approval = options.approveCalendarOffer ? [calendarApproval(options.approveCalendarOffer)] : [];
   const householdUpdate = decision.householdUpdate;
@@ -7647,6 +7868,8 @@ function decisionCommit(
     cancelMonitorIds: decision.followUp?.operation === "cancel" ? [decision.followUp.followUpId] : [],
     reminderMutation,
     familyWorkMutation,
+    familyWorkRetainedDocuments: [...(options.retainedFamilyWorkDocuments ?? [])],
+    docketMutation,
     completeDocketCandidateIds: docketCompletions,
     interestMutation: decision.interest ?? null,
     outbound,

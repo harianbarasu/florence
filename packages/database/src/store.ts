@@ -7603,6 +7603,8 @@ export class PostgresFlorenceStore {
       group by w.id,w.objective,w.current_conclusion,w.end_condition,w.next_check_at,w.why
       order by w.next_check_at,w.id
     `;
+    // Direct port: pinned Hermes cron/jobs.py:list_jobs and tools/cronjob_tools.py:list expose the
+    // full managed set to the agent, so an older reminder remains selectable in ordinary chat.
     const reminderRows = await this.#sql<
       {
         id: string;
@@ -7626,7 +7628,6 @@ export class PostgresFlorenceStore {
       order by
         case when status in ('active','paused') then 0 else 1 end,
         next_check_at nulls last,created_at desc,id
-      limit 100
     `;
     const familyWorkRows = await this.#sql<
       {
@@ -15362,6 +15363,8 @@ async function visibleRemindersForScope(
   sql: postgres.TransactionSql,
   input: { householdId: string; audience: Audience; senderAdultId: string },
 ): Promise<readonly VisibleReminder[]> {
+  // Direct port: pinned Hermes cron/jobs.py:list_jobs and tools/cronjob_tools.py:list return the
+  // complete job set so an older job never becomes unaddressable behind a presentation limit.
   const rows = await sql<VisibleReminderRow[]>`
     select id,objective,reminder_schedule,status,next_check_at,last_run_at,created_at
     from proactive_work
@@ -15371,7 +15374,6 @@ async function visibleRemindersForScope(
         or (${input.audience === "group"} and visibility='household' and owner_adult_id is null))
     order by case when status in ('active','paused') then 0 else 1 end,
       next_check_at nulls last,created_at desc,id
-    limit 100
   `;
   return rows.map(visibleReminder);
 }

@@ -1475,6 +1475,7 @@ release("Florence parent journeys", () => {
     let transientRetryAttempts = 0;
     let retryCueLeakedIntoConversation = false;
     let activeReminderListSeen = false;
+    let reminderBeyondFormerBoundaryCancelled = false;
     let pausedReminderListSeen = false;
     const harness = await createHarness(async (input) => {
       if (input.currentMessage.text === TRANSIENT_RETRY_REQUEST) {
@@ -1651,6 +1652,7 @@ release("Florence parent journeys", () => {
         });
       }
       if (input.currentMessage.text === CANCEL_REMINDER_REQUEST && stretchReminder) {
+        reminderBeyondFormerBoundaryCancelled = input.visibleReminders.length > 100;
         return decision({
           bubbles: [{ text: CANCEL_REMINDER_ACK, delayMs: 0 }],
           reminder: {
@@ -2553,8 +2555,39 @@ release("Florence parent journeys", () => {
           and next_check_at='2026-08-19T22:02:00.000Z'::timestamptz)`,
     );
 
+    await writeFile(
+      harness.assertionFile,
+      `insert into proactive_work (
+        id,household_id,kind,visibility,owner_adult_id,objective,reminder_schedule,
+        status,next_check_at,created_at
+      )
+      select ('30000000-0000-4000-8000-'||lpad(fixture.ordinal::text,12,'0'))::uuid,
+        ${sqlLiteral(householdId)}::uuid,'reminder','household',null,
+        'fixture earlier reminder '||fixture.ordinal,
+        jsonb_build_object(
+          'kind','once',
+          'at',to_char(
+            ('2026-08-19T21:59:00.000Z'::timestamptz
+              + fixture.ordinal * interval '1 second') at time zone 'UTC',
+            'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
+          )
+        ),
+        'active',
+        '2026-08-19T21:59:00.000Z'::timestamptz + fixture.ordinal * interval '1 second',
+        '2026-08-19T20:00:00.000Z'::timestamptz + fixture.ordinal * interval '1 millisecond'
+      from generate_series(1,100) as fixture(ordinal);`,
+    );
+    await migrateDatabase(harness.databaseUrl, harness.assertionFile);
     await harness.accept("group", "partner-cancel-stretch-reminder", CANCEL_REMINDER_REQUEST, "partner");
     await harness.drain();
+    expect(reminderBeyondFormerBoundaryCancelled).toBe(true);
+    await writeFile(
+      harness.assertionFile,
+      `delete from proactive_work
+        where household_id=${sqlLiteral(householdId)}::uuid and kind='reminder'
+          and objective like 'fixture earlier reminder %';`,
+    );
+    await migrateDatabase(harness.databaseUrl, harness.assertionFile);
     harness.state.now = Date.parse("2026-08-19T22:03:00.000Z");
     await harness.drain();
     expect(

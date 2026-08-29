@@ -555,21 +555,19 @@ export const florenceReasonerInputSchema = z
           .max(20),
       })
       .strict(),
-    visibleReminders: z
-      .array(
-        z
-          .object({
-            reminderId: opaqueId,
-            action: shortText,
-            schedule: reminderScheduleSchema,
-            status: z.enum(["active", "paused", "completed", "cancelled"]),
-            nextAt: timestamp.nullable(),
-            lastRunAt: timestamp.nullable(),
-            createdAt: timestamp,
-          })
-          .strict(),
-      )
-      .max(100),
+    visibleReminders: z.array(
+      z
+        .object({
+          reminderId: opaqueId,
+          action: shortText,
+          schedule: reminderScheduleSchema,
+          status: z.enum(["active", "paused", "completed", "cancelled"]),
+          nextAt: timestamp.nullable(),
+          lastRunAt: timestamp.nullable(),
+          createdAt: timestamp,
+        })
+        .strict(),
+    ),
     visibleFamilyWork: z.array(
       z
         .object({

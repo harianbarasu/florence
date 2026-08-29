@@ -109,6 +109,8 @@ const NATIVE_DOCKET_SUMMARY = "Maya’s field-trip form needs one parent signatu
 const NATIVE_DOCKET_OWNER = "Parents";
 const NATIVE_DOCKET_NEXT_ACTION = "Choose who will sign and return Maya’s field-trip form.";
 const NATIVE_DOCKET_WAITING_ON = "A parent to claim the signature";
+const NATIVE_DOCKET_COMPLETION_CONDITION =
+  "Maya’s field-trip form has been signed, returned, and confirmed received by the school.";
 const NATIVE_DOCKET_CORRECTION =
   "Correction: Maya’s field-trip form needs one parent signature by Wednesday, not Tuesday.";
 const NATIVE_DOCKET_UPDATED_SUMMARY = "Maya’s field-trip form needs one parent signature by Wednesday.";
@@ -124,6 +126,8 @@ const PRIVATE_CONVERSATION_DOCKET_REQUEST =
 const PRIVATE_CONVERSATION_DOCKET_SUMMARY = "Decide whether to volunteer at Maya’s school.";
 const PRIVATE_CONVERSATION_DOCKET_NEXT_ACTION = "Decide whether you can volunteer at Maya’s school.";
 const PRIVATE_CONVERSATION_DOCKET_WAITING_ON = "Your decision";
+const PRIVATE_CONVERSATION_DOCKET_COMPLETION_CONDITION =
+  "The volunteer decision has been made and any needed school response is confirmed.";
 const PRIVATE_CONVERSATION_DOCKET_HANDLED = "I decided about the private school volunteer note.";
 const PRIVATE_CONVERSATION_DOCKET_HANDLED_ACK = "Got it—I’ll take that private decision off your docket.";
 const INTEREST_REQUEST = "Maya likes soccer. Keep an eye out for a good family match we could attend.";
@@ -277,6 +281,8 @@ const PARTNER_DUPLICATE_CONFLICT_SUMMARY = "The family still needs to decide on 
 const FOUNDER_FORM_SUMMARY = "Maya’s field-trip form still needs a parent response.";
 const FOUNDER_FORM_NEXT_ACTION = "Choose who will sign and return Maya’s field-trip form.";
 const FOUNDER_FORM_WAITING_ON = "A parent response";
+const FOUNDER_FORM_COMPLETION_CONDITION =
+  "Maya’s field-trip form is signed, returned, and confirmed received by the school.";
 const PARTNER_PERMISSION_SUMMARY = "Maya’s permission-slip deadline still needs family attention.";
 const PARTNER_PERMISSION_NEXT_ACTION = "Confirm and return Maya’s permission slip.";
 const PARTNER_PERMISSION_WAITING_ON = "Alex’s confirmation";
@@ -3009,6 +3015,7 @@ release("Florence parent journeys", () => {
         familyWorkRuns += 1;
         if (familyWorkRuns === 1) {
           expect(input.objective).toBe(SOURCE_CHANGE_FAMILY_WORK_OBJECTIVE);
+          expect(input.state.completionCondition).toBe(FOUNDER_FORM_COMPLETION_CONDITION);
           return {
             kind: "waiting",
             state: {
@@ -3022,6 +3029,9 @@ release("Florence parent journeys", () => {
                 owner: "Parents",
                 nextAction: "Choose who will sign the field-trip form.",
                 waitingOn: SOURCE_CHANGE_FAMILY_WORK_QUESTION,
+                completionCondition:
+                  input.state.completionCondition ??
+                  "The field-trip form is signed, returned, and confirmed received.",
                 needsAnswer: true,
               },
             },
@@ -3030,6 +3040,7 @@ release("Florence parent journeys", () => {
         }
 
         expect(input.objective).toBe(SOURCE_CHANGE_FAMILY_WORK_OBJECTIVE);
+        expect(input.state.completionCondition).toBe(FOUNDER_FORM_COMPLETION_CONDITION);
         expect(input.state.steering).toEqual(
           expect.arrayContaining([
             expect.objectContaining({
@@ -3228,6 +3239,8 @@ release("Florence parent journeys", () => {
                 owner: "Alex Anbarasu",
                 nextAction: "Answer Florence's private question.",
                 waitingOn: question,
+                completionCondition:
+                  input.state.completionCondition ?? "The family plan is completed and confirmed.",
                 needsAnswer: true,
               },
             },
@@ -3361,6 +3374,8 @@ release("Florence parent journeys", () => {
                 owner: "Hari Anbarasu",
                 nextAction: "Choose one camp date.",
                 waitingOn: question,
+                completionCondition:
+                  input.state.completionCondition ?? "The camp date is chosen and confirmed.",
                 needsAnswer: true,
               },
             },
@@ -3486,6 +3501,8 @@ release("Florence parent journeys", () => {
                 owner: "Hari Anbarasu",
                 nextAction: "Choose one option.",
                 waitingOn: question,
+                completionCondition:
+                  input.state.completionCondition ?? "The selected option is completed and confirmed.",
                 needsAnswer: true,
               },
             },
@@ -4996,6 +5013,7 @@ release("Florence parent journeys", () => {
               owner: NATIVE_DOCKET_OWNER,
               nextAction: NATIVE_DOCKET_UPDATED_NEXT_ACTION,
               waitingOn: NATIVE_DOCKET_WAITING_ON,
+              completionCondition: NATIVE_DOCKET_COMPLETION_CONDITION,
             },
             sourceIds: [input.currentMessage.sourceId, input.currentMessage.replyTo.sourceId],
           },
@@ -5035,6 +5053,7 @@ release("Florence parent journeys", () => {
               owner: "You",
               nextAction: PRIVATE_CONVERSATION_DOCKET_NEXT_ACTION,
               waitingOn: PRIVATE_CONVERSATION_DOCKET_WAITING_ON,
+              completionCondition: PRIVATE_CONVERSATION_DOCKET_COMPLETION_CONDITION,
             },
             sourceIds: [input.currentMessage.sourceId],
           },
@@ -5212,6 +5231,7 @@ release("Florence parent journeys", () => {
             owner: NATIVE_DOCKET_OWNER,
             nextAction: NATIVE_DOCKET_NEXT_ACTION,
             waitingOn: NATIVE_DOCKET_WAITING_ON,
+            completionCondition: NATIVE_DOCKET_COMPLETION_CONDITION,
           },
           sourceIds: [input.currentMessage.sourceId],
         },
@@ -5220,6 +5240,7 @@ release("Florence parent journeys", () => {
     const harness = await createHarness(householdReasoner, {
       continueFamilyWork: async (input, reads) => {
         if (input.objective === NATIVE_DOCKET_WORK_OBJECTIVE) {
+          expect(input.state.completionCondition).toBe(NATIVE_DOCKET_COMPLETION_CONDITION);
           expect(input.visibility).toBe("household");
           expect(input.ownerAdultId).toBeNull();
           expect(input.initiatingAdultId).toBe(harness.partnerAdultId);
@@ -5280,7 +5301,7 @@ release("Florence parent journeys", () => {
               terminal: {
                 outcome: "succeeded",
                 text: NATIVE_DOCKET_WORK_RESULT,
-                completionBasis: mockReasonedCompletionBasis(NATIVE_DOCKET_WORK_RESULT),
+                completionBasis: mockReasonedCompletionBasis(NATIVE_DOCKET_COMPLETION_CONDITION),
               },
             },
             outcome: "succeeded",
@@ -5328,6 +5349,9 @@ release("Florence parent journeys", () => {
                 owner: "Parents",
                 nextAction: docketWorkNextAction,
                 waitingOn: docketWorkWaitingOn,
+                completionCondition:
+                  input.state.completionCondition ??
+                  "The school form has been completed and confirmed received.",
                 needsAnswer: true,
               },
             },
@@ -5338,6 +5362,8 @@ release("Florence parent journeys", () => {
             owner: "Parents",
             nextAction: docketWorkNextAction,
             waitingOn: docketWorkWaitingOn,
+            completionCondition:
+              input.state.completionCondition ?? "The school form has been completed and confirmed received.",
             needsAnswer: true,
           },
           completionEvidenceOutputs: [],
@@ -6234,6 +6260,7 @@ release("Florence parent journeys", () => {
       owner: NATIVE_DOCKET_OWNER,
       nextAction: NATIVE_DOCKET_NEXT_ACTION,
       waitingOn: NATIVE_DOCKET_WAITING_ON,
+      completionCondition: NATIVE_DOCKET_COMPLETION_CONDITION,
       needsAnswer: true,
     });
     const nativeDocketCandidateId = nativeCreatedItems[0]?.candidateId;
@@ -6280,6 +6307,7 @@ release("Florence parent journeys", () => {
         owner: NATIVE_DOCKET_OWNER,
         nextAction: NATIVE_DOCKET_UPDATED_NEXT_ACTION,
         waitingOn: NATIVE_DOCKET_WAITING_ON,
+        completionCondition: NATIVE_DOCKET_COMPLETION_CONDITION,
         needsAnswer: true,
       }),
     ]);
@@ -6318,6 +6346,7 @@ release("Florence parent journeys", () => {
       owner: "Florence",
       nextAction: NATIVE_DOCKET_WORK_OBJECTIVE,
       waitingOn: null,
+      completionCondition: NATIVE_DOCKET_COMPLETION_CONDITION,
       needsAnswer: false,
     });
     harness.state.now += 24 * 60 * 60_000 + 1_001;
@@ -6340,6 +6369,7 @@ release("Florence parent journeys", () => {
         select 1 from proactive_work work
         where work.kind='family_task' and work.objective=${sqlLiteral(NATIVE_DOCKET_WORK_OBJECTIVE)}
           and work.visibility='household' and work.owner_adult_id is null and work.status='completed'
+          and work.task_state->>'completionCondition'=${sqlLiteral(NATIVE_DOCKET_COMPLETION_CONDITION)}
       ) and (
         select count(*)=4 from proactive_work work
         join proactive_work_sources link on link.work_id=work.id
@@ -6396,6 +6426,7 @@ release("Florence parent journeys", () => {
       owner: "You",
       nextAction: PRIVATE_CONVERSATION_DOCKET_NEXT_ACTION,
       waitingOn: PRIVATE_CONVERSATION_DOCKET_WAITING_ON,
+      completionCondition: PRIVATE_CONVERSATION_DOCKET_COMPLETION_CONDITION,
       needsAnswer: true,
     });
     expect(
@@ -9437,6 +9468,9 @@ function createReasoner(
           owner: founder ? "Hari" : "Alex",
           nextAction: founder ? FOUNDER_FORM_NEXT_ACTION : PARTNER_PERMISSION_NEXT_ACTION,
           waitingOn: founder ? FOUNDER_FORM_WAITING_ON : PARTNER_PERMISSION_WAITING_ON,
+          completionCondition: founder
+            ? FOUNDER_FORM_COMPLETION_CONDITION
+            : "Maya’s permission slip is returned and confirmed received before the deadline.",
         },
         monitor: null,
         familyCalendar: founder
@@ -9501,6 +9535,7 @@ function createReasoner(
                 owner: "Parents",
                 nextAction: "Decide whether to register for the fall activity.",
                 waitingOn: "A family decision",
+                completionCondition: "The family has made and confirmed the fall-registration decision.",
               },
               monitor: null,
               familyCalendar: null,
@@ -9523,6 +9558,7 @@ function createReasoner(
                 owner: null,
                 nextAction: "Assign Friday’s school pickup.",
                 waitingOn: "A parent to take pickup",
+                completionCondition: "Friday’s school pickup has an assigned and confirmed adult.",
               },
               monitor: null,
               familyCalendar: null,
@@ -9535,6 +9571,7 @@ function createReasoner(
                 owner: "You",
                 nextAction: "Confirm the school office contact details.",
                 waitingOn: "Your confirmation",
+                completionCondition: "The school-office contact details are confirmed.",
                 needsAnswer: true,
               },
               actionAnchor: "private school detail",
@@ -9568,6 +9605,7 @@ function createReasoner(
                 owner: "Parents",
                 nextAction: "Decide whether to register for the fall activity.",
                 waitingOn: "A family decision",
+                completionCondition: "The family has made and confirmed the fall-registration decision.",
               },
               monitor: null,
               familyCalendar: null,
@@ -9590,6 +9628,7 @@ function createReasoner(
                 owner: "Family",
                 nextAction: "Review Tuesday’s family-meeting plan.",
                 waitingOn: null,
+                completionCondition: "The family has reviewed and confirmed Tuesday’s meeting plan.",
               },
               monitor: null,
               familyCalendar: null,
@@ -9758,6 +9797,8 @@ function createReasoner(
                 owner: "Florence",
                 nextAction: "Use the revised instructions to finish the existing field-trip task.",
                 waitingOn: null,
+                completionCondition:
+                  "The revised field-trip instructions are used and the completed result is confirmed.",
               },
               sourceIds: [sourceChange.sourceId],
               urgency: "soon" as const,
@@ -9793,6 +9834,7 @@ function createReasoner(
                   owner: "Family",
                   nextAction: "Review the updated family-calendar plan.",
                   waitingOn: null,
+                  completionCondition: "The family has reviewed and confirmed the updated calendar plan.",
                 },
                 sourceIds: [
                   ...(privateCalendarAnniversarySource ? [privateCalendarAnniversarySource.sourceId] : []),
@@ -9821,6 +9863,7 @@ function createReasoner(
                     owner: "Family",
                     nextAction: `Review Tuesday’s plan for ${PRIVATE_CALENDAR_ADULT_TITLE}.`,
                     waitingOn: null,
+                    completionCondition: `Tuesday’s plan for ${PRIVATE_CALENDAR_ADULT_TITLE} is reviewed and confirmed.`,
                   },
                   sourceIds: [
                     privateCalendarAdultSource.sourceId,
@@ -9860,6 +9903,7 @@ function createReasoner(
                       owner: "Family",
                       nextAction: `Review Monday’s plan for ${PRIVATE_CALENDAR_ANNIVERSARY_TITLE}.`,
                       waitingOn: null,
+                      completionCondition: `Monday’s plan for ${PRIVATE_CALENDAR_ANNIVERSARY_TITLE} is reviewed and confirmed.`,
                     },
                     sourceIds: [privateCalendarAnniversarySource.sourceId],
                     urgency: "watch" as const,
@@ -9920,6 +9964,8 @@ function createReasoner(
                           owner: "Parents",
                           nextAction: "Decide how to cover the overlapping calendar events.",
                           waitingOn: "A parent decision",
+                          completionCondition:
+                            "The overlapping events have an agreed and confirmed coverage plan.",
                         },
                         sourceIds: calendarOnlySources.map((source) => source.sourceId),
                         urgency: "now" as const,
@@ -10097,6 +10143,7 @@ function createReasoner(
             owner: "School office",
             nextAction: "Wait for the school to finish checking the signature.",
             waitingOn: "The school’s signature check",
+            completionCondition: "The school finishes its signature check and confirms the result.",
           },
           sourceIds: [source.sourceId],
           currentConclusion: summary,
@@ -10118,6 +10165,7 @@ function createReasoner(
           owner: null,
           nextAction: "No further action is needed.",
           waitingOn: null,
+          completionCondition: "The school has confirmed the form is signed.",
         },
         sourceIds: [source.sourceId],
         currentConclusion: "The form is signed.",

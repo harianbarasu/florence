@@ -1532,6 +1532,9 @@ function ActiveWorkList({ work, timeZone }: { work: VaultActiveWork[]; timeZone:
           <strong className="watch-objective">{item.objective}</strong>
           <p className="watch-conclusion">{activeWorkProgress(item)}</p>
           <p className="watch-source">{activeWorkCoordination(item, timeZone)}</p>
+          {item.completionCondition && (
+            <p className="docket-completion">Done when: {item.completionCondition}</p>
+          )}
         </article>
       ))}
     </div>
@@ -1628,6 +1631,7 @@ function DocketList({
           <strong>{item.summary}</strong>
           {item.dueAt && <p>{docketDateLabel(item.dueAt, timeZone, item.category)}</p>}
           <p className="docket-coordination">{docketCoordinationLabel(item)}</p>
+          <p className="docket-completion">Done when: {item.completionCondition}</p>
           <div className="docket-badges">
             <span className="docket-badge">{docketCategoryLabel(item.category)}</span>
             <span className={`docket-badge urgency-${item.urgency}`}>{docketUrgencyLabel(item.urgency)}</span>

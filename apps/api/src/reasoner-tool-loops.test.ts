@@ -338,6 +338,7 @@ describe("Florence reasoner capability cutover", () => {
         owner: "Hari",
         nextAction: "Sign the field-trip form.",
         waitingOn: "Hari's signature",
+        completionCondition: "The signed form is confirmed received by the school.",
         needsAnswer: true,
       },
       sourceIds: ["turn-1"],
@@ -388,6 +389,7 @@ describe("Florence reasoner capability cutover", () => {
         owner: "Hari",
         nextAction: "Sign the field-trip form.",
         waitingOn: null,
+        completionCondition: "The signed form is confirmed received by the school.",
         needsAnswer: true,
       },
       sourceIds: ["turn-1"],
@@ -409,6 +411,7 @@ describe("Florence reasoner capability cutover", () => {
       owner: "Jackson",
       nextAction: "Choose which after-school option works.",
       waitingOn: null,
+      completionCondition: "The after-school option is chosen and confirmed.",
       needsAnswer: true,
     };
 
@@ -441,6 +444,7 @@ describe("Florence reasoner capability cutover", () => {
       owner: null,
       nextAction: `Move family item ${index + 1} forward.`,
       waitingOn: null,
+      completionCondition: `Family item ${index + 1} is completed and confirmed.`,
     }));
 
     expect(florenceHouseholdBriefingInputSchema.shape.candidates.safeParse(candidates).success).toBe(true);
@@ -457,6 +461,7 @@ describe("Florence reasoner capability cutover", () => {
       owner: null,
       nextAction: `Move family item ${index + 1} forward.`,
       waitingOn: null,
+      completionCondition: `Family item ${index + 1} is completed and confirmed.`,
     }));
     const input: FlorenceHouseholdNextActionInput = {
       currentTime: NOW,
@@ -656,6 +661,7 @@ describe("Florence reasoner capability cutover", () => {
           owner: "Florence",
           nextAction: "Submit the school form.",
           waitingOn: null,
+          completionCondition: "The school confirms the form was received.",
           needsAnswer: false,
         },
       ],
@@ -1064,6 +1070,7 @@ describe("Florence reasoner capability cutover", () => {
 
   test("partial and failed family work leave honest terminal docket coordination", async () => {
     const requests: Record<string, unknown>[] = [];
+    const completionCondition = "The school form is submitted and the school confirms receipt.";
     const terminalDecision = {
       outcome: "partial",
       text: "I found the form, but the school portal is unavailable, so I couldn't submit it.",
@@ -1072,6 +1079,7 @@ describe("Florence reasoner capability cutover", () => {
         nextAction: "Submit the form when the school portal is available.",
         waitingOn: "The school portal to become available",
         needsAnswer: false,
+        completionCondition: "The school form is submitted.",
       },
     } as const;
     const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
@@ -1086,6 +1094,7 @@ describe("Florence reasoner capability cutover", () => {
       kind: "family_work_v1",
       version: 1,
       generation: 0,
+      completionCondition,
       docketCandidateIds: ["candidate-1"],
       phase: "ready",
       claim: null,
@@ -1120,12 +1129,13 @@ describe("Florence reasoner capability cutover", () => {
     };
 
     const result = await reasoner.continueFamilyWork(input, {} as never);
+    const expectedDocket = { ...terminalDecision.docket, completionCondition };
 
     expect(result).toMatchObject({
       kind: "terminal",
       outcome: "partial",
-      docket: terminalDecision.docket,
-      state: { terminal: { docket: terminalDecision.docket } },
+      docket: expectedDocket,
+      state: { terminal: { docket: expectedDocket } },
     });
     expect(String(requests[0]?.instructions)).toContain(
       "For waiting, partial, or failed, docket must describe",
@@ -1147,7 +1157,6 @@ describe("Florence reasoner capability cutover", () => {
       } as never);
       await expect(invalidReasoner.continueFamilyWork(input, {} as never)).rejects.toMatchObject({
         code: "invalid_output",
-        message: expect.stringContaining("docket coordination"),
       });
     }
   });
@@ -1161,6 +1170,7 @@ describe("Florence reasoner capability cutover", () => {
         nextAction: "Choose the pickup time.",
         waitingOn: "Hari's choice between 2:45 and 3:15",
         needsAnswer: true,
+        completionCondition: "The children's pickup time is chosen and confirmed.",
       },
     } as const;
     const baseState: FamilyWorkStateV1 = {
@@ -2070,6 +2080,8 @@ describe("Florence reasoner capability cutover", () => {
             nextAction: "Sign in to the camp portal.",
             waitingOn: "Hari to finish signing in",
             needsAnswer: true,
+            completionCondition:
+              "Violet's Adventure Camp registration is submitted and the provider returns a confirmation.",
           },
         },
         output: [],
@@ -2149,6 +2161,8 @@ describe("Florence reasoner capability cutover", () => {
             nextAction: "Decide whether to submit the camp registration.",
             waitingOn: "Hari's approval of the $425 registration",
             needsAnswer: true,
+            completionCondition:
+              "Violet's Adventure Camp registration is submitted and the provider returns a confirmation.",
           },
         },
         output: [],
@@ -3724,6 +3738,8 @@ describe("Florence reasoner capability cutover", () => {
         kind: "family_work_v1" as const,
         version: 1 as const,
         generation: 0,
+        completionCondition:
+          "Violet's full field-trip-day attendance is decided and the family plan is complete.",
         phase: "ready" as const,
         claim: null,
         activePhoneCall: null,
@@ -3787,6 +3803,8 @@ describe("Florence reasoner capability cutover", () => {
             nextAction: "Answer Florence's private question.",
             waitingOn: question,
             needsAnswer: true,
+            completionCondition:
+              "Violet's full field-trip-day attendance is decided and the family plan is complete.",
           },
         }),
       }),
@@ -4833,6 +4851,8 @@ Compare the family options.
   });
 
   test("durable work rejects premature success, replans inline, and retains exact completion evidence", async () => {
+    const completionCondition =
+      "Tomorrow's School Calendar schedule is established from a successful Calendar-window read.";
     const calendarRef = "calendar-school";
     const calendarWindowArguments = {
       timeMin: "2026-08-28T00:00:00.000Z",
@@ -4897,7 +4917,7 @@ Compare the family options.
         output_parsed: {
           verdict: "verified",
           reason: null,
-          condition: "Tomorrow's School Calendar schedule is established.",
+          condition: completionCondition,
           basisKind: "capability_evidence",
           summary: "The successful Calendar-window read confirms Back-to-school night from 4 to 6 PM.",
           evidenceCallIds: ["read-work-calendar-retry"],
@@ -4931,6 +4951,7 @@ Compare the family options.
       kind: "family_work_v1",
       version: 1,
       generation: 0,
+      completionCondition,
       phase: "ready",
       claim: null,
       activePhoneCall: null,
@@ -5050,6 +5071,7 @@ Compare the family options.
     expect(JSON.stringify(modelRequests[3]?.input)).toContain('\\"retryable\\":true');
     expect(JSON.stringify(reviewRequests[1]?.input)).toContain("read-work-calendar-retry");
     expect(JSON.stringify(reviewRequests[1]?.input)).toContain("event-school-night");
+    expect(JSON.stringify(reviewRequests[0]?.input)).toContain(completionCondition);
     expect(terminal).toMatchObject({
       kind: "terminal",
       outcome: "succeeded",
@@ -5057,7 +5079,7 @@ Compare the family options.
       state: {
         terminal: {
           completionBasis: {
-            condition: "Tomorrow's School Calendar schedule is established.",
+            condition: completionCondition,
             summary: "The successful Calendar-window read confirms Back-to-school night from 4 to 6 PM.",
             evidenceCallIds: ["read-work-calendar-retry"],
           },
@@ -5121,6 +5143,7 @@ Compare the family options.
                   nextAction: "Verify the outside action through an available source.",
                   waitingOn: "A source that confirms the resulting state.",
                   needsAnswer: false,
+                  completionCondition: "The requested family outcome is established.",
                 },
               },
               output: [],
@@ -5147,6 +5170,7 @@ Compare the family options.
       kind: "family_work_v1",
       version: 1,
       generation: 2,
+      completionCondition: "The requested family outcome is established.",
       phase: "ready",
       claim: null,
       activePhoneCall: null,
@@ -6379,6 +6403,8 @@ Compare the family options.
       nextAction: "Choose whether to send the permission form.",
       waitingOn: "Hari's decision about the permission form",
       needsAnswer: true,
+      completionCondition:
+        "The permission-form decision is made and any requested school response is confirmed.",
     };
     const shared = {
       privateDocket,

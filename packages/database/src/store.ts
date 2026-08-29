@@ -368,6 +368,8 @@ export type DocketCoordination = {
   nextAction: string;
   /** The concrete answer, event, or outside response preventing that move, when any. */
   waitingOn: string | null;
+  /** The observable result that must be true before this item can leave the docket. */
+  completionCondition: string;
 };
 
 export type PrivateDocketCoordination = DocketCoordination & {
@@ -731,6 +733,8 @@ export type FamilyWorkStateV1 = {
   readonly generation: number;
   readonly acknowledgementText?: string | null;
   readonly docketCandidateIds?: readonly string[];
+  /** Parent-readable definition of done carried from the source-backed docket into this task. */
+  readonly completionCondition?: string | null;
   /** Durable reasoner-authored coordination while one parent answer blocks this occurrence. */
   readonly waitingDocket?: PrivateDocketCoordination | null;
   readonly phase: "ready" | "tool_pending" | "waiting" | "terminal";
@@ -826,6 +830,7 @@ export type VisibleActiveFamilyWork = {
   nextAction: string | null;
   waitingOn: string | null;
   needsAnswer: boolean;
+  completionCondition: string | null;
   nextCheckAt: string | null;
 };
 
@@ -2451,6 +2456,7 @@ export class PostgresFlorenceStore {
           nextAction: coordination.nextAction,
           waitingOn: coordination.waitingOn,
           needsAnswer: coordination.needsAnswer,
+          completionCondition: state.completionCondition ?? coordination.completionCondition,
           nextCheckAt: row.next_check_at?.toISOString() ?? null,
         },
       ];
@@ -3236,6 +3242,7 @@ export class PostgresFlorenceStore {
                     owner: candidate.owner,
                     nextAction: candidate.nextAction,
                     waitingOn: candidate.waitingOn,
+                    completionCondition: candidate.completionCondition,
                   }
                 : null,
               householdCategory: candidate?.category ?? null,
@@ -3573,6 +3580,11 @@ export class PostgresFlorenceStore {
           ownerAdultId: null,
           executionAdultId: input.executionAdultId as string,
           objective: nextJob.objective,
+          completionCondition: combinedDocketCompletionCondition(
+            selectedCandidateGroups.flatMap((group, index) =>
+              referencedGroups.has(index) ? [...group.members] : [],
+            ),
+          ),
           kickoffSourceId: deterministicUuid(
             `initial-household-briefing-message\0${work.id}\0${nextJob.kickoffBubbleIndex}`,
           ),
@@ -5243,6 +5255,7 @@ export class PostgresFlorenceStore {
       if (![group.adult_one_id, group.adult_two_id].includes(input.executionAdultId)) {
         throw new FlorenceStoreUnauthorized("The household next-action executor left the family group");
       }
+      let selectedCompletionCondition: string | null = null;
       if (input.nextJob) {
         await assertNoCurrentHouseholdObjective(sql, poll.household_id);
         if (candidateIds.length > 0) {
@@ -5252,7 +5265,9 @@ export class PostgresFlorenceStore {
             requestingAdultId: input.executionAdultId,
             handledAt: occurredAt,
           });
-          selectCurrentHouseholdDocketCandidates(docketState, candidateIds);
+          selectedCompletionCondition = combinedDocketCompletionCondition(
+            selectCurrentHouseholdDocketCandidates(docketState, candidateIds).candidates,
+          );
         }
       }
 
@@ -5278,6 +5293,7 @@ export class PostgresFlorenceStore {
             ownerAdultId: null,
             executionAdultId: input.executionAdultId,
             objective: input.nextJob.objective,
+            completionCondition: selectedCompletionCondition,
             kickoffSourceId,
             actionOwners: [],
             continuityKeys: [],
@@ -10043,6 +10059,7 @@ export class PostgresFlorenceStore {
           let selectedDocketSourceIds: readonly string[] = [];
           let selectedDocketActionOwners: readonly ProactiveFamilyWorkActionOwner[] = [];
           let linkedDocketCandidateIds: readonly string[] = [...mutation.candidateIds];
+          let completionCondition: string | null = null;
           if (mutation.candidateIds.length > 0) {
             if (expectedVisibility !== "household") {
               await lockHouseholdGooglePolls(sql, turn.household_id);
@@ -10054,6 +10071,7 @@ export class PostgresFlorenceStore {
               handledAt,
             });
             const selection = selectCurrentHouseholdDocketCandidates(docketState, mutation.candidateIds);
+            completionCondition = combinedDocketCompletionCondition(selection.candidates);
             linkedDocketCandidateIds = unique([
               ...mutation.candidateIds,
               ...selection.groups.flatMap((group) => group.members.map((candidate) => candidate.candidateId)),
@@ -10153,6 +10171,7 @@ export class PostgresFlorenceStore {
           const state = initialFamilyWorkState(
             mutation.acknowledgementText ?? null,
             linkedDocketCandidateIds,
+            completionCondition,
           );
           const scheduled = mutation.schedule ? newScheduledFamilyWork(mutation.schedule) : null;
           let nextCheckAt = new Date(handledAt.getTime() + FAMILY_WORK_INITIAL_DELAY_MS);
@@ -16113,6 +16132,10 @@ async function applyGooglePollDeliveries(
         ownerAdultId: privateJob ? work.owner_adult_id : null,
         executionAdultId,
         objective: delivery.nextJob.objective,
+        completionCondition:
+          householdDocketCandidate?.completionCondition ??
+          delivery.privateDocket?.completionCondition ??
+          null,
         kickoffSourceId: proactiveOutboundSourceId(work.id, privateJob ? privateSuffix : householdSuffix),
         actionOwners: work.owner_adult_id
           ? [{ key: googleActionKey, ownerAdultId: work.owner_adult_id }]
@@ -16281,6 +16304,7 @@ async function reconcileHouseholdDocketCandidates(
               owner: candidate.owner,
               nextAction: candidate.nextAction,
               waitingOn: candidate.waitingOn,
+              completionCondition: candidate.completionCondition,
             },
             candidate.sourceIds,
             candidate.actionAnchorDigest,
@@ -16301,6 +16325,7 @@ async function reconcileHouseholdDocketCandidates(
                 owner: finding.owner,
                 nextAction: finding.nextAction,
                 waitingOn: finding.waitingOn,
+                completionCondition: finding.completionCondition,
                 needsAnswer: finding.needsAnswer,
               },
               sourceIds: finding.sourceIds,
@@ -17219,6 +17244,8 @@ function familyWorkActiveCoordination(
         owner: participantRequest?.targetAdultName ?? null,
         nextAction: "Reply to Florence.",
         waitingOn: participantRequest?.question ?? visibleLine(row.current_conclusion, "Florence’s question"),
+        completionCondition:
+          state.completionCondition ?? "Florence has completed and confirmed the requested result.",
         needsAnswer: true,
       }
     );
@@ -17228,6 +17255,8 @@ function familyWorkActiveCoordination(
       owner: null,
       nextAction: "Resume Florence’s work.",
       waitingOn: null,
+      completionCondition:
+        state.completionCondition ?? "Florence has completed and confirmed the requested result.",
       needsAnswer: false,
     };
   }
@@ -17236,6 +17265,8 @@ function familyWorkActiveCoordination(
       owner: "Florence",
       nextAction: "Share the finished result.",
       waitingOn: null,
+      completionCondition:
+        state.completionCondition ?? "Florence has completed and confirmed the requested result.",
       needsAnswer: false,
     };
   }
@@ -17243,6 +17274,8 @@ function familyWorkActiveCoordination(
     owner: "Florence",
     nextAction: visibleLine(row.objective, "Finish the work in progress."),
     waitingOn: null,
+    completionCondition:
+      state.completionCondition ?? "Florence has completed and confirmed the requested result.",
     needsAnswer: false,
   };
 }
@@ -19901,6 +19934,7 @@ const FAMILY_WORK_STATE_KEYS = [
   "browserSession",
   "claim",
   "completionEvidence",
+  "completionCondition",
   "completionRejection",
   "continuationItems",
   "docketCandidateIds",
@@ -19922,6 +19956,7 @@ const FAMILY_WORK_STATE_KEYS = [
 function initialFamilyWorkState(
   acknowledgementText: string | null = null,
   docketCandidateIds: readonly string[] = [],
+  completionCondition: string | null = null,
 ): FamilyWorkStateV1 {
   return {
     kind: "family_work_v1",
@@ -19929,6 +19964,7 @@ function initialFamilyWorkState(
     generation: 0,
     acknowledgementText,
     docketCandidateIds: [...docketCandidateIds],
+    completionCondition,
     waitingDocket: null,
     phase: "ready",
     claim: null,
@@ -20417,6 +20453,7 @@ function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWor
     throw new FlorenceStoreConflict("Stored family work state is invalid");
   }
   const state = canonical;
+  const completionConditionWasStored = state.completionCondition !== undefined;
   if (state.activePhoneCall === undefined) state.activePhoneCall = null;
   if (state.activeTextMessage === undefined) state.activeTextMessage = null;
   if (state.acknowledgementText === undefined) state.acknowledgementText = null;
@@ -20424,6 +20461,7 @@ function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWor
   if (state.browserImages === undefined) state.browserImages = [];
   if (state.browserSession === undefined) state.browserSession = null;
   if (state.completionEvidence === undefined) state.completionEvidence = [];
+  if (state.completionCondition === undefined) state.completionCondition = null;
   if (state.completionRejection === undefined) state.completionRejection = null;
   if (state.docketCandidateIds === undefined) state.docketCandidateIds = [];
   if (state.evidenceRevisionAt === undefined) state.evidenceRevisionAt = null;
@@ -20452,6 +20490,56 @@ function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWor
   if (unique(docketCandidateIds).length !== docketCandidateIds.length) {
     throw new FlorenceStoreConflict("Family work docket candidates contain a duplicate");
   }
+  let completionCondition =
+    state.completionCondition === null
+      ? null
+      : bounded(
+          requiredStringField(state, "completionCondition", "Family work completion condition"),
+          2_000,
+        );
+  if (!completionConditionWasStored && completionCondition === null && docketCandidateIds.length > 0) {
+    const waitingDocketCondition =
+      isRecord(state.waitingDocket) && typeof state.waitingDocket.completionCondition === "string"
+        ? state.waitingDocket.completionCondition
+        : null;
+    const storedTerminal =
+      state.terminal !== undefined && isRecord(state.terminal) ? state.terminal : null;
+    const terminalDocket =
+      storedTerminal?.docket !== undefined && isRecord(storedTerminal.docket)
+        ? storedTerminal.docket
+        : null;
+    const terminalDocketCondition =
+      terminalDocket && typeof terminalDocket.completionCondition === "string"
+        ? terminalDocket.completionCondition
+        : null;
+    const terminalCompletionBasis =
+      storedTerminal?.completionBasis !== undefined && isRecord(storedTerminal.completionBasis)
+        ? storedTerminal.completionBasis
+        : null;
+    const terminalCompletionBasisCondition =
+      terminalCompletionBasis && typeof terminalCompletionBasis.condition === "string"
+        ? terminalCompletionBasis.condition
+        : null;
+    const storedCompletionRejection =
+      state.completionRejection !== null && isRecord(state.completionRejection)
+        ? state.completionRejection
+        : null;
+    const completionRejectionCondition =
+      storedCompletionRejection && typeof storedCompletionRejection.condition === "string"
+        ? storedCompletionRejection.condition
+        : null;
+    completionCondition = bounded(
+      waitingDocketCondition ??
+        terminalDocketCondition ??
+        terminalCompletionBasisCondition ??
+        completionRejectionCondition ??
+        "The linked family matter reaches its intended result and is confirmed.",
+      2_000,
+    );
+  }
+  if (completionCondition !== null && /[\r\n]/u.test(completionCondition)) {
+    throw new FlorenceStoreConflict("Family work completion condition must fit on one visible line");
+  }
   const progressRevision = familyWorkCounter(state.progressRevision, "Family work progress revision");
   const evidenceRevisionAt =
     state.evidenceRevisionAt === null
@@ -20476,9 +20564,13 @@ function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWor
   let waitingDocket: FamilyWorkStateV1["waitingDocket"] = null;
   if (state.waitingDocket !== null) {
     const storedWaitingDocket = strictJsonRecord(state.waitingDocket, "Family work waiting docket");
+    if (storedWaitingDocket.completionCondition === undefined) {
+      storedWaitingDocket.completionCondition =
+        completionCondition ?? "The waiting family task reaches its requested result and is confirmed.";
+    }
     assertExactJsonKeys(
       storedWaitingDocket,
-      ["needsAnswer", "nextAction", "owner", "waitingOn"],
+      ["completionCondition", "needsAnswer", "nextAction", "owner", "waitingOn"],
       "Family work waiting docket",
     );
     if (typeof storedWaitingDocket.needsAnswer !== "boolean") {
@@ -20495,6 +20587,14 @@ function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWor
       },
       "Family work waiting docket",
     );
+    if (
+      completionCondition !== null &&
+      waitingDocket.completionCondition !== completionCondition
+    ) {
+      throw new FlorenceStoreConflict(
+        "Waiting family work changed its original definition of done",
+      );
+    }
   }
   if (phase !== "waiting" && waitingDocket !== null) {
     throw new FlorenceStoreConflict("Only waiting family work may retain waiting docket coordination");
@@ -20802,6 +20902,15 @@ function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWor
     if (completionBasis !== null && outcome !== "succeeded") {
       throw new FlorenceStoreConflict("Only succeeded family work may retain a completion basis");
     }
+    if (
+      completionBasis !== null &&
+      completionCondition !== null &&
+      completionBasis.condition !== completionCondition
+    ) {
+      throw new FlorenceStoreConflict(
+        "Family work completion was not established against its original definition of done",
+      );
+    }
     const docket =
       storedTerminalDocket === undefined && (outcome === "partial" || outcome === "failed")
         ? {
@@ -20811,15 +20920,22 @@ function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWor
                 ? "Decide the remaining next step."
                 : "Choose another way to move this forward.",
             waitingOn: null,
+            completionCondition:
+              completionCondition ?? "The remaining family task reaches its requested result and is confirmed.",
             needsAnswer: false,
           }
         : storedTerminalDocket === undefined || storedTerminalDocket === null
           ? null
           : (() => {
               const stored = strictJsonRecord(storedTerminalDocket, "Family work terminal docket");
+              if (stored.completionCondition === undefined) {
+                stored.completionCondition =
+                  completionCondition ??
+                  "The remaining family task reaches its requested result and is confirmed.";
+              }
               assertExactJsonKeys(
                 stored,
-                ["needsAnswer", "nextAction", "owner", "waitingOn"],
+                ["completionCondition", "needsAnswer", "nextAction", "owner", "waitingOn"],
                 "Family work terminal docket",
               );
               if (typeof stored.needsAnswer !== "boolean") {
@@ -20836,6 +20952,15 @@ function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWor
     if ((outcome === "partial" || outcome === "failed") !== (docket !== null)) {
       throw new FlorenceStoreConflict(
         "Partial or failed family work needs terminal docket coordination, and every other outcome must leave it empty",
+      );
+    }
+    if (
+      completionCondition !== null &&
+      docket !== null &&
+      docket.completionCondition !== completionCondition
+    ) {
+      throw new FlorenceStoreConflict(
+        "Terminal family work changed its original definition of done",
       );
     }
     terminal = {
@@ -20889,6 +21014,7 @@ function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWor
     generation,
     acknowledgementText,
     docketCandidateIds,
+    completionCondition,
     waitingDocket,
     phase,
     claim,
@@ -21311,7 +21437,11 @@ async function completeDeliveredFamilyWorkTerminal(
     const recurringCandidateIds =
       state.terminal.outcome === "succeeded" ? [] : (state.docketCandidateIds ?? []);
     const nextState = familyWorkState({
-      ...initialFamilyWorkState(state.acknowledgementText ?? null, recurringCandidateIds),
+      ...initialFamilyWorkState(
+        state.acknowledgementText ?? null,
+        recurringCandidateIds,
+        state.completionCondition ?? null,
+      ),
       generation: incrementFamilyWorkCounter(state.generation, "Family work generation"),
     });
     const nextAt = completedSchedule.paused
@@ -21856,6 +21986,7 @@ async function proactiveGoogleHouseholdDocketCandidateIds(
       owner: current.owner,
       nextAction: current.nextAction,
       waitingOn: current.waitingOn,
+      completionCondition: current.completionCondition,
     },
     current.sourceIds,
     current.actionAnchorDigest,
@@ -22071,6 +22202,7 @@ async function stageProactiveFamilyWork(
     ownerAdultId: string | null;
     executionAdultId: string;
     objective: string;
+    completionCondition: string | null;
     kickoffSourceId: string;
     actionOwners: readonly ProactiveFamilyWorkActionOwner[];
     continuityKeys: readonly string[];
@@ -22112,6 +22244,19 @@ async function stageProactiveFamilyWork(
     assertUuid(sourceId, "Proactive family-work evidence source ID");
   }
   const objective = bounded(required(input.objective, "Proactive family-work objective"), 4_000);
+  const completionCondition =
+    input.completionCondition === null
+      ? null
+      : docketCoordination(
+          {
+            owner: null,
+            nextAction: objective,
+            waitingOn: null,
+            completionCondition: input.completionCondition,
+          },
+          "Proactive family-work completion",
+          false,
+        ).completionCondition;
   const proposedWorkId = deterministicUuid(
     `proactive-family-work\0${required(input.basis, "Proactive work basis")}`,
   );
@@ -22297,6 +22442,7 @@ async function stageProactiveFamilyWork(
   const existingState = existing ? familyWorkState(existing.task_state) : null;
   const existingCandidateIds = [...(existingState?.docketCandidateIds ?? [])];
   const mergedCandidateIds = unique([...existingCandidateIds, ...candidateIds]).sort();
+  const nextCompletionCondition = existingState?.completionCondition ?? completionCondition ?? null;
   await assertDocketCandidatesAvailableForFamilyWork(sql, {
     householdId: input.householdId,
     candidateIds: mergedCandidateIds,
@@ -22304,7 +22450,7 @@ async function stageProactiveFamilyWork(
   });
   if (!existing) {
     const initialState = familyWorkState({
-      ...initialFamilyWorkState(null, mergedCandidateIds),
+      ...initialFamilyWorkState(null, mergedCandidateIds, completionCondition),
       evidenceRevisionAt: input.occurredAt.toISOString(),
       evidenceRevisionKey,
     });
@@ -22332,7 +22478,9 @@ async function stageProactiveFamilyWork(
       [...existingCandidateIds].sort(),
       [...mergedCandidateIds].sort(),
     );
-    const needsReplan = !alreadyReplanned || candidateLinkageChanged;
+    const completionConditionChanged =
+      nextCompletionCondition !== (existingState?.completionCondition ?? null);
+    const needsReplan = !alreadyReplanned || candidateLinkageChanged || completionConditionChanged;
     const pendingEffect =
       existingState?.phase === "tool_pending" &&
       existingState.pendingCall !== null &&
@@ -22348,6 +22496,7 @@ async function stageProactiveFamilyWork(
       let nextState = familyWorkState({
         ...(existingState as FamilyWorkStateV1),
         docketCandidateIds: mergedCandidateIds,
+        completionCondition: nextCompletionCondition,
         evidenceRevisionAt: nextEvidenceRevisionAt,
         evidenceRevisionKey: nextEvidenceRevisionKey,
       });
@@ -22636,6 +22785,7 @@ async function readConversationDocketItems(
           owner: record.owner,
           nextAction: record.nextAction,
           waitingOn: record.waitingOn,
+          completionCondition: record.completionCondition,
           sourceIds: record.sourceIds,
           actionAnchorDigest: record.actionAnchorDigest,
           actionKey: record.actionKey,
@@ -22788,6 +22938,25 @@ function selectCurrentHouseholdDocketCandidates(
       ...conversationItems.map((item) => item.candidate),
     ],
   };
+}
+
+function combinedDocketCompletionCondition(
+  candidates: readonly Pick<StoredBriefingCandidate, "completionCondition">[],
+): string | null {
+  const conditions = unique(
+    candidates.map((candidate) => required(candidate.completionCondition, "Docket completion condition")),
+  ).sort();
+  if (conditions.length === 0) return null;
+  const combined =
+    conditions.length === 1
+      ? conditions[0]
+      : `All of these results are confirmed: ${conditions
+          .map((condition, index) => `(${index + 1}) ${condition}`)
+          .join(" ")}`;
+  if (!combined || combined.length > 2_000 || /[\r\n]/u.test(combined)) {
+    throw new FlorenceStoreConflict("The selected docket completion condition is too long");
+  }
+  return combined;
 }
 
 async function retainFamilyWorkMessageEvidence(
@@ -23440,10 +23609,15 @@ function docketCoordination(
   const owner = input.owner === null ? null : visibleLine(input.owner, "owner", 500);
   const nextAction = visibleLine(input.nextAction, "next action", 2_000);
   const waitingOn = input.waitingOn === null ? null : visibleLine(input.waitingOn, "waiting reason", 2_000);
+  const completionCondition = visibleLine(
+    input.completionCondition,
+    "completion condition",
+    2_000,
+  );
   if (needsAnswer && waitingOn === null) {
     throw new FlorenceStoreConflict(`${name} must say what answer it is waiting on`);
   }
-  return { owner, nextAction, waitingOn };
+  return { owner, nextAction, waitingOn, completionCondition };
 }
 
 function requiredDocketCoordination(
@@ -23476,6 +23650,7 @@ function storedDocketCoordination(
   const ownerValue = record.owner;
   const nextActionValue = record.nextAction;
   const waitingOnValue = record.waitingOn;
+  const completionConditionValue = record.completionCondition;
   if (ownerValue !== undefined && ownerValue !== null && typeof ownerValue !== "string") {
     throw new FlorenceStoreConflict(`${name} owner is invalid`);
   }
@@ -23485,16 +23660,26 @@ function storedDocketCoordination(
   if (waitingOnValue !== undefined && waitingOnValue !== null && typeof waitingOnValue !== "string") {
     throw new FlorenceStoreConflict(`${name} waiting reason is invalid`);
   }
+  if (completionConditionValue !== undefined && typeof completionConditionValue !== "string") {
+    throw new FlorenceStoreConflict(`${name} completion condition is invalid`);
+  }
+  const nextAction =
+    nextActionValue === undefined
+      ? needsAnswer
+        ? "Make the needed decision."
+        : "Decide the next step."
+      : nextActionValue;
   return docketCoordination(
     {
       owner: ownerValue === undefined || ownerValue === null ? null : ownerValue,
-      nextAction:
-        nextActionValue === undefined
-          ? needsAnswer
-            ? "Make the needed decision."
-            : "Decide the next step."
-          : nextActionValue,
+      nextAction,
       waitingOn: waitingOnValue === undefined ? (needsAnswer ? "A family answer" : null) : waitingOnValue,
+      // Existing production rows predate an explicit definition of done. Keep them usable without
+      // a reset, while every newly authored item carries its exact source-backed condition.
+      completionCondition:
+        completionConditionValue === undefined
+          ? "The unresolved family matter reaches its intended result and is confirmed."
+          : completionConditionValue,
     },
     name,
     needsAnswer,
@@ -23586,6 +23771,7 @@ function privateReviewFinding(
       owner: coordination.owner,
       nextAction: coordination.nextAction,
       waitingOn: coordination.waitingOn,
+      completionCondition: coordination.completionCondition,
     },
     finding.sourceIds,
     actionAnchorDigest,
@@ -23601,6 +23787,7 @@ function privateReviewFinding(
     owner: candidate.owner,
     nextAction: candidate.nextAction,
     waitingOn: candidate.waitingOn,
+    completionCondition: candidate.completionCondition,
     needsAnswer: candidate.needsAnswer,
     sourceIds: candidate.sourceIds,
     actionAnchorDigest: candidate.actionAnchorDigest,
@@ -23620,6 +23807,7 @@ function privateFindingAsDocketCandidate(finding: StoredPrivateReviewFinding): S
     owner: finding.owner,
     nextAction: finding.nextAction,
     waitingOn: finding.waitingOn,
+    completionCondition: finding.completionCondition,
     sourceIds: finding.sourceIds,
     actionAnchorDigest: finding.actionAnchorDigest,
     actionKey: finding.actionKey,
@@ -24045,10 +24233,11 @@ function initialGoogleScanFinding(value: JsonValue): InitialGoogleScanFinding {
     privateDocketValue === undefined
       ? familyRelevance === "owner_private" && finding.surfaceNow === false
         ? {
-            owner: null,
-            nextAction: "Decide the next step.",
-            waitingOn: "A family answer",
-            needsAnswer: true,
+          owner: null,
+          nextAction: "Decide the next step.",
+          waitingOn: "A family answer",
+          completionCondition: "The family has made and confirmed the needed decision.",
+          needsAnswer: true,
           }
         : null
       : privateDocketValue === null

@@ -55,6 +55,10 @@ In the group Florence:
 - gives prioritized next actions rather than raw source recaps; and
 - avoids duplicate or semantically repeated reminders.
 
+Each unresolved docket item carries one observable definition of done. When Florence starts work
+from that item, the same condition travels with the task and cannot be weakened by a later summary
+or completion review; only a confirmed result against that condition closes the item.
+
 When shared work genuinely needs the other adult, Florence keeps one household task alive, asks
 that exact adult one focused question in their private thread, treats the answer as the next turn of
 the same task, and closes the loop back in the family group. The answer must not become an unrelated

@@ -1115,6 +1115,12 @@ a {
   color: var(--text);
 }
 
+.docket-completion {
+  color: var(--secondary);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 .docket-badges {
   display: flex;
   flex-wrap: wrap;

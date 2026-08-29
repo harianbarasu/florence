@@ -6320,6 +6320,7 @@ export class Florence {
                 owner: householdConclusion.owner,
                 nextAction: householdConclusion.nextAction,
                 waitingOn: householdConclusion.waitingOn,
+                completionCondition: householdConclusion.completionCondition,
               }
             : null,
           householdCategory: householdConclusion?.category ?? null,
@@ -6833,6 +6834,7 @@ export class Florence {
                   owner: finding.householdConclusion.owner,
                   nextAction: finding.householdConclusion.nextAction,
                   waitingOn: finding.householdConclusion.waitingOn,
+                  completionCondition: finding.householdConclusion.completionCondition,
                 }
               : null,
             householdCategory: finding.householdConclusion?.category ?? null,
@@ -9816,6 +9818,7 @@ function privateCalendarSafeBackgroundSharing<
     owner: string | null;
     nextAction: string;
     waitingOn: string | null;
+    completionCondition: string;
   },
 >(input: {
   familyRelevance: string;
@@ -9900,6 +9903,7 @@ function privateCalendarSafeHouseholdConclusion<
     owner: string | null;
     nextAction: string;
     waitingOn: string | null;
+    completionCondition: string;
   },
 >(input: {
   conclusion: T | null;
@@ -9925,6 +9929,7 @@ function privateCalendarSafeHouseholdConclusion<
     dueAt: earliestCalendarStart(privateCalendarSources),
     owner: "Family",
     nextAction: `Coordinate around ${input.adultFirstName}’s calendar conflict.`,
+    completionCondition: `${input.adultFirstName}’s calendar conflict has a confirmed family plan.`,
     waitingOn:
       input.conclusion.waitingOn === null
         ? null

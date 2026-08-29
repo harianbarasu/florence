@@ -258,6 +258,7 @@ export const vaultDocketItemSchema = z
     owner: nonempty(2_000).nullable(),
     nextAction: nonempty(2_000),
     waitingOn: nonempty(2_000).nullable(),
+    completionCondition: nonempty(2_000),
   })
   .strict();
 export type VaultDocketItem = z.infer<typeof vaultDocketItemSchema>;
@@ -284,6 +285,7 @@ export const vaultActiveWorkSchema = z
     nextAction: nonempty(2_000).nullable(),
     waitingOn: nonempty(2_000).nullable(),
     needsAnswer: z.boolean(),
+    completionCondition: nonempty(2_000).nullable(),
     nextCheckAt: timestampSchema.nullable(),
   })
   .strict();

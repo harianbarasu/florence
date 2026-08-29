@@ -1,3 +1,4 @@
+import type { FileArtifactReference } from "@florence/artifacts";
 import type { FactRecord, SourceRecord } from "@florence/database";
 import { describe, expect, test } from "vitest";
 import { VAULT_SEARCH_PAGE_BYTE_BUDGET, VaultRecall, type VaultSearchPage } from "./vault-recall.js";
@@ -122,6 +123,42 @@ describe("VaultRecall", () => {
     );
     expect(full?.supports.at(-1)?.metadata).toEqual(sources.at(-1)?.metadata);
   });
+
+  test("returns an opaque reusable file URI only through its authorized fact", () => {
+    const artifact: FileArtifactReference = {
+      artifactId: "10000000-0000-4000-8000-000000000001",
+      workId: "20000000-0000-4000-8000-000000000002",
+      filename: "field-trip-form.pdf",
+      mimeType: "application/pdf",
+      byteLength: 2_048,
+      sha256: "a".repeat(64),
+    };
+    const saved = fact(700, {
+      statement: "The reusable field-trip form for school.",
+      title: "Field-trip form",
+      details: "The original school form, saved for later completion or submission.",
+      artifactKind: "reference",
+      files: [artifact],
+    });
+    const recall = new VaultRecall([saved]);
+    const factUri = `vault://fact/${saved.id}`;
+    const fileUri = `${factUri}/file/${artifact.artifactId}`;
+
+    expect(recall.search({ query: "field trip form" }).results[0]?.uri).toBe(factUri);
+    expect(recall.read({ uri: factUri, level: "abstract" })?.memory.files).toEqual([]);
+    expect(recall.read({ uri: factUri, level: "overview" })?.memory.files).toEqual([
+      {
+        uri: fileUri,
+        artifactId: artifact.artifactId,
+        filename: artifact.filename,
+        mimeType: artifact.mimeType,
+        byteLength: artifact.byteLength,
+        sha256: artifact.sha256,
+      },
+    ]);
+    expect(recall.resolveFile(fileUri)).toEqual({ factId: saved.id, uri: fileUri, artifact });
+    expect(new VaultRecall([]).resolveFile(fileUri)).toBeNull();
+  });
 });
 
 function fact(
@@ -133,6 +170,7 @@ function fact(
     tags?: readonly string[];
     artifactKind?: "recipe" | "list" | "plan" | "note" | "reference" | "other" | null;
     sources?: readonly SourceRecord[];
+    files?: readonly FileArtifactReference[];
   }> = {},
 ): FactRecord {
   const artifactKind = overrides.artifactKind ?? null;
@@ -150,6 +188,7 @@ function fact(
       title: overrides.title ?? null,
       details: overrides.details ?? null,
       tags: overrides.tags ? [...overrides.tags] : [],
+      ...(overrides.files ? { files: [...overrides.files] } : {}),
     },
     visibility: "household",
     ownerAdultId: null,

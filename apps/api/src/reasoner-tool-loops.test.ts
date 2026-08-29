@@ -22,6 +22,7 @@ import {
 import {
   type FlorenceDecision,
   type FlorenceGoogleChangesAssessmentInput,
+  type FlorenceHouseholdNextActionInput,
   type FlorencePrivateGoogleBatchInput,
   FlorenceReasoner,
   FlorenceReasonerError,
@@ -430,6 +431,152 @@ describe("Florence reasoner capability cutover", () => {
     }));
 
     expect(florenceHouseholdBriefingInputSchema.shape.candidates.safeParse(candidates).success).toBe(true);
+  });
+
+  test("a household wake can page through Vault and start one objective from the complete docket", async () => {
+    const candidates = Array.from({ length: 101 }, (_, index) => ({
+      candidateId: `candidate-${index + 1}`,
+      category: "loose_end" as const,
+      summary: `Family item ${index + 1} still needs follow-through.`,
+      urgency: "watch" as const,
+      dueAt: null,
+      needsAnswer: false,
+      owner: null,
+      nextAction: `Move family item ${index + 1} forward.`,
+      waitingOn: null,
+    }));
+    const input: FlorenceHouseholdNextActionInput = {
+      currentTime: NOW,
+      familyProfile: {
+        familyLabel: "Test family",
+        timeZone: "America/Los_Angeles",
+        adultFirstNames: ["Hari", "Jackson"],
+        children: [],
+        postalCode: "90045",
+      },
+      householdDocket: { totalItems: candidates.length, items: candidates },
+      activeWork: [],
+      lastInterruption: null,
+      familyCalendar: {
+        timeMin: NOW,
+        timeMax: "2026-09-17T20:00:00.000Z",
+        events: [],
+      },
+    };
+    const memoryUri = "vault://fact/11111111-1111-4111-8111-111111111111";
+    const requests: Record<string, unknown>[] = [];
+    const responses = [
+      {
+        status: "completed",
+        output_parsed: null,
+        output: [functionCall("search-page-1", "search_vault", { query: "family item 101", cursor: null })],
+      },
+      {
+        status: "completed",
+        output_parsed: null,
+        output: [
+          functionCall("search-page-2", "search_vault", {
+            query: "family item 101",
+            cursor: "vault-page-2",
+          }),
+        ],
+      },
+      {
+        status: "completed",
+        output_parsed: null,
+        output: [functionCall("read-memory", "read_vault", { uri: memoryUri, level: "overview" })],
+      },
+      {
+        status: "completed",
+        output_parsed: {
+          message: "I found the family plan that fits this—I’m moving item 101 forward now.",
+          nextJob: {
+            objective: "Move family item 101 forward using the retained family plan.",
+            candidateIds: ["candidate-101"],
+          },
+        },
+        output: [],
+      },
+    ];
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        parse(request: Record<string, unknown>) {
+          requests.push(request);
+          const response = responses.shift();
+          if (!response) throw new Error("Unexpected household-next-action model turn");
+          return response;
+        },
+      },
+    } as never);
+    const searches: Array<{ query: string; cursor: string | null }> = [];
+    const reads: Array<{ uri: string; level: string }> = [];
+
+    const decision = await reasoner.decideHouseholdNextAction(input, {
+      async searchVault(arguments_) {
+        searches.push(arguments_);
+        return arguments_.cursor === null
+          ? {
+              query: arguments_.query,
+              results: [],
+              total: 1,
+              complete: false,
+              nextCursor: "vault-page-2",
+            }
+          : {
+              query: arguments_.query,
+              results: [
+                {
+                  uri: memoryUri,
+                  score: 1,
+                  abstract: "A reusable family plan for moving this item forward.",
+                  memoryKind: "artifact",
+                  artifactKind: "plan",
+                  title: "Family plan",
+                  tags: ["family", "plan"],
+                  updatedAt: NOW,
+                },
+              ],
+              total: 1,
+              complete: true,
+              nextCursor: null,
+            };
+      },
+      async readVault(arguments_) {
+        reads.push(arguments_);
+        return {
+          uri: memoryUri,
+          level: "overview",
+          memory: {
+            factId: "11111111-1111-4111-8111-111111111111",
+            statement: "The family has a reusable plan for moving this item forward.",
+            memoryKind: "artifact",
+            artifactKind: "plan",
+            title: "Family plan",
+            details: "Use the retained family plan to move the item forward.",
+            tags: ["family", "plan"],
+            files: [],
+            visibility: "household",
+            updatedAt: NOW,
+          },
+          supports: [],
+        };
+      },
+    });
+
+    expect(decision.nextJob?.candidateIds).toEqual(["candidate-101"]);
+    expect(searches).toEqual([
+      { query: "family item 101", cursor: null },
+      { query: "family item 101", cursor: "vault-page-2" },
+    ]);
+    expect(reads).toEqual([{ uri: memoryUri, level: "overview" }]);
+    const initialInput = JSON.parse(
+      String(
+        ((requests[0]?.input as Array<{ content?: Array<{ text?: string }> }>)?.[0]?.content ?? [])[0]?.text,
+      ),
+    ) as Record<string, unknown>;
+    expect((initialInput.householdDocket as { items: unknown[] }).items).toHaveLength(101);
+    expect(initialInput).not.toHaveProperty("memory");
+    expect(requests.every((request) => !("max_tool_calls" in request))).toBe(true);
   });
 
   test("a natural text mention can acknowledge work Florence starts in the family group", async () => {
@@ -3117,6 +3264,7 @@ describe("Florence reasoner capability cutover", () => {
 
   test("one durable household objective composes Vault, reminder, and Family Calendar receipts", async () => {
     const calendarRef = "calendar-family";
+    const recipeFileAssetId = "10000000-0000-4000-8000-000000000010";
     const modelRequests: Record<string, unknown>[] = [];
     const responses = [
       {
@@ -3136,6 +3284,8 @@ describe("Florence reasoner capability cutover", () => {
               tags: ["dinner", "chicken"],
             },
             sourceIds: ["source-adult-1"],
+            fileAssetIds: [recipeFileAssetId],
+            expectedUpdatedAt: null,
           }),
         ],
       },
@@ -3256,6 +3406,17 @@ describe("Florence reasoner capability cutover", () => {
         activeTextMessage: null,
         pendingParticipantRequest: null,
         browserSession: null,
+        browserFiles: [
+          {
+            assetId: recipeFileAssetId,
+            signalId: "family-work-dinner",
+            workId: "family-work-dinner",
+            filename: "sheet-pan-chicken.pdf",
+            mimeType: "application/pdf",
+            byteLength: 2_048,
+            sha256: "a".repeat(64),
+          },
+        ],
         continuationItems: [],
         pendingCall: null,
         steering: [],
@@ -3270,8 +3431,9 @@ describe("Florence reasoner capability cutover", () => {
     let vaultCommits = 0;
     const capabilityCalls: string[] = [];
     const reads = {
-      async runVaultWork() {
+      async runVaultWork(request: { fileAssetIds: readonly string[] | null }) {
         capabilityCalls.push("vault_work");
+        expect(request.fileAssetIds).toEqual([recipeFileAssetId]);
         if (!vaultReceipt) {
           vaultCommits += 1;
           vaultReceipt = {
@@ -5029,6 +5191,7 @@ Compare the family options.
               title: "School pickup",
               details: "School pickup is normally at 2:45 PM.",
               tags: ["school", "pickup"],
+              files: [],
               visibility: "private" as const,
               updatedAt: NOW,
             },
@@ -5150,6 +5313,7 @@ Compare the family options.
             title: "Weeknight noodles",
             details: "Toss noodles with sesame oil, soy sauce, and rice vinegar.",
             tags: ["dinner", "noodles"],
+            files: [],
             visibility: "household" as const,
             updatedAt: NOW,
           },

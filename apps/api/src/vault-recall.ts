@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { decodeFactFileArtifacts, type FileArtifactReference } from "@florence/artifacts";
 import { decodeMemoryPresentation, type MemoryPresentation } from "@florence/contracts";
 import type { FactRecord, SourceRecord } from "@florence/database";
 
@@ -43,8 +44,24 @@ export type VaultMemory = Readonly<{
   title: string | null;
   details: string | null;
   tags: readonly string[];
+  files: readonly VaultFileResource[];
   visibility: FactRecord["visibility"];
   updatedAt: string;
+}>;
+
+export type VaultFileResource = Readonly<{
+  uri: string;
+  artifactId: string;
+  filename: string;
+  mimeType: string;
+  byteLength: number;
+  sha256: string;
+}>;
+
+export type AuthorizedVaultFile = Readonly<{
+  factId: string;
+  uri: string;
+  artifact: FileArtifactReference;
 }>;
 
 export type VaultSupport = Readonly<{
@@ -68,6 +85,7 @@ type IndexedFact = Readonly<{
   uri: string;
   statement: string;
   presentation: MemoryPresentation;
+  files: readonly FileArtifactReference[];
   abstract: string;
   fields: readonly SearchField[];
 }>;
@@ -109,12 +127,14 @@ export class VaultRecall {
     for (const fact of authorizedFacts) {
       if (byId.has(fact.id)) throw new Error(`Vault contains duplicate fact ${fact.id}`);
       const presentation = decodeMemoryPresentation(fact.value);
+      const files = decodeFactFileArtifacts(fact.value);
       const statement = factStatement(fact);
       const indexed = {
         fact,
         uri: `${FACT_URI_PREFIX}${fact.id}`,
         statement,
         presentation,
+        files,
         abstract: memoryAbstract(fact, statement, presentation),
         fields: searchFields(fact, statement, presentation),
       } satisfies IndexedFact;
@@ -182,6 +202,15 @@ export class VaultRecall {
       supports: input.level === "full" ? indexed.fact.sources.map(vaultSupport) : [],
     };
   }
+
+  resolveFile(uri: string): AuthorizedVaultFile | null {
+    const parsed = factFileFromUri(uri);
+    if (!parsed) return null;
+    const indexed = this.#byId.get(parsed.factId);
+    if (!indexed) return null;
+    const artifact = indexed.files.find((candidate) => candidate.artifactId === parsed.artifactId);
+    return artifact ? { factId: indexed.fact.id, uri, artifact } : null;
+  }
 }
 
 function page(
@@ -212,6 +241,7 @@ function exactMemory(indexed: IndexedFact, abstract: boolean): VaultMemory {
     title: presentation.title,
     details: abstract ? null : presentation.details,
     tags: presentation.tags,
+    files: abstract ? [] : indexed.files.map((artifact) => vaultFileResource(fact.id, artifact)),
     visibility: fact.visibility,
     updatedAt: fact.updatedAt,
   };
@@ -273,6 +303,7 @@ function searchFields(
   statement: string,
   presentation: MemoryPresentation,
 ): readonly SearchField[] {
+  const files = decodeFactFileArtifacts(fact.value);
   return [
     searchField(presentation.title, 12),
     searchField(presentation.tags.join(" "), 10),
@@ -281,11 +312,23 @@ function searchFields(
     searchField(statement, 6),
     searchField(presentation.details, 4),
     searchField(`${presentation.memoryKind} ${presentation.artifactKind ?? ""} ${fact.kind}`, 3),
+    searchField(files.map((file) => `${file.filename} ${file.mimeType}`).join(" "), 3),
     searchField(
       fact.sources.map((source) => `${source.label} ${canonicalJson(source.metadata)}`).join(" "),
       1,
     ),
   ].filter((field) => field.text.length > 0);
+}
+
+function vaultFileResource(factId: string, artifact: FileArtifactReference): VaultFileResource {
+  return {
+    uri: `${FACT_URI_PREFIX}${factId}/file/${artifact.artifactId}`,
+    artifactId: artifact.artifactId,
+    filename: artifact.filename,
+    mimeType: artifact.mimeType,
+    byteLength: artifact.byteLength,
+    sha256: artifact.sha256,
+  };
 }
 
 function searchField(value: string | null, weight: number): SearchField {
@@ -311,6 +354,14 @@ function factIdFromUri(uri: string): string | null {
   if (!uri.startsWith(FACT_URI_PREFIX)) return null;
   const id = uri.slice(FACT_URI_PREFIX.length);
   return id && !id.includes("/") && !id.includes("?") && !id.includes("#") ? id : null;
+}
+
+function factFileFromUri(uri: string): { factId: string; artifactId: string } | null {
+  if (!uri.startsWith(FACT_URI_PREFIX)) return null;
+  const [factId, segment, artifactId, ...rest] = uri.slice(FACT_URI_PREFIX.length).split("/");
+  if (!factId || segment !== "file" || !artifactId || rest.length > 0) return null;
+  if ([factId, artifactId].some((part) => part.includes("?") || part.includes("#"))) return null;
+  return { factId, artifactId };
 }
 
 function encodeCursor(queryDigest: string, revision: string, offset: number): string {

@@ -21,6 +21,7 @@ const INTEREST_CHECK_INTERVAL_MS = 7 * 24 * 60 * 60_000;
 const LINQ_RECEIPT_CLOCK_SKEW_MS = 5 * 60_000;
 const FAMILY_WORK_INITIAL_DELAY_MS = 1_000;
 const FAMILY_WORK_CLAIM_LEASE_MS = 2 * 60_000;
+const HOUSEHOLD_NEXT_ACTION_CLAIM_LEASE_MS = 2 * 60_000;
 const MAX_FAMILY_WORK_STATE_BYTES = 256 * 1024;
 const MAX_FAMILY_WORK_FILE_BYTES = 100 * 1024 * 1024;
 const MAX_FAMILY_WORK_COUNTER = 999_999_999;
@@ -851,6 +852,23 @@ export type DueProactiveWork =
       } | null;
     }
   | {
+      kind: "household_next_action";
+      workId: string;
+      household: SharedFamilyProfile;
+      executionAdultId: string;
+      connectionId: string;
+      familyCalendarId: string;
+      revision: number;
+      claimId: string;
+      lastStateDigest: string | null;
+      lastInterruption: {
+        message: string;
+        objective: string | null;
+        candidateIds: readonly string[];
+        occurredAt: string;
+      } | null;
+    }
+  | {
       kind: "personal_google_poll";
       workId: string;
       household: SharedFamilyProfile;
@@ -899,6 +917,20 @@ export type DueProactiveWork =
       genericInterestTerms: readonly string[];
       coarseLocation: string;
     };
+
+export type CompleteHouseholdNextActionInput = {
+  workId: string;
+  revision: number;
+  claimId: string;
+  stateDigest: string;
+  message: string | null;
+  nextJob: {
+    objective: string;
+    candidateIds: readonly string[];
+  } | null;
+  executionAdultId: string;
+  occurredAt: string;
+};
 
 export type CompleteFounderOnboardingInput = {
   setupTokenDigest: string;
@@ -1522,8 +1554,9 @@ export type ClaimedFamilyWorkDatabaseCapability =
   | {
       name: "vault_work";
       mutation:
-        | { operation: "remember" | "correct"; fact: FactDraft }
-        | { operation: "forget"; factId: string };
+        | { operation: "remember"; fact: FactDraft }
+        | { operation: "correct"; fact: FactDraft; expectedUpdatedAt: string }
+        | { operation: "forget"; factId: string; expectedUpdatedAt: string };
     }
   | { name: "reminder_work"; mutation: ReminderMutation }
   | {
@@ -1922,6 +1955,26 @@ type ProactiveWorkRow = {
   last_error: string | null;
   created_at: Date;
 };
+
+type HouseholdNextActionWakeV1 = Readonly<{
+  kind: "household_next_action_wake_v1";
+  version: 1;
+  requestedRevision: number;
+  completedRevision: number;
+  dueAt: string | null;
+  claim: {
+    claimId: string;
+    revision: number;
+    leaseUntil: string;
+  } | null;
+  lastStateDigest: string | null;
+  lastInterruption: {
+    message: string;
+    objective: string | null;
+    candidateIds: readonly string[];
+    occurredAt: string;
+  } | null;
+}>;
 
 type LinqObservationRow = {
   source_id: string;
@@ -3614,14 +3667,97 @@ export class PostgresFlorenceStore {
       }
 
       const due = await sql<ProactiveWorkRow[]>`
-        select * from proactive_work where status='active' and next_check_at<=${now}
+        select * from proactive_work where status='active'
           and kind in (
             'reminder','family_task','personal_google_poll','family_calendar_poll',
             'finite_monitor','interest_monitor'
           )
-        order by next_check_at,id
+          and (
+            next_check_at<=${now}
+            or (
+              kind='family_calendar_poll'
+              and briefing_candidates->>'kind'='household_next_action_wake_v1'
+              and (briefing_candidates->>'dueAt')::timestamptz<=${now}
+            )
+          )
+        order by least(
+          next_check_at,
+          case when briefing_candidates->>'kind'='household_next_action_wake_v1'
+            then (briefing_candidates->>'dueAt')::timestamptz else null end
+        ) nulls last,id
       `;
       for (const work of due) {
+        if (work.kind === "family_calendar_poll") {
+          const wake = householdNextActionWake(work.briefing_candidates);
+          if (wake.dueAt && instant(wake.dueAt) <= now) {
+            const [claimedPoll] = await sql<ProactiveWorkRow[]>`
+              select * from proactive_work where id=${work.id} and kind='family_calendar_poll'
+                and status='active' for update skip locked
+            `;
+            if (!claimedPoll) continue;
+            const currentWake = householdNextActionWake(claimedPoll.briefing_candidates);
+            if (!currentWake.dueAt || instant(currentWake.dueAt) > now) continue;
+            if (currentWake.claim && instant(currentWake.claim.leaseUntil) > now) continue;
+            const claimId = randomUUID();
+            const leaseUntil = new Date(now.getTime() + HOUSEHOLD_NEXT_ACTION_CLAIM_LEASE_MS);
+            const claimedWake: HouseholdNextActionWakeV1 = {
+              ...currentWake,
+              dueAt: leaseUntil.toISOString(),
+              claim: {
+                claimId,
+                revision: currentWake.requestedRevision,
+                leaseUntil: leaseUntil.toISOString(),
+              },
+            };
+            const [context] = await sql<
+              {
+                adult_id: string;
+                connection_id: string;
+                calendar_id: string;
+              }[]
+            >`
+              select adult.id as adult_id,connection.id as connection_id,
+                household.family_calendar_id as calendar_id
+              from households household
+              join google_connections connection on connection.household_id=household.id
+                and connection.status='active'
+                and connection.id in (
+                  household.family_calendar_owner_connection_id,
+                  household.family_calendar_partner_connection_id
+                )
+              join people adult on adult.household_id=household.id
+                and adult.id=connection.owner_adult_id and adult.kind='adult'
+                and adult.status='verified'
+              join linq_channels family_group on family_group.household_id=household.id
+                and family_group.audience='group' and family_group.adult_two_id is not null
+                and family_group.revoked_at is null and family_group.stopped_at is null
+              where household.id=${work.household_id}
+                and household.family_calendar_id is not null
+                and household.family_calendar_created_at is not null
+                and nullif(adult.preferences->>'proactiveUseAcceptedAt','') is not null
+                and coalesce(adult.preferences->'proactiveGoogleEnabled'='true'::jsonb,true)
+              order by adult.adult_slot,connection.created_at,connection.id limit 1
+              for share of household,connection,adult,family_group
+            `;
+            if (!context) continue;
+            await sql`
+              update proactive_work set briefing_candidates=${sql.json(claimedWake)}
+              where id=${claimedPoll.id} and kind='family_calendar_poll' and status='active'
+            `;
+            return {
+              kind: "household_next_action",
+              workId: claimedPoll.id,
+              household: await sharedFamilyProfile(sql, claimedPoll.household_id),
+              executionAdultId: context.adult_id,
+              connectionId: context.connection_id,
+              familyCalendarId: context.calendar_id,
+              revision: currentWake.requestedRevision,
+              claimId,
+              lastStateDigest: currentWake.lastStateDigest,
+              lastInterruption: currentWake.lastInterruption,
+            };
+          }
+        }
         if (work.kind === "family_task") {
           const [familyTask] = await sql<ProactiveWorkRow[]>`
             select * from proactive_work
@@ -3994,6 +4130,11 @@ export class PostgresFlorenceStore {
       if (input.capability.name === "vault_work") {
         const mutation = input.capability.mutation;
         if (mutation.operation === "forget") {
+          await assertConversationFactRevision(sql, {
+            householdId: context.work.household_id,
+            factId: mutation.factId,
+            expectedUpdatedAt: mutation.expectedUpdatedAt,
+          });
           await applyConversationFactMutations(sql, {
             householdId: context.work.household_id,
             audience: context.channel.audience,
@@ -4009,6 +4150,13 @@ export class PostgresFlorenceStore {
             statement: null,
           };
         } else {
+          if (mutation.operation === "correct") {
+            await assertConversationFactRevision(sql, {
+              householdId: context.work.household_id,
+              factId: mutation.fact.id,
+              expectedUpdatedAt: mutation.expectedUpdatedAt,
+            });
+          }
           const [factId] = await applyConversationFactMutations(sql, {
             householdId: context.work.household_id,
             audience: context.channel.audience,
@@ -4923,6 +5071,192 @@ export class PostgresFlorenceStore {
         where id=${work.id} and status='active' returning id
       `;
       if (!updated) throw new FlorenceStoreConflict("The Google poll changed before completion");
+      if (
+        input.googleEvidence.length > 0 ||
+        input.removedGoogleSourceIds.length > 0 ||
+        input.deliveries.length > 0 ||
+        facts.length > 0
+      ) {
+        await requestHouseholdNextAction(sql, work.household_id, occurredAt);
+      }
+    });
+  }
+
+  async completeHouseholdNextAction(
+    input: CompleteHouseholdNextActionInput,
+  ): Promise<"completed" | "unchanged" | "stale"> {
+    assertUuid(input.workId, "Household next-action work ID");
+    assertUuid(input.claimId, "Household next-action claim ID");
+    assertUuid(input.executionAdultId, "Household next-action execution adult ID");
+    familyWorkCounter(input.revision, "Household next-action revision");
+    assertDigest(input.stateDigest, "Household next-action state digest");
+    const occurredAt = instant(input.occurredAt);
+    const candidateIds = unique(input.nextJob?.candidateIds ?? []);
+    if (candidateIds.length !== (input.nextJob?.candidateIds.length ?? 0)) {
+      throw new FlorenceStoreConflict("Household next-action work repeated a docket candidate");
+    }
+    for (const candidateId of candidateIds) {
+      assertUuid(candidateId, "Household next-action docket candidate ID");
+    }
+    const message = input.message === null ? null : bounded(required(input.message, "Household next action"), 4_000);
+    // A job always needs a visible kickoff; an offer may have copy without a job.
+    if (input.nextJob && !message) {
+      throw new FlorenceStoreConflict("Household next-action work needs a visible kickoff");
+    }
+    if (input.nextJob === null && candidateIds.length > 0) {
+      throw new FlorenceStoreConflict("Household next-action candidates need durable work");
+    }
+
+    return this.#sql.begin(async (sql) => {
+      const [poll] = await sql<ProactiveWorkRow[]>`
+        select * from proactive_work where id=${input.workId} and kind='family_calendar_poll'
+          and status='active' for update
+      `;
+      if (!poll) return "stale";
+      const wake = householdNextActionWake(poll.briefing_candidates);
+      if (
+        wake.claim?.claimId !== input.claimId ||
+        wake.claim.revision !== input.revision
+      ) {
+        return "stale";
+      }
+      if (wake.requestedRevision !== input.revision) {
+        const rescheduled: HouseholdNextActionWakeV1 = {
+          ...wake,
+          dueAt: occurredAt.toISOString(),
+          claim: null,
+        };
+        await sql`
+          update proactive_work set briefing_candidates=${sql.json(rescheduled)}
+          where id=${poll.id} and kind='family_calendar_poll' and status='active'
+        `;
+        return "stale";
+      }
+      if (wake.lastStateDigest === input.stateDigest) {
+        const unchanged: HouseholdNextActionWakeV1 = {
+          ...wake,
+          completedRevision: input.revision,
+          dueAt: null,
+          claim: null,
+        };
+        await sql`
+          update proactive_work set briefing_candidates=${sql.json(unchanged)},last_error=null
+          where id=${poll.id} and kind='family_calendar_poll' and status='active'
+        `;
+        return "unchanged";
+      }
+
+      const [group] = await sql<ChannelRow[]>`
+        select * from linq_channels where household_id=${poll.household_id}
+          and audience='group' and adult_two_id is not null
+          and revoked_at is null and stopped_at is null
+        order by bound_at,id limit 1 for share
+      `;
+      if (!group?.adult_two_id) {
+        throw new FlorenceStoreUnauthorized("The family group is no longer active");
+      }
+      if (![group.adult_one_id, group.adult_two_id].includes(input.executionAdultId)) {
+        throw new FlorenceStoreUnauthorized("The household next-action executor left the family group");
+      }
+      if (input.nextJob) {
+        await assertNoCurrentHouseholdObjective(sql, poll.household_id);
+        if (candidateIds.length > 0) {
+          const docketState = await currentHouseholdDocketState(sql, {
+            householdId: poll.household_id,
+            audience: "group",
+            requestingAdultId: input.executionAdultId,
+            handledAt: occurredAt,
+          });
+          selectCurrentHouseholdDocketCandidates(docketState, candidateIds);
+        }
+      }
+
+      if (message) {
+        const suffix = `household-next-action:${input.stateDigest}`;
+        await insertProactiveOutbound(sql, {
+          workId: poll.id,
+          suffix,
+          householdId: poll.household_id,
+          channel: group,
+          visibility: "household",
+          ownerAdultId: null,
+          text: message,
+          notBefore: occurredAt,
+          occurredAt,
+        });
+        if (input.nextJob) {
+          const kickoffSourceId = proactiveOutboundSourceId(poll.id, suffix);
+          await stageProactiveFamilyWork(sql, {
+            basis: `household-next-action\0${input.stateDigest}`,
+            householdId: poll.household_id,
+            visibility: "household",
+            ownerAdultId: null,
+            executionAdultId: input.executionAdultId,
+            objective: input.nextJob.objective,
+            kickoffSourceId,
+            actionOwners: [],
+            continuityKeys: [],
+            continuedWorkIds: [],
+            evidenceSourceIds: [],
+            candidateIds,
+            occurredAt,
+          });
+        }
+      }
+      const completed: HouseholdNextActionWakeV1 = {
+        ...wake,
+        completedRevision: input.revision,
+        dueAt: null,
+        claim: null,
+        lastStateDigest: input.stateDigest,
+        lastInterruption: message
+          ? {
+              message,
+              objective: input.nextJob?.objective ?? null,
+              candidateIds,
+              occurredAt: occurredAt.toISOString(),
+            }
+          : wake.lastInterruption,
+      };
+      await sql`
+        update proactive_work set briefing_candidates=${sql.json(completed)},last_error=null
+        where id=${poll.id} and kind='family_calendar_poll' and status='active'
+      `;
+      return "completed";
+    });
+  }
+
+  async retryHouseholdNextAction(input: {
+    workId: string;
+    revision: number;
+    claimId: string;
+    retryAt: string;
+    error: string;
+  }): Promise<void> {
+    assertUuid(input.workId, "Household next-action work ID");
+    assertUuid(input.claimId, "Household next-action claim ID");
+    familyWorkCounter(input.revision, "Household next-action revision");
+    const retryAt = instant(input.retryAt);
+    await this.#sql.begin(async (sql) => {
+      const [poll] = await sql<ProactiveWorkRow[]>`
+        select * from proactive_work where id=${input.workId} and kind='family_calendar_poll'
+          and status='active' for update
+      `;
+      if (!poll) return;
+      const wake = householdNextActionWake(poll.briefing_candidates);
+      if (wake.claim?.claimId !== input.claimId || wake.claim.revision !== input.revision) return;
+      const retry: HouseholdNextActionWakeV1 = {
+        ...wake,
+        // A newer event already supplied its own immediate due time while this claim was running.
+        // Preserve that coalesced wake instead of delaying it behind the older attempt's backoff.
+        dueAt: wake.requestedRevision === input.revision ? retryAt.toISOString() : wake.dueAt,
+        claim: null,
+      };
+      await sql`
+        update proactive_work set briefing_candidates=${sql.json(retry)},
+          last_error=${bounded(required(input.error, "Household next-action retry"), 2_000)}
+        where id=${poll.id} and kind='family_calendar_poll' and status='active'
+      `;
     });
   }
 
@@ -5230,6 +5564,12 @@ export class PostgresFlorenceStore {
             last_error=${googleActionKey ? googleActionWorkMarker(googleActionKey) : null}
           where id=${work.id}
         `;
+      }
+      if (
+        (input.outcome === "complete" && googleActionKey) ||
+        (input.outcome === "update" && googleActionKey && householdConclusion && householdDocket)
+      ) {
+        await requestHouseholdNextAction(sql, work.household_id, occurredAt);
       }
     });
   }
@@ -9609,11 +9949,19 @@ export class PostgresFlorenceStore {
           for (const candidateId of mutation.candidateIds) {
             assertUuid(candidateId, "Family work docket candidate ID");
           }
+          if (expectedVisibility === "household") {
+            // Serialize explicit group work with the event-driven next-action settlement on the
+            // existing poll row, then recheck the one current household objective invariant.
+            await lockHouseholdGooglePolls(sql, turn.household_id);
+            await assertNoCurrentHouseholdObjective(sql, turn.household_id);
+          }
           let selectedDocketSourceIds: readonly string[] = [];
           let selectedDocketActionOwners: readonly ProactiveFamilyWorkActionOwner[] = [];
           let linkedDocketCandidateIds: readonly string[] = [...mutation.candidateIds];
           if (mutation.candidateIds.length > 0) {
-            await lockHouseholdGooglePolls(sql, turn.household_id);
+            if (expectedVisibility !== "household") {
+              await lockHouseholdGooglePolls(sql, turn.household_id);
+            }
             const docketState = await currentHouseholdDocketState(sql, {
               householdId: turn.household_id,
               audience: turn.audience,
@@ -10044,6 +10392,10 @@ export class PostgresFlorenceStore {
           basisSourceId: turn.source_id,
           handledAt,
         });
+      }
+
+      if (input.docketMutation || completeDocketCandidateIds.length > 0) {
+        await requestHouseholdNextAction(sql, turn.household_id, handledAt);
       }
 
       for (const outbound of input.outbound ?? []) {
@@ -17099,6 +17451,22 @@ function reminderText(action: string): string {
   return `Reminder: ${normalized}${/[.!?]$/u.test(normalized) ? "" : "."}`;
 }
 
+async function assertConversationFactRevision(
+  sql: postgres.TransactionSql,
+  input: { householdId: string; factId: string; expectedUpdatedAt: string },
+): Promise<void> {
+  assertUuid(input.factId, "Fact revision ID");
+  const expectedUpdatedAt = instant(input.expectedUpdatedAt);
+  const [fact] = await sql<{ updated_at: Date }[]>`
+    select updated_at from facts
+    where id=${input.factId} and household_id=${input.householdId}
+    for update
+  `;
+  if (!fact || fact.updated_at.getTime() !== expectedUpdatedAt.getTime()) {
+    throw new FlorenceStoreConflict("Vault memory changed before this task could update it");
+  }
+}
+
 async function applyConversationFactMutations(
   sql: postgres.TransactionSql,
   input: {
@@ -20557,6 +20925,7 @@ async function completeDeliveredFamilyWorkTerminal(
       });
     }
   }
+  await requestHouseholdNextAction(sql, delivery.household_id, delivery.sent_at);
 }
 
 async function resolveConversationDocketItemsCompletedByFamilyWork(
@@ -21103,6 +21472,146 @@ async function assertDocketCandidatesAvailableForFamilyWork(
   if (linked.length > 0) {
     throw new FlorenceStoreConflict("That docket item already has family work in progress");
   }
+}
+
+function householdNextActionWake(value: JsonValue): HouseholdNextActionWakeV1 {
+  const record = jsonRecord(value);
+  if (record.kind !== "household_next_action_wake_v1") {
+    return {
+      kind: "household_next_action_wake_v1",
+      version: 1,
+      requestedRevision: 0,
+      completedRevision: 0,
+      dueAt: null,
+      claim: null,
+      lastStateDigest: null,
+      lastInterruption: null,
+    };
+  }
+  if (record.version !== 1) {
+    throw new FlorenceStoreConflict("The household next-action wake version is invalid");
+  }
+  const requestedRevision = familyWorkCounter(
+    record.requestedRevision,
+    "Household next-action requested revision",
+  );
+  const completedRevision = familyWorkCounter(
+    record.completedRevision,
+    "Household next-action completed revision",
+  );
+  if (completedRevision > requestedRevision) {
+    throw new FlorenceStoreConflict("The household next-action wake revisions are invalid");
+  }
+  const dueAt = record.dueAt === null ? null : instant(requiredStringField(record, "dueAt", "Household next-action due time")).toISOString();
+  const lastStateDigest =
+    record.lastStateDigest === null
+      ? null
+      : requiredStringField(record, "lastStateDigest", "Household next-action state digest");
+  if (lastStateDigest !== null) assertDigest(lastStateDigest, "Household next-action state digest");
+  let lastInterruption: HouseholdNextActionWakeV1["lastInterruption"] = null;
+  if (record.lastInterruption !== undefined && record.lastInterruption !== null) {
+    const storedInterruption = jsonRecord(record.lastInterruption);
+    const message = bounded(
+      requiredStringField(storedInterruption, "message", "Household next-action prior message"),
+      4_000,
+    );
+    const objective =
+      storedInterruption.objective === null
+        ? null
+        : bounded(
+            requiredStringField(
+              storedInterruption,
+              "objective",
+              "Household next-action prior objective",
+            ),
+            4_000,
+          );
+    const candidateIds = jsonArrayField(
+      storedInterruption,
+      "candidateIds",
+      "Household next-action prior candidate IDs",
+    ).map((candidateId) => {
+      if (typeof candidateId !== "string") {
+        throw new FlorenceStoreConflict("Household next-action prior candidate ID is invalid");
+      }
+      return candidateId;
+    });
+    if (unique(candidateIds).length !== candidateIds.length) {
+      throw new FlorenceStoreConflict("Household next-action prior candidate IDs repeat");
+    }
+    for (const candidateId of candidateIds) {
+      assertUuid(candidateId, "Household next-action prior candidate ID");
+    }
+    lastInterruption = {
+      message,
+      objective,
+      candidateIds,
+      occurredAt: instant(
+        requiredStringField(
+          storedInterruption,
+          "occurredAt",
+          "Household next-action prior occurrence",
+        ),
+      ).toISOString(),
+    };
+  }
+  let claim: HouseholdNextActionWakeV1["claim"] = null;
+  if (record.claim !== null) {
+    const storedClaim = jsonRecord(record.claim);
+    const claimId = requiredStringField(storedClaim, "claimId", "Household next-action claim ID");
+    assertUuid(claimId, "Household next-action claim ID");
+    const revision = familyWorkCounter(storedClaim.revision, "Household next-action claim revision");
+    const leaseUntil = instant(
+      requiredStringField(storedClaim, "leaseUntil", "Household next-action claim lease"),
+    ).toISOString();
+    claim = { claimId, revision, leaseUntil };
+  }
+  return {
+    kind: "household_next_action_wake_v1",
+    version: 1,
+    requestedRevision,
+    completedRevision,
+    dueAt,
+    claim,
+    lastStateDigest,
+    lastInterruption,
+  };
+}
+
+/**
+ * Workflow copy of Hermes's monitor-change gate and normal-agent wake
+ * (hermes-agent 6dcebea7, cron/scheduler.py:5578-5624 and gateway/wake.py:56-105):
+ * coalesce changing household state on the existing durable poll row, then let the normal
+ * Florence reasoner decide what—if anything—deserves a family turn.
+ */
+async function requestHouseholdNextAction(
+  sql: postgres.TransactionSql,
+  householdId: string,
+  occurredAt: Date,
+): Promise<void> {
+  const [poll] = await sql<ProactiveWorkRow[]>`
+    select poll.* from proactive_work poll
+    join proactive_work briefing on briefing.household_id=poll.household_id
+      and briefing.kind='initial_household_briefing' and briefing.status='completed'
+    where poll.household_id=${householdId} and poll.kind='family_calendar_poll'
+      and poll.status='active'
+    order by poll.created_at,poll.id limit 1 for update of poll
+  `;
+  if (!poll) return;
+  const current = householdNextActionWake(poll.briefing_candidates);
+  const requestedRevision = incrementFamilyWorkCounter(
+    current.requestedRevision,
+    "Household next-action requested revision",
+  );
+  const next: HouseholdNextActionWakeV1 = {
+    ...current,
+    requestedRevision,
+    dueAt: occurredAt.toISOString(),
+  };
+  await sql`
+    update proactive_work set briefing_candidates=${sql.json(next)}
+    where id=${poll.id} and kind='family_calendar_poll' and status='active'
+  `;
 }
 
 async function stageProactiveFamilyWork(
@@ -21699,6 +22208,21 @@ async function lockHouseholdGooglePolls(sql: postgres.TransactionSql, householdI
       and status in ('active','paused')
     order by id for update
   `;
+}
+
+async function assertNoCurrentHouseholdObjective(
+  sql: postgres.TransactionSql,
+  householdId: string,
+): Promise<void> {
+  const activeRows = await sql<ProactiveWorkRow[]>`
+    select * from proactive_work where household_id=${householdId}
+      and kind='family_task' and visibility='household' and owner_adult_id is null
+      and status in ('active','paused','delivering')
+    order by created_at,id for update
+  `;
+  if (activeRows.some((work) => !isIdleScheduledFamilyWork(work, familyWorkState(work.task_state)))) {
+    throw new FlorenceStoreConflict("Household work cannot replace an objective already in progress");
+  }
 }
 
 async function lockHouseholdDocketMonitors(

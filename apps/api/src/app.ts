@@ -64,6 +64,7 @@ const sessionCookieName = "florence_session";
 const sessionLifetimeSeconds = 7 * 24 * 60 * 60;
 const memberParamsSchema = z.object({ memberId: idSchema }).strict();
 const factParamsSchema = z.object({ factId: idSchema }).strict();
+const factFileParamsSchema = z.object({ factId: idSchema, artifactId: idSchema }).strict();
 const watchParamsSchema = z.object({ workId: idSchema }).strict();
 
 export function createDefaultDependencies(env: NodeJS.ProcessEnv = process.env): AppDependencies {
@@ -320,6 +321,22 @@ export async function buildApp(
     };
   });
 
+  app.get("/api/v1/vault/facts/:factId/files/:artifactId", async (request, reply) => {
+    reply.header("Cache-Control", "private, no-store");
+    const caller = await requireAdult(request, reply, dependencies.callerResolver);
+    if (!caller) return;
+    const params = factFileParamsSchema.safeParse(request.params);
+    if (!params.success) return invalidRequest(reply);
+    const file = await dependencies.florence.vaultFileForAdult(
+      caller.adultId,
+      params.data.factId,
+      params.data.artifactId,
+    );
+    if (!file) return reply.status(404).send({ error: "vault_file_not_found" });
+    reply.header("Content-Disposition", contentDisposition(file.filename));
+    return reply.type(file.mimeType).send(Buffer.from(file.bytes));
+  });
+
   app.patch("/api/v1/vault/watches/:workId", async (request, reply) => {
     const caller = await requireAdult(request, reply, dependencies.callerResolver);
     if (!caller) return;
@@ -407,6 +424,13 @@ export async function buildApp(
     await registerFrontend(app, options.frontendRoot);
   }
   return app;
+}
+
+function contentDisposition(filename: string): string {
+  return `attachment; filename*=UTF-8''${encodeURIComponent(filename).replace(
+    /['()*]/gu,
+    (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`,
+  )}`;
 }
 
 function createDefaultGoogleConnection(

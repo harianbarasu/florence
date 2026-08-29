@@ -1332,6 +1332,40 @@ a {
   font-size: 11px;
 }
 
+.library-files {
+  display: grid;
+  gap: 7px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.library-files a {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  padding: 9px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  text-decoration: none;
+}
+
+.library-files a:hover {
+  background: var(--muted);
+}
+
+.library-files span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.library-files small {
+  color: var(--secondary);
+}
+
 .library-card-footer {
   display: flex;
   align-items: center;

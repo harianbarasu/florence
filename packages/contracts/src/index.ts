@@ -175,6 +175,17 @@ export const memoryPresentationSchema = z
 export type MemoryPresentation = z.infer<typeof memoryPresentationSchema>;
 const storedMemoryPresentationSchema = memoryPresentationSchema.required();
 
+export const vaultFileSchema = z
+  .object({
+    artifactId: idSchema,
+    filename: nonempty(500),
+    mimeType: nonempty(200),
+    byteLength: z.number().int().positive(),
+    sha256: z.string().regex(/^[0-9a-f]{64}$/),
+  })
+  .strict();
+export type VaultFile = z.infer<typeof vaultFileSchema>;
+
 /** Decode only the explicit presentation persisted by current writers and migration 006. */
 export function decodeMemoryPresentation(value: unknown): MemoryPresentation {
   const keys = ["memoryKind", "artifactKind", "title", "details", "tags"] as const;
@@ -199,6 +210,7 @@ export const vaultFactSchema = memoryPresentationSchema
     recordedAt: timestampSchema.nullable(),
     editable: z.boolean(),
     deletable: z.boolean(),
+    files: z.array(vaultFileSchema).default([]),
   })
   .strict();
 export type VaultFact = z.infer<typeof vaultFactSchema>;

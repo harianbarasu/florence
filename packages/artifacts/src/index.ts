@@ -56,6 +56,37 @@ export type FileArtifactReference = Readonly<{
   sha256: string;
 }>;
 
+export function decodeFactFileArtifacts(value: unknown): readonly FileArtifactReference[] {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new ImageVaultError("invalid_artifact", "Vault memory is not an object");
+  }
+  const files = (value as { files?: unknown }).files;
+  if (files === undefined) return [];
+  if (!Array.isArray(files)) {
+    throw new ImageVaultError("invalid_artifact", "Vault memory files are invalid");
+  }
+  const artifacts = files.map((candidate) => {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+      throw new ImageVaultError("invalid_artifact", "Vault memory file receipt is invalid");
+    }
+    const record = candidate as Partial<FileArtifactReference>;
+    const artifact = {
+      artifactId: record.artifactId,
+      workId: record.workId,
+      filename: record.filename,
+      mimeType: record.mimeType,
+      byteLength: record.byteLength,
+      sha256: record.sha256,
+    } as FileArtifactReference;
+    requireFileArtifactReference(artifact);
+    return artifact;
+  });
+  if (new Set(artifacts.map((artifact) => artifact.artifactId)).size !== artifacts.length) {
+    throw new ImageVaultError("invalid_artifact", "Vault memory repeats a file receipt");
+  }
+  return artifacts;
+}
+
 export type HeicNormalizer = (bytes: Uint8Array) => Promise<Uint8Array>;
 
 type HeicConverter = (input: { buffer: Uint8Array; format: "JPEG"; quality: number }) => Promise<Uint8Array>;
@@ -257,6 +288,44 @@ export class EncryptedImageVault {
       throw new ImageVaultError("unauthorized_or_missing", "File artifact is unavailable");
     }
     return loaded.bytes;
+  }
+
+  /**
+   * Reopens a durable file only after an authorized Vault fact supplied its
+   * complete receipt. The producing work remains part of the receipt, but a
+   * later task does not need to impersonate that work to reuse the family's
+   * saved resource.
+   */
+  async readHouseholdFileArtifact(input: {
+    householdId: string;
+    artifact: FileArtifactReference;
+  }): Promise<Uint8Array> {
+    requireFileArtifactUuid(input.householdId, "File artifact household");
+    requireFileArtifactReference(input.artifact);
+    const loaded = await this.#loadFileArtifact(input.artifact.artifactId);
+    if (!loaded || !sameHouseholdFileArtifact(loaded.metadata, input.householdId, input.artifact)) {
+      throw new ImageVaultError("unauthorized_or_missing", "File artifact is unavailable");
+    }
+    return loaded.bytes;
+  }
+
+  async deleteHouseholdFileArtifact(input: {
+    householdId: string;
+    artifact: FileArtifactReference;
+  }): Promise<boolean> {
+    requireFileArtifactUuid(input.householdId, "File artifact household");
+    requireFileArtifactReference(input.artifact);
+    const loaded = await this.#loadFileArtifact(input.artifact.artifactId);
+    if (!loaded || !sameHouseholdFileArtifact(loaded.metadata, input.householdId, input.artifact)) {
+      return false;
+    }
+    try {
+      await unlink(this.#fileArtifactPath(input.artifact.artifactId));
+      return true;
+    } catch (error) {
+      if (isMissing(error)) return false;
+      throw error;
+    }
   }
 
   async readFileArtifactById(input: {
@@ -843,6 +912,22 @@ function fileArtifactReference(metadata: FileArtifactMetadata): FileArtifactRefe
     byteLength: metadata.byteLength,
     sha256: metadata.sha256,
   });
+}
+
+function sameHouseholdFileArtifact(
+  metadata: FileArtifactMetadata,
+  householdId: string,
+  artifact: FileArtifactReference,
+): boolean {
+  return (
+    metadata.householdId === householdId &&
+    metadata.artifactId === artifact.artifactId &&
+    metadata.workId === artifact.workId &&
+    metadata.filename === artifact.filename &&
+    metadata.mimeType === artifact.mimeType &&
+    metadata.byteLength === artifact.byteLength &&
+    metadata.sha256 === artifact.sha256
+  );
 }
 
 function existingStoreResult(

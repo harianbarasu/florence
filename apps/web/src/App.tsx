@@ -18,6 +18,7 @@ import {
   Check,
   ChevronLeft,
   ChevronRight,
+  FileText,
   MapPin,
   MessageCircle,
   Pause,
@@ -2477,6 +2478,22 @@ function ArtifactCard({
             <p className="library-summary">{artifact.statement}</p>
           )}
           {artifact.details && <p className="library-details">{artifact.details}</p>}
+          {!!artifact.files.length && (
+            <ul className="library-files" aria-label="Saved files">
+              {artifact.files.map((file) => (
+                <li key={file.artifactId}>
+                  <a
+                    href={`/api/v1/vault/facts/${encodeURIComponent(artifact.id)}/files/${encodeURIComponent(file.artifactId)}`}
+                    download={file.filename}
+                  >
+                    <FileText size={15} aria-hidden="true" />
+                    <span>{file.filename}</span>
+                    <small>{formatFileSize(file.byteLength)}</small>
+                  </a>
+                </li>
+              ))}
+            </ul>
+          )}
           {!!artifact.tags.length && (
             <ul className="library-tags" aria-label="Tags">
               {[...new Set(artifact.tags)].map((tag) => (
@@ -2526,6 +2543,12 @@ function artifactKindLabel(kind: VaultFact["artifactKind"]): string {
     default:
       return "Saved item";
   }
+}
+
+function formatFileSize(byteLength: number): string {
+  if (byteLength < 1_000) return `${byteLength} B`;
+  if (byteLength < 1_000_000) return `${Math.round(byteLength / 1_000)} KB`;
+  return `${Math.round((byteLength / 1_000_000) * 10) / 10} MB`;
 }
 
 function factSourceSummary(fact: VaultFact): string {

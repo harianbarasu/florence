@@ -1,5 +1,10 @@
 import { createHash } from "node:crypto";
-import { type EncryptedImageVault, ImageVaultError } from "@florence/artifacts";
+import {
+  decodeFactFileArtifacts,
+  type EncryptedImageVault,
+  type FileArtifactReference,
+  ImageVaultError,
+} from "@florence/artifacts";
 import {
   type CompleteFamilyOnboardingInput,
   calendarMonthSchema,
@@ -55,6 +60,7 @@ import type {
   FiniteMonitorUpdate,
   GoogleEvidenceDraft,
   GoogleStableFactContext,
+  HouseholdDocket,
   HouseholdRecord,
   InboundPreparationContext,
   InboundTurn,
@@ -74,6 +80,7 @@ import type {
   ReminderMutation,
   ReviewedGoogleSourceDisposition,
   SourceRecord,
+  VisibleActiveFamilyWork,
 } from "@florence/database";
 import {
   calendarEvidenceSourceId,
@@ -116,6 +123,7 @@ import {
 import type { FlorenceBrowserClient, FlorenceBrowserOperation } from "./browser.js";
 import { CapabilityAdapterError } from "./capability-lifecycle.js";
 import type { EnrollmentCodes, WebAccessPath } from "./enrollment.js";
+import { gmailFileAssetId, vaultFileArtifactId } from "./file-assets.js";
 import type { FlorenceFlightsClient } from "./flights.js";
 import type { FlorenceMapsClient } from "./maps.js";
 import type { FlorencePublicPageClient } from "./public-page.js";
@@ -129,6 +137,7 @@ import {
   type FlorenceFamilyCalendarWorkRequest,
   type FlorenceFamilyCalendarWorkResult,
   type FlorenceHouseholdAvailabilityRead,
+  type FlorenceHouseholdNextActionInput,
   type FlorenceNarrowFamilyProfile,
   type FlorenceParticipantRequest,
   type FlorenceParticipantRequestResult,
@@ -461,8 +470,42 @@ export class Florence {
 
   async deleteFact(adultId: string, factId: string): Promise<WorkspaceView> {
     const household = await this.#householdForAdult(adultId);
+    const files = household.facts
+      .filter((fact) => fact.id === factId)
+      .flatMap((fact) => [...decodeFactFileArtifacts(fact.value)]);
     await this.#store.deleteFact({ householdId: household.id, adultId, factId });
+    if (this.#imageVault) {
+      await Promise.allSettled(
+        files.map((artifact) =>
+          this.#imageVault?.deleteHouseholdFileArtifact({ householdId: household.id, artifact }),
+        ),
+      );
+    }
     return this.workspaceForAdult(adultId);
+  }
+
+  async vaultFileForAdult(
+    adultId: string,
+    factId: string,
+    artifactId: string,
+  ): Promise<{ filename: string; mimeType: string; bytes: Uint8Array } | null> {
+    if (!this.#imageVault) return null;
+    const household = await this.#householdForAdult(adultId);
+    const fact = household.facts.find((candidate) => candidate.id === factId);
+    const artifact = fact
+      ? decodeFactFileArtifacts(fact.value).find((candidate) => candidate.artifactId === artifactId)
+      : null;
+    if (!artifact) return null;
+    try {
+      const bytes = await this.#imageVault.readHouseholdFileArtifact({
+        householdId: household.id,
+        artifact,
+      });
+      return { filename: artifact.filename, mimeType: artifact.mimeType, bytes };
+    } catch (error) {
+      if (error instanceof ImageVaultError && error.code === "unauthorized_or_missing") return null;
+      throw error;
+    }
   }
 
   async patchWatch(adultId: string, workId: string, untrustedInput: PatchWatchInput): Promise<WorkspaceView> {
@@ -4096,9 +4139,13 @@ export class Florence {
           : {}),
       });
       if (!familyWorkHousehold) throw new Error("The family task household is unavailable");
-      const familyWorkMemoryCorpus = memorySources(familyWorkHousehold.facts);
+      const familyWorkFacts =
+        work.visibility === "household"
+          ? familyWorkHousehold.facts.filter((fact) => fact.visibility === "household")
+          : familyWorkHousehold.facts;
+      const familyWorkMemoryCorpus = memorySources(familyWorkFacts);
       const familyWorkSearchableMemory = representativeMemorySources(familyWorkMemoryCorpus);
-      const familyWorkVaultRecall = new VaultRecall(familyWorkHousehold.facts);
+      const familyWorkVaultRecall = new VaultRecall(familyWorkFacts);
       const familyWorkVisibleSources = selectVisibleMemorySources(familyWorkSearchableMemory, {
         primary: work.objective,
         context: [
@@ -4195,7 +4242,12 @@ export class Florence {
             : [];
       const familyWorkGmailAttachmentIndex = new Map<
         string,
-        Readonly<{ connectionId: string; attachment: GmailAttachmentReference }>
+        Readonly<{
+          connectionId: string;
+          sourceId: string;
+          fileAssetId: string;
+          attachment: GmailAttachmentReference;
+        }>
       >();
       const indexFamilyWorkGmailMessage = (
         message: GmailEvidence,
@@ -4211,7 +4263,15 @@ export class Florence {
           message,
         });
         for (const [key, attachment] of prepared.attachments) {
-          familyWorkGmailAttachmentIndex.set(key, { connectionId, attachment });
+          familyWorkGmailAttachmentIndex.set(key, {
+            connectionId,
+            sourceId: prepared.source.sourceId,
+            fileAssetId: gmailFileAssetId(
+              prepared.source.sourceId,
+              key.slice(prepared.source.sourceId.length + 1),
+            ),
+            attachment,
+          });
         }
         return prepared.source;
       };
@@ -4588,6 +4648,78 @@ export class Florence {
           familyWorkSourceIndex.set(modelMessage.sourceId, conversationHistorySource(modelMessage));
           return modelMessage;
         });
+      const readFamilyWorkFileAsset = async (
+        assetId: string,
+        taskSignal?: AbortSignal,
+      ): Promise<{ filename: string; mimeType: string; bytes: Uint8Array }> => {
+        taskSignal?.throwIfAborted();
+        if (!this.#imageVault) throw new Error("Florence file storage is not configured");
+        const browserFile = (work.state.browserFiles ?? []).find(
+          (candidate) => candidate.assetId === assetId && candidate.workId === work.workId,
+        );
+        if (browserFile) {
+          const bytes = await this.#imageVault.readFileArtifact({
+            householdId: work.household.householdId,
+            workId: work.workId,
+            artifact: {
+              artifactId: browserFile.assetId,
+              workId: browserFile.workId,
+              filename: browserFile.filename,
+              mimeType: browserFile.mimeType,
+              byteLength: browserFile.byteLength,
+              sha256: browserFile.sha256,
+            },
+          });
+          return { filename: browserFile.filename, mimeType: browserFile.mimeType, bytes };
+        }
+        const image = familyWorkOriginImages.find((candidate) => candidate.assetId === assetId);
+        if (image) {
+          const read = await this.#imageVault.read({
+            householdId: work.household.householdId,
+            signalId: image.signalId,
+            image: { assetId: image.assetId, mimeType: image.mimeType },
+          });
+          return {
+            filename: browserImageUploadFilename(image.assetId, read.mimeType),
+            mimeType: read.mimeType,
+            bytes: read.bytes,
+          };
+        }
+        const document = familyWorkOriginDocuments.find((candidate) => candidate.id === assetId);
+        if (document) {
+          const read = this.#imageVault.openPdf({
+            documentId: document.id,
+            householdId: work.household.householdId,
+            signalId: document.parentSourceId,
+            filename: document.filename,
+            mimeType: document.mimeType,
+            contentDigest: document.contentDigest,
+            contentEnvelope: document.contentEnvelope,
+            discardAfter: document.discardAfter,
+            now: this.#now(),
+          });
+          return {
+            filename: browserPdfUploadFilename(document.filename, document.id),
+            mimeType: document.mimeType,
+            bytes: read.bytes,
+          };
+        }
+        if (google && familyWorkExecutionAdultId) {
+          const gmailFile = [...familyWorkGmailAttachmentIndex.values()].find(
+            (candidate) => candidate.fileAssetId === assetId,
+          );
+          if (gmailFile) {
+            const read = await google.readGmailAttachment({
+              householdId: work.household.householdId,
+              ownerAdultId: familyWorkExecutionAdultId,
+              connectionId: gmailFile.connectionId,
+              attachment: gmailFile.attachment,
+            });
+            return { filename: read.filename, mimeType: read.mimeType, bytes: read.bytes };
+          }
+        }
+        throw new Error("The selected file is no longer available to this task");
+      };
       const runVaultWork = async (
         request: FlorenceVaultWorkRequest,
         taskSignal?: AbortSignal,
@@ -4595,7 +4727,7 @@ export class Florence {
         taskSignal?.throwIfAborted();
         const identity = familyWorkPendingCapabilityIdentity("vault_work");
         if (request.operation === "forget") {
-          const existing = familyWorkHousehold.facts.find((fact) => fact.id === request.factId);
+          const existing = familyWorkFacts.find((fact) => fact.id === request.factId);
           if (
             !existing ||
             (work.visibility === "household" && existing.visibility !== "household") ||
@@ -4605,19 +4737,40 @@ export class Florence {
           ) {
             throw new Error("Durable work cannot forget memory outside its conversation");
           }
+          if (request.expectedUpdatedAt !== existing.updatedAt) {
+            throw new FlorenceStoreConflict("Vault memory changed before this task could forget it");
+          }
           const receipt = await this.#store.runClaimedFamilyWorkDatabaseCapability({
             ...identity,
-            capability: { name: "vault_work", mutation: { operation: "forget", factId: request.factId } },
+            capability: {
+              name: "vault_work",
+              mutation: {
+                operation: "forget",
+                factId: request.factId,
+                expectedUpdatedAt: request.expectedUpdatedAt,
+              },
+            },
           });
+          if (this.#imageVault) {
+            await Promise.allSettled(
+              decodeFactFileArtifacts(existing.value).map((artifact) =>
+                this.#imageVault?.deleteHouseholdFileArtifact({
+                  householdId: work.household.householdId,
+                  artifact,
+                }),
+              ),
+            );
+          }
           return receipt.output as FlorenceVaultWorkResult;
         }
 
         const existing =
-          request.operation === "correct"
-            ? familyWorkHousehold.facts.find((fact) => fact.id === request.factId)
-            : null;
+          request.operation === "correct" ? familyWorkFacts.find((fact) => fact.id === request.factId) : null;
         if (request.operation === "correct" && !existing) {
           throw new Error("Durable work cannot correct memory it has not read");
+        }
+        if (request.operation === "correct" && request.expectedUpdatedAt !== existing?.updatedAt) {
+          throw new FlorenceStoreConflict("Vault memory changed before this task could correct it");
         }
         if (work.visibility === "household" && request.visibility !== "household") {
           throw new Error("Household-visible work cannot create private memory");
@@ -4629,6 +4782,33 @@ export class Florence {
         if (request.visibility === "private" && !ownerAdultId) {
           throw new Error("Private durable memory lost its adult owner");
         }
+        const factId =
+          existing?.id ?? deterministicUuid(`family-work-fact\0${work.workId}\0${identity.callId}`);
+        const existingFiles = existing ? decodeFactFileArtifacts(existing.value) : [];
+        const selectedAssetIds = request.fileAssetIds === null ? null : [...new Set(request.fileAssetIds)];
+        if (selectedAssetIds && selectedAssetIds.length !== request.fileAssetIds?.length) {
+          throw new Error("A Vault artifact cannot retain the same file twice");
+        }
+        const stagedFiles: readonly FileArtifactReference[] =
+          selectedAssetIds === null
+            ? []
+            : await Promise.all(
+                selectedAssetIds.map(async (assetId) => {
+                  if (!this.#imageVault) throw new Error("Florence file storage is not configured");
+                  const file = await readFamilyWorkFileAsset(assetId, taskSignal);
+                  return this.#imageVault.storeFileArtifact({
+                    artifactId: vaultFileArtifactId(factId, `${identity.callId}\0${assetId}`),
+                    householdId: work.household.householdId,
+                    workId: work.workId,
+                    callId: identity.callId,
+                    filename: file.filename,
+                    declaredMimeType: file.mimeType,
+                    bytes: file.bytes,
+                  });
+                }),
+              );
+        const files: readonly FileArtifactReference[] =
+          selectedAssetIds === null ? existingFiles : stagedFiles;
         const slot =
           existing?.slot ??
           (request.memory.memoryKind === "artifact" && request.memory.title
@@ -4636,7 +4816,7 @@ export class Florence {
             : `${request.memory.memoryKind}:${sha256(request.statement.toLocaleLowerCase())}`);
         const sourceIds = [...new Set([...request.sourceIds, work.origin.message.sourceId])];
         const fact: FactDraft = {
-          id: existing?.id ?? deterministicUuid(`family-work-fact\0${work.workId}\0${identity.callId}`),
+          id: factId,
           subjectPersonId: existing?.subjectPersonId ?? null,
           kind: existing?.kind ?? (request.memory.memoryKind === "preference" ? "preference" : "general"),
           slot,
@@ -4648,15 +4828,59 @@ export class Florence {
             title: request.memory.title,
             details: request.memory.details,
             tags: request.memory.tags,
+            files,
           },
           visibility: request.visibility,
           ownerAdultId,
           sourceIds,
         };
-        const receipt = await this.#store.runClaimedFamilyWorkDatabaseCapability({
-          ...identity,
-          capability: { name: "vault_work", mutation: { operation: request.operation, fact } },
-        });
+        const mutation =
+          request.operation === "correct"
+            ? (() => {
+                if (!existing) throw new Error("Durable work lost the memory it was correcting");
+                return {
+                  operation: "correct" as const,
+                  fact,
+                  expectedUpdatedAt: request.expectedUpdatedAt,
+                };
+              })()
+            : { operation: "remember" as const, fact };
+        const receipt = await (async () => {
+          try {
+            return await this.#store.runClaimedFamilyWorkDatabaseCapability({
+              ...identity,
+              capability: {
+                name: "vault_work",
+                mutation,
+              },
+            });
+          } catch (error) {
+            if (error instanceof FlorenceStoreConflict && this.#imageVault) {
+              await Promise.allSettled(
+                stagedFiles.map((artifact) =>
+                  this.#imageVault?.deleteHouseholdFileArtifact({
+                    householdId: work.household.householdId,
+                    artifact,
+                  }),
+                ),
+              );
+            }
+            throw error;
+          }
+        })();
+        if (this.#imageVault) {
+          const retainedArtifactIds = new Set(files.map((artifact) => artifact.artifactId));
+          await Promise.allSettled(
+            existingFiles
+              .filter((artifact) => !retainedArtifactIds.has(artifact.artifactId))
+              .map((artifact) =>
+                this.#imageVault?.deleteHouseholdFileArtifact({
+                  householdId: work.household.householdId,
+                  artifact,
+                }),
+              ),
+          );
+        }
         return receipt.output as FlorenceVaultWorkResult;
       };
       const runReminderWork = async (
@@ -5249,6 +5473,14 @@ export class Florence {
                             });
                             return { filename: storedFile.filename, bytes };
                           }
+                          const savedVaultFile = familyWorkVaultRecall.resolveFile(operation.attachmentRef);
+                          if (savedVaultFile) {
+                            const bytes = await this.#imageVault.readHouseholdFileArtifact({
+                              householdId: work.household.householdId,
+                              artifact: savedVaultFile.artifact,
+                            });
+                            return { filename: savedVaultFile.artifact.filename, bytes };
+                          }
                           const image = familyWorkOriginImages.find(
                             (candidate) => candidate.assetId === operation.attachmentRef,
                           );
@@ -5724,7 +5956,135 @@ export class Florence {
     }
   }
 
+  async #executeHouseholdNextAction(
+    work: Extract<DueProactiveWork, { kind: "household_next_action" }>,
+  ): Promise<void> {
+    if (!this.#google || !this.#reasoner) {
+      await this.#store.retryHouseholdNextAction({
+        workId: work.workId,
+        revision: work.revision,
+        claimId: work.claimId,
+        retryAt: later(this.#now(), RETRY_MS),
+        error: "Florence's household next-action pass is not configured",
+      });
+      return;
+    }
+    const currentTime = this.#now().toISOString();
+    try {
+      const [household, docket, visibleWork, familyCalendar] = await Promise.all([
+        this.#store.readHousehold({ householdId: work.household.householdId }),
+        this.#store.readHouseholdDocket({
+          householdId: work.household.householdId,
+          limit: null,
+          now: currentTime,
+        }),
+        this.#store.readVisibleActiveFamilyWork({
+          householdId: work.household.householdId,
+          viewerAdultId: work.executionAdultId,
+          now: currentTime,
+        }),
+        this.#google.readInitialCalendarReview({
+          householdId: work.household.householdId,
+          ownerAdultId: work.executionAdultId,
+          connectionId: work.connectionId,
+          calendarId: work.familyCalendarId,
+          currentTime,
+          // This is Google's maximum transport page size; readInitialCalendarReview exhausts pages.
+          limit: 50,
+        }),
+      ]);
+      if (!household) throw new Error("The household next-action family is unavailable");
+      if (familyCalendar.status !== "complete" || !familyCalendar.cursor) {
+        throw new Error("The household next-action Family Calendar window is incomplete");
+      }
+      const householdFacts = household.facts.filter((fact) => fact.visibility === "household");
+      const activeWork = visibleWork.filter((item) => item.visibility === "household");
+      const familyCalendarEvents = familyCalendar.events.map((event) =>
+        event.intervalKind === "timed"
+          ? {
+              intervalKind: event.intervalKind,
+              title: event.title,
+              startsAt: event.startsAt,
+              endsAt: event.endsAt,
+              timeZone: event.timeZone,
+            }
+          : {
+              intervalKind: event.intervalKind,
+              title: event.title,
+              startDate: event.startDate,
+              endDate: event.endDate,
+            },
+      );
+      const stateDigest = householdNextActionStateDigest({
+        docket,
+        activeWork,
+        familyCalendar: familyCalendarEvents,
+        facts: householdFacts,
+      });
+      if (stateDigest === work.lastStateDigest) {
+        await this.#store.completeHouseholdNextAction({
+          workId: work.workId,
+          revision: work.revision,
+          claimId: work.claimId,
+          stateDigest,
+          message: null,
+          nextJob: null,
+          executionAdultId: work.executionAdultId,
+          occurredAt: currentTime,
+        });
+        return;
+      }
+      const vault = new VaultRecall(householdFacts);
+      const input: FlorenceHouseholdNextActionInput = {
+        currentTime,
+        familyProfile: initialFamilyProfile(work.household),
+        householdDocket: {
+          totalItems: docket.totalItems,
+          items: docket.items.map(({ visibility: _visibility, ...item }) => item),
+        },
+        activeWork: activeWork.map(({ visibility: _visibility, candidateIds, ...item }) => ({
+          ...item,
+          candidateIds: [...candidateIds],
+        })),
+        lastInterruption: work.lastInterruption
+          ? { ...work.lastInterruption, candidateIds: [...work.lastInterruption.candidateIds] }
+          : null,
+        familyCalendar: {
+          timeMin: currentTime,
+          timeMax: new Date(Date.parse(currentTime) + 21 * 24 * 60 * 60_000).toISOString(),
+          events: familyCalendarEvents,
+        },
+      };
+      const decision = await this.#reasoner.decideHouseholdNextAction(input, {
+        searchVault: async (request) => vault.search(request),
+        readVault: async (request) => vault.read(request),
+      });
+      await this.#store.completeHouseholdNextAction({
+        workId: work.workId,
+        revision: work.revision,
+        claimId: work.claimId,
+        stateDigest,
+        message: decision.message,
+        nextJob: decision.nextJob,
+        executionAdultId: work.executionAdultId,
+        occurredAt: this.#now().toISOString(),
+      });
+    } catch (error) {
+      await this.#store.retryHouseholdNextAction({
+        workId: work.workId,
+        revision: work.revision,
+        claimId: work.claimId,
+        retryAt: later(this.#now(), RETRY_MS),
+        error: errorText(error),
+      });
+    }
+  }
+
   async #executeProactiveWork(work: Exclude<DueProactiveWork, { kind: "family_task" }>): Promise<void> {
+    if (work.kind === "household_next_action") {
+      await this.#executeHouseholdNextAction(work);
+      return;
+    }
     if (work.kind === "cancelled_family_task") {
       const stopped = await this.#stopFamilyWorkPhoneCall(work.workId, work.activePhoneCall);
       if (stopped) {
@@ -7323,6 +7683,9 @@ function workspace(
                 id: fact.id,
                 statement: factStatement(fact),
                 ...vaultMemoryFields(fact),
+                files: decodeFactFileArtifacts(fact.value).map(
+                  ({ workId: _workId, ...artifact }) => artifact,
+                ),
                 visibility: fact.visibility,
                 source: source ? vaultSource(source) : null,
                 recordedAt: source?.occurredAt ?? null,
@@ -10236,6 +10599,48 @@ function conversationalGmailEvidence(input: {
 
 function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");
+}
+
+function householdNextActionStateDigest(input: {
+  docket: HouseholdDocket;
+  activeWork: readonly VisibleActiveFamilyWork[];
+  familyCalendar: FlorenceHouseholdNextActionInput["familyCalendar"]["events"];
+  facts: readonly FactRecord[];
+}): string {
+  const semanticRows = (values: readonly unknown[]): string[] =>
+    [...new Set(values.map((value) => JSON.stringify(canonicalHouseholdState(value))))].sort();
+  return sha256(
+    JSON.stringify({
+      docket: semanticRows(
+        input.docket.items.map(({ candidateId: _candidateId, visibility: _visibility, ...item }) => item),
+      ),
+      activeWork: semanticRows(
+        input.activeWork.map(
+          ({ workId: _workId, candidateIds: _candidateIds, visibility: _visibility, ...item }) => item,
+        ),
+      ),
+      familyCalendar: semanticRows(input.familyCalendar),
+      vault: semanticRows(
+        input.facts.map(({ id: _id, householdId: _householdId, sources: _sources, ...fact }) => ({
+          ...fact,
+          correctedAt: null,
+          updatedAt: null,
+        })),
+      ),
+    }),
+  );
+}
+
+function canonicalHouseholdState(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalHouseholdState);
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, entry]) => [key, canonicalHouseholdState(entry)]),
+    );
+  }
+  return value;
 }
 
 function sameStrings(left: readonly string[], right: readonly string[]): boolean {

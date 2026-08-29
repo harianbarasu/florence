@@ -767,6 +767,7 @@ describe("Florence reasoner capability cutover", () => {
             },
           ],
           totalCalendarCount: 1,
+          nextCursor: null,
         };
       },
       async readCalendarWindow() {
@@ -784,6 +785,14 @@ describe("Florence reasoner capability cutover", () => {
             },
           ],
           totalCalendarCount: 1,
+          calendarCoverage: {
+            complete: true,
+            observedCalendarCount: 1,
+            completeCalendarCount: 1,
+            missingCalendarCount: 0,
+            unavailableCalendarCount: 0,
+            digest: "2".repeat(64),
+          },
           events: [],
           totalEventCount: 0,
           nextCursor: null,

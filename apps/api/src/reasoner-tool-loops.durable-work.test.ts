@@ -1241,6 +1241,7 @@ Compare the family options.
             },
           ],
           totalCalendarCount: 1,
+          nextCursor: null,
         };
       },
       async readCalendarWindow(calendarInput: {
@@ -1269,6 +1270,14 @@ Compare the family options.
             },
           ],
           totalCalendarCount: 1,
+          calendarCoverage: {
+            complete: true,
+            observedCalendarCount: 1,
+            completeCalendarCount: 1,
+            missingCalendarCount: 0,
+            unavailableCalendarCount: 0,
+            digest: "1".repeat(64),
+          },
           events: [
             {
               eventRef: "event-school-night",

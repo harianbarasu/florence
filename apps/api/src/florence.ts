@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import {
   decodeFactFileArtifacts,
   type EncryptedImageVault,
@@ -177,6 +177,11 @@ const GOOGLE_WORKSPACE_ACTION_SCOPES = [
 ] as const;
 const FOREGROUND_MEMORY_QUERY_REWRITE_TIMEOUT_MS = 2_000;
 const DURABLE_MEMORY_QUERY_REWRITE_TIMEOUT_MS = 5_000;
+// Keep one catalog tool result comfortably below the reasoner's 50 KB output
+// envelope. Catalog completeness is carried by opaque continuation cursors,
+// never by an arbitrary number of calendars.
+const CALENDAR_CATALOG_PAGE_BYTE_BUDGET = 40_000;
+const CALENDAR_CATALOG_CURSOR_MAX_LENGTH = 2_000;
 const GOOGLE_GMAIL_READ_SCOPES = [
   "https://www.googleapis.com/auth/gmail.modify",
   "https://www.googleapis.com/auth/gmail.readonly",
@@ -2319,8 +2324,27 @@ export class Florence {
         },
       };
     };
+    let conversationCalendarCatalogSnapshot: ReturnType<typeof readConversationCalendarCatalog> | null = null;
+    const readConversationCalendarCatalogSnapshot = async () => {
+      conversationCalendarCatalogSnapshot ??= readConversationCalendarCatalog();
+      try {
+        return await conversationCalendarCatalogSnapshot;
+      } catch (error) {
+        // A transient first attempt must not poison every retry in this turn.
+        conversationCalendarCatalogSnapshot = null;
+        throw error;
+      }
+    };
+    const calendarCatalogCursorOffsets = new Map<string, number>();
+    const calendarCatalogCursorFor = (offset: number): string => {
+      const cursor = `calendar_catalog_${sha256(
+        `${turn.message.sourceId}\0${activeGoogleConnection?.connectionId ?? "unavailable"}\0${offset}`,
+      ).slice(0, 48)}`;
+      calendarCatalogCursorOffsets.set(cursor, offset);
+      return cursor;
+    };
     const enumerateConversationCalendars = async () =>
-      (await readConversationCalendarCatalog()).read.calendars;
+      (await readConversationCalendarCatalogSnapshot()).read.calendars;
     const maps = this.#maps;
     const publicPages = this.#publicPages;
     const weather = this.#weather;
@@ -2474,23 +2498,27 @@ export class Florence {
             },
           }
         : {}),
-      listCalendars: async (): Promise<FlorenceCalendarCatalogRead> => {
+      listCalendars: async ({ cursor }): Promise<FlorenceCalendarCatalogRead> => {
         if (!this.#google || !activeGoogleConnection || !googleOwnerAdultId) {
           return {
             status: "unavailable",
             calendars: [],
             totalCalendarCount: 0,
+            nextCursor: null,
           };
         }
         try {
-          const catalogRead = await readConversationCalendarCatalog();
+          const offset = cursor === null ? 0 : (calendarCatalogCursorOffsets.get(cursor) ?? Number.NaN);
+          if (!Number.isSafeInteger(offset) || offset < 0) {
+            throw new Error("The Calendar catalog cursor is invalid or belongs to another turn");
+          }
+          const catalogRead = await readConversationCalendarCatalogSnapshot();
           const { read, credential } = catalogRead;
           if (read.status !== "unavailable") {
             googleConnectionIdsUsed.add(credential.connectionId);
           }
-          const calendars = read.calendars.slice(0, 100).map((target) => {
+          const projectedCalendars = read.calendars.map((target) => {
             const calendarRef = calendarRefFor(target.calendarId);
-            calendarTargets.set(calendarRef, target);
             return {
               calendarRef,
               label:
@@ -2503,13 +2531,19 @@ export class Florence {
               eventCoverage: target.eventCoverage,
             };
           });
+          const page = byteBoundedCalendarCatalogPage(projectedCalendars, read.totalCalendarCount, offset);
+          for (let index = offset; index < page.nextOffset; index += 1) {
+            const target = read.calendars[index];
+            const projected = projectedCalendars[index];
+            if (target && projected) calendarTargets.set(projected.calendarRef, target);
+          }
+          const nextCursor =
+            page.nextOffset < projectedCalendars.length ? calendarCatalogCursorFor(page.nextOffset) : null;
           return {
-            status:
-              read.status === "complete" && read.totalCalendarCount > calendars.length
-                ? "truncated"
-                : read.status,
-            calendars,
+            status: nextCursor === null ? read.status : "truncated",
+            calendars: page.calendars,
             totalCalendarCount: read.totalCalendarCount,
+            nextCursor,
           };
         } catch (error) {
           if (error instanceof GoogleCalendarTransientError) {
@@ -2522,27 +2556,13 @@ export class Florence {
       },
       readCalendarWindow: async ({ timeMin, timeMax, pageSize, cursor, scope, calendarRefs }) => {
         if (!this.#google || !activeGoogleConnection || !googleOwnerAdultId) {
-          return {
-            status: "unavailable",
-            calendars: [],
-            totalCalendarCount: 0,
-            events: [],
-            totalEventCount: 0,
-            nextCursor: null,
-          };
+          return unavailableCalendarWindowRead();
         }
         try {
           let calendarIds: readonly string[] | undefined;
           if (turn.authority.audience === "group") {
             if (!turn.household.familyCalendarId) {
-              return {
-                status: "unavailable",
-                calendars: [],
-                totalCalendarCount: 0,
-                events: [],
-                totalEventCount: 0,
-                nextCursor: null,
-              };
+              return unavailableCalendarWindowRead();
             }
             calendarIds = [turn.household.familyCalendarId];
           } else if (scope === "all") {
@@ -2551,14 +2571,7 @@ export class Florence {
             const targets = await enumerateConversationCalendars();
             const primary = targets.find((target) => target.primary);
             if (!primary) {
-              return {
-                status: "unavailable",
-                calendars: [],
-                totalCalendarCount: 0,
-                events: [],
-                totalEventCount: 0,
-                nextCursor: null,
-              };
+              return unavailableCalendarWindowRead();
             }
             calendarIds = [primary.calendarId];
           } else {
@@ -2609,13 +2622,10 @@ export class Florence {
                 ] as const,
             ),
           );
-          const projectedCalendars = read.calendars.slice(0, 100);
-          const modelStatus =
-            read.status === "complete" && read.totalCalendarCount > projectedCalendars.length
-              ? "truncated"
-              : read.status;
+          const projectedCalendars =
+            turn.authority.audience === "group" || scope !== "all" ? read.calendars : [];
           return {
-            status: modelStatus,
+            status: read.status,
             calendars: projectedCalendars.map((calendar) => ({
               calendarRef: calendarRefFor(calendar.calendarId),
               label: labels.get(calendar.calendarId) ?? null,
@@ -2629,6 +2639,7 @@ export class Florence {
               eventCount: calendar.eventCount,
             })),
             totalCalendarCount: read.totalCalendarCount,
+            calendarCoverage: calendarWindowCoverage(read),
             totalEventCount: read.totalEventCount,
             nextCursor: read.nextCursor,
             events: read.events.map((event) => {
@@ -2780,9 +2791,9 @@ export class Florence {
           bytes: read.bytes,
         };
       },
-      searchGmail: async ({ query, after, before, limit }) => {
+      searchGmail: async ({ query, after, before, limit, cursor }) => {
         if (!this.#google || !activeGoogleConnection || turn.authority.audience !== "private") {
-          return { status: "complete", sources: [] };
+          return { status: "complete", complete: true, sources: [], nextCursor: null };
         }
         const evidence = await this.#google.searchGmail({
           householdId: turn.authority.householdId,
@@ -2792,11 +2803,17 @@ export class Florence {
           ...(after === null ? {} : { after }),
           ...(before === null ? {} : { before }),
           limit,
+          ...(cursor === null ? {} : { cursor }),
         });
         const sources = evidence.messages.map((message) =>
           indexConversationalGmailMessage(message, activeGoogleConnection.connectionId),
         );
-        return { status: evidence.status, sources };
+        return {
+          status: evidence.status,
+          complete: evidence.complete,
+          sources,
+          nextCursor: evidence.nextCursor,
+        };
       },
     };
     return {
@@ -4429,14 +4446,14 @@ export class Florence {
           credentials: familyWorkFamilyCalendarCredentials,
           ...input,
         });
-      const listFamilyWorkCalendars = async (): Promise<FlorenceCalendarCatalogRead> => {
+      const readFamilyWorkCalendarCatalogSnapshot = async (): Promise<FlorenceCalendarCatalogRead> => {
         if (!google) {
-          return { status: "unavailable", calendars: [], totalCalendarCount: 0 };
+          return { status: "unavailable", calendars: [], totalCalendarCount: 0, nextCursor: null };
         }
         if (work.visibility === "household") {
           const calendarId = familyWorkHousehold.familyCalendarId;
           if (!calendarId || familyWorkFamilyCalendarCredentials.length === 0) {
-            return { status: "unavailable", calendars: [], totalCalendarCount: 0 };
+            return { status: "unavailable", calendars: [], totalCalendarCount: 0, nextCursor: null };
           }
           const { read } = await readFamilyWorkExactCalendarCatalog(calendarId);
           return {
@@ -4450,10 +4467,11 @@ export class Florence {
               eventCoverage: calendar.eventCoverage,
             })),
             totalCalendarCount: read.totalCalendarCount,
+            nextCursor: null,
           };
         }
         if (!familyWorkCalendarConnection || !familyWorkGoogleAdultId) {
-          return { status: "unavailable", calendars: [], totalCalendarCount: 0 };
+          return { status: "unavailable", calendars: [], totalCalendarCount: 0, nextCursor: null };
         }
         const personalRead = await google.readPersonalCalendarCatalog({
           householdId: work.household.householdId,
@@ -4476,7 +4494,7 @@ export class Florence {
         return {
           status,
           calendars: [
-            ...personalRead.calendars.slice(0, 99).map((calendar) => ({
+            ...personalRead.calendars.map((calendar) => ({
               calendarRef: familyWorkCalendarRef(calendar.calendarId),
               label: calendar.label ?? (calendar.primary ? "Primary calendar" : "Calendar"),
               timeZone: calendar.timeZone,
@@ -4485,7 +4503,7 @@ export class Florence {
               eventCoverage: calendar.eventCoverage,
             })),
             ...(familyRead
-              ? familyRead.calendars.slice(0, 1).map((calendar) => ({
+              ? familyRead.calendars.map((calendar) => ({
                   calendarRef: familyWorkCalendarRef(calendar.calendarId),
                   label:
                     familyWorkHousehold.familyCalendarLabel ?? familyWorkHousehold.name ?? "Family Calendar",
@@ -4497,6 +4515,56 @@ export class Florence {
               : []),
           ],
           totalCalendarCount: personalRead.totalCalendarCount + (familyRead?.totalCalendarCount ?? 0),
+          nextCursor: null,
+        };
+      };
+      let familyWorkCalendarCatalogSnapshot: ReturnType<typeof readFamilyWorkCalendarCatalogSnapshot> | null =
+        null;
+      const familyWorkCalendarCatalogCursorIdentity =
+        familyWorkCalendarConnection?.connectionId ??
+        familyWorkFamilyCalendarCredentials[0]?.connectionId ??
+        "unavailable";
+      const listFamilyWorkCalendars = async ({
+        cursor,
+      }: {
+        cursor: string | null;
+      }): Promise<FlorenceCalendarCatalogRead> => {
+        const decodedCursor =
+          cursor === null
+            ? null
+            : durableCalendarCatalogCursor({
+                cursor,
+                workId: work.workId,
+                connectionIdentity: familyWorkCalendarCatalogCursorIdentity,
+              });
+        const offset = decodedCursor?.offset ?? 0;
+        familyWorkCalendarCatalogSnapshot ??= readFamilyWorkCalendarCatalogSnapshot();
+        let snapshot: FlorenceCalendarCatalogRead;
+        try {
+          snapshot = await familyWorkCalendarCatalogSnapshot;
+        } catch (error) {
+          familyWorkCalendarCatalogSnapshot = null;
+          throw error;
+        }
+        const snapshotDigest = calendarCatalogSnapshotDigest(snapshot);
+        if (decodedCursor && decodedCursor.snapshotDigest !== snapshotDigest) {
+          throw new Error("The durable Calendar catalog cursor is stale because the catalog changed");
+        }
+        const page = byteBoundedCalendarCatalogPage(snapshot.calendars, snapshot.totalCalendarCount, offset);
+        const nextCursor =
+          page.nextOffset < snapshot.calendars.length
+            ? durableCalendarCatalogCursorFor({
+                workId: work.workId,
+                connectionIdentity: familyWorkCalendarCatalogCursorIdentity,
+                snapshotDigest,
+                offset: page.nextOffset,
+              })
+            : null;
+        return {
+          status: nextCursor === null ? snapshot.status : "truncated",
+          calendars: page.calendars,
+          totalCalendarCount: snapshot.totalCalendarCount,
+          nextCursor,
         };
       };
       const readFamilyWorkCalendarWindow = async (input: {
@@ -4508,40 +4576,19 @@ export class Florence {
         calendarRefs: readonly string[];
       }): Promise<FlorenceCalendarWindowRead> => {
         if (!google) {
-          return {
-            status: "unavailable",
-            calendars: [],
-            totalCalendarCount: 0,
-            events: [],
-            totalEventCount: 0,
-            nextCursor: null,
-          };
+          return unavailableCalendarWindowRead();
         }
         let read: GooglePersonalCalendarWindowRead;
         if (work.visibility === "household") {
           const calendarId = familyWorkHousehold.familyCalendarId;
           if (!calendarId || familyWorkFamilyCalendarCredentials.length === 0) {
-            return {
-              status: "unavailable",
-              calendars: [],
-              totalCalendarCount: 0,
-              events: [],
-              totalEventCount: 0,
-              nextCursor: null,
-            };
+            return unavailableCalendarWindowRead();
           }
           if (
             input.scope === "selected" &&
             (input.calendarRefs.length !== 1 || input.calendarRefs[0] !== familyWorkCalendarRef(calendarId))
           ) {
-            return {
-              status: "unavailable",
-              calendars: [],
-              totalCalendarCount: 0,
-              events: [],
-              totalEventCount: 0,
-              nextCursor: null,
-            };
+            return unavailableCalendarWindowRead();
           }
           read = (
             await readFamilyWorkExactCalendarWindow({
@@ -4554,14 +4601,7 @@ export class Florence {
           ).read;
         } else {
           if (!familyWorkCalendarConnection || !familyWorkGoogleAdultId) {
-            return {
-              status: "unavailable",
-              calendars: [],
-              totalCalendarCount: 0,
-              events: [],
-              totalEventCount: 0,
-              nextCursor: null,
-            };
+            return unavailableCalendarWindowRead();
           }
           const familyCalendarId = familyWorkHousehold.familyCalendarId;
           const selectedFamilyCalendar =
@@ -4571,14 +4611,7 @@ export class Florence {
             input.calendarRefs[0] === familyWorkCalendarRef(familyCalendarId);
           if (selectedFamilyCalendar) {
             if (familyWorkFamilyCalendarCredentials.length === 0) {
-              return {
-                status: "unavailable",
-                calendars: [],
-                totalCalendarCount: 0,
-                events: [],
-                totalEventCount: 0,
-                nextCursor: null,
-              };
+              return unavailableCalendarWindowRead();
             }
             read = (
               await readFamilyWorkExactCalendarWindow({
@@ -4610,27 +4643,13 @@ export class Florence {
                 return calendarId ? [calendarId] : [];
               });
               if (resolved.length !== input.calendarRefs.length) {
-                return {
-                  status: "unavailable",
-                  calendars: [],
-                  totalCalendarCount: 0,
-                  events: [],
-                  totalEventCount: 0,
-                  nextCursor: null,
-                };
+                return unavailableCalendarWindowRead();
               }
               calendarIds = resolved;
             } else if (input.scope === "primary") {
               const primary = (await catalog()).calendars.find((calendar) => calendar.primary);
               if (!primary) {
-                return {
-                  status: "unavailable",
-                  calendars: [],
-                  totalCalendarCount: 0,
-                  events: [],
-                  totalEventCount: 0,
-                  nextCursor: null,
-                };
+                return unavailableCalendarWindowRead();
               }
               calendarIds = [primary.calendarId];
             }
@@ -4655,13 +4674,10 @@ export class Florence {
               : calendar.label,
           ]),
         );
-        const projectedCalendars = read.calendars.slice(0, 100);
-        const modelStatus =
-          read.status === "complete" && read.totalCalendarCount > projectedCalendars.length
-            ? "truncated"
-            : read.status;
+        const projectedCalendars =
+          work.visibility === "household" || input.scope !== "all" ? read.calendars : [];
         return {
-          status: modelStatus,
+          status: read.status,
           calendars: projectedCalendars.map((calendar) => ({
             calendarRef: familyWorkCalendarRef(calendar.calendarId),
             label: labels.get(calendar.calendarId) ?? null,
@@ -4679,6 +4695,7 @@ export class Florence {
             eventCount: calendar.eventCount,
           })),
           totalCalendarCount: read.totalCalendarCount,
+          calendarCoverage: calendarWindowCoverage(read),
           totalEventCount: read.totalEventCount,
           nextCursor: read.nextCursor,
           events: read.events.map((event) => {
@@ -5381,7 +5398,7 @@ export class Florence {
             : {}),
           ...(google && familyWorkGmailConnection && familyWorkExecutionAdultId
             ? {
-                searchGmail: async ({ query, after, before, limit }) => {
+                searchGmail: async ({ query, after, before, limit, cursor }) => {
                   const evidence = await google.searchGmail({
                     householdId: work.household.householdId,
                     ownerAdultId: familyWorkExecutionAdultId,
@@ -5390,11 +5407,17 @@ export class Florence {
                     ...(after === null ? {} : { after }),
                     ...(before === null ? {} : { before }),
                     limit,
+                    ...(cursor === null ? {} : { cursor }),
                   });
                   const sources = evidence.messages.map((message) =>
                     indexFamilyWorkGmailMessage(message, familyWorkGmailConnection.connectionId),
                   );
-                  return { status: evidence.status, sources };
+                  return {
+                    status: evidence.status,
+                    complete: evidence.complete,
+                    sources,
+                    nextCursor: evidence.nextCursor,
+                  };
                 },
                 readGmailAttachment: async ({ sourceId, attachment }) => {
                   const indexed = familyWorkGmailAttachmentIndex.get(
@@ -8030,6 +8053,167 @@ type RankedMemorySource = Readonly<{
   source: FlorenceSource;
   score: number;
 }>;
+
+function calendarCatalogSnapshotDigest(snapshot: FlorenceCalendarCatalogRead): string {
+  return sha256(
+    JSON.stringify({
+      status: snapshot.status,
+      calendars: snapshot.calendars,
+      totalCalendarCount: snapshot.totalCalendarCount,
+    }),
+  );
+}
+
+function calendarWindowCoverage(
+  read: GooglePersonalCalendarWindowRead,
+): FlorenceCalendarWindowRead["calendarCoverage"] {
+  let completeCalendarCount = 0;
+  let missingCalendarCount = 0;
+  let unavailableCalendarCount = 0;
+  for (const calendar of read.calendars) {
+    if (calendar.status === "complete") completeCalendarCount += 1;
+    else if (calendar.status === "missing") missingCalendarCount += 1;
+    else unavailableCalendarCount += 1;
+  }
+  const observedCalendarCount = read.calendars.length;
+  return {
+    complete:
+      read.status !== "partial" &&
+      read.status !== "unavailable" &&
+      observedCalendarCount === read.totalCalendarCount &&
+      completeCalendarCount === read.totalCalendarCount,
+    observedCalendarCount,
+    completeCalendarCount,
+    missingCalendarCount,
+    unavailableCalendarCount,
+    digest: createHash("sha256")
+      .update(
+        JSON.stringify({
+          totalCalendarCount: read.totalCalendarCount,
+          calendars: read.calendars.map((calendar) => ({
+            calendarId: calendar.calendarId,
+            status: calendar.status,
+            eventCount: calendar.eventCount,
+          })),
+        }),
+      )
+      .digest("hex"),
+  };
+}
+
+function unavailableCalendarWindowRead(): FlorenceCalendarWindowRead {
+  return {
+    status: "unavailable",
+    calendars: [],
+    totalCalendarCount: 0,
+    calendarCoverage: {
+      complete: false,
+      observedCalendarCount: 0,
+      completeCalendarCount: 0,
+      missingCalendarCount: 0,
+      unavailableCalendarCount: 0,
+      digest: createHash("sha256").update("unavailable-calendar-window").digest("hex"),
+    },
+    events: [],
+    totalEventCount: 0,
+    nextCursor: null,
+  };
+}
+
+function durableCalendarCatalogCursorFor(input: {
+  workId: string;
+  connectionIdentity: string;
+  snapshotDigest: string;
+  offset: number;
+}): string {
+  if (
+    !/^[0-9a-f]{64}$/.test(input.snapshotDigest) ||
+    !Number.isSafeInteger(input.offset) ||
+    input.offset < 1
+  ) {
+    throw new Error("The durable Calendar catalog cursor payload is invalid");
+  }
+  const payload = `calendar_catalog_v1_${input.offset.toString(36)}_${input.snapshotDigest}`;
+  const signature = createHmac("sha256", input.connectionIdentity)
+    .update(`${payload}\0${input.workId}`)
+    .digest("hex");
+  return `${payload}_${signature}`;
+}
+
+function durableCalendarCatalogCursor(input: {
+  cursor: string;
+  workId: string;
+  connectionIdentity: string;
+}): Readonly<{ offset: number; snapshotDigest: string }> {
+  const match = /^calendar_catalog_v1_([0-9a-z]+)_([0-9a-f]{64})_([0-9a-f]{64})$/.exec(input.cursor);
+  if (!match) {
+    throw new Error("The durable Calendar catalog cursor is invalid or belongs to another work item");
+  }
+  const [, encodedOffset, snapshotDigest, signature] = match;
+  const offset = Number.parseInt(encodedOffset ?? "", 36);
+  if (
+    !encodedOffset ||
+    !snapshotDigest ||
+    !signature ||
+    !Number.isSafeInteger(offset) ||
+    offset < 1 ||
+    offset.toString(36) !== encodedOffset
+  ) {
+    throw new Error("The durable Calendar catalog cursor payload is invalid");
+  }
+  const payload = `calendar_catalog_v1_${encodedOffset}_${snapshotDigest}`;
+  const expectedSignature = createHmac("sha256", input.connectionIdentity)
+    .update(`${payload}\0${input.workId}`)
+    .digest("hex");
+  if (!timingSafeEqual(Buffer.from(signature, "hex"), Buffer.from(expectedSignature, "hex"))) {
+    throw new Error("The durable Calendar catalog cursor is invalid or belongs to another work item");
+  }
+  return { offset, snapshotDigest };
+}
+
+function byteBoundedCalendarCatalogPage(
+  calendars: FlorenceCalendarCatalogRead["calendars"],
+  totalCalendarCount: number,
+  offset: number,
+): Readonly<{
+  calendars: FlorenceCalendarCatalogRead["calendars"];
+  nextOffset: number;
+}> {
+  if (
+    !Number.isSafeInteger(totalCalendarCount) ||
+    totalCalendarCount < calendars.length ||
+    !Number.isSafeInteger(offset) ||
+    offset < 0 ||
+    offset > calendars.length
+  ) {
+    throw new Error("The Calendar catalog cursor offset is out of range");
+  }
+  const page: FlorenceCalendarCatalogRead["calendars"][number][] = [];
+  let serializedBytes = Buffer.byteLength(
+    JSON.stringify({
+      status: "truncated",
+      calendars: [],
+      totalCalendarCount,
+      nextCursor: "x".repeat(CALENDAR_CATALOG_CURSOR_MAX_LENGTH),
+    }),
+    "utf8",
+  );
+  for (let index = offset; index < calendars.length; index += 1) {
+    const calendar = calendars[index];
+    if (!calendar) break;
+    const separatorBytes = page.length > 0 ? 1 : 0;
+    const calendarBytes = Buffer.byteLength(JSON.stringify(calendar), "utf8");
+    if (serializedBytes + separatorBytes + calendarBytes > CALENDAR_CATALOG_PAGE_BYTE_BUDGET) {
+      if (page.length === 0) {
+        throw new Error("One Calendar catalog entry exceeds the model page byte budget");
+      }
+      break;
+    }
+    page.push(calendar);
+    serializedBytes += separatorBytes + calendarBytes;
+  }
+  return { calendars: page, nextOffset: offset + page.length };
+}
 
 const MEMORY_FUNCTION_WORDS = new Set([
   "a",

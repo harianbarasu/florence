@@ -316,6 +316,14 @@ export function completeCalendarRead() {
     status: "complete" as const,
     calendars: [],
     totalCalendarCount: 0,
+    calendarCoverage: {
+      complete: true,
+      observedCalendarCount: 0,
+      completeCalendarCount: 0,
+      missingCalendarCount: 0,
+      unavailableCalendarCount: 0,
+      digest: "0".repeat(64),
+    },
     events: [],
     totalEventCount: 0,
     nextCursor: null,
@@ -547,7 +555,12 @@ export function inertReads() {
       return null;
     },
     async searchGmail() {
-      return { status: "complete" as const, sources: [] };
+      return {
+        status: "complete" as const,
+        complete: true,
+        sources: [],
+        nextCursor: null,
+      };
     },
     async readCalendarWindow() {
       return completeCalendarRead();

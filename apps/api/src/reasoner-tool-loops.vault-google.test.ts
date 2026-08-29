@@ -357,7 +357,24 @@ describe("Florence reasoner capability cutover", () => {
       {
         status: "completed",
         output_parsed: null,
-        output: [functionCall("durable-gmail-search", "search_gmail", { query: "school form", limit: 3 })],
+        output: [
+          functionCall("durable-gmail-search-1", "search_gmail", {
+            query: "school form",
+            limit: 3,
+            cursor: null,
+          }),
+        ],
+      },
+      {
+        status: "completed",
+        output_parsed: null,
+        output: [
+          functionCall("durable-gmail-search-2", "search_gmail", {
+            query: "school form",
+            limit: 3,
+            cursor: "gmail-page-2",
+          }),
+        ],
       },
       {
         status: "completed",
@@ -391,6 +408,7 @@ describe("Florence reasoner capability cutover", () => {
       },
     } as never);
     let attachmentReads = 0;
+    const gmailSearchCursors: Array<string | null> = [];
 
     const result = await reasoner.continueFamilyWork(
       {
@@ -477,8 +495,22 @@ describe("Florence reasoner capability cutover", () => {
             supports: [],
           };
         },
-        async searchGmail() {
-          return { status: "complete", sources: [gmail] };
+        async searchGmail(input) {
+          gmailSearchCursors.push(input.cursor);
+          if (input.cursor === null) {
+            return {
+              status: "truncated" as const,
+              complete: false,
+              sources: [],
+              nextCursor: "gmail-page-2",
+            };
+          }
+          return {
+            status: "complete" as const,
+            complete: true,
+            sources: [gmail],
+            nextCursor: null,
+          };
         },
         async readGmailAttachment(input) {
           attachmentReads += 1;
@@ -493,6 +525,7 @@ describe("Florence reasoner capability cutover", () => {
       },
     );
 
+    expect(gmailSearchCursors).toEqual([null, "gmail-page-2"]);
     expect(result).toMatchObject({
       kind: "terminal",
       outcome: "succeeded",
@@ -638,6 +671,14 @@ describe("Florence reasoner capability cutover", () => {
     const firstRead = {
       status: "truncated" as const,
       calendars: calendarCoverage,
+      calendarCoverage: {
+        complete: true,
+        observedCalendarCount: 1,
+        completeCalendarCount: 1,
+        missingCalendarCount: 0,
+        unavailableCalendarCount: 0,
+        digest: "3".repeat(64),
+      },
       events: calendarEvents.slice(0, 50),
       totalCalendarCount: 1,
       totalEventCount: 73,
@@ -646,6 +687,7 @@ describe("Florence reasoner capability cutover", () => {
     const secondRead = {
       status: "complete" as const,
       calendars: calendarCoverage,
+      calendarCoverage: firstRead.calendarCoverage,
       events: calendarEvents.slice(50),
       totalCalendarCount: 1,
       totalEventCount: 73,
@@ -744,6 +786,7 @@ describe("Florence reasoner capability cutover", () => {
             },
           ],
           totalCalendarCount: 1,
+          nextCursor: null,
         };
       },
       async readCalendarWindow(input) {
@@ -867,6 +910,14 @@ describe("Florence reasoner capability cutover", () => {
               },
             ],
             totalCalendarCount: 1,
+            calendarCoverage: {
+              complete: false,
+              observedCalendarCount: 1,
+              completeCalendarCount: 1,
+              missingCalendarCount: 0,
+              unavailableCalendarCount: 0,
+              digest: "4".repeat(64),
+            },
             events: [calendarEvent],
             totalEventCount: 73,
             nextCursor: "calendar-page-2",
@@ -879,7 +930,7 @@ describe("Florence reasoner capability cutover", () => {
     });
   });
 
-  test("truncated Calendar metadata remains usable for a focused read", async () => {
+  test("complete Calendar coverage remains bounded for an all-calendar read", async () => {
     const requests: Record<string, unknown>[] = [];
     const responses = [
       {
@@ -912,29 +963,27 @@ describe("Florence reasoner capability cutover", () => {
         },
       },
     } as never);
-    const calendars = Array.from({ length: 100 }, (_, index) => ({
-      calendarRef: `calendar-${index}`,
-      label: `Calendar ${index + 1}`,
-      timeZone: "America/Los_Angeles",
-      primary: index === 0,
-      accessRole: "owner" as const,
-      status: "complete" as const,
-      eventCount: index === 0 ? 1 : 0,
-    }));
-
     const result = await reasoner.decide(foregroundInput(), {
       ...inertReads(),
       async readCalendarWindow() {
         return {
-          status: "truncated",
-          calendars,
+          status: "complete",
+          calendars: [],
           totalCalendarCount: 101,
+          calendarCoverage: {
+            complete: true,
+            observedCalendarCount: 101,
+            completeCalendarCount: 101,
+            missingCalendarCount: 0,
+            unavailableCalendarCount: 0,
+            digest: "5".repeat(64),
+          },
           events: [
             {
               eventRef: "event-wanted",
               providerUpdatedAt: "2026-08-27T19:00:00.000Z",
-              calendarRef: calendars[0]?.calendarRef ?? "missing-calendar",
-              calendarLabel: calendars[0]?.label ?? "Calendar",
+              calendarRef: "calendar-0",
+              calendarLabel: "Calendar 1",
               title: "The event I wanted",
               location: null,
               status: "confirmed",
@@ -953,8 +1002,10 @@ describe("Florence reasoner capability cutover", () => {
 
     expect(result.conversation.bubbles[0]?.text).toContain("found the event");
     expect(functionOutputEnvelopes(requests[1])[0]?.output).toMatchObject({
-      status: "truncated",
+      status: "complete",
       totalCalendarCount: 101,
+      calendars: [],
+      calendarCoverage: { complete: true, observedCalendarCount: 101 },
       nextCursor: null,
     });
   });

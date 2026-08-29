@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
 
 /**
  * Google Workspace REST adapter.
@@ -31,6 +31,9 @@ const MAX_GMAIL_DRAFT_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 const MAX_GMAIL_DRAFT_TOTAL_ATTACHMENT_BYTES = 24 * 1024 * 1024;
 const MAX_GMAIL_DRAFT_MESSAGE_RESULT_BYTES = 140_000;
 const MAX_DRIVE_NATIVE_EXPORT_BYTES = 10 * 1024 * 1024;
+const GMAIL_SEARCH_CURSOR_KIND = "gmail_workspace_search_v1" as const;
+const MAX_GMAIL_SEARCH_CURSOR_LENGTH = 32_768;
+const MAX_GMAIL_SEARCH_PAGE_TOKEN_LENGTH = 16_384;
 
 export type GoogleSheetScalar = string | number | boolean | null;
 
@@ -87,7 +90,7 @@ export type GoogleWorkspaceGmailThread = Readonly<{
 export type GoogleWorkspaceOperation =
   | Readonly<{ operation: "gmail_get"; messageId: string }>
   | Readonly<{ operation: "gmail_thread_get"; threadId: string }>
-  | Readonly<{ operation: "gmail_search"; query: string; limit: number }>
+  | Readonly<{ operation: "gmail_search"; query: string; limit: number; cursor?: string }>
   | Readonly<{
       operation: "gmail_send";
       to: readonly string[];
@@ -284,6 +287,8 @@ export class GoogleWorkspaceError extends Error {
 type ExecutionContext = Readonly<{
   fetch: typeof fetch;
   accessToken: string;
+  cursorKey: Buffer;
+  cursorScope: string;
   signal?: AbortSignal;
 }>;
 
@@ -293,13 +298,28 @@ export async function executeGoogleWorkspaceOperation(input: {
   fetch: typeof fetch;
   accessToken: string;
   operation: GoogleWorkspaceOperation;
+  /** Stable secret used to authenticate opaque continuation cursors. */
+  cursorKey?: Uint8Array;
+  /** Stable authority binding for continuation cursors. */
+  cursorScope?: string;
   signal?: AbortSignal;
 }): Promise<GoogleWorkspaceResult> {
   if (typeof input.fetch !== "function") invalid("Google Workspace fetch implementation is required");
   const accessToken = bounded(input.accessToken, "Google access token", 16_384);
+  const cursorKey =
+    input.cursorKey === undefined
+      ? createHash("sha256").update("florence-google-workspace-cursor\0").update(accessToken).digest()
+      : Buffer.from(input.cursorKey);
+  if (cursorKey.byteLength !== 32) invalid("Google Workspace cursor key must contain exactly 32 bytes");
+  const cursorScope =
+    input.cursorScope === undefined
+      ? createHash("sha256").update("florence-google-workspace-scope\0").update(accessToken).digest("hex")
+      : bounded(input.cursorScope, "Google Workspace cursor scope", 1_024);
   const context: ExecutionContext = {
     fetch: input.fetch,
     accessToken,
+    cursorKey,
+    cursorScope,
     ...(input.signal === undefined ? {} : { signal: input.signal }),
   };
   const operation = input.operation;
@@ -310,7 +330,10 @@ export async function executeGoogleWorkspaceOperation(input: {
     case "gmail_thread_get":
       return envelope(operation.operation, await gmailThreadGet(context, operation.threadId));
     case "gmail_search":
-      return envelope(operation.operation, await gmailSearch(context, operation.query, operation.limit));
+      return envelope(
+        operation.operation,
+        await gmailSearch(context, operation.query, operation.limit, operation.cursor),
+      );
     case "gmail_send":
       return envelope(operation.operation, await gmailSend(context, operation));
     case "gmail_reply":
@@ -420,16 +443,19 @@ async function gmailSearch(
   context: ExecutionContext,
   queryInput: string,
   limitInput: number,
-): Promise<{ readonly messages: GoogleWorkspaceJsonValue }> {
+  cursorInput: string | undefined,
+): Promise<{ readonly [key: string]: GoogleWorkspaceJsonValue }> {
   const query = boundedAllowEmpty(queryInput, "Gmail search query", 2_000);
   const limit = boundedInteger(limitInput, "Gmail search limit", 1, 100);
-  const listed = await paginatedRecords(context, {
-    service: "Gmail",
-    url: `${GMAIL_API}/messages`,
-    itemField: "messages",
-    limit,
-    params: { q: query, maxResults: String(Math.min(limit, 100)) },
-  });
+  const queryDigest = workspaceGmailSearchQueryDigest(context.cursorScope, query);
+  const pageToken =
+    cursorInput === undefined ? null : workspaceGmailSearchCursorPageToken(context, cursorInput, queryDigest);
+  const params = new URLSearchParams({ q: query, maxResults: String(limit) });
+  if (pageToken !== null) params.set("pageToken", pageToken);
+  const page = await googleJson(context, "Gmail", `${GMAIL_API}/messages?${params}`);
+  const listed = recordArray(page.messages, "Gmail messages");
+  if (listed.length > limit) invalidResponse("Gmail exceeded the requested search page size", "Gmail");
+  const nextPageToken = workspaceGmailNextPageToken(page, pageToken);
   const projected: GoogleWorkspaceJsonValue[] = [];
   for (let offset = 0; offset < listed.length; offset += 10) {
     const batch = listed.slice(offset, offset + 10);
@@ -458,7 +484,14 @@ async function gmailSearch(
     );
     projected.push(...messages);
   }
-  return { messages: projected };
+  const complete = nextPageToken === null;
+  return {
+    status: complete ? "complete" : "truncated",
+    complete,
+    messages: projected,
+    nextCursor:
+      nextPageToken === null ? null : workspaceGmailSearchCursor(context, queryDigest, nextPageToken),
+  };
 }
 
 async function gmailSend(
@@ -2682,6 +2715,106 @@ function taskDue(value: string): string {
   if (!Number.isFinite(parsed.getTime())) invalid("Google Task due date must be ISO 8601");
   const day = parsed.toISOString().slice(0, 10);
   return `${day}T00:00:00.000Z`;
+}
+
+function workspaceGmailSearchQueryDigest(cursorScope: string, query: string): string {
+  return createHash("sha256")
+    .update(
+      JSON.stringify({
+        kind: GMAIL_SEARCH_CURSOR_KIND,
+        cursorScope,
+        query,
+      }),
+      "utf8",
+    )
+    .digest("hex");
+}
+
+function workspaceGmailSearchCursor(
+  context: ExecutionContext,
+  queryDigest: string,
+  pageTokenInput: string,
+): string {
+  const pageToken = workspaceGmailPageToken(pageTokenInput, "Gmail search page token");
+  const nonce = randomBytes(12);
+  const cipher = createCipheriv("aes-256-gcm", context.cursorKey, nonce);
+  cipher.setAAD(Buffer.from(workspaceGmailSearchCursorAad(queryDigest)));
+  const ciphertext = Buffer.concat([
+    cipher.update(JSON.stringify({ kind: GMAIL_SEARCH_CURSOR_KIND, queryDigest, pageToken }), "utf8"),
+    cipher.final(),
+  ]);
+  return [
+    "gw1",
+    nonce.toString("base64url"),
+    ciphertext.toString("base64url"),
+    cipher.getAuthTag().toString("base64url"),
+  ].join(".");
+}
+
+function workspaceGmailSearchCursorPageToken(
+  context: ExecutionContext,
+  cursorInput: string,
+  queryDigest: string,
+): string {
+  let payload: unknown;
+  try {
+    const cursor = bounded(cursorInput, "Gmail search cursor", MAX_GMAIL_SEARCH_CURSOR_LENGTH);
+    const [version, nonce, ciphertext, tag, extra] = cursor.split(".");
+    if (version !== "gw1" || !nonce || !ciphertext || !tag || extra) {
+      invalid("Gmail search cursor is invalid");
+    }
+    const decipher = createDecipheriv("aes-256-gcm", context.cursorKey, Buffer.from(nonce, "base64url"));
+    decipher.setAAD(Buffer.from(workspaceGmailSearchCursorAad(queryDigest)));
+    decipher.setAuthTag(Buffer.from(tag, "base64url"));
+    payload = JSON.parse(
+      Buffer.concat([decipher.update(Buffer.from(ciphertext, "base64url")), decipher.final()]).toString(
+        "utf8",
+      ),
+    );
+  } catch {
+    invalid("Gmail search cursor is invalid or belongs to another query");
+  }
+  if (!isRecord(payload)) invalid("Gmail search cursor payload is invalid");
+  if (payload.kind !== GMAIL_SEARCH_CURSOR_KIND) {
+    invalid("Unsupported Gmail search cursor version");
+  }
+  if (payload.queryDigest !== queryDigest) {
+    invalid("Gmail search cursor belongs to another query");
+  }
+  return workspaceGmailPageToken(payload.pageToken, "Gmail search cursor page token");
+}
+
+function workspaceGmailSearchCursorAad(queryDigest: string): string {
+  if (!/^[0-9a-f]{64}$/.test(queryDigest)) invalid("Gmail search query digest is invalid");
+  return `florence-google-workspace-gmail-search-v1\0${queryDigest}`;
+}
+
+function workspaceGmailNextPageToken(page: JsonRecord, currentPageToken: string | null): string | null {
+  const value = optionalString(page.nextPageToken);
+  if (value === null) return null;
+  let nextPageToken: string;
+  try {
+    nextPageToken = workspaceGmailPageToken(value, "Gmail search page token");
+  } catch {
+    invalidResponse("Gmail returned an invalid search page token", "Gmail");
+  }
+  if (nextPageToken === currentPageToken) {
+    invalidResponse("Gmail repeated the search page token", "Gmail");
+  }
+  return nextPageToken;
+}
+
+function workspaceGmailPageToken(value: unknown, label: string): string {
+  if (
+    typeof value !== "string" ||
+    !value ||
+    value !== value.trim() ||
+    value.length > MAX_GMAIL_SEARCH_PAGE_TOKEN_LENGTH ||
+    hasUnsupportedControlCharacter(value)
+  ) {
+    invalid(`${label} is invalid`);
+  }
+  return value;
 }
 
 async function paginatedRecords(

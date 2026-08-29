@@ -15,6 +15,7 @@ import {
   type GoogleFamilyCalendarProvisioningResult,
   type GoogleFamilyCalendarRenameResult,
   GoogleFamilyCalendarTransientError,
+  type GooglePersonalCalendarCatalogTarget,
   type GooglePersonalCalendarWindowEvent,
   type GoogleWorkspaceOperation,
   type GoogleWorkspaceResult,
@@ -38,6 +39,7 @@ import { EnrollmentCodes } from "./enrollment.js";
 import { Florence } from "./florence.js";
 import { createLinqIngress } from "./linq-ingress.js";
 import {
+  type FlorenceCalendarCatalogRead,
   type FlorenceDecision,
   type FlorenceReadTools,
   FlorenceReasoner,
@@ -465,6 +467,7 @@ type HarnessState = {
   calendarExecutions: CalendarExecutionInput[];
   calendarReads: CalendarReadInput[];
   personalCalendarReads: PersonalCalendarReadInput[];
+  personalCalendarCatalogExtras: GooglePersonalCalendarCatalogTarget[];
   calendarEvents: Map<string, FakeCalendarEvent>;
   uncertainCalendarCreateTitle: string | null;
   timeline: string[];
@@ -535,6 +538,17 @@ type HarnessState = {
   unrelatedAccountEmailPending: boolean;
   unrelatedAccountEmailDelivered: boolean;
 };
+
+function largePersonalCalendarCatalog(): GooglePersonalCalendarCatalogTarget[] {
+  return Array.from({ length: 137 }, (_, index) => ({
+    calendarId: `extra-calendar-${String(index + 1).padStart(3, "0")}`,
+    label: `Long named Calendar ${String(index + 1).padStart(3, "0")} ${"detail ".repeat(55)}`.trim(),
+    timeZone: "America/Los_Angeles",
+    accessRole: "reader" as const,
+    primary: false,
+    eventCoverage: "readable" as const,
+  }));
+}
 
 const release = TEST_DATABASE_URL ? describe : describe.skip;
 
@@ -4013,7 +4027,7 @@ release("Florence parent journeys", () => {
             details: expect.stringContaining(runIndex === 0 ? "keep it mild" : "black beans"),
           });
 
-          const catalog = await reads.listCalendars?.();
+          const catalog = await reads.listCalendars?.({ cursor: null });
           const familyCalendar = catalog?.calendars.find(
             (calendar) => calendar.primary === null && calendar.accessRole === null,
           );
@@ -4236,6 +4250,9 @@ release("Florence parent journeys", () => {
     let privateSourceRead = false;
     let selectedFamilyCalendarRead = false;
     let providerReceiptObserved = false;
+    let durableCatalogPages = 0;
+    let durableCatalogCursor: string | null = null;
+    const durableCatalogClaims = new Set<string>();
     const harness = await createHarness(
       async (input) =>
         input.currentMessage.text === request
@@ -4261,6 +4278,7 @@ release("Florence parent journeys", () => {
             const gmail = await reads.searchGmail?.({
               query: "Maya school form needs signature",
               limit: 10,
+              cursor: null,
             });
             privateSourceRead =
               gmail?.status === "complete" &&
@@ -4272,11 +4290,32 @@ release("Florence parent journeys", () => {
               throw new Error("The private durable task could not read its initiating adult's Gmail");
             }
 
-            const catalog = await reads.listCalendars?.();
+            const catalog: FlorenceCalendarCatalogRead | undefined = await reads.listCalendars?.({
+              cursor: durableCatalogCursor,
+            });
+            if (!input.state.claim) throw new Error("The durable Calendar read lost its work claim");
+            durableCatalogClaims.add(input.state.claim.claimId);
+            durableCatalogPages += 1;
+            if (catalog) {
+              expect(Buffer.byteLength(JSON.stringify(catalog), "utf8")).toBeLessThanOrEqual(40_000);
+            }
             const familyCalendar = catalog?.calendars.find(
               (calendar) => calendar.primary === null && calendar.accessRole === null,
             );
-            if (catalog?.status !== "complete" || !familyCalendar) {
+            if (!familyCalendar && catalog?.nextCursor) {
+              durableCatalogCursor = catalog.nextCursor;
+              return {
+                kind: "continue",
+                state: {
+                  ...input.state,
+                  claim: null,
+                  progressRevision: input.state.progressRevision + 1,
+                },
+                progressText: null,
+                nextCheckDelayMs: 0,
+              };
+            }
+            if (!familyCalendar) {
               throw new Error("The private durable task could not resolve the exact Family Calendar");
             }
             const personal = await reads.readCalendarWindow?.({
@@ -4363,6 +4402,7 @@ release("Florence parent journeys", () => {
       },
     );
     await harness.readyHousehold();
+    harness.state.personalCalendarCatalogExtras = largePersonalCalendarCatalog();
 
     const messagesBeforeRequest = harness.linq.messages.length;
     await harness.accept("private", "private-durable-family-calendar", request);
@@ -4371,6 +4411,8 @@ release("Florence parent journeys", () => {
     await harness.drain();
 
     expect(privateSourceRead).toBe(true);
+    expect(durableCatalogPages).toBeGreaterThan(1);
+    expect(durableCatalogClaims.size).toBeGreaterThan(1);
     expect(selectedFamilyCalendarRead).toBe(true);
     expect(providerReceiptObserved).toBe(true);
     expect(
@@ -5266,6 +5308,7 @@ release("Florence parent journeys", () => {
           await reads.searchGmail({
             query: GOOGLE_CITED_REPLY_QUERY,
             limit: 10,
+            cursor: null,
           })
         ).sources;
         if (!source?.text.includes("emergency card")) {
@@ -5281,6 +5324,7 @@ release("Florence parent journeys", () => {
           await reads.searchGmail({
             query: ORDINARY_UNUSED_GMAIL_QUERY,
             limit: 10,
+            cursor: null,
           })
         ).sources;
         if (!source) throw new Error("The ordinary Gmail search returned no evidence");
@@ -7606,6 +7650,94 @@ release("Florence parent journeys", () => {
     );
   }, 90_000);
 
+  test("keeps every private Calendar reachable through byte-bounded catalog pages", async () => {
+    const request = "Find my last long-named calendar.";
+    const reply = "I found the last calendar in your account.";
+    let observedLabels: string[] = [];
+    let selectedLastCalendar = false;
+    const harness = await createHarness(async (input, reads) => {
+      if (input.currentMessage.text !== request) return decision();
+      if (!reads.listCalendars) throw new Error("The private Calendar catalog is unavailable");
+      const labels: string[] = [];
+      const seenCursors = new Set<string>();
+      let cursor: string | null = null;
+      let targetCalendarRef: string | null = null;
+      let pageCount = 0;
+      while (true) {
+        const page = await reads.listCalendars({ cursor });
+        const replay = await reads.listCalendars({ cursor });
+        expect(replay).toEqual(page);
+        expect(Buffer.byteLength(JSON.stringify(page), "utf8")).toBeLessThanOrEqual(40_000);
+        expect(page.totalCalendarCount).toBe(138);
+        pageCount += 1;
+        labels.push(...page.calendars.map((calendar) => calendar.label));
+        targetCalendarRef =
+          page.calendars.find((calendar) => calendar.label.startsWith("Long named Calendar 137"))
+            ?.calendarRef ?? targetCalendarRef;
+        if (page.nextCursor === null) {
+          expect(page.status).toBe("complete");
+          break;
+        }
+        expect(page.status).toBe("truncated");
+        if (seenCursors.has(page.nextCursor)) {
+          throw new Error("The Calendar catalog repeated a continuation cursor");
+        }
+        seenCursors.add(page.nextCursor);
+        cursor = page.nextCursor;
+      }
+      expect(pageCount).toBeGreaterThan(1);
+      expect(new Set(labels).size).toBe(138);
+      if (!targetCalendarRef || !reads.readCalendarWindow) {
+        throw new Error("The final Calendar page did not expose a selectable reference");
+      }
+      const selected = await reads.readCalendarWindow({
+        timeMin: "2026-08-18T07:00:00.000Z",
+        timeMax: "2026-08-19T07:00:00.000Z",
+        pageSize: 50,
+        cursor: null,
+        scope: "selected",
+        calendarRefs: [targetCalendarRef],
+      });
+      selectedLastCalendar =
+        selected.status === "complete" && selected.calendars[0]?.calendarRef === targetCalendarRef;
+      const allCalendars = await reads.readCalendarWindow({
+        timeMin: "2026-08-18T07:00:00.000Z",
+        timeMax: "2026-08-19T07:00:00.000Z",
+        pageSize: 50,
+        cursor: null,
+        scope: "all",
+        calendarRefs: [],
+      });
+      expect(allCalendars.calendars).toEqual([]);
+      expect(allCalendars.totalCalendarCount).toBe(138);
+      expect(allCalendars.calendarCoverage).toMatchObject({
+        complete: true,
+        observedCalendarCount: 138,
+        completeCalendarCount: 138,
+        missingCalendarCount: 0,
+        unavailableCalendarCount: 0,
+      });
+      expect(allCalendars.calendarCoverage.digest).toMatch(/^[a-f0-9]{64}$/);
+      expect(Buffer.byteLength(JSON.stringify(allCalendars), "utf8")).toBeLessThanOrEqual(100_000);
+      observedLabels = labels;
+      return decision({ bubbles: [{ text: reply, delayMs: 0 }] });
+    });
+    await harness.readyHousehold();
+    harness.state.personalCalendarCatalogExtras = largePersonalCalendarCatalog();
+
+    await harness.accept("private", "paged-calendar-catalog", request);
+    await harness.drain();
+
+    expect(observedLabels).toHaveLength(138);
+    expect(observedLabels.some((label) => label.startsWith("Long named Calendar 137"))).toBe(true);
+    expect(selectedLastCalendar).toBe(true);
+    expect(
+      harness.linq.messages.some(
+        (message) => message.providerConversationId === PRIVATE_FOUNDER && message.text === reply,
+      ),
+    ).toBe(true);
+  }, 20_000);
+
   test("keeps private context isolated while both parents can manage shared memory, Calendar, and group repair", async () => {
     const recipeRequest =
       "Save our weeknight sesame noodles recipe for the family: 12 ounces spaghetti, 3 tablespoons soy sauce, 1 tablespoon sesame oil, and 2 teaspoons rice vinegar. Toss while warm.";
@@ -7710,7 +7842,7 @@ release("Florence parent journeys", () => {
         });
       }
       if (text === "What is on all of my calendars tomorrow?") {
-        const catalog = await reads.listCalendars?.();
+        const catalog = await reads.listCalendars?.({ cursor: null });
         if (catalog?.status !== "complete") {
           throw new Error("The private Calendar catalog was unavailable");
         }
@@ -9198,6 +9330,7 @@ async function createHarness(
     calendarExecutions: [],
     calendarReads: [],
     personalCalendarReads: [],
+    personalCalendarCatalogExtras: [],
     calendarEvents: new Map(),
     uncertainCalendarCreateTitle: null,
     timeline: [],
@@ -10862,6 +10995,7 @@ function createGoogle(store: PostgresFlorenceStore, state: HarnessState): Google
       after?: string;
       before?: string;
       limit?: number;
+      cursor?: string;
     }) => {
       await activeCredential(input);
       if (state.linkedGmailMonitorExercise && input.query === "-category:promotions -category:social") {
@@ -10891,6 +11025,8 @@ function createGoogle(store: PostgresFlorenceStore, state: HarnessState): Google
               : `gmail-${input.ownerAdultId}-${recent}`;
       return {
         status: "complete" as const,
+        complete: true,
+        nextCursor: null,
         messages: [
           {
             messageId,
@@ -11186,6 +11322,7 @@ function createGoogle(store: PostgresFlorenceStore, state: HarnessState): Google
           primary: false,
           eventCoverage: "readable" as const,
         },
+        ...state.personalCalendarCatalogExtras,
       ]
         .filter((target) => target.calendarId !== input.excludedFamilyCalendarId)
         .sort((left, right) => left.calendarId.localeCompare(right.calendarId));
@@ -11255,6 +11392,13 @@ function createGoogle(store: PostgresFlorenceStore, state: HarnessState): Google
           accessRole: "owner" as const,
           primary: false,
         },
+        ...state.personalCalendarCatalogExtras.map((calendar) => ({
+          calendarId: calendar.calendarId,
+          label: calendar.label,
+          timeZone: calendar.timeZone,
+          accessRole: calendar.accessRole,
+          primary: calendar.primary,
+        })),
       ].filter((target) => target.calendarId !== input.excludedFamilyCalendarId);
       const selectedIds = input.calendarIds ? new Set(input.calendarIds) : null;
       const selectedTargets = availableTargets.filter(

@@ -74,6 +74,31 @@ function calendarEvent(index: number): Record<string, unknown> {
   };
 }
 
+function searchableGmailMessage(index: number): Record<string, unknown> {
+  const text = `School update ${index}`;
+  return {
+    id: `search-message-${index}`,
+    threadId: `search-thread-${index}`,
+    historyId: String(2_000 + index),
+    internalDate: String(Date.UTC(2026, 7, 28, 16, index)),
+    labelIds: ["INBOX"],
+    snippet: text,
+    payload: {
+      mimeType: "text/plain",
+      headers: [
+        { name: "From", value: "School <school@example.com>" },
+        { name: "To", value: "Parent <parent@example.com>" },
+        { name: "Subject", value: `School note ${index}` },
+        { name: "Date", value: `Fri, 28 Aug 2026 16:${String(index).padStart(2, "0")}:00 -0700` },
+      ],
+      body: {
+        size: Buffer.byteLength(text),
+        data: Buffer.from(text, "utf8").toString("base64url"),
+      },
+    },
+  };
+}
+
 describe("Gmail draft provider journey", () => {
   test("forwards external text, compacts provider bodies, and binds draft identity before reconciliation", async () => {
     const idempotencyKey = "forward-school-note";
@@ -226,6 +251,167 @@ describe("Gmail draft provider journey", () => {
       "GET /gmail/v1/users/me/drafts/draft-1?format=full",
       expect.stringContaining("GET /gmail/v1/users/me/messages?"),
     ]);
+  });
+});
+
+describe("Gmail search continuation", () => {
+  test("workspace search returns one provider page and validates its opaque continuation", async () => {
+    const listRequests: URL[] = [];
+    const fetchMock = vi.fn<typeof fetch>(async (input) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/gmail/v1/users/me/messages") {
+        listRequests.push(url);
+        const pageToken = url.searchParams.get("pageToken");
+        return jsonResponse(
+          pageToken === null
+            ? {
+                messages: [searchableGmailMessage(0), searchableGmailMessage(1)],
+                nextPageToken: "provider-page-2",
+              }
+            : { messages: [searchableGmailMessage(2)] },
+        );
+      }
+      const match = /^\/gmail\/v1\/users\/me\/messages\/search-message-(\d+)$/.exec(url.pathname);
+      if (match) return jsonResponse(searchableGmailMessage(Number(match[1])));
+      throw new Error(`Unexpected provider request: ${url}`);
+    });
+    const cursorKey = Buffer.alloc(32, 9);
+    const first = await executeGoogleWorkspaceOperation({
+      fetch: fetchMock,
+      accessToken: "google-access-token",
+      cursorKey,
+      cursorScope: "connection-1",
+      operation: { operation: "gmail_search", query: "school updates", limit: 2 },
+    });
+    expect(first.result).toMatchObject({ status: "truncated", complete: false });
+    expect(
+      (first.result.messages as unknown[]).map((message) => (message as { messageId: string }).messageId),
+    ).toEqual(["search-message-0", "search-message-1"]);
+    const cursor = first.result.nextCursor;
+    expect(typeof cursor).toBe("string");
+    if (typeof cursor !== "string") throw new Error("Expected a Gmail search continuation cursor");
+    expect(cursor).not.toContain("provider-page-2");
+    expect(cursor).not.toContain("school updates");
+
+    const second = await executeGoogleWorkspaceOperation({
+      fetch: fetchMock,
+      accessToken: "another-access-token",
+      cursorKey,
+      cursorScope: "connection-1",
+      operation: { operation: "gmail_search", query: "school updates", limit: 1, cursor },
+    });
+    expect(second.result).toMatchObject({ status: "complete", complete: true, nextCursor: null });
+    expect(
+      (second.result.messages as unknown[]).map((message) => (message as { messageId: string }).messageId),
+    ).toEqual(["search-message-2"]);
+    expect(listRequests.map((url) => url.searchParams.get("pageToken"))).toEqual([null, "provider-page-2"]);
+    expect(listRequests.map((url) => url.searchParams.get("maxResults"))).toEqual(["2", "1"]);
+
+    await expect(
+      executeGoogleWorkspaceOperation({
+        fetch: fetchMock,
+        accessToken: "another-access-token",
+        cursorKey,
+        cursorScope: "connection-1",
+        operation: { operation: "gmail_search", query: "another query", limit: 1, cursor },
+      }),
+    ).rejects.toThrow(/cursor is invalid|another query/i);
+    const tamperIndex = Math.floor(cursor.length / 2);
+    const tampered = `${cursor.slice(0, tamperIndex)}${cursor[tamperIndex] === "a" ? "b" : "a"}${cursor.slice(tamperIndex + 1)}`;
+    await expect(
+      executeGoogleWorkspaceOperation({
+        fetch: fetchMock,
+        accessToken: "another-access-token",
+        cursorKey,
+        cursorScope: "connection-1",
+        operation: { operation: "gmail_search", query: "school updates", limit: 1, cursor: tampered },
+      }),
+    ).rejects.toThrow(/cursor is invalid/i);
+    expect(listRequests).toHaveLength(2);
+  });
+
+  test("live Gmail evidence search continues without a Florence total-result cutoff", async () => {
+    const connectionId = "connection-search";
+    const householdId = "household-search";
+    const ownerAdultId = "adult-search";
+    const key = Buffer.alloc(32, 4);
+    const listRequests: URL[] = [];
+    let tokenNumber = 0;
+    const fetchMock = vi.fn<typeof fetch>(async (input) => {
+      const url = new URL(String(input));
+      if (url.origin === "https://oauth2.googleapis.com") {
+        tokenNumber += 1;
+        return jsonResponse({ access_token: `access-token-${tokenNumber}`, token_type: "Bearer" });
+      }
+      if (url.pathname === "/gmail/v1/users/me/messages") {
+        listRequests.push(url);
+        return jsonResponse(
+          url.searchParams.get("pageToken") === null
+            ? {
+                messages: [searchableGmailMessage(0), searchableGmailMessage(1)],
+                nextPageToken: "provider-page-2",
+              }
+            : { messages: [searchableGmailMessage(2)] },
+        );
+      }
+      const match = /^\/gmail\/v1\/users\/me\/messages\/search-message-(\d+)$/.exec(url.pathname);
+      if (match) return jsonResponse(searchableGmailMessage(Number(match[1])));
+      throw new Error(`Unexpected provider request: ${url}`);
+    });
+    const store = {
+      async readActiveGoogleCredential() {
+        return {
+          connectionId,
+          householdId,
+          ownerAdultId,
+          refreshTokenEnvelope: refreshTokenEnvelope({ key, connectionId, householdId, ownerAdultId }),
+        };
+      },
+    } as unknown as GoogleConnectionStore;
+    const google = new GoogleConnection({
+      store,
+      clientId: "client-id",
+      clientSecret: "client-secret",
+      redirectUri: "https://app.tryflorence.com/oauth/google/callback",
+      encryptionKey: key,
+      fetch: fetchMock,
+    });
+    const search = (cursor?: string, limit = 2) =>
+      google.searchGmail({
+        householdId,
+        ownerAdultId,
+        connectionId,
+        query: "school updates",
+        limit,
+        ...(cursor === undefined ? {} : { cursor }),
+      });
+
+    const first = await search();
+    expect(first).toMatchObject({ status: "truncated", complete: false });
+    expect(first.messages.map((message) => message.messageId)).toEqual([
+      "search-message-0",
+      "search-message-1",
+    ]);
+    expect(first.nextCursor).not.toBeNull();
+    if (first.nextCursor === null) throw new Error("Expected a live Gmail search continuation cursor");
+    expect(first.nextCursor).not.toContain("provider-page-2");
+
+    const second = await search(first.nextCursor, 1);
+    expect(second).toMatchObject({ status: "complete", complete: true, nextCursor: null });
+    expect(second.messages.map((message) => message.messageId)).toEqual(["search-message-2"]);
+    expect(listRequests.map((url) => url.searchParams.get("pageToken"))).toEqual([null, "provider-page-2"]);
+
+    await expect(
+      google.searchGmail({
+        householdId,
+        ownerAdultId,
+        connectionId,
+        query: "different query",
+        limit: 1,
+        cursor: first.nextCursor,
+      }),
+    ).rejects.toThrow(/cursor is invalid|another query/i);
+    expect(listRequests).toHaveLength(2);
   });
 });
 

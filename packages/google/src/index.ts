@@ -30,6 +30,7 @@ const CALENDAR_BASELINE_PAGE_SIZE = 50;
 const GMAIL_BASELINE_MAX_WINDOW_MS = 90 * 24 * 60 * 60_000;
 const CALENDAR_BASELINE_MAX_WINDOW_MS = 111 * 24 * 60 * 60_000;
 const MAX_GOOGLE_BASELINE_PAGE_TOKEN_LENGTH = 16_384;
+const GMAIL_SEARCH_CURSOR_KIND = "gmail_search_v1" as const;
 const PERSONAL_CALENDAR_WINDOW_CURSOR_KIND = "personal_calendar_window_v1" as const;
 
 export const GOOGLE_SCOPES = [
@@ -297,7 +298,10 @@ export type GmailEvidence = {
 
 export type GmailSearchResult = {
   status: "complete" | "truncated";
+  complete: boolean;
   messages: readonly GmailEvidence[];
+  /** Opaque continuation over the same exact Gmail query. */
+  nextCursor: string | null;
 };
 
 /**
@@ -757,6 +761,14 @@ export class GoogleConnection {
       fetch: this.#fetch,
       accessToken,
       operation: input.operation,
+      cursorKey: this.#key,
+      cursorScope: digest(
+        JSON.stringify({
+          householdId: input.householdId,
+          ownerAdultId: input.ownerAdultId,
+          connectionId: input.connectionId,
+        }),
+      ),
       ...(signal ? { signal } : {}),
     });
   }
@@ -989,6 +1001,7 @@ export class GoogleConnection {
     after?: string;
     before?: string;
     limit?: number;
+    cursor?: string;
   }): Promise<GmailSearchResult> {
     const queryText = required(input.query, "Gmail search query").trim();
     if (queryText.length > 500) throw new Error("Gmail search query exceeds 500 characters");
@@ -1007,19 +1020,38 @@ export class GoogleConnection {
     const boundedQuery = bounds
       ? `(${queryText}) after:${Math.floor(bounds.after.getTime() / 1_000)} before:${Math.ceil(bounds.before.getTime() / 1_000)}`
       : queryText;
+    const queryDigest = gmailSearchQueryDigest({
+      householdId: input.householdId,
+      ownerAdultId: input.ownerAdultId,
+      connectionId: input.connectionId,
+      query: queryText,
+      after: bounds?.after.toISOString() ?? null,
+      before: bounds?.before.toISOString() ?? null,
+    });
+    const pageToken =
+      input.cursor === undefined
+        ? null
+        : gmailSearchCursorPageToken({ cursor: input.cursor, key: this.#key, queryDigest });
     const query = new URLSearchParams({ maxResults: String(limit), q: boundedQuery });
+    if (pageToken !== null) query.set("pageToken", pageToken);
     const list = await this.#gmailJson(`messages?${query}`, accessToken);
-    const nextPageToken = optionalStringField(list, "nextPageToken");
+    const listed = recordArray(list.messages);
+    if (listed.length > limit) throw providerError("Gmail exceeded the requested search page size");
+    const nextPageToken = nextGoogleBaselinePageToken(list, pageToken, "Gmail search page token");
     const identities = await Promise.all(
-      recordArray(list.messages)
-        .slice(0, limit)
-        .map((message) => this.#messageIdentity(accessToken, message)),
+      listed.map((message) => this.#messageIdentity(accessToken, message)),
     );
+    const complete = nextPageToken === null;
     return {
-      status: nextPageToken === null ? "complete" : "truncated",
+      status: complete ? "complete" : "truncated",
+      complete,
       messages: await Promise.all(
         identities.map((identity) => this.#readGmailMessage(accessToken, identity)),
       ),
+      nextCursor:
+        nextPageToken === null
+          ? null
+          : gmailSearchCursor({ key: this.#key, queryDigest, pageToken: nextPageToken }),
     };
   }
 
@@ -4236,6 +4268,71 @@ function personalCalendarSelection(value: readonly string[] | undefined): readon
     throw new Error("Personal Calendar selection contains a duplicate Calendar ID");
   }
   return [...uniqueCalendarIds].sort((left, right) => left.localeCompare(right));
+}
+
+function gmailSearchQueryDigest(input: {
+  householdId: string;
+  ownerAdultId: string;
+  connectionId: string;
+  query: string;
+  after: string | null;
+  before: string | null;
+}): string {
+  return digest(
+    JSON.stringify({
+      kind: GMAIL_SEARCH_CURSOR_KIND,
+      householdId: input.householdId,
+      ownerAdultId: input.ownerAdultId,
+      connectionId: input.connectionId,
+      query: input.query,
+      after: input.after,
+      before: input.before,
+    }),
+  );
+}
+
+function gmailSearchCursor(input: { key: Buffer; queryDigest: string; pageToken: string }): string {
+  const pageToken = googleBaselinePageToken(input.pageToken, "Gmail search page token");
+  if (pageToken === null) throw new Error("Gmail search cursor page token is required");
+  return encrypt(
+    JSON.stringify({ kind: GMAIL_SEARCH_CURSOR_KIND, queryDigest: input.queryDigest, pageToken }),
+    input.key,
+    gmailSearchCursorAad(input.queryDigest),
+  );
+}
+
+function gmailSearchCursorPageToken(input: { cursor: string; key: Buffer; queryDigest: string }): string {
+  let value: unknown;
+  try {
+    const cursor = required(input.cursor, "Gmail search cursor");
+    if (cursor.length > MAX_GOOGLE_BASELINE_PAGE_TOKEN_LENGTH * 2) {
+      throw new Error("Gmail search cursor is too long");
+    }
+    value = JSON.parse(decrypt(cursor, input.key, gmailSearchCursorAad(input.queryDigest)));
+  } catch {
+    throw new Error("Gmail search cursor is invalid or belongs to another query");
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Gmail search cursor payload is invalid");
+  }
+  const payload = value as Record<string, unknown>;
+  if (payload.kind !== GMAIL_SEARCH_CURSOR_KIND) {
+    throw new Error("Unsupported Gmail search cursor version");
+  }
+  if (payload.queryDigest !== input.queryDigest) {
+    throw new Error("Gmail search cursor belongs to another query");
+  }
+  if (typeof payload.pageToken !== "string") {
+    throw new Error("Gmail search cursor page token is invalid");
+  }
+  const pageToken = googleBaselinePageToken(payload.pageToken, "Gmail search cursor page token");
+  if (pageToken === null) throw new Error("Gmail search cursor page token is invalid");
+  return pageToken;
+}
+
+function gmailSearchCursorAad(queryDigest: string): string {
+  assertDigest(queryDigest, "Gmail search query digest");
+  return `florence-google-gmail-search-v1\0${queryDigest}`;
 }
 
 function personalCalendarTarget(

@@ -106,6 +106,7 @@ describe("Florence reasoner capability cutover", () => {
           total: 0,
           complete: true,
           nextCursor: null,
+          retrievalMode: "lexical_fallback",
         },
         state,
         currentTime: NOW,

@@ -25,6 +25,66 @@ import {
 } from "./reasoner-tool-loops.test-kit.js";
 
 describe("Florence reasoner capability cutover", () => {
+  test("Vault embeddings batch every input without changing provider order", async () => {
+    const calls: Array<{
+      model: string;
+      input: readonly string[];
+      signal: AbortSignal | undefined;
+    }> = [];
+    const shortInputs = Array.from({ length: 2_048 }, (_, index) => `${index}:family memory`);
+    const largeInputs = Array.from({ length: 33 }, (_, offset) => {
+      const index = shortInputs.length + offset;
+      const prefix = `${index}:`;
+      return `${prefix}${"x".repeat(8_000 - Buffer.byteLength(prefix, "utf8"))}`;
+    });
+    const inputs = [...shortInputs, ...largeInputs];
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      embeddings: {
+        async create(
+          request: { model: string; input: readonly string[] },
+          options: { signal?: AbortSignal } | undefined,
+        ) {
+          calls.push({
+            model: request.model,
+            input: request.input,
+            signal: options?.signal,
+          });
+          return {
+            data: request.input
+              .map((text, index) => {
+                const sourceIndex = Number(text.slice(0, text.indexOf(":")));
+                return { index, embedding: [sourceIndex, sourceIndex + 0.25] };
+              })
+              .reverse(),
+          };
+        },
+      },
+    } as never);
+    const adapter = reasoner.vaultEmbeddingAdapter();
+    const controller = new AbortController();
+
+    const vectors = await adapter?.embed(inputs, controller.signal);
+
+    expect(adapter?.version).toBe("openai:text-embedding-3-large");
+    expect(calls.map((call) => call.input.length)).toEqual([2_048, 31, 2]);
+    expect(calls.every((call) => call.model === "text-embedding-3-large")).toBe(true);
+    expect(calls.every((call) => call.signal === controller.signal)).toBe(true);
+    expect(
+      calls.every(
+        (call) =>
+          Buffer.byteLength(
+            JSON.stringify({
+              model: call.model,
+              input: call.input,
+              encoding_format: "float",
+            }),
+            "utf8",
+          ) <= 250_000,
+      ),
+    ).toBe(true);
+    expect(vectors).toEqual(inputs.map((_, index) => [index, index + 0.25]));
+  });
+
   test("rewrites a family need into one contextual Vault query", async () => {
     const requests: Record<string, unknown>[] = [];
     const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
@@ -445,6 +505,7 @@ describe("Florence reasoner capability cutover", () => {
           total: 1,
           complete: true,
           nextCursor: null,
+          retrievalMode: "lexical_fallback",
         },
         googleConnections: [
           {
@@ -613,6 +674,7 @@ describe("Florence reasoner capability cutover", () => {
           total: 1,
           complete: true,
           nextCursor: null,
+          retrievalMode: "lexical_fallback" as const,
         };
       },
       async readVault() {

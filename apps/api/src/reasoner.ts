@@ -85,7 +85,12 @@ import {
   type FlorenceTelephonyProvider,
   type FlorenceTelephonyResult,
 } from "./telephony.js";
-import type { VaultReadLevel, VaultReadResult, VaultSearchPage } from "./vault-recall.js";
+import type {
+  VaultEmbeddingAdapter,
+  VaultReadLevel,
+  VaultReadResult,
+  VaultSearchPage,
+} from "./vault-recall.js";
 import {
   type FlorenceWeatherRequest,
   type FlorenceWeatherResult,
@@ -98,6 +103,28 @@ const MAX_VOICE_NOTE_BYTES = 20 * 1024 * 1024;
 const VOICE_TRANSCODE_SAMPLE_RATE = 16_000;
 const VOICE_TRANSCODE_MAX_AUDIO_SECONDS = 600;
 const MAX_TRANSCODED_VOICE_BYTES = 44 + VOICE_TRANSCODE_MAX_AUDIO_SECONDS * VOICE_TRANSCODE_SAMPLE_RATE * 2;
+const DEFAULT_MEMORY_EMBEDDING_MODEL = "text-embedding-3-large";
+const OPENAI_EMBEDDING_MAX_INPUTS_PER_REQUEST = 2_048;
+const OPENAI_EMBEDDING_MAX_REQUEST_BYTES = 250_000;
+// text-embedding-3 models accept at most 8,191 tokens per input. Since a BPE
+// token cannot consume fewer than one UTF-8 byte, this byte bound is a
+// conservative provider-safe check without adding a tokenizer dependency.
+const OPENAI_EMBEDDING_MAX_INPUT_BYTES = 8_191;
+
+type OpenAIEmbeddingResource = Readonly<{
+  create: (
+    input: Readonly<{
+      model: string;
+      input: readonly string[];
+      encoding_format: "float";
+    }>,
+    options?: Readonly<{ signal: AbortSignal }>,
+  ) => Promise<unknown>;
+}>;
+
+type PartialOpenAIEmbeddingClient = Readonly<{
+  embeddings?: Partial<OpenAIEmbeddingResource>;
+}>;
 const MAX_VOICE_TRANSCRIPT_CHARS = 19_000;
 const VOICE_TRANSCODE_TIMEOUT_MS = 45_000;
 /**
@@ -585,6 +612,7 @@ const vaultSearchOutputSchema = z
     total: z.number().int().min(0),
     complete: z.boolean(),
     nextCursor: z.string().trim().min(1).max(2_000).nullable(),
+    retrievalMode: z.enum(["hybrid", "lexical_fallback"]),
   })
   .strict();
 
@@ -2463,7 +2491,11 @@ export interface FlorenceReadTools {
     bytes: Uint8Array;
   }>;
   listCalendars?(input: { cursor: string | null }): Promise<FlorenceCalendarCatalogRead>;
-  searchVault?(input: { query: string; cursor: string | null }): Promise<VaultSearchPage>;
+  searchVault?(input: {
+    query: string;
+    cursor: string | null;
+    signal?: AbortSignal;
+  }): Promise<VaultSearchPage>;
   readVault?(input: { uri: string; level: VaultReadLevel }): Promise<VaultReadResult | null>;
   searchConversationHistory?(input: {
     query: string | null;
@@ -2521,6 +2553,7 @@ export interface FlorenceGoogleChangesReadTools {
 export type FlorenceReasonerOptions = {
   apiKey: string;
   model: string;
+  embeddingModel?: string;
   timeoutMs?: number;
   maxOutputTokens?: number;
 };
@@ -6270,7 +6303,7 @@ function householdNextActionCapabilityRegistry(): CapabilityRegistry<HouseholdNe
       maxOutputBytes: 100_000,
       execute: async ({ arguments: args, context, signal }) =>
         executeReadAdapter(async () => {
-          const page = vaultSearchOutputSchema.parse(await context.reads.searchVault(args));
+          const page = vaultSearchOutputSchema.parse(await context.reads.searchVault({ ...args, signal }));
           throwIfAborted(signal);
           for (const result of page.results) context.knownVaultUris.add(result.uri);
           return { output: page };
@@ -6419,7 +6452,7 @@ function foregroundCapabilityRegistry(): CapabilityRegistry<ForegroundCapability
         executeReadAdapter(async () => {
           const searchVault = context.reads.searchVault;
           if (!searchVault) throw new CapabilityAdapterError("unavailable", "Vault search is unavailable.");
-          const page = vaultSearchOutputSchema.parse(await searchVault(args));
+          const page = vaultSearchOutputSchema.parse(await searchVault({ ...args, signal }));
           throwIfAborted(signal);
           context.vaultSearchState.succeeded = true;
           for (const result of page.results) context.knownVaultUris.add(result.uri);
@@ -8557,6 +8590,7 @@ function foregroundCommittedState(input: FlorenceReasonerInput): Readonly<Record
 export class FlorenceReasoner {
   readonly #client: OpenAI;
   readonly #model: string;
+  readonly #embeddingModel: string;
   readonly #maxOutputTokens: number;
 
   constructor(options: FlorenceReasonerOptions, client?: OpenAI) {
@@ -8565,7 +8599,18 @@ export class FlorenceReasoner {
     const timeout = positiveInteger(options.timeoutMs ?? 30_000, "OpenAI timeout");
     this.#maxOutputTokens = positiveInteger(options.maxOutputTokens ?? 4_000, "OpenAI output limit");
     this.#model = options.model;
+    this.#embeddingModel = options.embeddingModel?.trim() || DEFAULT_MEMORY_EMBEDDING_MODEL;
     this.#client = client ?? new OpenAI({ apiKey: options.apiKey, timeout, maxRetries: 0 });
+  }
+
+  vaultEmbeddingAdapter(): VaultEmbeddingAdapter | null {
+    const embeddings = (this.#client as unknown as PartialOpenAIEmbeddingClient).embeddings;
+    if (!embeddings || typeof embeddings.create !== "function") return null;
+    const model = this.#embeddingModel;
+    return {
+      version: `openai:${model}`,
+      embed: (texts, signal) => embedVaultTexts(embeddings as OpenAIEmbeddingResource, model, texts, signal),
+    };
   }
 
   /**
@@ -10838,9 +10883,120 @@ export function createFlorenceReasonerFromEnv(env: NodeJS.ProcessEnv = process.e
   return new FlorenceReasoner({
     apiKey: env.OPENAI_API_KEY ?? "",
     model: env.FLORENCE_OPENAI_MODEL ?? "",
+    embeddingModel: env.FLORENCE_MEMORY_EMBEDDING_MODEL?.trim() || DEFAULT_MEMORY_EMBEDDING_MODEL,
     ...(timeoutMs === undefined ? {} : { timeoutMs }),
     ...(maxOutputTokens === undefined ? {} : { maxOutputTokens }),
   });
+}
+
+async function embedVaultTexts(
+  embeddings: OpenAIEmbeddingResource,
+  model: string,
+  texts: readonly string[],
+  signal?: AbortSignal,
+): Promise<readonly (readonly number[])[]> {
+  throwIfAborted(signal);
+  if (texts.length === 0) return [];
+
+  const requestEnvelopeBytes = Buffer.byteLength(
+    JSON.stringify({ model, input: [], encoding_format: "float" }),
+    "utf8",
+  );
+  if (requestEnvelopeBytes >= OPENAI_EMBEDDING_MAX_REQUEST_BYTES) {
+    throw configuration("FLORENCE_MEMORY_EMBEDDING_MODEL is too large for an embedding request");
+  }
+
+  const inputs = texts.map((text, index) => {
+    if (typeof text !== "string" || text.trim().length === 0) {
+      throw invalidOutput(`Vault embedding input ${index} must contain text`);
+    }
+    const utf8Bytes = Buffer.byteLength(text, "utf8");
+    if (utf8Bytes > OPENAI_EMBEDDING_MAX_INPUT_BYTES) {
+      throw invalidOutput(
+        `Vault embedding input ${index} exceeds the provider-safe ${OPENAI_EMBEDDING_MAX_INPUT_BYTES}-byte limit`,
+      );
+    }
+    return {
+      text,
+      encodedBytes: Buffer.byteLength(JSON.stringify(text), "utf8"),
+    };
+  });
+
+  const vectors: (readonly number[])[] = [];
+  let expectedDimension: number | null = null;
+  let offset = 0;
+  while (offset < inputs.length) {
+    const batch: string[] = [];
+    let requestBytes = requestEnvelopeBytes;
+    while (offset + batch.length < inputs.length && batch.length < OPENAI_EMBEDDING_MAX_INPUTS_PER_REQUEST) {
+      const candidate = inputs[offset + batch.length];
+      if (!candidate) break;
+      const candidateBytes = candidate.encodedBytes + (batch.length === 0 ? 0 : 1);
+      if (requestBytes + candidateBytes > OPENAI_EMBEDDING_MAX_REQUEST_BYTES) break;
+      batch.push(candidate.text);
+      requestBytes += candidateBytes;
+    }
+    if (batch.length === 0) {
+      throw invalidOutput("One Vault embedding input exceeds the provider request budget");
+    }
+
+    throwIfAborted(signal);
+    const response = await embeddings.create(
+      {
+        model,
+        input: batch,
+        encoding_format: "float",
+      },
+      signal ? { signal } : undefined,
+    );
+    throwIfAborted(signal);
+    const parsed = parseEmbeddingResponse(response, batch.length, expectedDimension);
+    expectedDimension = parsed.dimension;
+    vectors.push(...parsed.vectors);
+    offset += batch.length;
+  }
+  return vectors;
+}
+
+function parseEmbeddingResponse(
+  response: unknown,
+  inputCount: number,
+  expectedDimension: number | null,
+): Readonly<{ vectors: readonly (readonly number[])[]; dimension: number }> {
+  if (!isJsonRecord(response) || !Array.isArray(response.data) || response.data.length !== inputCount) {
+    throw invalidOutput("OpenAI returned an incomplete Vault embedding batch");
+  }
+  const vectors: Array<readonly number[] | undefined> = Array.from({ length: inputCount });
+  let dimension = expectedDimension;
+  for (const item of response.data) {
+    if (
+      !isJsonRecord(item) ||
+      !Number.isSafeInteger(item.index) ||
+      (item.index as number) < 0 ||
+      (item.index as number) >= inputCount ||
+      !Array.isArray(item.embedding) ||
+      item.embedding.length === 0 ||
+      item.embedding.some((value) => typeof value !== "number" || !Number.isFinite(value))
+    ) {
+      throw invalidOutput("OpenAI returned an invalid Vault embedding vector");
+    }
+    const index = item.index as number;
+    if (vectors[index] !== undefined) {
+      throw invalidOutput("OpenAI returned a duplicate Vault embedding index");
+    }
+    dimension ??= item.embedding.length;
+    if (item.embedding.length !== dimension) {
+      throw invalidOutput("OpenAI returned inconsistent Vault embedding dimensions");
+    }
+    vectors[index] = [...(item.embedding as number[])];
+  }
+  if (dimension === null || vectors.some((vector) => vector === undefined)) {
+    throw invalidOutput("OpenAI returned an incomplete Vault embedding batch");
+  }
+  return {
+    vectors: vectors as readonly (readonly number[])[],
+    dimension,
+  };
 }
 
 async function readVerifiedGmailAttachment(

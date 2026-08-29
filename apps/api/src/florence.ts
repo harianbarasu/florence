@@ -161,7 +161,12 @@ import type {
   FlorenceTelephonyOperation,
   FlorenceTelephonyResult,
 } from "./telephony.js";
-import { VAULT_SEARCH_PAGE_BYTE_BUDGET, VaultRecall } from "./vault-recall.js";
+import {
+  VAULT_SEARCH_PAGE_BYTE_BUDGET,
+  type VaultEmbeddingAdapter,
+  VaultRecall,
+  type VaultSearchPage,
+} from "./vault-recall.js";
 import type { FlorenceWeatherClient } from "./weather.js";
 
 const DEFAULT_PREFERENCES: PreferencesInput = {
@@ -177,6 +182,10 @@ const GOOGLE_WORKSPACE_ACTION_SCOPES = [
 ] as const;
 const FOREGROUND_MEMORY_QUERY_REWRITE_TIMEOUT_MS = 2_000;
 const DURABLE_MEMORY_QUERY_REWRITE_TIMEOUT_MS = 5_000;
+// These are the reasoner schemas' physical text envelopes, not memory-count
+// limits. Search/read keeps every authorized fact reachable beyond them.
+const FOREGROUND_MEMORY_SOURCE_TEXT_CHARACTER_LIMIT = 50_000;
+const PROACTIVE_MEMORY_TEXT_CHARACTER_LIMIT = 12_000;
 // Keep one catalog tool result comfortably below the reasoner's 50 KB output
 // envelope. Catalog completeness is carried by opaque continuation cursors,
 // never by an arbitrary number of calendars.
@@ -270,6 +279,17 @@ export class Florence {
     this.#linqSenderPhoneNumber = nullableText(input.linqSenderPhoneNumber ?? null);
     this.#setupOrigin = input.setupOrigin ? normalizedOrigin(input.setupOrigin) : null;
     this.#now = input.now ?? (() => new Date());
+  }
+
+  #vaultEmbeddingAdapter(): VaultEmbeddingAdapter | null {
+    // Production reasoners expose this adapter. Keep injected/local reasoner
+    // doubles provider-neutral so lexical recall remains a valid fail-open.
+    const reasoner = this.#reasoner as
+      | (FlorenceReasoner & {
+          vaultEmbeddingAdapter?: () => VaultEmbeddingAdapter | null;
+        })
+      | null;
+    return typeof reasoner?.vaultEmbeddingAdapter === "function" ? reasoner.vaultEmbeddingAdapter() : null;
   }
 
   async workspaceForAdult(adultId: string): Promise<WorkspaceView> {
@@ -1962,7 +1982,7 @@ export class Florence {
     const members = new Map(turn.household.members.map((member) => [member.id, member.displayName]));
     const memorySourceCorpus = memorySources(turn.facts);
     const searchableMemorySources = representativeMemorySources(memorySourceCorpus);
-    const vaultRecall = new VaultRecall(turn.facts);
+    const vaultRecall = new VaultRecall(turn.facts, this.#vaultEmbeddingAdapter());
     const fallbackMemorySearch = {
       primary: turnText(turn.message),
       context: boundedMemoryQueryContext([
@@ -1990,20 +2010,27 @@ export class Florence {
         // still drive deterministic recall when the auxiliary pass is unavailable.
       }
     }
-    let visibleSources = selectVisibleMemorySources(searchableMemorySources, memorySearch);
-    if (visibleSources.length === 0 && memorySearch !== fallbackMemorySearch) {
-      visibleSources = selectVisibleMemorySources(searchableMemorySources, fallbackMemorySearch);
-    }
-    const recalledMemory =
+    let recalledMemory =
       turn.facts.length > 0
-        ? vaultRecall.search({
+        ? await vaultRecall.search({
             query:
               memorySearch === fallbackMemorySearch
                 ? boundedMemorySearchQuery([fallbackMemorySearch.primary, ...fallbackMemorySearch.context])
                 : memorySearch.primary,
             cursor: null,
+            signal,
           })
         : null;
+    if (recalledMemory?.results.length === 0 && memorySearch !== fallbackMemorySearch) {
+      recalledMemory = await vaultRecall.search({
+        query: boundedMemorySearchQuery([fallbackMemorySearch.primary, ...fallbackMemorySearch.context]),
+        cursor: null,
+        signal,
+      });
+    }
+    const visibleSources = recalledMemory
+      ? recalledMemorySources(searchableMemorySources, recalledMemory)
+      : [];
     const sourceIndex = new Map(memorySourceCorpus.map((source) => [source.sourceId, source]));
     const googleEvidence = new Map<string, GoogleEvidenceDraft>();
     const pendingGoogleEvidence = new Map<string, GoogleEvidenceDraft>();
@@ -2483,7 +2510,7 @@ export class Florence {
             },
           }
         : {}),
-      searchVault: async (input) => vaultRecall.search(input),
+      searchVault: async (input) => vaultRecall.search({ ...input, signal: input.signal ?? signal }),
       readVault: async (input) => vaultRecall.read(input),
       searchFamilyMemory: async ({ query, limit }) =>
         searchMemorySources(searchableMemorySources, query).slice(0, limit),
@@ -3123,10 +3150,11 @@ export class Florence {
         }
         const household = await this.#store.readHousehold({ householdId: work.household.householdId });
         if (!household) throw new Error("The initial briefing household is unavailable");
+        const householdVault = new VaultRecall(household.facts, this.#vaultEmbeddingAdapter());
         const decision = await this.#reasoner.synthesizeHouseholdBriefing({
           currentTime,
           familyProfile: initialFamilyProfile(work.household),
-          memory: proactiveMemoryContext(household.facts, {
+          memory: await proactiveMemoryContext(householdVault, household.facts, {
             primary: [
               ...work.candidates.map((candidate) => candidate.summary),
               ...familyCalendar.events.flatMap((event) => (event.title ? [event.title] : [])),
@@ -4211,7 +4239,7 @@ export class Florence {
           : familyWorkHousehold.facts;
       const familyWorkMemoryCorpus = memorySources(familyWorkFacts);
       const familyWorkSearchableMemory = representativeMemorySources(familyWorkMemoryCorpus);
-      const familyWorkVaultRecall = new VaultRecall(familyWorkFacts);
+      const familyWorkVaultRecall = new VaultRecall(familyWorkFacts, this.#vaultEmbeddingAdapter());
       // Directly adapt Hermes's per-turn memory-provider prefetch
       // (hermes-agent 6dcebea7, agent/memory_provider.py:18,178-190 and
       // agent/memory_manager.py:576-616). Build this from the complete current
@@ -4251,16 +4279,17 @@ export class Florence {
       }
       let familyWorkPrefetchedVault =
         familyWorkFacts.length > 0
-          ? familyWorkVaultRecall.search({ query: familyWorkMemoryQuery, cursor: null })
+          ? await familyWorkVaultRecall.search({ query: familyWorkMemoryQuery, cursor: null, signal })
           : null;
       if (
         familyWorkPrefetchedVault?.results.length === 0 &&
         familyWorkMemoryQuery !== fallbackFamilyWorkMemoryQuery
       ) {
         familyWorkMemoryQuery = fallbackFamilyWorkMemoryQuery;
-        familyWorkPrefetchedVault = familyWorkVaultRecall.search({
+        familyWorkPrefetchedVault = await familyWorkVaultRecall.search({
           query: familyWorkMemoryQuery,
           cursor: null,
+          signal,
         });
       }
       const familyWorkSourceIndex = new Map(
@@ -5298,7 +5327,8 @@ export class Florence {
           ...(google && familyWorkHousehold.familyCalendarId && familyWorkFamilyCalendarCredentials.length > 0
             ? { runFamilyCalendarWork }
             : {}),
-          searchVault: async (input) => familyWorkVaultRecall.search(input),
+          searchVault: async (input) =>
+            familyWorkVaultRecall.search({ ...input, signal: input.signal ?? signal }),
           readVault: async (input) => familyWorkVaultRecall.read(input),
           searchConversationHistory: async ({ query, after, before, cursor }) => {
             const page = await this.#store.searchClaimedFamilyWorkConversationHistory({
@@ -6154,7 +6184,7 @@ export class Florence {
         });
         return;
       }
-      const vault = new VaultRecall(householdFacts);
+      const vault = new VaultRecall(householdFacts, this.#vaultEmbeddingAdapter());
       const nextActionMemoryContext = boundedMemoryQueryContext([
         ...docket.items.map((item) =>
           JSON.stringify({
@@ -6190,7 +6220,7 @@ export class Florence {
         }
       }
       const recalledMemory =
-        householdFacts.length > 0 ? vault.search({ query: nextActionMemoryQuery, cursor: null }) : null;
+        householdFacts.length > 0 ? await vault.search({ query: nextActionMemoryQuery, cursor: null }) : null;
       const input: FlorenceHouseholdNextActionInput = {
         currentTime,
         familyProfile: initialFamilyProfile(work.household),
@@ -6514,6 +6544,7 @@ export class Florence {
         ...(work.visibility === "private" ? { viewerAdultId: work.adultId } : {}),
       });
       if (!household) throw new Error("The proactive Google review household is unavailable");
+      const proactiveVault = new VaultRecall(household.facts, this.#vaultEmbeddingAdapter());
 
       const gmailMessages: GmailEvidence[] = [];
       let removedGmailSourceIds: string[] = [];
@@ -6888,7 +6919,11 @@ export class Florence {
               currentTime,
               evidence,
               activeMonitors: [...work.activeMonitors],
-              memory: proactiveMemoryContext(household.facts, privateGoogleMemoryQuery(batch)),
+              memory: await proactiveMemoryContext(
+                proactiveVault,
+                household.facts,
+                privateGoogleMemoryQuery(batch),
+              ),
               currentFacts:
                 work.kind === "personal_google_poll"
                   ? relevantGoogleFacts(work.currentFacts, privateGoogleMemoryQuery(batch))
@@ -7967,29 +8002,107 @@ function memberPatch(member: PatchFamilyMemberInput) {
   };
 }
 
-function proactiveMemoryContext(
+async function proactiveMemoryContext(
+  vault: VaultRecall,
   facts: readonly FactRecord[],
   query: MemorySearchContext,
-): {
-  slot: string;
-  label: string;
-  text: string;
-}[] {
-  const factsById = new Map(facts.map((fact) => [fact.id, fact]));
-  return selectVisibleMemorySources(representativeMemorySources(memorySources(facts)), query).flatMap(
-    (source) => {
-      const fact = source.recordId ? factsById.get(source.recordId) : null;
-      if (!fact) return [];
-      const presentation = vaultMemoryFields(fact);
-      return [
-        {
-          slot: fact.slot,
-          label: presentation.title ?? fact.label,
-          text: vaultMemoryText(fact, presentation),
-        },
-      ];
-    },
+  signal?: AbortSignal,
+): Promise<
+  {
+    slot: string;
+    label: string;
+    text: string;
+  }[]
+> {
+  const searchQuery = boundedMemorySearchQuery([query.primary, ...query.context]);
+  if (!searchQuery) return [];
+  const page = await vault.search({
+    query: searchQuery,
+    cursor: null,
+    ...(signal ? { signal } : {}),
+  });
+  const factsByUri = new Map<string, FactRecord>(facts.map((fact) => [`vault://fact/${fact.id}`, fact]));
+  const selected: { slot: string; label: string; text: string }[] = [];
+  let serializedBytes = Buffer.byteLength("[]", "utf8");
+  for (const result of page.results) {
+    const fact = factsByUri.get(result.uri);
+    if (!fact) continue;
+    const presentation = vaultMemoryFields(fact);
+    const separatorBytes = selected.length > 0 ? 1 : 0;
+    const fitted = fitSerializedText(
+      (text) => ({
+        slot: fact.slot,
+        label: presentation.title ?? fact.label,
+        text,
+      }),
+      vaultMemoryText(fact, presentation),
+      PROACTIVE_MEMORY_TEXT_CHARACTER_LIMIT,
+      VAULT_SEARCH_PAGE_BYTE_BUDGET - serializedBytes - separatorBytes,
+    );
+    if (!fitted) break;
+    selected.push(fitted);
+    serializedBytes += separatorBytes + Buffer.byteLength(JSON.stringify(fitted), "utf8");
+  }
+  return selected;
+}
+
+function recalledMemorySources(sources: readonly FlorenceSource[], page: VaultSearchPage): FlorenceSource[] {
+  const sourcesByUri = new Map<string, FlorenceSource>(
+    sources.flatMap((source) =>
+      source.recordId ? [[`vault://fact/${source.recordId}`, source] as const] : [],
+    ),
   );
+  const selected: FlorenceSource[] = [];
+  let serializedBytes = Buffer.byteLength("[]", "utf8");
+  for (const result of page.results) {
+    const source = sourcesByUri.get(result.uri);
+    if (!source) continue;
+    const separatorBytes = selected.length > 0 ? 1 : 0;
+    const fitted = fitSerializedText(
+      (text) => ({ ...source, text }),
+      result.abstract,
+      FOREGROUND_MEMORY_SOURCE_TEXT_CHARACTER_LIMIT,
+      VAULT_SEARCH_PAGE_BYTE_BUDGET - serializedBytes - separatorBytes,
+    );
+    if (!fitted) break;
+    selected.push(fitted);
+    serializedBytes += separatorBytes + Buffer.byteLength(JSON.stringify(fitted), "utf8");
+  }
+  return selected;
+}
+
+function fitSerializedText<T>(
+  build: (text: string) => T,
+  rawText: string,
+  characterLimit: number,
+  byteBudget: number,
+): T | null {
+  const text = rawText.trim();
+  if (!text || byteBudget <= 0) return null;
+  let low = 1;
+  let high = Math.min(text.length, characterLimit);
+  let fitted: T | null = null;
+  while (low <= high) {
+    const length = Math.floor((low + high) / 2);
+    const end = length > 0 && isHighSurrogate(text.charCodeAt(length - 1)) ? length - 1 : length;
+    const candidateText = text.slice(0, end).trimEnd();
+    if (!candidateText) {
+      low = length + 1;
+      continue;
+    }
+    const candidate = build(candidateText);
+    if (Buffer.byteLength(JSON.stringify(candidate), "utf8") <= byteBudget) {
+      fitted = candidate;
+      low = length + 1;
+    } else {
+      high = length - 1;
+    }
+  }
+  return fitted;
+}
+
+function isHighSurrogate(value: number): boolean {
+  return value >= 0xd800 && value <= 0xdbff;
 }
 
 function relevantGoogleFacts(

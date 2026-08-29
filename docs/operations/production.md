@@ -79,6 +79,7 @@ Optional phone providers:
 
 Optional bounded settings:
 
+- `FLORENCE_MEMORY_EMBEDDING_MODEL=text-embedding-3-large` (optional override for Vault semantic recall)
 - `FLORENCE_MODEL_TIMEOUT_MS=30000`
 - `FLORENCE_MODEL_MAX_OUTPUT_TOKENS=4000`
 - `LOG_LEVEL=info`

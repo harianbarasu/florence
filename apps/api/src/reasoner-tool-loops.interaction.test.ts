@@ -566,7 +566,7 @@ describe("Florence reasoner capability cutover", () => {
 
     const decision = await reasoner.decideHouseholdNextAction(input, {
       async searchVault(arguments_) {
-        searches.push(arguments_);
+        searches.push({ query: arguments_.query, cursor: arguments_.cursor });
         return arguments_.cursor === null
           ? {
               query: arguments_.query,
@@ -574,6 +574,7 @@ describe("Florence reasoner capability cutover", () => {
               total: 1,
               complete: false,
               nextCursor: "vault-page-2",
+              retrievalMode: "lexical_fallback" as const,
             }
           : {
               query: arguments_.query,
@@ -592,6 +593,7 @@ describe("Florence reasoner capability cutover", () => {
               total: 1,
               complete: true,
               nextCursor: null,
+              retrievalMode: "lexical_fallback" as const,
             };
       },
       async readVault(arguments_) {

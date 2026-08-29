@@ -53,6 +53,7 @@ import type {
   FamilyCalendarReviewProposal,
   FamilyGroupCreationWork,
   FamilyMemberRecord,
+  FamilyWorkCompletionMemoryMutation,
   FamilyWorkSelectedFile,
   FamilyWorkSelectedImage,
   FamilyWorkStateV1,
@@ -135,6 +136,7 @@ import {
   type FlorenceDecision,
   type FlorenceFamilyCalendarWorkRequest,
   type FlorenceFamilyCalendarWorkResult,
+  type FlorenceFamilyWorkCompletionMemory,
   type FlorenceHouseholdAvailabilityRead,
   type FlorenceHouseholdNextActionInput,
   type FlorenceNarrowFamilyProfile,
@@ -4766,7 +4768,9 @@ export class Florence {
         }
 
         const existing =
-          request.operation === "correct" ? familyWorkFacts.find((fact) => fact.id === request.factId) : null;
+          request.operation === "correct"
+            ? (familyWorkFacts.find((fact) => fact.id === request.factId) ?? null)
+            : null;
         if (request.operation === "correct" && !existing) {
           throw new Error("Durable work cannot correct memory it has not read");
         }
@@ -4810,31 +4814,17 @@ export class Florence {
               );
         const files: readonly FileArtifactReference[] =
           selectedAssetIds === null ? existingFiles : stagedFiles;
-        const slot =
-          existing?.slot ??
-          (request.memory.memoryKind === "artifact" && request.memory.title
-            ? `artifact:${request.memory.artifactKind}:${sha256(request.memory.title.toLocaleLowerCase())}`
-            : `${request.memory.memoryKind}:${sha256(request.statement.toLocaleLowerCase())}`);
         const sourceIds = [...new Set([...request.sourceIds, work.origin.message.sourceId])];
-        const fact: FactDraft = {
-          id: factId,
-          subjectPersonId: existing?.subjectPersonId ?? null,
-          kind: existing?.kind ?? (request.memory.memoryKind === "preference" ? "preference" : "general"),
-          slot,
-          label: request.memory.title ?? existing?.label ?? request.statement.slice(0, 160),
-          value: {
-            statement: request.statement,
-            memoryKind: request.memory.memoryKind,
-            artifactKind: request.memory.artifactKind,
-            title: request.memory.title,
-            details: request.memory.details,
-            tags: request.memory.tags,
-            files,
-          },
+        const fact = familyWorkMemoryFact({
+          factId,
+          existing,
+          statement: request.statement,
+          memory: request.memory,
           visibility: request.visibility,
           ownerAdultId,
           sourceIds,
-        };
+          files,
+        });
         const mutation =
           request.operation === "correct"
             ? (() => {
@@ -5857,6 +5847,15 @@ export class Florence {
             return;
           }
         }
+        const completionMemoryMutations = familyWorkCompletionMemoryMutations({
+          workId: work.workId,
+          generation: work.generation,
+          outcome: step.outcome,
+          decision: step.completionMemory ?? { operation: "no_change" },
+          visibility: work.visibility,
+          executionAdultId: familyWorkExecutionAdultId,
+          facts: familyWorkFacts,
+        });
         const settlement = await this.#store.settleFamilyWorkClaim({
           workId: work.workId,
           generation: work.generation,
@@ -5876,6 +5875,7 @@ export class Florence {
                 : null,
             },
             terminalText: step.text,
+            completionMemoryMutations,
             completionEvidenceOutputs: step.completionEvidenceOutputs,
           },
         });
@@ -8710,6 +8710,114 @@ function vaultSource(source: SourceRecord): VaultSource {
 
 function factStatement(fact: FactRecord): string {
   return factValueStatement(fact.value);
+}
+
+function familyWorkMemoryFact(input: {
+  factId: string;
+  existing: FactRecord | null;
+  statement: string;
+  memory: MemoryPresentation;
+  visibility: "private" | "household";
+  ownerAdultId: string | null;
+  sourceIds: readonly string[];
+  files: readonly FileArtifactReference[];
+}): FactDraft {
+  const slot = familyWorkMemorySlot(input.existing, input.statement, input.memory);
+  return {
+    id: input.factId,
+    subjectPersonId: input.existing?.subjectPersonId ?? null,
+    kind: input.existing?.kind ?? (input.memory.memoryKind === "preference" ? "preference" : "general"),
+    slot,
+    label: input.memory.title ?? input.existing?.label ?? input.statement.slice(0, 160),
+    value: {
+      statement: input.statement,
+      memoryKind: input.memory.memoryKind,
+      artifactKind: input.memory.artifactKind,
+      title: input.memory.title,
+      details: input.memory.details,
+      tags: input.memory.tags,
+      files: input.files,
+    },
+    visibility: input.visibility,
+    ownerAdultId: input.ownerAdultId,
+    sourceIds: input.sourceIds,
+  };
+}
+
+function familyWorkMemorySlot(
+  existing: FactRecord | null,
+  statement: string,
+  memory: MemoryPresentation,
+): string {
+  return (
+    existing?.slot ??
+    (memory.memoryKind === "artifact" && memory.title
+      ? `artifact:${memory.artifactKind}:${sha256(memory.title.toLocaleLowerCase())}`
+      : `${memory.memoryKind}:${sha256(statement.toLocaleLowerCase())}`)
+  );
+}
+
+function familyWorkCompletionMemoryMutations(input: {
+  workId: string;
+  generation: number;
+  outcome: "succeeded" | "partial" | "failed";
+  decision: FlorenceFamilyWorkCompletionMemory;
+  visibility: "private" | "household";
+  executionAdultId: string;
+  facts: readonly FactRecord[];
+}): readonly FamilyWorkCompletionMemoryMutation[] {
+  const decision = input.decision;
+  if (decision.operation === "no_change") return [];
+  if (input.outcome !== "succeeded") {
+    throw new FlorenceReasonerError(
+      "invalid_output",
+      "Only succeeded family work may retain a completion memory",
+    );
+  }
+  return decision.changes.map((change) => {
+    if (input.visibility === "household" && change.visibility !== "household") {
+      throw new FlorenceReasonerError(
+        "invalid_output",
+        "Household-visible family work cannot retain private memory",
+      );
+    }
+    const existing =
+      change.operation === "correct" ? (input.facts.find((fact) => fact.id === change.factId) ?? null) : null;
+    if (change.operation === "correct") {
+      if (!existing || existing.updatedAt !== change.expectedUpdatedAt) {
+        throw new FlorenceStoreConflict("Vault memory changed before this task could correct it");
+      }
+      if (existing.visibility !== change.visibility) {
+        throw new FlorenceReasonerError(
+          "invalid_output",
+          "A completion memory correction cannot change who can see it",
+        );
+      }
+    }
+    const ownerAdultId = change.visibility === "private" ? input.executionAdultId : null;
+    const slot = familyWorkMemorySlot(existing, change.statement, change.memory);
+    const fact = familyWorkMemoryFact({
+      factId:
+        existing?.id ??
+        deterministicUuid(
+          `family-work-completion-memory\0${input.workId}\0${input.generation}\0${change.visibility}\0${slot}`,
+        ),
+      existing,
+      statement: change.statement,
+      memory: change.memory,
+      visibility: change.visibility,
+      ownerAdultId,
+      sourceIds: [...new Set(change.sourceIds)],
+      files: existing ? decodeFactFileArtifacts(existing.value) : [],
+    });
+    return change.operation === "correct"
+      ? {
+          operation: "correct",
+          fact,
+          expectedUpdatedAt: change.expectedUpdatedAt,
+        }
+      : { operation: "remember", fact };
+  });
 }
 
 function vaultMemoryFields(fact: FactRecord): MemoryPresentation {

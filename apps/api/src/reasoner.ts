@@ -1882,6 +1882,45 @@ export const florenceInterestResearchDecisionSchema = z
   })
   .strict();
 
+const familyWorkCompletionMemoryChangeSchema = z.discriminatedUnion("operation", [
+  z
+    .object({
+      operation: z.literal("remember"),
+      factId: z.null(),
+      statement: shortText,
+      visibility: z.enum(["private", "household"]),
+      memory: requiredMemoryPresentationSchema,
+      sourceIds,
+      expectedUpdatedAt: z.null(),
+    })
+    .strict(),
+  z
+    .object({
+      operation: z.literal("correct"),
+      factId: opaqueId,
+      statement: shortText,
+      visibility: z.enum(["private", "household"]),
+      memory: requiredMemoryPresentationSchema,
+      sourceIds,
+      expectedUpdatedAt: timestamp,
+    })
+    .strict(),
+]);
+
+const familyWorkNoCompletionMemoryDecisionSchema = z.object({ operation: z.literal("no_change") }).strict();
+
+const familyWorkCompletionMemoryDecisionSchema = z
+  .discriminatedUnion("operation", [
+    familyWorkNoCompletionMemoryDecisionSchema,
+    z
+      .object({
+        operation: z.literal("retain"),
+        changes: z.array(familyWorkCompletionMemoryChangeSchema).min(1),
+      })
+      .strict(),
+  ])
+  .default({ operation: "no_change" });
+
 const familyWorkTerminalDecisionSchema = z
   .object({
     outcome: z.enum(["succeeded", "partial", "waiting", "failed", "deferred", "progress"]),
@@ -1891,6 +1930,7 @@ const familyWorkTerminalDecisionSchema = z
     selectedImageAssetIds: z.array(z.string().uuid()).default([]),
     selectedFileAssetIds: z.array(z.string().uuid()).default([]),
     docket: florencePrivateDocketCoordinationSchema.nullable().default(null),
+    completionMemory: familyWorkCompletionMemoryDecisionSchema,
   })
   .strict();
 
@@ -1903,6 +1943,7 @@ const familyWorkTerminalDecisionWithoutProgressSchema = z
     selectedImageAssetIds: z.array(z.string().uuid()).default([]),
     selectedFileAssetIds: z.array(z.string().uuid()).default([]),
     docket: florencePrivateDocketCoordinationSchema.nullable().default(null),
+    completionMemory: familyWorkTerminalDecisionSchema.shape.completionMemory,
   })
   .strict();
 
@@ -1915,6 +1956,7 @@ const familyWorkUnverifiedTerminalDecisionSchema = z
     selectedImageAssetIds: z.array(z.string().uuid()).default([]),
     selectedFileAssetIds: z.array(z.string().uuid()).default([]),
     docket: florencePrivateDocketCoordinationSchema.nullable().default(null),
+    completionMemory: familyWorkNoCompletionMemoryDecisionSchema.default({ operation: "no_change" }),
   })
   .strict();
 
@@ -2054,6 +2096,9 @@ export type FlorenceFamilyWorkInput = Readonly<{
 
 export type FlorenceVaultWorkRequest = z.infer<typeof vaultWorkDecisionSchema>;
 export type FlorenceVaultWorkResult = z.infer<typeof vaultWorkResultSchema>;
+export type FlorenceFamilyWorkCompletionMemory = z.infer<
+  typeof familyWorkTerminalDecisionSchema
+>["completionMemory"];
 export type FlorenceReminderWorkRequest = z.infer<typeof reminderDecisionSchema>;
 export type FlorenceReminderWorkResult = z.infer<typeof reminderWorkResultSchema>;
 export type FlorenceFamilyCalendarWorkRequest = z.infer<typeof familyCalendarMutationSchema>;
@@ -2143,6 +2188,7 @@ export type FlorenceFamilyWorkStep =
       docket?: FlorencePrivateDocketCoordination | null;
       selectedImages?: readonly FamilyWorkSelectedImage[];
       selectedFiles?: readonly FamilyWorkSelectedFile[];
+      completionMemory?: FlorenceFamilyWorkCompletionMemory;
       completionEvidenceOutputs: readonly {
         readonly callId: string;
         readonly output: JsonValue;
@@ -2600,6 +2646,8 @@ At the point when one concrete outside-effect call is fully formed, but before r
 
 Vault knowledge, reminders, and the shared Family Calendar are ordinary composable capabilities in this same task loop. Use them whenever they are a useful part of the requested outcome, without turning them into a named workflow or assuming that every task needs one. A current photo's assetId, current or linked PDF's documentId or fileAssetId, browser download's assetId, and Gmail attachment's fileAssetId are the exact IDs vault_work may retain with a reusable artifact; do not invent or translate them. A file URI returned by read_vault is the durable handle for that saved original and may be uploaded by browser_work during this or a later task. For a household task whose answer depends on when the family is available, read the exact needed household-availability window; this exposes only opted-in title-free busy intervals, and any non-complete coverage is unknown rather than free. List reminders before changing an existing one unless its exact ID was already returned here. Read a complete shared-Calendar window before creating within it, and copy an exact returned event target before updating or deleting. A successful capability result is already the durable receipt for that effect; do not repeat it or send a separate mechanical confirmation.
 
+Every result also makes one selective completionMemory decision. This is general memory consolidation, not a task category: choose retain for every distinct new household belief, preference, routine, reusable artifact, or correction that the completed work established and that would materially improve a later task. changes has no item limit: do not omit a durable delta to satisfy an arbitrary count, and do not split one coherent meaning into redundant fragments. A recipe or other artifact needs enough usable detail to act on later, not merely its name. Before remembering any new meaning, successfully search the Vault during this task pass; read an exact matching item when one exists and use a correct change with its exact factId, visibility, and updatedAt rather than creating a duplicate. Every change cites the distinct exact sourceIds from the task context or capability results that directly establish that meaning; never invent a source ID, cite the terminal result as its own evidence, or mechanically cite every steering message. If a reusable outcome includes an exact file that must remain available, retain it with vault_work before the terminal result; completionMemory retains the semantic knowledge. Omit anything vault_work already retained during this task. Choose no_change only when no distinct durable delta remains. Short-lived observations whose value is only the current answer, one-off receipts or confirmations, temporary failures, generic completion status, and anything already represented unchanged are not durable deltas. Partial, waiting, failed, deferred, and progress results always choose no_change. This decision is silent Vault maintenance; never mention it mechanically in the result text.
+
 For household-visible work, participant_request may ask exactly one other enrolled adult one focused private question when their answer genuinely blocks the shared outcome. Resolve anything derivable from existing context or available information tools first. Address the exact adult name exposed by the tool and write one natural question that contains enough context to answer. Do not use participant_request as a workflow router, a substitute for research, or a way to ask several questions at once. Queuing it pauses this same task until that adult's correlated reply arrives; do not also ask or announce the private question in the family thread, and do not poll for the reply.
 
 linkedSources contains exact retained Message, PDF, Gmail, or Calendar source descriptors that grounded this task when the parent selected a docket item. It is structured evidence context, not prose and not a second objective. Use read_source on an exact linked source when its evidence can advance the objective; Message and provider bodies are intentionally absent until that read. Exact linked photos and PDFs are attached to the task input and remain available through the current-image/PDF readers. Do not search broadly for another adult's private sources. For household-visible work, use linked private evidence only to produce or complete the requested household outcome, and share only the household-relevant conclusion or confirmed action rather than exposing unrelated private wording or details.
@@ -2612,7 +2660,7 @@ Keep choosing and chaining useful read or investigation tools in the current rea
 
 If useful work genuinely depends on outside state that cannot reasonably have changed yet, return outcome deferred with a proportionate absolute future resumeAt. Deferred work remains the same task and will wake automatically at that instant. It is not a substitute for using an available tool now, asking a genuinely blocking parent question, or returning a finished result. Use progressText only the first time Florence has something useful to say about the wait; use null on unchanged later checks so the family does not receive repeated status messages. A useful progress note tells the family what materially changed or what Florence is now waiting on in ordinary conversational language; it is not a provider-status translation.
 
-The result object always contains outcome, text, resumeAt, progressText, selectedImageAssetIds, selectedFileAssetIds, and docket. For waiting, partial, or failed, docket must describe the linked unfinished item's current coordination: name who or what is naturally responsible for moving it next, give the smallest concrete next action, say whether a family answer is needed, and name the exact blocker or dependency in waitingOn when one exists. Keep docket to minimum family-safe coordination even when this task and its terminal chat text are private: never put private email or Calendar titles, source wording, or unrelated personal detail in it. A waiting result always needs a family answer, so set needsAnswer true and waitingOn to the exact choice or information requested by the one focused question in text. For partial or failed, needsAnswer is true only when a family answer is actually the next dependency; an outside blocker may instead have needsAnswer false while still being named in waitingOn. Use one supplied parent's exact name, Family, Florence, a plainly named outside person or organization, or null only when responsibility is genuinely unassigned. Derive all coordination from the task's actual current meaning, never from task category, origin or source ownership, private versus household visibility, the initiating parent, or which parent or worker claimed it. For succeeded, deferred, and progress, docket must be null. For outcome progress, text and resumeAt must be null, progressText must contain the useful update, and both selected asset-ID arrays must be empty. For outcome deferred, text must be null, resumeAt must be the absolute future instant, progressText may be useful text or null, and both selected asset-ID arrays must be empty. For every other outcome, text must contain the result or question and both resumeAt and progressText must be null. A browser capture marked user-visible returns an opaque selected image asset ID. A successful browser download returns an opaque selected file asset ID. Copy exact IDs into the matching array only when that image or original file materially helps the finished result. Routine browser screenshots are for your own inspection and must not be selected. Do not invent an asset ID. Selected images and files are currently delivered only with a succeeded or partial result, so waiting and failed results leave both arrays empty.
+The result object always contains outcome, text, resumeAt, progressText, selectedImageAssetIds, selectedFileAssetIds, docket, and completionMemory. For waiting, partial, or failed, docket must describe the linked unfinished item's current coordination: name who or what is naturally responsible for moving it next, give the smallest concrete next action, say whether a family answer is needed, and name the exact blocker or dependency in waitingOn when one exists. Keep docket to minimum family-safe coordination even when this task and its terminal chat text are private: never put private email or Calendar titles, source wording, or unrelated personal detail in it. A waiting result always needs a family answer, so set needsAnswer true and waitingOn to the exact choice or information requested by the one focused question in text. For partial or failed, needsAnswer is true only when a family answer is actually the next dependency; an outside blocker may instead have needsAnswer false while still being named in waitingOn. Use one supplied parent's exact name, Family, Florence, a plainly named outside person or organization, or null only when responsibility is genuinely unassigned. Derive all coordination from the task's actual current meaning, never from task category, origin or source ownership, private versus household visibility, the initiating parent, or which parent or worker claimed it. For succeeded, deferred, and progress, docket must be null. For outcome progress, text and resumeAt must be null, progressText must contain the useful update, and both selected asset-ID arrays must be empty. For outcome deferred, text must be null, resumeAt must be the absolute future instant, progressText may be useful text or null, and both selected asset-ID arrays must be empty. For every other outcome, text must contain the result or question and both resumeAt and progressText must be null. A browser capture marked user-visible returns an opaque selected image asset ID. A successful browser download returns an opaque selected file asset ID. Copy exact IDs into the matching array only when that image or original file materially helps the finished result. Routine browser screenshots are for your own inspection and must not be selected. Do not invent an asset ID. Selected images and files are currently delivered only with a succeeded or partial result, so waiting and failed results leave both arrays empty.
 
 When completionCondition in the task context is non-null, that exact condition is the definition of done. Copy it unchanged into any non-null docket result, and do not weaken, replace, or reinterpret it.
 
@@ -2629,6 +2677,8 @@ Use ordinary objective semantics; never classify the work into named topics, wor
 
 When taskContext.completionCondition is non-null, evaluate that exact condition and copy it unchanged into condition. Do not substitute a narrower, easier, or newly invented definition of done.
 
+Inspect proposedResult.completionMemory as part of the same judgment. no_change is acceptable when no durable delta exists. Every retained change must be distinct, durable, reusable, directly established by the task request, transcript, or successful capability evidence, cite the exact supporting sourceIds exposed in that evidence, and remain consistent with any exact Vault item read in that transcript. Reject an unrelated, speculative, transient, duplicate, mechanically phrased, incorrectly sourced, or arbitrarily omitted durable memory so the agent can return the complete supported set or no_change. Do not require a memory merely because the task succeeded.
+
 For an answer, comparison, synthesis, recommendation, or other objective whose requested result is the reasoning itself, basisKind may be reasoned_result and evidenceCallIds and evidenceSelections must be empty when the proposed answer actually satisfies the objective. If the proposed result claims that outside state changed, an appointment or reservation exists, a message arrived or was sent, a task was completed, a provider now has a particular state, or any similar real-world outcome, basisKind must be capability_evidence and evidenceCallIds must select the exact successful supplied calls that directly establish the resulting state. For every selected call, evidenceSelections must name the smallest exact JSON Pointer values in that call's output that prove the completion condition. Select concrete status, identifier, resulting-state, time, or fact fields—not the whole output, a large body, or unrelated provider payload. A successful call envelope is not automatically completion: inspect its output. An accepted, queued, started, prepared, submitted, or uncertain result does not prove a later completed outcome. Never select a failed call, invent a call ID, or invent a pointer.
 
 condition states the concrete definition of done. For verified, summary concisely explains how it was met, reason is null, and the basis fields follow the rules above. For continue, reason concisely says what remains unestablished, basisKind and summary are null, and evidenceCallIds and evidenceSelections are empty. Output only the strict review schema.`;
@@ -2637,7 +2687,7 @@ const FAMILY_WORK_UNVERIFIED_DISPOSITION_INSTRUCTIONS = `You are giving one trut
 
 Do not claim success and do not merely say Florence is still working. Use partial when useful findings or completed pieces can be delivered despite one exact remaining blocker. Use waiting only when one consequential parent choice or missing fact is genuinely required, and ask exactly one focused natural question. Use failed only when no available route can advance the objective now, and name the exact blocker rather than giving a generic refusal.
 
-For partial, waiting, or failed, docket must capture the natural owner, smallest next action, exact blocker in waitingOn when one exists, and whether a family answer is needed. Preserve any useful concrete findings from the supplied transcript. Write naturally as Florence rejoining the conversation, not as a system or ticket. Output only the strict result schema.`;
+For partial, waiting, or failed, docket must capture the natural owner, smallest next action, exact blocker in waitingOn when one exists, and whether a family answer is needed. Preserve any useful concrete findings from the supplied transcript. completionMemory must be no_change because an unverified outcome cannot become durable household knowledge. Write naturally as Florence rejoining the conversation, not as a system or ticket. Output only the strict result schema.`;
 
 const FAMILY_WORK_PROGRESS_REVIEW_INSTRUCTIONS = `You decide whether one proposed Florence progress message is worth interrupting a family conversation.
 
@@ -4914,6 +4964,7 @@ type ForegroundCapabilityContext = {
   readonly knownFactVisibilities: Map<string, "private" | "household">;
   readonly knownFactRevisions: Map<string, string>;
   readonly knownVaultUris: Set<string>;
+  readonly vaultSearchState: { succeeded: boolean };
   readonly knownFileAssetIds: Set<string>;
   readonly calendarReads: CalendarReadCoverage[];
   readonly calendarReadChains: Map<string, CalendarReadChain>;
@@ -6157,6 +6208,7 @@ function foregroundCapabilityRegistry(): CapabilityRegistry<ForegroundCapability
           if (!searchVault) throw new CapabilityAdapterError("unavailable", "Vault search is unavailable.");
           const page = vaultSearchOutputSchema.parse(await searchVault(args));
           throwIfAborted(signal);
+          context.vaultSearchState.succeeded = true;
           for (const result of page.results) context.knownVaultUris.add(result.uri);
           return { output: page };
         }, signal),
@@ -9372,6 +9424,7 @@ export class FlorenceReasoner {
     const knownFactRevisions = pendingVaultFactRevisions(checkpointInput.state);
     const knownFacts = new Set([...knownFactVisibilities.keys(), ...knownFactRevisions.keys()]);
     const knownVaultUris = new Set<string>();
+    const vaultSearchState = { succeeded: false };
     const knownFileAssetIds = new Set([
       ...(checkpointInput.state.browserFiles ?? []).map((file) => file.assetId),
       ...reasonerInput.currentMessage.images.map((image) => image.assetId),
@@ -9441,6 +9494,7 @@ export class FlorenceReasoner {
       knownFactVisibilities,
       knownFactRevisions,
       knownVaultUris,
+      vaultSearchState,
       knownFileAssetIds,
       calendarReads,
       calendarReadChains,
@@ -9604,6 +9658,59 @@ export class FlorenceReasoner {
             familyWorkTerminalDecisionSchema.parse(response.output_parsed),
             checkpointInput.state.completionCondition,
           );
+          const completionMemory = validatedTerminal.current.completionMemory;
+          const completionMemoryChanges =
+            completionMemory.operation === "retain" ? completionMemory.changes : [];
+          if (
+            completionMemoryChanges.some((change) => change.operation === "remember") &&
+            !vaultSearchState.succeeded
+          ) {
+            throw invalidOutput(
+              "A new completion memory requires a successful Vault search in this task pass",
+            );
+          }
+          if (validatedTerminal.current.outcome !== "succeeded" && completionMemoryChanges.length > 0) {
+            throw invalidOutput("Only succeeded family work may retain a completion memory");
+          }
+          if (
+            reasonerInput.audience === "group" &&
+            completionMemoryChanges.some((change) => change.visibility !== "household")
+          ) {
+            throw invalidOutput("Household-visible family work cannot retain private memory");
+          }
+          const completionMemoryKeys = completionMemoryChanges.map((change) =>
+            change.memory.memoryKind === "artifact" && change.memory.title
+              ? `${change.visibility}\0artifact\0${change.memory.artifactKind}\0${change.memory.title.toLocaleLowerCase()}`
+              : `${change.visibility}\0${change.memory.memoryKind}\0${change.statement.toLocaleLowerCase()}`,
+          );
+          if (new Set(completionMemoryKeys).size !== completionMemoryKeys.length) {
+            throw invalidOutput("Completion memory cannot repeat the same durable meaning");
+          }
+          const correctedFactIds = completionMemoryChanges.flatMap((change) =>
+            change.operation === "correct" ? [change.factId] : [],
+          );
+          if (new Set(correctedFactIds).size !== correctedFactIds.length) {
+            throw invalidOutput("Completion memory cannot correct the same Vault item twice");
+          }
+          for (const change of completionMemoryChanges) {
+            if (
+              new Set(change.sourceIds).size !== change.sourceIds.length ||
+              change.sourceIds.some((sourceId) => !knownSources.has(sourceId))
+            ) {
+              throw invalidOutput(
+                "A completion memory change must cite distinct exact sources available to this task",
+              );
+            }
+            if (change.operation !== "correct") continue;
+            if (knownFactRevisions.get(change.factId) !== change.expectedUpdatedAt) {
+              throw invalidOutput(
+                "A completion memory correction must use the exact Vault revision read in this task",
+              );
+            }
+            if (knownFactVisibilities.get(change.factId) !== change.visibility) {
+              throw invalidOutput("A completion memory correction cannot change who can see it");
+            }
+          }
           completionReview.current = null;
           completionBasis.current = null;
           completionSelectedEvidence.current = [];
@@ -10109,6 +10216,7 @@ export class FlorenceReasoner {
         docket: terminal.docket,
         selectedImages,
         selectedFiles,
+        completionMemory: terminal.completionMemory,
         completionEvidenceOutputs:
           terminal.outcome === "succeeded"
             ? completionSelectedEvidence.current.map((evidence) => ({
@@ -10200,6 +10308,7 @@ export class FlorenceReasoner {
     const knownFacts = new Set(knownFactVisibilities.keys());
     const knownFactRevisions = new Map<string, string>();
     const knownVaultUris = new Set<string>();
+    const vaultSearchState = { succeeded: false };
     const knownFileAssetIds = new Set<string>();
     const calendarReads: CalendarReadCoverage[] = [];
     const calendarReadChains = new Map<string, CalendarReadChain>();
@@ -10220,6 +10329,7 @@ export class FlorenceReasoner {
       knownFactVisibilities,
       knownFactRevisions,
       knownVaultUris,
+      vaultSearchState,
       knownFileAssetIds,
       calendarReads,
       calendarReadChains,

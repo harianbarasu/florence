@@ -1099,6 +1099,30 @@ release("Durable family work store", () => {
         },
       },
     };
+    const completionMemoryMutations = [
+      {
+        operation: "remember" as const,
+        fact: {
+          id: "10000000-0000-4000-8000-000000000019",
+          subjectPersonId: null,
+          kind: "general" as const,
+          slot: "routine:camp-registration-form",
+          label: "Camp registration form",
+          value: {
+            statement: "Use the revised blue form for camp registration.",
+            memoryKind: "routine",
+            artifactKind: null,
+            title: "Camp registration form",
+            details: "The revised blue form is the current form to use for camp registration.",
+            tags: ["camp", "registration"],
+            files: [],
+          },
+          visibility: "private" as const,
+          ownerAdultId: "10000000-0000-4000-8000-000000000002",
+          sourceIds: ["10000000-0000-4000-8000-000000000007"],
+        },
+      },
+    ];
     await expect(
       store.settleFamilyWorkClaim({
         workId: finalClaim.workId,
@@ -1109,6 +1133,7 @@ release("Durable family work store", () => {
           type: "terminal",
           state: terminalState,
           terminalText,
+          completionMemoryMutations,
           completionEvidenceOutputs: [
             {
               callId: campCompletionEvidence.callId,
@@ -1118,6 +1143,10 @@ release("Durable family work store", () => {
         },
       }),
     ).rejects.toThrow(/completion output does not match its exact receipt/u);
+    await assertDatabase(
+      "A rejected terminal result retained completion memory",
+      `not exists (select 1 from facts where id='10000000-0000-4000-8000-000000000019')`,
+    );
     expect(
       await store.settleFamilyWorkClaim({
         workId: finalClaim.workId,
@@ -1128,12 +1157,17 @@ release("Durable family work store", () => {
           type: "terminal",
           state: terminalState,
           terminalText,
+          completionMemoryMutations,
           completionEvidenceOutputs: [
             { callId: campCompletionEvidence.callId, output: campCompletionOutput },
           ],
         },
       }),
     ).toBe("settled");
+    await assertDatabase(
+      "Terminal work retained completion memory before the result was delivered",
+      `not exists (select 1 from facts where id='10000000-0000-4000-8000-000000000019')`,
+    );
     await assertDatabase(
       "Family work completed before its terminal receipt",
       `exists (select 1 from proactive_work where id='10000000-0000-4000-8000-000000000003'
@@ -1162,6 +1196,17 @@ release("Durable family work store", () => {
       providerMessageId: "provider-terminal",
       sentAt: at(120_301),
     });
+    await assertDatabase(
+      "Delivered terminal work did not retain its sourced completion memory exactly once",
+      `exists (
+        select 1 from facts fact
+        where fact.id='10000000-0000-4000-8000-000000000019'
+          and fact.value->>'statement'='Use the revised blue form for camp registration.'
+          and fact.visibility='private'
+          and fact.owner_adult_id='10000000-0000-4000-8000-000000000002'
+          and (select count(*) from fact_sources link where link.fact_id=fact.id)=2
+      )`,
+    );
     await assertDatabase(
       "Family work did not complete exactly once after its terminal receipt",
       `exists (select 1 from proactive_work where id='10000000-0000-4000-8000-000000000003'

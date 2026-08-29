@@ -24,6 +24,124 @@ import {
 } from "./reasoner-tool-loops.test-kit.js";
 
 describe("Florence reasoner capability cutover", () => {
+  test("verified useful work searches before retaining reusable completion memory", async () => {
+    const modelRequests: Record<string, unknown>[] = [];
+    const completionMemory = {
+      operation: "retain" as const,
+      changes: [
+        {
+          operation: "remember" as const,
+          factId: null,
+          statement: "The family's weeknight noodle recipe uses sesame oil, soy sauce, and rice vinegar.",
+          visibility: "household" as const,
+          memory: {
+            memoryKind: "artifact" as const,
+            artifactKind: "recipe" as const,
+            title: "Weeknight noodles",
+            details:
+              "Mix sesame oil, soy sauce, and rice vinegar for the sauce, then toss with cooked noodles.",
+            tags: ["weeknight", "noodles"],
+          },
+          sourceIds: ["source-adult-1"],
+          expectedUpdatedAt: null,
+        },
+      ],
+    };
+    let taskTurn = 0;
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        parse(request: Record<string, unknown>) {
+          const review = defaultFamilyWorkCompletionReview(request);
+          if (review) return review;
+          modelRequests.push(request);
+          if (taskTurn++ === 0) {
+            return {
+              status: "completed",
+              output_parsed: null,
+              output: [
+                functionCall("completion-memory-search", "search_vault", {
+                  query: "family weeknight noodle recipe",
+                  cursor: null,
+                }),
+              ],
+            };
+          }
+          return {
+            status: "completed",
+            output_parsed: {
+              outcome: "succeeded",
+              text: "Weeknight noodles: toss cooked noodles with sesame oil, soy sauce, and rice vinegar.",
+              resumeAt: null,
+              progressText: null,
+              completionMemory,
+            },
+            output: [],
+          };
+        },
+      },
+    } as never);
+    const state: FamilyWorkStateV1 = {
+      kind: "family_work_v1",
+      version: 1,
+      generation: 1,
+      phase: "ready",
+      claim: null,
+      activePhoneCall: null,
+      activeTextMessage: null,
+      pendingParticipantRequest: null,
+      browserSession: null,
+      continuationItems: [],
+      pendingCall: null,
+      steering: [],
+      progressRevision: 0,
+      terminal: null,
+    };
+
+    const result = await reasoner.continueFamilyWork(
+      {
+        workId: "family-work-recipe",
+        scheduledOccurrence: null,
+        objective: "Turn our noodle notes into one reusable recipe.",
+        visibility: "household",
+        ownerAdultId: null,
+        origin: familyWorkOrigin("Please turn the noodle notes into a reusable recipe."),
+        household: {
+          householdId: "household-1",
+          familyLabel: "Test family",
+          timeZone: "America/Los_Angeles",
+          postalCode: "90045",
+          adults: [{ adultId: "adult-1", firstName: "Hari", displayName: "Hari Anbarasu" }],
+          children: [],
+        },
+        state,
+        currentTime: NOW,
+      },
+      {
+        async searchVault({ query }) {
+          return {
+            query,
+            results: [],
+            total: 0,
+            complete: true,
+            nextCursor: null,
+          };
+        },
+      },
+    );
+
+    expect(result).toMatchObject({
+      kind: "terminal",
+      outcome: "succeeded",
+      completionMemory,
+    });
+    expect(String(modelRequests[0]?.instructions)).toContain("selective completionMemory decision");
+    expect(String(modelRequests[0]?.instructions)).toContain("search the Vault");
+    expect(JSON.stringify(modelRequests[0]?.text)).toContain('"completionMemory"');
+    expect(functionOutputEnvelopes(modelRequests[1])).toContainEqual(
+      expect.objectContaining({ callId: "completion-memory-search", outcome: "succeeded" }),
+    );
+  });
+
   test("durable work compacts complete history and preserves its recent tail before continuing", async () => {
     const oldResultUrl = "https://example.com/older-comparison";
     const recentResultUrl = "https://example.com/recent-comparison";

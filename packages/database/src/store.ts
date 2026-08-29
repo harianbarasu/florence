@@ -843,6 +843,14 @@ export type ScheduledFamilyWork = Readonly<{
   completionCondition?: string | null;
 }>;
 
+export type FamilyWorkCompletionMemoryMutation =
+  | { readonly operation: "remember"; readonly fact: FactDraft }
+  | {
+      readonly operation: "correct";
+      readonly fact: FactDraft;
+      readonly expectedUpdatedAt: string;
+    };
+
 export type SettleFamilyWorkClaimInput = {
   workId: string;
   generation: number;
@@ -861,6 +869,7 @@ export type SettleFamilyWorkClaimInput = {
         type: "terminal";
         state: FamilyWorkStateV1;
         terminalText: string;
+        completionMemoryMutations?: readonly FamilyWorkCompletionMemoryMutation[];
         completionEvidenceOutputs: readonly { readonly callId: string; readonly output: JsonValue }[];
       }
     | { type: "retry"; state: FamilyWorkStateV1; retryAt: string; error: string };
@@ -4648,6 +4657,11 @@ export class PostgresFlorenceStore {
 
       if (input.result.type === "terminal") {
         const terminalText = bounded(required(input.result.terminalText, "Family work result"), 10_000);
+        const completionMemoryMutations = await validateFamilyWorkCompletionMemoryMutations(sql, {
+          work,
+          mutations: input.result.completionMemoryMutations ?? [],
+          observedAt: settledAt,
+        });
         if (
           nextState.phase !== "terminal" ||
           nextState.pendingParticipantRequest !== null ||
@@ -4688,6 +4702,10 @@ export class PostgresFlorenceStore {
             nextState.completionEvidence ?? [],
             input.result.completionEvidenceOutputs,
           );
+        } else if (completionMemoryMutations.length > 0) {
+          throw new FlorenceStoreConflict(
+            "Only succeeded family work may retain a completion memory",
+          );
         } else if ((nextState.completionEvidence ?? []).length > 0) {
           throw new FlorenceStoreConflict(
             "Only succeeded family work may retain terminal completion evidence",
@@ -4718,7 +4736,15 @@ export class PostgresFlorenceStore {
             and task_state->'claim'->>'claimId'=${input.claimId} returning id
         `;
         if (updated.length !== 1) return "stale";
-        await insertFamilyWorkOutbound(sql, work, nextState, "terminal", terminalText, settledAt);
+        await insertFamilyWorkOutbound(
+          sql,
+          work,
+          nextState,
+          "terminal",
+          terminalText,
+          settledAt,
+          completionMemoryMutations,
+        );
         return "settled";
       }
 
@@ -17736,6 +17762,353 @@ async function applyConversationFactMutations(
   return storedFactIds;
 }
 
+function familyWorkCompletionMemoryFact(value: JsonValue, name: string): FactDraft {
+  const fact = strictJsonRecord(value, name);
+  assertExactJsonKeys(
+    fact,
+    [
+      "id",
+      "kind",
+      "label",
+      "ownerAdultId",
+      "slot",
+      "sourceIds",
+      "subjectPersonId",
+      "value",
+      "visibility",
+    ],
+    name,
+  );
+  const id = requiredStringField(fact, "id", `${name} ID`);
+  assertUuid(id, `${name} ID`);
+  const subjectPersonId = fact.subjectPersonId;
+  if (subjectPersonId !== null && typeof subjectPersonId !== "string") {
+    throw new FlorenceStoreConflict(`${name} subject is invalid`);
+  }
+  if (subjectPersonId !== null) assertUuid(subjectPersonId, `${name} subject`);
+  const kind = fact.kind;
+  if (
+    kind !== "identity" &&
+    kind !== "school" &&
+    kind !== "caregiver" &&
+    kind !== "activity" &&
+    kind !== "schedule" &&
+    kind !== "address" &&
+    kind !== "phone" &&
+    kind !== "contact" &&
+    kind !== "preference" &&
+    kind !== "safety" &&
+    kind !== "general"
+  ) {
+    throw new FlorenceStoreConflict(`${name} kind is invalid`);
+  }
+  const slot = requiredStringField(fact, "slot", `${name} slot`);
+  const label = requiredStringField(fact, "label", `${name} label`);
+  if (fact.value === undefined) throw new FlorenceStoreConflict(`${name} value is invalid`);
+  if (!jsonString(fact.value, "statement")) {
+    throw new FlorenceStoreConflict(`${name} needs a retrieval statement`);
+  }
+  try {
+    decodeMemoryPresentation(fact.value);
+  } catch {
+    throw new FlorenceStoreConflict(`${name} needs valid memory presentation`);
+  }
+  const visibility = fact.visibility;
+  if (visibility !== "private" && visibility !== "household") {
+    throw new FlorenceStoreConflict(`${name} visibility is invalid`);
+  }
+  const ownerAdultId = fact.ownerAdultId;
+  if (ownerAdultId !== null && typeof ownerAdultId !== "string") {
+    throw new FlorenceStoreConflict(`${name} owner is invalid`);
+  }
+  if (ownerAdultId !== null) assertUuid(ownerAdultId, `${name} owner`);
+  if (
+    (visibility === "household" && ownerAdultId !== null) ||
+    (visibility === "private" && ownerAdultId === null)
+  ) {
+    throw new FlorenceStoreConflict(`${name} owner does not match its visibility`);
+  }
+  const sourceIds = jsonArrayField(fact, "sourceIds", `${name} source IDs`).map((sourceId) => {
+    if (typeof sourceId !== "string") {
+      throw new FlorenceStoreConflict(`${name} source ID is invalid`);
+    }
+    assertUuid(sourceId, `${name} source ID`);
+    return sourceId;
+  });
+  if (sourceIds.length === 0) throw new FlorenceStoreConflict(`${name} requires a source`);
+  if (unique(sourceIds).length !== sourceIds.length) {
+    throw new FlorenceStoreConflict(`${name} contains a duplicate source`);
+  }
+  return {
+    id,
+    subjectPersonId,
+    kind,
+    slot,
+    label,
+    value: fact.value,
+    visibility,
+    ownerAdultId,
+    sourceIds,
+  };
+}
+
+function familyWorkCompletionMemoryMutation(
+  value: JsonValue,
+  name: string,
+): FamilyWorkCompletionMemoryMutation {
+  const mutation = strictJsonRecord(value, name);
+  const operation = mutation.operation;
+  if (operation === "remember") {
+    assertExactJsonKeys(mutation, ["fact", "operation"], name);
+    if (mutation.fact === undefined) throw new FlorenceStoreConflict(`${name} fact is invalid`);
+    return {
+      operation,
+      fact: familyWorkCompletionMemoryFact(mutation.fact, `${name} fact`),
+    };
+  }
+  if (operation === "correct") {
+    assertExactJsonKeys(mutation, ["expectedUpdatedAt", "fact", "operation"], name);
+    if (mutation.fact === undefined) throw new FlorenceStoreConflict(`${name} fact is invalid`);
+    return {
+      operation,
+      fact: familyWorkCompletionMemoryFact(mutation.fact, `${name} fact`),
+      expectedUpdatedAt: instant(
+        requiredStringField(mutation, "expectedUpdatedAt", `${name} expected revision`),
+      ).toISOString(),
+    };
+  }
+  throw new FlorenceStoreConflict(`${name} operation is invalid`);
+}
+
+function familyWorkCompletionMemoryMutationJson(
+  mutation: FamilyWorkCompletionMemoryMutation,
+): JsonObject {
+  const fact: JsonObject = {
+    id: mutation.fact.id,
+    subjectPersonId: mutation.fact.subjectPersonId,
+    kind: mutation.fact.kind,
+    slot: mutation.fact.slot,
+    label: mutation.fact.label,
+    value: mutation.fact.value,
+    visibility: mutation.fact.visibility,
+    ownerAdultId: mutation.fact.ownerAdultId,
+    sourceIds: [...mutation.fact.sourceIds],
+  };
+  return mutation.operation === "correct"
+    ? {
+        operation: mutation.operation,
+        fact,
+        expectedUpdatedAt: mutation.expectedUpdatedAt,
+      }
+    : { operation: mutation.operation, fact };
+}
+
+function storedFamilyWorkCompletionMemoryMutations(
+  metadata: JsonValue,
+): readonly FamilyWorkCompletionMemoryMutation[] {
+  const stored = jsonRecord(metadata).familyWorkCompletionMemoryMutations;
+  if (stored === undefined) return [];
+  if (!Array.isArray(stored)) {
+    throw new FlorenceStoreConflict("Family work completion memories are invalid");
+  }
+  return stored.map((mutation, index) =>
+    familyWorkCompletionMemoryMutation(mutation, `Family work completion memory ${index + 1}`),
+  );
+}
+
+async function validateFamilyWorkCompletionMemoryMutations(
+  sql: postgres.TransactionSql,
+  input: {
+    work: ProactiveWorkRow;
+    mutations: readonly FamilyWorkCompletionMemoryMutation[];
+    observedAt: Date;
+  },
+): Promise<readonly FamilyWorkCompletionMemoryMutation[]> {
+  if (input.mutations.length === 0) return [];
+  const normalized = input.mutations.map((mutation, index) =>
+    familyWorkCompletionMemoryMutation(
+      familyWorkCompletionMemoryMutationJson(mutation),
+      `Family work completion memory ${index + 1}`,
+    ),
+  );
+  const resolvedOrigin = await familyWorkOriginContext(sql, input.work, input.observedAt);
+  const audience = input.work.visibility === "household" ? "group" : "private";
+  const factIds = new Set<string>();
+  const slots = new Set<string>();
+  for (const mutation of normalized) {
+    const fact = mutation.fact;
+    const slotKey = `${fact.slot}\0${fact.visibility}\0${fact.ownerAdultId ?? ""}`;
+    if (factIds.has(fact.id) || slots.has(slotKey)) {
+      throw new FlorenceStoreConflict("Family work completion memories repeat one Vault item");
+    }
+    factIds.add(fact.id);
+    slots.add(slotKey);
+    if (!(await familyWorkCompletionMemorySourcesAreAuthorized(sql, input.work, fact.sourceIds))) {
+      throw new FlorenceStoreUnauthorized(
+        "Family work completion memory cited evidence outside the task",
+      );
+    }
+    if (audience === "group" && fact.visibility !== "household") {
+      throw new FlorenceStoreUnauthorized("Household family work cannot retain private memory");
+    }
+    if (fact.visibility === "private" && fact.ownerAdultId !== resolvedOrigin.initiatingAdultId) {
+      throw new FlorenceStoreUnauthorized("A private completion memory belongs to the initiating adult");
+    }
+    if (mutation.operation === "remember") {
+      const [existing] = await sql<{ id: string }[]>`
+        select id from facts where household_id=${input.work.household_id}
+          and (id=${fact.id} or (slot=${fact.slot} and visibility=${fact.visibility}
+            and owner_adult_id is not distinct from ${fact.ownerAdultId}))
+        for update
+      `;
+      if (existing) {
+        throw new FlorenceStoreConflict(
+          "A new completion memory conflicts with current Vault knowledge; correct the exact item instead",
+        );
+      }
+      continue;
+    }
+    const expectedUpdatedAt = instant(mutation.expectedUpdatedAt);
+    const [existing] = await sql<
+      {
+        slot: string;
+        visibility: Visibility;
+        owner_adult_id: string | null;
+        updated_at: Date;
+      }[]
+    >`
+      select slot,visibility,owner_adult_id,updated_at from facts
+      where id=${fact.id} and household_id=${input.work.household_id} for update
+    `;
+    if (
+      !existing ||
+      existing.updated_at.getTime() !== expectedUpdatedAt.getTime() ||
+      existing.slot !== fact.slot ||
+      existing.visibility !== fact.visibility ||
+      existing.owner_adult_id !== fact.ownerAdultId
+    ) {
+      throw new FlorenceStoreConflict("Vault memory changed before this task could correct it");
+    }
+  }
+  return normalized;
+}
+
+async function applyDeliveredFamilyWorkCompletionMemories(
+  sql: postgres.TransactionSql,
+  input: {
+    work: ProactiveWorkRow;
+    terminalSourceId: string;
+    mutations: readonly FamilyWorkCompletionMemoryMutation[];
+    handledAt: Date;
+  },
+): Promise<void> {
+  if (input.mutations.length === 0) return;
+  assertUuid(input.terminalSourceId, "Family work terminal source ID");
+  const resolvedOrigin = await familyWorkOriginContext(sql, input.work, input.handledAt);
+  const audience = input.work.visibility === "household" ? "group" : "private";
+  for (const mutation of input.mutations) {
+    if (
+      !(await familyWorkCompletionMemorySourcesAreAuthorized(
+        sql,
+        input.work,
+        mutation.fact.sourceIds,
+      ))
+    ) {
+      // Evidence may be removed while an already-sent terminal result is in
+      // flight. Delivery still completes, but stale support cannot enter the Vault.
+      continue;
+    }
+    const fact: FactDraft = {
+      ...mutation.fact,
+      // The ordinary fact mutation is authorized by the exact terminal result.
+      // Exact task-selected supports are attached below after their narrower
+      // family-work authorization has been checked.
+      sourceIds: [input.terminalSourceId],
+    };
+    if (mutation.operation === "remember") {
+      const [existing] = await sql<{ id: string }[]>`
+        select id from facts where household_id=${input.work.household_id}
+          and (id=${fact.id} or (slot=${fact.slot} and visibility=${fact.visibility}
+            and owner_adult_id is not distinct from ${fact.ownerAdultId}))
+        for update
+      `;
+      // Another delivered task or parent correction established this slot
+      // while the result was in flight. Never overwrite that newer belief.
+      if (existing) continue;
+    } else {
+      const expectedUpdatedAt = instant(mutation.expectedUpdatedAt);
+      const [existing] = await sql<
+        {
+          slot: string;
+          visibility: Visibility;
+          owner_adult_id: string | null;
+          updated_at: Date;
+        }[]
+      >`
+        select slot,visibility,owner_adult_id,updated_at from facts
+        where id=${fact.id} and household_id=${input.work.household_id} for update
+      `;
+      // A correction after settlement is newer than this in-flight result.
+      if (
+        !existing ||
+        existing.updated_at.getTime() !== expectedUpdatedAt.getTime() ||
+        existing.slot !== fact.slot ||
+        existing.visibility !== fact.visibility ||
+        existing.owner_adult_id !== fact.ownerAdultId
+      ) {
+        continue;
+      }
+    }
+    await applyConversationFactMutations(sql, {
+      householdId: input.work.household_id,
+      audience,
+      senderAdultId: resolvedOrigin.initiatingAdultId,
+      facts: [fact],
+      deleteFactIds: [],
+      handledAt: input.handledAt,
+    });
+    // A correction's sources describe its current meaning. Do not reattach
+    // earlier supports that may be the evidence this change just superseded.
+    for (const sourceId of mutation.fact.sourceIds) {
+      await sql`
+        insert into fact_sources (fact_id,source_id) values (${fact.id},${sourceId})
+        on conflict (fact_id,source_id) do nothing
+      `;
+    }
+  }
+}
+
+async function familyWorkCompletionMemorySourcesAreAuthorized(
+  sql: postgres.TransactionSql,
+  work: ProactiveWorkRow,
+  sourceIds: readonly string[],
+): Promise<boolean> {
+  const ids = unique(sourceIds);
+  if (ids.length === 0 || ids.length !== sourceIds.length) return false;
+  const rows = await sql<{ id: string }[]>`
+    select source.id from sources source
+    where source.household_id=${work.household_id} and source.id in ${sql(ids)}
+      and (source.kind not in ('gmail','calendar')
+        or coalesce(source.metadata->>'providerRemoved','false')<>'true')
+      and (
+        (source.visibility='household' and source.owner_adult_id is null)
+        or (
+          ${work.visibility}='private' and source.visibility='private'
+          and source.owner_adult_id=${work.owner_adult_id}
+        )
+        or (
+          ${work.visibility}='household' and source.visibility='private'
+          and source.owner_adult_id is not null
+          and exists (
+            select 1 from proactive_work_sources work_source
+            where work_source.work_id=${work.id} and work_source.source_id=source.id
+          )
+        )
+      )
+  `;
+  return rows.length === ids.length;
+}
+
 async function applyConversationalReminderMutation(
   sql: postgres.TransactionSql,
   input: {
@@ -21511,6 +21884,22 @@ async function completeDeliveredFamilyWorkTerminal(
   if (!state.terminal) {
     throw new FlorenceStoreConflict("Delivered family work lost its terminal result");
   }
+  const completionMemoryMutations = storedFamilyWorkCompletionMemoryMutations(
+    delivery.source_metadata,
+  );
+  if (state.terminal.outcome !== "succeeded" && completionMemoryMutations.length > 0) {
+    throw new FlorenceStoreConflict(
+      "Only a delivered successful family-work result may retain completion memory",
+    );
+  }
+  if (state.terminal.outcome === "succeeded") {
+    await applyDeliveredFamilyWorkCompletionMemories(sql, {
+      work: delivery,
+      terminalSourceId: sourceId,
+      mutations: completionMemoryMutations,
+      handledAt: delivery.sent_at,
+    });
+  }
   const evidenceBasisAt = state.evidenceRevisionAt ? instant(state.evidenceRevisionAt) : delivery.created_at;
   const scheduled = scheduledFamilyWork(delivery.reminder_schedule);
   const completedSchedule = scheduled
@@ -21923,6 +22312,7 @@ async function insertFamilyWorkOutbound(
   deliveryKind: FamilyWorkDeliveryKind,
   text: string,
   occurredAt: Date,
+  completionMemoryMutations: readonly FamilyWorkCompletionMemoryMutation[] = [],
 ): Promise<void> {
   const channel = await activeReminderChannel(sql, work);
   if (!channel) {
@@ -21935,9 +22325,10 @@ async function insertFamilyWorkOutbound(
       : null;
   const selectedFiles = deliveryKind === "terminal" ? (state.terminal?.selectedFiles ?? []) : [];
   const selectedImages = deliveryKind === "terminal" ? (state.terminal?.selectedImages ?? []) : [];
+  const suffix = `family-work:${deliveryKind}:${state.generation}:${state.progressRevision}`;
   await insertProactiveOutbound(sql, {
     workId: work.id,
-    suffix: `family-work:${deliveryKind}:${state.generation}:${state.progressRevision}`,
+    suffix,
     householdId: work.household_id,
     channel,
     visibility: work.visibility,
@@ -21967,6 +22358,13 @@ async function insertFamilyWorkOutbound(
       familyWorkGeneration: state.generation,
       familyWorkProgressRevision: state.progressRevision,
       familyWorkDeliveryKind: deliveryKind,
+      ...(deliveryKind === "terminal" && completionMemoryMutations.length > 0
+        ? {
+            familyWorkCompletionMemoryMutations: completionMemoryMutations.map(
+              familyWorkCompletionMemoryMutationJson,
+            ),
+          }
+        : {}),
       ...(resolutionMetadata ?? {}),
     },
     notBefore: occurredAt,

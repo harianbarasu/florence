@@ -4726,6 +4726,8 @@ export class Florence {
       ): Promise<FlorenceVaultWorkResult> => {
         taskSignal?.throwIfAborted();
         const identity = familyWorkPendingCapabilityIdentity("vault_work");
+        const replay = work.state.pendingCall?.receipt;
+        if (replay) return replay.output as FlorenceVaultWorkResult;
         if (request.operation === "forget") {
           const existing = familyWorkFacts.find((fact) => fact.id === request.factId);
           if (

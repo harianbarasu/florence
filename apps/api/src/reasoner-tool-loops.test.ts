@@ -3561,6 +3561,94 @@ describe("Florence reasoner capability cutover", () => {
     );
   });
 
+  test("a pending Vault correction keeps the exact revision it read before the checkpoint", async () => {
+    const factId = "22222222-2222-4222-8222-222222222222";
+    const expectedUpdatedAt = "2026-08-27T19:55:00.000Z";
+    const callId = "correct-saved-recipe";
+    const arguments_ = {
+      operation: "correct" as const,
+      factId,
+      statement: "The weeknight noodle recipe uses tamari instead of soy sauce.",
+      visibility: "household" as const,
+      memory: {
+        memoryKind: "artifact" as const,
+        artifactKind: "recipe" as const,
+        title: "Weeknight noodles",
+        details: "Toss noodles with sesame oil, tamari, and rice vinegar.",
+        tags: ["dinner", "noodles", "tamari"],
+      },
+      sourceIds: ["source-adult-1"],
+      fileAssetIds: null,
+      expectedUpdatedAt,
+    };
+    const state: FamilyWorkStateV1 = {
+      kind: "family_work_v1",
+      version: 1,
+      generation: 0,
+      phase: "tool_pending",
+      claim: null,
+      activePhoneCall: null,
+      activeTextMessage: null,
+      pendingParticipantRequest: null,
+      browserSession: null,
+      continuationItems: [functionCall(callId, "vault_work", arguments_)],
+      pendingCall: {
+        callId,
+        name: "vault_work",
+        argumentsJson: JSON.stringify(arguments_),
+        attempt: 0,
+        receipt: null,
+      },
+      steering: [],
+      progressRevision: 0,
+      terminal: null,
+    };
+    const input = {
+      workId: "family-work-vault-correction",
+      scheduledOccurrence: null,
+      objective: "Update the saved noodle recipe to use tamari.",
+      visibility: "household" as const,
+      ownerAdultId: null,
+      origin: familyWorkOrigin("Update the saved noodle recipe to use tamari."),
+      household: {
+        householdId: "household-1",
+        familyLabel: "Test family",
+        timeZone: "America/Los_Angeles",
+        postalCode: "90045",
+        adults: [
+          { adultId: "adult-1", firstName: "Hari", displayName: "Hari Anbarasu" },
+          { adultId: "adult-2", firstName: "Jackson", displayName: "Jackson Williams" },
+        ],
+        children: [],
+      },
+      state,
+      currentTime: NOW,
+    };
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        parse() {
+          throw new Error("A resumed pending effect should settle before another model turn");
+        },
+      },
+    } as never);
+    const requests: unknown[] = [];
+
+    const settled = await reasoner.continueFamilyWork(input, {
+      async runVaultWork(request) {
+        requests.push(request);
+        return {
+          operation: "correct" as const,
+          status: "committed" as const,
+          factId,
+          statement: arguments_.statement,
+        };
+      },
+    });
+
+    expect(requests).toEqual([expect.objectContaining({ factId, expectedUpdatedAt })]);
+    expect(settled).toMatchObject({ kind: "continue", state: { phase: "ready", pendingCall: null } });
+  });
+
   test("household work privately asks one exact other adult and waits without polling the group", async () => {
     const modelRequests: Record<string, unknown>[] = [];
     const question = "Can Violet stay for the full field-trip day on Friday?";

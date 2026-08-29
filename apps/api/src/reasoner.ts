@@ -8848,8 +8848,8 @@ export class FlorenceReasoner {
           : [],
       ),
     );
-    const knownFacts = new Set(knownFactVisibilities.keys());
     const knownFactRevisions = pendingVaultFactRevisions(checkpointInput.state);
+    const knownFacts = new Set([...knownFactVisibilities.keys(), ...knownFactRevisions.keys()]);
     const knownVaultUris = new Set<string>();
     const knownFileAssetIds = new Set([
       ...(checkpointInput.state.browserFiles ?? []).map((file) => file.assetId),

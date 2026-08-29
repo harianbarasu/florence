@@ -521,6 +521,16 @@ release("Durable family work store", () => {
       progressRevision: 0,
       terminal: null,
     } as const;
+    const steeredInitialState = {
+      ...initialState,
+      steering: [
+        {
+          sourceId: "10000000-0000-4000-8000-000000000017",
+          text: "Please use the latest camp instructions.",
+          occurredAt: at(-9_400),
+        },
+      ],
+    } as const;
     const cancelledBrowserSession = {
       sessionId: "browserbase-cancelled-session",
       expiresAt: at(3_600_000),
@@ -595,8 +605,8 @@ release("Durable family work store", () => {
         '10000000-0000-4000-8000-000000000003',
         '10000000-0000-4000-8000-000000000001','family_task','private',
         '10000000-0000-4000-8000-000000000002','Prepare the camp registration','Starting now.',
-        ${sqlLiteral(JSON.stringify(initialState))}::jsonb,'active',
-        ${sqlLiteral(at(-1_000))},${sqlLiteral(at(-9_000))}
+        ${sqlLiteral(JSON.stringify(steeredInitialState))}::jsonb,'active',
+        ${sqlLiteral(at(-1_000))},${sqlLiteral(at(-9_450))}
       );
       insert into sources (
         id,household_id,kind,visibility,owner_adult_id,external_key,label,metadata,occurred_at
@@ -625,6 +635,13 @@ release("Durable family work store", () => {
         'Florence question',
         '{"authoredText":"Which camp form should I use?","voiceTranscriptPresent":false}'::jsonb,
         ${sqlLiteral(at(-9_600))}
+      ),(
+        '10000000-0000-4000-8000-000000000017',
+        '10000000-0000-4000-8000-000000000001','linq_message','private',
+        '10000000-0000-4000-8000-000000000002','family-work-steering',
+        'Latest family work steering',
+        '{"authoredText":"Please use the latest camp instructions.","voiceTranscriptPresent":false}'::jsonb,
+        ${sqlLiteral(at(-9_400))}
       );
       insert into messages (
         source_id,channel_id,direction,sender_adult_id,move_kind,text,provider_event_id,
@@ -652,6 +669,13 @@ release("Durable family work store", () => {
         '10000000-0000-4000-8000-000000000008',0,'handled',
         '[{"assetId":"10000000-0000-4000-8000-000000000012","mimeType":"image/jpeg"}]'::jsonb,
         null,null
+      ),(
+        '10000000-0000-4000-8000-000000000017',
+        '10000000-0000-4000-8000-000000000004','inbound',
+        '10000000-0000-4000-8000-000000000002','message',
+        'Please use the latest camp instructions.',
+        'family-work-steering-event','family-work-steering-message',null,
+        '10000000-0000-4000-8000-000000000018',0,'handled','[]'::jsonb,null,null
       );
       insert into sources (
         id,household_id,kind,visibility,owner_adult_id,external_key,parent_source_id,label,
@@ -684,6 +708,9 @@ release("Durable family work store", () => {
       insert into proactive_work_sources (work_id,source_id) values (
         '10000000-0000-4000-8000-000000000003',
         '10000000-0000-4000-8000-000000000007'
+      ),(
+        '10000000-0000-4000-8000-000000000003',
+        '10000000-0000-4000-8000-000000000017'
       );
       insert into proactive_work (
         id,household_id,kind,visibility,owner_adult_id,objective,current_conclusion,
@@ -983,6 +1010,10 @@ release("Durable family work store", () => {
     if (!progress || !(await store.outboundSendIsCurrent(progress.sourceId))) {
       throw new Error("Progress outbound was not current");
     }
+    expect(progress).toMatchObject({
+      moveKind: "reply",
+      replyToProviderMessageId: "family-work-steering-message",
+    });
     await store.completeOutbound({
       sourceId: progress.sourceId,
       providerMessageId: "provider-progress",
@@ -1023,6 +1054,10 @@ release("Durable family work store", () => {
     if (!terminal || !(await store.outboundSendIsCurrent(terminal.sourceId))) {
       throw new Error("Terminal outbound was not current");
     }
+    expect(terminal).toMatchObject({
+      moveKind: "reply",
+      replyToProviderMessageId: "family-work-steering-message",
+    });
     await store.completeOutbound({
       sourceId: terminal.sourceId,
       providerMessageId: "provider-terminal",
@@ -1034,7 +1069,9 @@ release("Durable family work store", () => {
         and status='completed' and task_state->>'progressRevision'='2')
        and (select count(*)=2 from messages message join sources source on source.id=message.source_id
         where source.metadata->>'familyWorkId'='10000000-0000-4000-8000-000000000003'
-          and message.status='sent')`,
+          and message.status='sent'
+          and message.reply_to_source_id='10000000-0000-4000-8000-000000000017'::uuid
+          and source.parent_source_id='10000000-0000-4000-8000-000000000017'::uuid)`,
     );
     expect(await store.readNextOutbound(at(120_400))).toBeNull();
   });
@@ -2765,9 +2802,11 @@ release("Florence parent journeys", () => {
     await harness.drain();
 
     expect(familyWorkRuns).toBe(1);
-    expect(
-      harness.linq.messages.filter((message) => message.text === PROACTIVE_FAMILY_WORK_RESULT),
-    ).toHaveLength(1);
+    const proactiveResult = harness.linq.messages.find(
+      (message) => message.text === PROACTIVE_FAMILY_WORK_RESULT,
+    );
+    expect(proactiveResult).toBeDefined();
+    expect(proactiveResult?.replyTo).toBeUndefined();
     await harness.assertDatabase(
       "A proactive household judgment did not produce exactly one completed family task from its kickoff",
       `(select count(*)=1 from proactive_work
@@ -3021,6 +3060,7 @@ release("Florence parent journeys", () => {
       (message) => message.providerConversationId === FAMILY_GROUP && message.text === firstResult,
     );
     if (!firstDelivery) throw new Error("The first scheduled dinner plan was not delivered");
+    expect(firstDelivery.replyTo).toBeUndefined();
     const firstReceipt = harness.linq.ledger.sent.get(firstDelivery.idempotencyKey);
     if (firstReceipt?.status !== "committed" || !firstReceipt.providerReceiptId) {
       throw new Error("The first scheduled dinner plan lost its Linq receipt");
@@ -3418,11 +3458,11 @@ release("Florence parent journeys", () => {
       },
     ]);
     const taskMessages = harness.linq.messages.slice(messagesBeforeRequest);
-    expect(
-      taskMessages.filter(
-        (message) => message.providerConversationId === FAMILY_GROUP && message.text === terminalText,
-      ),
-    ).toHaveLength(1);
+    const taskTerminal = taskMessages.filter(
+      (message) => message.providerConversationId === FAMILY_GROUP && message.text === terminalText,
+    );
+    expect(taskTerminal).toHaveLength(1);
+    expect(taskTerminal[0]?.replyTo).toEqual({ providerMessageId: "message-partner-google-task" });
     expect(
       taskMessages.filter(
         (message) =>
@@ -3508,12 +3548,28 @@ release("Florence parent journeys", () => {
               authoredText: "Find Maya's field-trip form in Gmail and upload it for us.",
               voiceTranscriptPresent: false,
             });
+            const signalId = input.workId;
+            const storedImage = await harness.vault.store({
+              assetId: deterministicUuid(`camp-registration-image\0${input.workId}`),
+              householdId: input.household.householdId,
+              signalId,
+              declaredMimeType: "image/jpeg",
+              bytes: JPEG_BYTES,
+            });
             return {
               kind: "continue",
               state: {
                 ...input.state,
                 phase: "tool_pending",
                 claim: null,
+                browserImages: [
+                  {
+                    ...storedImage.image,
+                    signalId,
+                    workId: input.workId,
+                    filename: "camp-registration.jpg",
+                  },
+                ],
                 pendingCall: {
                   callId: "upload-field-trip-form",
                   name: "browser_work",
@@ -3523,7 +3579,7 @@ release("Florence parent journeys", () => {
                     sourceId: source.sourceId,
                     attachmentRef: attachment.attachmentRef,
                   }),
-                  attempt: 1,
+                  attempt: 0,
                 },
               },
               progressText: null,
@@ -3554,6 +3610,8 @@ release("Florence parent journeys", () => {
             };
           }
           const terminalText = "I uploaded Maya's field-trip form.";
+          const selectedImage = input.state.browserImages?.[0];
+          if (!selectedImage) throw new Error("The completed browser work lost its selected image");
           return {
             kind: "terminal",
             state: {
@@ -3561,10 +3619,12 @@ release("Florence parent journeys", () => {
               phase: "terminal",
               claim: null,
               pendingCall: null,
-              terminal: { outcome: "succeeded", text: terminalText },
+              progressRevision: input.state.progressRevision + 1,
+              terminal: { outcome: "succeeded", text: terminalText, selectedImages: [selectedImage] },
             },
             outcome: "succeeded",
             text: terminalText,
+            selectedImages: [selectedImage],
           };
         },
       },
@@ -3594,6 +3654,19 @@ release("Florence parent journeys", () => {
     });
     expect(browserRuns[1]?.uploadFile).toBeUndefined();
     expect(closedSessions).toEqual([expect.objectContaining({ sessionId: "browserbase-family-session" })]);
+    const terminalMove = harness.linq.moves.find(
+      ({ move }) =>
+        move.type === "message" &&
+        move.parts.some((part) => part.type === "text" && part.text === "I uploaded Maya's field-trip form."),
+    );
+    expect(terminalMove?.move).toMatchObject({
+      type: "message",
+      replyTo: { providerMessageId: "message-group-browser-work" },
+      parts: [
+        { type: "text", text: "I uploaded Maya's field-trip form." },
+        { type: "media", source: { type: "attachment", providerAttachmentId: expect.any(String) } },
+      ],
+    });
   }, 20_000);
 
   test("gets ahead from both parents’ context, native inputs, a monitor, and the read-only calendar", async () => {
@@ -6923,6 +6996,7 @@ class FakeLinq {
   readonly sendMessageAttempts: LinqSendMessage[] = [];
   readonly moves: LinqSendMove[] = [];
   readonly reactions: LinqSendReaction[] = [];
+  readonly uploads: Parameters<LinqClient["uploadAttachment"]>[0][] = [];
   readonly media = new Map<string, { reference: LinqMediaReference; bytes: Uint8Array }>();
   #partnerInitialPromptBarrier: {
     reached: Promise<void>;
@@ -7074,6 +7148,11 @@ class FakeLinq {
     const media = this.media.get(reference.providerAttachmentId);
     if (!media) throw new Error(`Unknown fake Linq media ${reference.providerAttachmentId}`);
     return { ...media.reference, bytes: media.bytes };
+  }
+
+  async uploadAttachment(input: Parameters<LinqClient["uploadAttachment"]>[0]): Promise<string> {
+    this.uploads.push(input);
+    return `uploaded-attachment-${this.uploads.length}`;
   }
 
   async setTyping(): Promise<boolean> {

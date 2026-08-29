@@ -17931,6 +17931,39 @@ async function completeDeliveredFamilyWorkTerminal(
   }
 }
 
+// Adapted port: Pi packages/agent/src/agent-loop.ts keeps steering in the live lifecycle, while
+// Hermes gateway/stream_consumer.py propagates its initial_reply_to_id through progress and final
+// sends. Resolving that anchor from Florence's PostgreSQL source lineage stays Florence-owned
+// because neither pinned upstream has Linq or Florence source rows.
+async function familyWorkReplySourceId(
+  sql: postgres.TransactionSql,
+  work: ProactiveWorkRow,
+  state: FamilyWorkStateV1,
+  channel: ChannelRow,
+): Promise<string | null> {
+  if (work.reminder_schedule !== null) return null;
+  const latestSteeringSourceId = state.steering.at(-1)?.sourceId ?? null;
+  const candidates = await sql<{ source_id: string }[]>`
+    select message.source_id
+    from proactive_work_sources work_source
+    join sources source on source.id=work_source.source_id
+    join messages message on message.source_id=source.id
+    where work_source.work_id=${work.id} and source.household_id=${work.household_id}
+      and source.kind='linq_message' and source.visibility=${work.visibility}
+      and source.owner_adult_id is not distinct from ${work.owner_adult_id}
+      and message.channel_id=${channel.id} and message.direction='inbound'
+      and message.move_kind in ('message','reply') and message.sender_adult_id is not null
+      and message.provider_message_id is not null
+    order by source.occurred_at,source.id
+  `;
+  const latestSteering = latestSteeringSourceId
+    ? candidates.find(({ source_id: sourceId }) => sourceId === latestSteeringSourceId)
+    : undefined;
+  if (latestSteering) return latestSteering.source_id;
+  const steeringSourceIds = new Set(state.steering.map(({ sourceId }) => sourceId));
+  return candidates.find(({ source_id: sourceId }) => !steeringSourceIds.has(sourceId))?.source_id ?? null;
+}
+
 async function insertFamilyWorkOutbound(
   sql: postgres.TransactionSql,
   work: ProactiveWorkRow,
@@ -17943,6 +17976,7 @@ async function insertFamilyWorkOutbound(
   if (!channel) {
     throw new FlorenceStoreConflict("Family work no longer has an active delivery conversation");
   }
+  const replyToSourceId = await familyWorkReplySourceId(sql, work, state, channel);
   const resolutionMetadata =
     deliveryKind === "terminal" ? await proactiveFamilyWorkResolutionMetadata(sql, work.id) : null;
   const selectedImages = deliveryKind === "terminal" ? (state.terminal?.selectedImages ?? []) : [];
@@ -17954,6 +17988,7 @@ async function insertFamilyWorkOutbound(
     visibility: work.visibility,
     ownerAdultId: work.owner_adult_id,
     text,
+    ...(replyToSourceId ? { replyToSourceId } : {}),
     ...(selectedImages.length > 0
       ? {
           nativeMove: {
@@ -18171,6 +18206,7 @@ async function insertProactiveOutbound(
     visibility: Visibility;
     ownerAdultId: string | null;
     text: string;
+    replyToSourceId?: string | null;
     nativeMove?: OutboundNativeMoveDraft;
     metadata?: JsonObject;
     notBefore: Date;
@@ -18184,8 +18220,11 @@ async function insertProactiveOutbound(
   await insertOutbound(sql, {
     sourceId: proactiveOutboundSourceId(input.workId, input.suffix),
     idempotencyKey: `proactive:${input.workId}:${stable}`,
-    moveKind: "message",
+    moveKind: input.replyToSourceId ? "reply" : "message",
     text: bounded(required(input.text, "Proactive message"), 10_000),
+    ...(input.replyToSourceId
+      ? { replyToSourceId: input.replyToSourceId, parentSourceId: input.replyToSourceId }
+      : {}),
     ...(input.nativeMove ? { nativeMove: input.nativeMove } : {}),
     turnId: deterministicUuid(`proactive-turn\0${input.workId}\0${stable}`),
     turnPart: 0,

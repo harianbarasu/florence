@@ -2438,9 +2438,18 @@ export class Florence {
         );
         return "failed";
       }
-      const nativeMove = outbound.nativeMove
+      const preparedNativeMove = outbound.nativeMove
         ? await this.#prepareLinqNativeMove(outbound.nativeMove, outbound.householdId, outbound.sourceId)
         : null;
+      const nativeMove =
+        preparedNativeMove?.type === "message" && outbound.moveKind === "reply"
+          ? {
+              ...preparedNativeMove,
+              replyTo: {
+                providerMessageId: requiredText(outbound.replyToProviderMessageId, "Reply target message"),
+              },
+            }
+          : preparedNativeMove;
       const result =
         nativeMove !== null
           ? await this.#linq.sendMove({

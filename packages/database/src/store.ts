@@ -357,7 +357,20 @@ export type SharedFamilyProfile = {
   }[];
 };
 
-export type SharedBriefingCandidate = {
+export type DocketCoordination = {
+  /** The person or party expected to move the item next; null means genuinely unassigned. */
+  owner: string | null;
+  /** One concrete next move, written for the family rather than as workflow state. */
+  nextAction: string;
+  /** The concrete answer, event, or outside response preventing that move, when any. */
+  waitingOn: string | null;
+};
+
+export type PrivateDocketCoordination = DocketCoordination & {
+  needsAnswer: boolean;
+};
+
+export type SharedBriefingCandidate = DocketCoordination & {
   candidateId: string;
   category: "deadline" | "conflict" | "handoff" | "family_date" | "loose_end";
   summary: string;
@@ -373,6 +386,7 @@ export type HouseholdDocket = {
 
 export type PrivateReviewFinding = {
   privateSummary: string;
+  privateDocket: PrivateDocketCoordination | null;
   actionAnchorDigest?: string;
   sourceIds: readonly string[];
   familyRelevance: FamilyRelevance;
@@ -578,7 +592,9 @@ export type FiniteMonitorGmailSourceAnchor = {
 
 export type ProactiveDelivery = {
   privateDetail: string | null;
+  privateDocket: PrivateDocketCoordination | null;
   householdConclusion: string | null;
+  householdDocket: DocketCoordination | null;
   householdCategory: SharedBriefingCandidate["category"] | null;
   householdNeedsAnswer?: boolean;
   sourceIds: readonly string[];
@@ -681,6 +697,8 @@ export type FamilyWorkStateV1 = {
   readonly generation: number;
   readonly acknowledgementText?: string | null;
   readonly docketCandidateIds?: readonly string[];
+  /** Durable reasoner-authored coordination while one parent answer blocks this occurrence. */
+  readonly waitingDocket?: PrivateDocketCoordination | null;
   readonly phase: "ready" | "tool_pending" | "waiting" | "terminal";
   readonly claim: { readonly claimId: string; readonly leaseUntil: string } | null;
   readonly browserSession: {
@@ -715,12 +733,14 @@ export type FamilyWorkStateV1 = {
   readonly terminal: {
     readonly outcome: "succeeded" | "partial" | "failed" | "cancelled";
     readonly text: string;
+    readonly docket?: PrivateDocketCoordination | null;
     readonly selectedImages?: readonly FamilyWorkSelectedImage[];
   } | null;
 };
 
 export type VisibleFamilyWork = {
   workId: string;
+  candidateIds: readonly string[];
   objective: string;
   currentProgress: string;
   schedule: ReminderSchedule | null;
@@ -2182,11 +2202,33 @@ export class PostgresFlorenceStore {
       householdId: input.householdId,
       viewerAdultId: input.viewerAdultId ?? null,
     });
+    const familyWorkRows = await this.#sql<ProactiveWorkRow[]>`
+      select work.* from proactive_work work
+      where work.household_id=${input.householdId} and work.kind='family_task'
+        and work.status in ('active','paused','delivering')
+        and (
+          work.visibility='household'
+          or (${input.viewerAdultId ?? null}::uuid is not null and work.visibility='private'
+            and work.owner_adult_id=${input.viewerAdultId ?? null})
+        )
+      order by work.created_at,work.id
+    `;
+    const activeWorkCoordination = new Map<string, PrivateDocketCoordination>();
+    for (const work of familyWorkRows) {
+      const state = familyWorkState(work.task_state);
+      const coordination = activeFamilyWorkDocketCoordination(work, state);
+      if (!coordination) continue;
+      for (const candidateId of state.docketCandidateIds ?? []) {
+        activeWorkCoordination.set(candidateId, coordination);
+      }
+    }
     const ranked = [
       ...groups.map(({ candidate }) => ({ ...candidate, visibility: "household" as const })),
       ...privateItems.map((candidate) => ({ ...candidate, visibility: "private" as const })),
       ...conversationItems.map(({ candidate, visibility }) => ({ ...candidate, visibility })),
-    ].sort(compareBriefingCandidates);
+    ]
+      .map((item) => ({ ...item, ...(activeWorkCoordination.get(item.candidateId) ?? {}) }))
+      .sort(compareBriefingCandidates);
     return {
       totalItems: ranked.length,
       items: (limit === null ? ranked : ranked.slice(0, limit)).map(
@@ -2194,6 +2236,7 @@ export class PostgresFlorenceStore {
           sourceIds: _sourceIds,
           actionAnchorDigest: _actionAnchorDigest,
           actionKey: _actionKey,
+          coordinationUpdatedAt: _coordinationUpdatedAt,
           ...item
         }) => item,
       ),
@@ -2747,6 +2790,7 @@ export class PostgresFlorenceStore {
             finding.sourceIds,
             finding.actionAnchorDigest ?? null,
             actionKey,
+            occurredAt,
           ),
         ];
       });
@@ -2759,9 +2803,9 @@ export class PostgresFlorenceStore {
         );
         if (
           finding.familyRelevance !== "owner_private" ||
-          finding.surfaceNow !== false ||
           findingIsResolved(findingIndex) ||
           finding.householdCandidate !== null ||
+          finding.privateDocket === null ||
           finding.monitor != null ||
           finding.familyCalendar != null ||
           alreadyRetainedAsMemory
@@ -2774,6 +2818,7 @@ export class PostgresFlorenceStore {
             finding,
             finding.actionAnchorDigest ?? null,
             findingActionKeys[findingIndex] ?? null,
+            occurredAt,
           ),
         ];
       });
@@ -2965,8 +3010,16 @@ export class PostgresFlorenceStore {
           return [
             {
               privateDetail: finding.privateSummary,
+              privateDocket: finding.privateDocket,
               ...(finding.actionAnchorDigest ? { actionAnchorDigest: finding.actionAnchorDigest } : {}),
               householdConclusion: candidate?.summary ?? null,
+              householdDocket: candidate
+                ? {
+                    owner: candidate.owner,
+                    nextAction: candidate.nextAction,
+                    waitingOn: candidate.waitingOn,
+                  }
+                : null,
               householdCategory: candidate?.category ?? null,
               householdNeedsAnswer: candidate?.needsAnswer ?? false,
               sourceIds: finding.sourceIds,
@@ -3283,6 +3336,11 @@ export class PostgresFlorenceStore {
           return index;
         });
         const referencedGroups = new Set(referencedGroupIndexes);
+        const referencedCandidateIds = unique(
+          selectedCandidateGroups.flatMap((group, index) =>
+            referencedGroups.has(index) ? group.members.map((candidate) => candidate.candidateId) : [],
+          ),
+        ).sort();
         await stageProactiveFamilyWork(sql, {
           basis: `initial-household-briefing\0${work.id}`,
           householdId: work.household_id,
@@ -3296,6 +3354,7 @@ export class PostgresFlorenceStore {
           actionOwners: visibleGoogleActions.flatMap(({ key, candidateGroupIndex, ownerAdultId }) =>
             referencedGroups.has(candidateGroupIndex) && ownerAdultId ? [{ key, ownerAdultId }] : [],
           ),
+          candidateIds: referencedCandidateIds,
           occurredAt,
         });
       }
@@ -3447,6 +3506,7 @@ export class PostgresFlorenceStore {
               phase: "terminal",
               claim: null,
               pendingCall: null,
+              waitingDocket: null,
               progressRevision: incrementFamilyWorkCounter(
                 state.progressRevision,
                 "Family work progress revision",
@@ -3936,9 +3996,15 @@ export class PostgresFlorenceStore {
       if (
         nextState.generation !== input.generation ||
         nextState.claim !== null ||
-        !sameFamilyWorkSteering(currentState.steering, nextState.steering)
+        !sameFamilyWorkSteering(currentState.steering, nextState.steering) ||
+        !sameStrings(
+          [...(currentState.docketCandidateIds ?? [])].sort(),
+          [...(nextState.docketCandidateIds ?? [])].sort(),
+        )
       ) {
-        throw new FlorenceStoreConflict("A family work settlement changed its claim generation or steering");
+        throw new FlorenceStoreConflict(
+          "A family work settlement changed its claim generation, steering, or docket linkage",
+        );
       }
       if (
         nextState.browserImages?.some(
@@ -3977,7 +4043,12 @@ export class PostgresFlorenceStore {
       }
 
       if (input.result.type === "waiting") {
-        if (nextState.phase !== "waiting" || nextState.pendingCall !== null || nextState.terminal !== null) {
+        if (
+          nextState.phase !== "waiting" ||
+          nextState.pendingCall !== null ||
+          nextState.terminal !== null ||
+          nextState.waitingDocket?.needsAnswer !== true
+        ) {
           throw new FlorenceStoreConflict("Waiting family work needs a waiting checkpoint");
         }
         if (nextState.progressRevision <= currentState.progressRevision) {
@@ -4454,6 +4525,7 @@ export class PostgresFlorenceStore {
         privateFindings: desiredState.privateDocketFindings,
         preservedPrivateActions: desiredState.preservedPrivateDocketActions,
         completedActionKeys: desiredState.completedMonitorActionKeys,
+        occurredAt,
       });
       await reconcileReviewedGoogleSources(sql, {
         work,
@@ -4520,16 +4592,23 @@ export class PostgresFlorenceStore {
     outcome: "silent" | "update" | "complete";
     privateDetail: string | null;
     householdConclusion: string | null;
+    householdDocket: DocketCoordination | null;
     householdCategory: SharedBriefingCandidate["category"] | null;
+    householdNeedsAnswer: boolean;
     sourceIds: readonly string[];
     currentConclusion: string;
     nextCheck: string | null;
     why: string;
     googleEvidence: readonly GoogleEvidenceDraft[];
+    reviewStartedAt: string;
     deliverNotBefore: string;
     occurredAt: string;
   }): Promise<void> {
     const occurredAt = instant(input.occurredAt);
+    const reviewStartedAt = instant(input.reviewStartedAt);
+    if (reviewStartedAt > occurredAt) {
+      throw new FlorenceStoreConflict("A finite monitor review cannot finish before it started");
+    }
     const deliverNotBefore = proactiveDeliveryTime(input.deliverNotBefore, occurredAt);
     await this.#sql.begin(async (sql) => {
       const [work] = await sql<ProactiveWorkRow[]>`
@@ -4540,10 +4619,22 @@ export class PostgresFlorenceStore {
       const googleActionKey = googleActionKeyFromWorkMarker(work.last_error);
       if (
         (input.householdConclusion === null) !== (input.householdCategory === null) ||
+        (input.householdConclusion === null) !== (input.householdDocket === null) ||
+        (input.householdConclusion === null && input.householdNeedsAnswer) ||
         (input.householdCategory !== null && !isSharedBriefingCategory(input.householdCategory))
       ) {
-        throw new FlorenceStoreConflict("A finite monitor household conclusion needs one valid category");
+        throw new FlorenceStoreConflict(
+          "A finite monitor household conclusion needs one valid category and complete coordination",
+        );
       }
+      const householdDocket =
+        input.householdConclusion === null
+          ? null
+          : requiredDocketCoordination(
+              input.householdDocket,
+              "Finite monitor household docket coordination",
+              input.householdNeedsAnswer,
+            );
       const [privateOwner] =
         work.visibility === "private" && work.owner_adult_id
           ? await sql<{ conflict_sharing_enabled: boolean }[]>`
@@ -4593,6 +4684,17 @@ export class PostgresFlorenceStore {
           householdId: work.household_id,
           ownerAdultId: work.owner_adult_id,
           actionKey: googleActionKey,
+          notUpdatedAfter: reviewStartedAt,
+        });
+      } else if (input.outcome === "update" && googleActionKey && householdConclusion && householdDocket) {
+        await updateHouseholdDocketCandidateForGoogleAction(sql, {
+          householdId: work.household_id,
+          ownerAdultId: work.owner_adult_id,
+          actionKey: googleActionKey,
+          summary: householdConclusion,
+          coordination: { ...householdDocket, needsAnswer: input.householdNeedsAnswer },
+          reviewStartedAt,
+          updatedAt: occurredAt,
         });
       }
       await persistGoogleEvidenceDrafts(sql, {
@@ -8557,6 +8659,7 @@ export class PostgresFlorenceStore {
           }
           let selectedDocketSourceIds: readonly string[] = [];
           let selectedDocketActionOwners: readonly ProactiveFamilyWorkActionOwner[] = [];
+          let linkedDocketCandidateIds: readonly string[] = [...mutation.candidateIds];
           if (mutation.candidateIds.length > 0) {
             await lockHouseholdGooglePolls(sql, turn.household_id);
             const docketState = await currentHouseholdDocketState(sql, {
@@ -8566,6 +8669,10 @@ export class PostgresFlorenceStore {
               handledAt,
             });
             const selection = selectCurrentHouseholdDocketCandidates(docketState, mutation.candidateIds);
+            linkedDocketCandidateIds = unique([
+              ...mutation.candidateIds,
+              ...selection.groups.flatMap((group) => group.members.map((candidate) => candidate.candidateId)),
+            ]).sort();
             const candidateSourceIds = unique(
               selection.candidates.flatMap((candidate) => [...candidate.sourceIds]),
             );
@@ -8653,7 +8760,15 @@ export class PostgresFlorenceStore {
             select * from proactive_work where id=${mutation.workId} for update
           `;
           if (sameId) throw new FlorenceStoreConflict("A family work ID was already used");
-          const state = initialFamilyWorkState(mutation.acknowledgementText ?? null, mutation.candidateIds);
+          await assertDocketCandidatesAvailableForFamilyWork(sql, {
+            householdId: turn.household_id,
+            candidateIds: linkedDocketCandidateIds,
+            excludeWorkId: null,
+          });
+          const state = initialFamilyWorkState(
+            mutation.acknowledgementText ?? null,
+            linkedDocketCandidateIds,
+          );
           const scheduled = mutation.schedule ? newScheduledFamilyWork(mutation.schedule) : null;
           let nextCheckAt = new Date(handledAt.getTime() + FAMILY_WORK_INITIAL_DELAY_MS);
           if (scheduled) {
@@ -8923,6 +9038,7 @@ export class PostgresFlorenceStore {
               phase: "terminal",
               claim: null,
               pendingCall: null,
+              waitingDocket: null,
               progressRevision,
               terminal: { outcome: "cancelled", text: "Cancelled." },
             });
@@ -13672,30 +13788,34 @@ type GooglePollDesiredState = Readonly<{
   completedMonitorActionKeys: ReadonlySet<string>;
 }>;
 
-type GooglePollDocketCandidate = Readonly<{
-  actionKey: string;
-  category: SharedBriefingCandidate["category"];
-  summary: string;
-  urgency: SharedBriefingCandidate["urgency"];
-  dueAt: string | null;
-  needsAnswer: boolean;
-  sourceIds: readonly string[];
-  actionAnchorDigest: string | null;
-}>;
+type GooglePollDocketCandidate = Readonly<
+  DocketCoordination & {
+    actionKey: string;
+    category: SharedBriefingCandidate["category"];
+    summary: string;
+    urgency: SharedBriefingCandidate["urgency"];
+    dueAt: string | null;
+    needsAnswer: boolean;
+    sourceIds: readonly string[];
+    actionAnchorDigest: string | null;
+  }
+>;
 
 type GooglePollDocketPreservation = Readonly<{
   sourceIds: readonly string[];
   actionAnchorDigest: string;
 }>;
 
-type GooglePollPrivateDocketFinding = Readonly<{
-  actionKey: string;
-  summary: string;
-  urgency: SharedBriefingCandidate["urgency"];
-  dueAt: string | null;
-  sourceIds: readonly string[];
-  actionAnchorDigest: string | null;
-}>;
+type GooglePollPrivateDocketFinding = Readonly<
+  PrivateDocketCoordination & {
+    actionKey: string;
+    summary: string;
+    urgency: SharedBriefingCandidate["urgency"];
+    dueAt: string | null;
+    sourceIds: readonly string[];
+    actionAnchorDigest: string | null;
+  }
+>;
 
 function googleOutboundOutcomeIdentity(
   actionKey: string,
@@ -13783,6 +13903,14 @@ async function applyGooglePollDeliveries(
     ) {
       throw new FlorenceStoreConflict("A proactive household conclusion needs one valid category");
     }
+    if ((delivery.householdConclusion === null) !== (delivery.householdDocket === null)) {
+      throw new FlorenceStoreConflict(
+        "A proactive household conclusion needs one complete coordination state",
+      );
+    }
+    if (delivery.privateDocket !== null && delivery.privateDetail === null) {
+      throw new FlorenceStoreConflict("A private docket item needs one private finding");
+    }
     if (delivery.monitor && delivery.familyCalendar) {
       throw new FlorenceStoreConflict(
         "One Google finding cannot create both a Calendar action and a reminder monitor",
@@ -13867,6 +13995,11 @@ async function applyGooglePollDeliveries(
     }
     return [
       {
+        ...requiredDocketCoordination(
+          delivery.householdDocket,
+          "Google household docket coordination",
+          delivery.householdNeedsAnswer ?? false,
+        ),
         actionKey,
         category: delivery.householdCategory,
         summary,
@@ -13899,18 +14032,19 @@ async function applyGooglePollDeliveries(
       !delivery ||
       !actionKey ||
       work.visibility !== "private" ||
-      delivery.surfaceNow !== false ||
       delivery.preserveDocket === true ||
       !delivery.privateDetail ||
       householdConclusions[index] !== null ||
       delivery.monitor !== null ||
       (delivery.familyCalendar ?? null) !== null ||
-      (delivery.nextJob ?? null) !== null
+      (delivery.nextJob ?? null) !== null ||
+      delivery.privateDocket === null
     ) {
       return [];
     }
     return [
       {
+        ...requiredPrivateDocketCoordination(delivery.privateDocket, "Google private docket coordination"),
         actionKey,
         summary: delivery.privateDetail,
         urgency: delivery.urgency,
@@ -14082,6 +14216,21 @@ async function applyGooglePollDeliveries(
       ) {
         throw new FlorenceStoreUnauthorized("A proactive next job has no matching kickoff conversation");
       }
+      const householdDocketCandidate = householdDocketCandidates.find(
+        (candidate) => candidate.actionKey === googleActionKey,
+      );
+      if (!privateJob && !householdDocketCandidate) {
+        throw new FlorenceStoreConflict("A proactive household job lost its docket candidate");
+      }
+      const candidateIds =
+        privateJob || !householdDocketCandidate
+          ? []
+          : await proactiveGoogleHouseholdDocketCandidateIds(
+              sql,
+              work,
+              householdDocketCandidate,
+              input.occurredAt,
+            );
       await stageProactiveFamilyWork(sql, {
         basis: `google-action\0${googleActionKey}`,
         householdId: work.household_id,
@@ -14093,6 +14242,7 @@ async function applyGooglePollDeliveries(
         actionOwners: work.owner_adult_id
           ? [{ key: googleActionKey, ownerAdultId: work.owner_adult_id }]
           : [],
+        candidateIds,
         occurredAt: input.occurredAt,
       });
     }
@@ -14181,6 +14331,7 @@ async function reconcileHouseholdDocketCandidates(
     privateFindings: readonly GooglePollPrivateDocketFinding[];
     preservedPrivateActions: readonly GooglePollDocketPreservation[];
     completedActionKeys: ReadonlySet<string>;
+    occurredAt: Date;
   },
 ): Promise<void> {
   if (input.work.kind !== "personal_google_poll" || !input.work.owner_adult_id) return;
@@ -14245,10 +14396,14 @@ async function reconcileHouseholdDocketCandidates(
               urgency: candidate.urgency,
               dueAt: candidate.dueAt,
               needsAnswer: candidate.needsAnswer,
+              owner: candidate.owner,
+              nextAction: candidate.nextAction,
+              waitingOn: candidate.waitingOn,
             },
             candidate.sourceIds,
             candidate.actionAnchorDigest,
             candidate.actionKey,
+            input.occurredAt,
           ),
         ],
   );
@@ -14260,12 +14415,19 @@ async function reconcileHouseholdDocketCandidates(
             deterministicUuid(`private-review-finding\0${review.id}\0${finding.actionKey}`),
             {
               privateSummary: finding.summary,
+              privateDocket: {
+                owner: finding.owner,
+                nextAction: finding.nextAction,
+                waitingOn: finding.waitingOn,
+                needsAnswer: finding.needsAnswer,
+              },
               sourceIds: finding.sourceIds,
               urgency: finding.urgency,
               dueAt: finding.dueAt,
             },
             finding.actionAnchorDigest,
             finding.actionKey,
+            input.occurredAt,
           ),
         ],
   );
@@ -14286,6 +14448,7 @@ async function removeHouseholdDocketCandidateForGoogleAction(
     householdId: string;
     ownerAdultId: string | null;
     actionKey: string;
+    notUpdatedAfter?: Date;
   },
 ): Promise<void> {
   if (!input.ownerAdultId) return;
@@ -14303,13 +14466,79 @@ async function removeHouseholdDocketCandidateForGoogleAction(
     input.householdId,
     unique(candidates.flatMap((candidate) => [...candidate.sourceIds])),
   );
-  const retained = candidates.filter(
-    (candidate) => googleActionKeyForCandidate(candidate, sourceDigests) !== input.actionKey,
-  );
+  const retained = candidates.filter((candidate) => {
+    if (googleActionKeyForCandidate(candidate, sourceDigests) !== input.actionKey) return true;
+    return (
+      input.notUpdatedAfter !== undefined &&
+      candidate.coordinationUpdatedAt !== null &&
+      instant(candidate.coordinationUpdatedAt) > input.notUpdatedAfter
+    );
+  });
   if (retained.length === candidates.length) return;
   await sql`
     update proactive_work set briefing_candidates=${sql.json(
       completedPrivateReviewState(retained, privateFindings),
+    )}
+    where id=${review.id} and kind='initial_private_review' and status='completed'
+  `;
+}
+
+async function updateHouseholdDocketCandidateForGoogleAction(
+  sql: postgres.TransactionSql,
+  input: {
+    householdId: string;
+    ownerAdultId: string | null;
+    actionKey: string;
+    summary: string;
+    coordination: PrivateDocketCoordination;
+    reviewStartedAt: Date;
+    updatedAt: Date;
+  },
+): Promise<void> {
+  if (!input.ownerAdultId) return;
+  const [review] = await sql<ProactiveWorkRow[]>`
+    select * from proactive_work where household_id=${input.householdId}
+      and owner_adult_id=${input.ownerAdultId}
+      and kind='initial_private_review' and status='completed'
+    order by created_at desc,id desc limit 1 for update
+  `;
+  if (!review) return;
+  const candidates = storedBriefingCandidates(review.briefing_candidates);
+  const privateFindings = storedPrivateReviewFindings(review.briefing_candidates);
+  const sourceDigests = await readStableGoogleSourceDigestMap(
+    sql,
+    input.householdId,
+    unique(candidates.flatMap((candidate) => [...candidate.sourceIds])),
+  );
+  let changed = false;
+  const updated = candidates.map((candidate) => {
+    if (googleActionKeyForCandidate(candidate, sourceDigests) !== input.actionKey) return candidate;
+    if (
+      candidate.coordinationUpdatedAt !== null &&
+      instant(candidate.coordinationUpdatedAt) > input.reviewStartedAt
+    ) {
+      return candidate;
+    }
+    changed = true;
+    return privateReviewCandidate(
+      candidate.candidateId,
+      {
+        category: candidate.category,
+        summary: input.summary,
+        urgency: candidate.urgency,
+        dueAt: candidate.dueAt,
+        ...input.coordination,
+      },
+      candidate.sourceIds,
+      candidate.actionAnchorDigest,
+      candidate.actionKey,
+      input.updatedAt,
+    );
+  });
+  if (!changed) return;
+  await sql`
+    update proactive_work set briefing_candidates=${sql.json(
+      completedPrivateReviewState(updated, privateFindings),
     )}
     where id=${review.id} and kind='initial_private_review' and status='completed'
   `;
@@ -15082,11 +15311,56 @@ type VisibleFamilyWorkRow = {
   created_at: Date;
 };
 
+function activeFamilyWorkDocketCoordination(
+  row: ProactiveWorkRow,
+  state: FamilyWorkStateV1,
+): PrivateDocketCoordination | null {
+  if ((state.docketCandidateIds?.length ?? 0) === 0) return null;
+  const visibleLine = (value: string | null, fallback: string): string => {
+    const line = (value ?? "").replaceAll(/\s+/gu, " ").trim();
+    return bounded(line || fallback, 2_000);
+  };
+  if (state.phase === "waiting") {
+    return (
+      state.waitingDocket ?? {
+        owner: null,
+        nextAction: "Reply to Florence.",
+        waitingOn: visibleLine(row.current_conclusion, "Florence’s question"),
+        needsAnswer: true,
+      }
+    );
+  }
+  if (row.status === "paused") {
+    return {
+      owner: null,
+      nextAction: "Resume Florence’s work.",
+      waitingOn: null,
+      needsAnswer: false,
+    };
+  }
+  if (isIdleScheduledFamilyWork(row, state)) return null;
+  if (row.status === "delivering") {
+    return {
+      owner: "Florence",
+      nextAction: "Share the finished result.",
+      waitingOn: null,
+      needsAnswer: false,
+    };
+  }
+  return {
+    owner: "Florence",
+    nextAction: visibleLine(row.objective, "Finish the work in progress."),
+    waitingOn: null,
+    needsAnswer: false,
+  };
+}
+
 function visibleFamilyWork(row: VisibleFamilyWorkRow): VisibleFamilyWork {
   const scheduled = scheduledFamilyWork(row.reminder_schedule);
   const state = familyWorkState(row.task_state);
   return {
     workId: row.id,
+    candidateIds: [...(state.docketCandidateIds ?? [])],
     objective: row.objective,
     currentProgress: row.current_conclusion,
     schedule: scheduled?.schedule ?? null,
@@ -17709,6 +17983,7 @@ const FAMILY_WORK_STATE_KEYS = [
   "steering",
   "terminal",
   "version",
+  "waitingDocket",
 ] as const;
 
 function initialFamilyWorkState(
@@ -17721,6 +17996,7 @@ function initialFamilyWorkState(
     generation: 0,
     acknowledgementText,
     docketCandidateIds: [...docketCandidateIds],
+    waitingDocket: null,
     phase: "ready",
     claim: null,
     activePhoneCall: null,
@@ -17805,6 +18081,7 @@ function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWor
   if (state.browserSession === undefined) state.browserSession = null;
   if (state.docketCandidateIds === undefined) state.docketCandidateIds = [];
   if (state.progressBlocked === undefined) state.progressBlocked = false;
+  if (state.waitingDocket === undefined) state.waitingDocket = null;
   assertExactJsonKeys(state, FAMILY_WORK_STATE_KEYS, "Family work state");
   if (state.kind !== "family_work_v1" || state.version !== 1) {
     throw new FlorenceStoreConflict("Family work state has an unsupported version");
@@ -17833,6 +18110,32 @@ function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWor
   const phase = state.phase;
   if (phase !== "ready" && phase !== "tool_pending" && phase !== "waiting" && phase !== "terminal") {
     throw new FlorenceStoreConflict("Family work state has an invalid phase");
+  }
+  let waitingDocket: FamilyWorkStateV1["waitingDocket"] = null;
+  if (state.waitingDocket !== null) {
+    const storedWaitingDocket = strictJsonRecord(state.waitingDocket, "Family work waiting docket");
+    assertExactJsonKeys(
+      storedWaitingDocket,
+      ["needsAnswer", "nextAction", "owner", "waitingOn"],
+      "Family work waiting docket",
+    );
+    if (typeof storedWaitingDocket.needsAnswer !== "boolean") {
+      throw new FlorenceStoreConflict("Family work waiting docket answer state is invalid");
+    }
+    waitingDocket = requiredPrivateDocketCoordination(
+      {
+        ...storedDocketCoordination(
+          storedWaitingDocket,
+          storedWaitingDocket.needsAnswer,
+          "Family work waiting docket",
+        ),
+        needsAnswer: storedWaitingDocket.needsAnswer,
+      },
+      "Family work waiting docket",
+    );
+  }
+  if (phase !== "waiting" && waitingDocket !== null) {
+    throw new FlorenceStoreConflict("Only waiting family work may retain waiting docket coordination");
   }
 
   let claim: FamilyWorkStateV1["claim"] = null;
@@ -18015,14 +18318,52 @@ function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWor
   if (state.terminal !== null) {
     const storedTerminal = strictJsonRecord(state.terminal, "Family work terminal result");
     const hasSelectedImages = storedTerminal.selectedImages !== undefined;
+    const storedTerminalDocket = storedTerminal.docket;
+    const hasDocket = storedTerminalDocket !== undefined;
     assertExactJsonKeys(
       storedTerminal,
-      hasSelectedImages ? ["outcome", "text", "selectedImages"] : ["outcome", "text"],
+      ["outcome", "text", ...(hasSelectedImages ? ["selectedImages"] : []), ...(hasDocket ? ["docket"] : [])],
       "Family work terminal result",
     );
     const outcome = storedTerminal.outcome;
     if (outcome !== "succeeded" && outcome !== "partial" && outcome !== "failed" && outcome !== "cancelled") {
       throw new FlorenceStoreConflict("Family work terminal outcome is invalid");
+    }
+    const docket =
+      storedTerminalDocket === undefined && (outcome === "partial" || outcome === "failed")
+        ? {
+            owner: null,
+            nextAction:
+              outcome === "partial"
+                ? "Decide the remaining next step."
+                : "Choose another way to move this forward.",
+            waitingOn: null,
+            needsAnswer: false,
+          }
+        : storedTerminalDocket === undefined || storedTerminalDocket === null
+          ? null
+          : (() => {
+              const stored = strictJsonRecord(storedTerminalDocket, "Family work terminal docket");
+              assertExactJsonKeys(
+                stored,
+                ["needsAnswer", "nextAction", "owner", "waitingOn"],
+                "Family work terminal docket",
+              );
+              if (typeof stored.needsAnswer !== "boolean") {
+                throw new FlorenceStoreConflict("Family work terminal docket answer state is invalid");
+              }
+              return requiredPrivateDocketCoordination(
+                {
+                  ...storedDocketCoordination(stored, stored.needsAnswer, "Family work terminal docket"),
+                  needsAnswer: stored.needsAnswer,
+                },
+                "Family work terminal docket",
+              );
+            })();
+    if ((outcome === "partial" || outcome === "failed") !== (docket !== null)) {
+      throw new FlorenceStoreConflict(
+        "Partial or failed family work needs terminal docket coordination, and every other outcome must leave it empty",
+      );
     }
     terminal = {
       outcome,
@@ -18031,6 +18372,7 @@ function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWor
         10_000,
         "Family work terminal text",
       ),
+      docket,
       ...(hasSelectedImages
         ? {
             selectedImages: familyWorkSelectedImages(
@@ -18057,6 +18399,7 @@ function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWor
     generation,
     acknowledgementText,
     docketCandidateIds,
+    waitingDocket,
     phase,
     claim,
     activePhoneCall,
@@ -18158,6 +18501,7 @@ export function steerFamilyWorkState(
     pendingCall: null,
     steering: [...state.steering, steering],
     terminal: null,
+    waitingDocket: null,
   });
 }
 
@@ -18388,8 +18732,10 @@ async function completeDeliveredFamilyWorkTerminal(
         and task_state->>'generation'=${String(state.generation)}
     `;
   } else {
+    const recurringCandidateIds =
+      state.terminal.outcome === "succeeded" ? [] : (state.docketCandidateIds ?? []);
     const nextState = familyWorkState({
-      ...initialFamilyWorkState(state.acknowledgementText ?? null),
+      ...initialFamilyWorkState(state.acknowledgementText ?? null, recurringCandidateIds),
       generation: incrementFamilyWorkCounter(state.generation, "Family work generation"),
     });
     const nextAt = completedSchedule.paused
@@ -18409,22 +18755,47 @@ async function completeDeliveredFamilyWorkTerminal(
     `;
     if (updated.length !== 1) return;
   }
-  if (state.terminal.outcome === "succeeded" && (state.docketCandidateIds?.length ?? 0) > 0) {
-    await resolveConversationDocketItemsCompletedByFamilyWork(sql, {
+  const candidateIds = state.docketCandidateIds ?? [];
+  if (
+    (state.terminal.outcome === "partial" || state.terminal.outcome === "failed") &&
+    state.terminal.docket &&
+    candidateIds.length > 0
+  ) {
+    await persistFamilyWorkTerminalDocketCoordination(sql, {
       householdId: delivery.household_id,
       visibility: delivery.visibility,
       ownerAdultId: delivery.owner_adult_id,
-      candidateIds: state.docketCandidateIds ?? [],
-      resolutionSourceId: sourceId,
-      resolvedAt: delivery.sent_at,
+      candidateIds,
+      coordination: state.terminal.docket,
+      workStartedAt: delivery.created_at,
+      updatedAt: delivery.sent_at,
     });
   }
-  for (const { key, ownerAdultId } of proactiveFamilyWorkActionOwners(delivery.source_metadata)) {
-    await removeHouseholdDocketCandidateForGoogleAction(sql, {
-      householdId: delivery.household_id,
-      ownerAdultId,
-      actionKey: key,
-    });
+  if (state.terminal.outcome === "succeeded") {
+    if (candidateIds.length > 0) {
+      await resolveConversationDocketItemsCompletedByFamilyWork(sql, {
+        householdId: delivery.household_id,
+        visibility: delivery.visibility,
+        ownerAdultId: delivery.owner_adult_id,
+        candidateIds,
+        resolutionSourceId: sourceId,
+        workStartedAt: delivery.created_at,
+        resolvedAt: delivery.sent_at,
+      });
+      await removeInitialReviewDocketCandidatesCompletedByFamilyWork(sql, {
+        householdId: delivery.household_id,
+        candidateIds,
+        workStartedAt: delivery.created_at,
+      });
+    }
+    for (const { key, ownerAdultId } of proactiveFamilyWorkActionOwners(delivery.source_metadata)) {
+      await removeHouseholdDocketCandidateForGoogleAction(sql, {
+        householdId: delivery.household_id,
+        ownerAdultId,
+        actionKey: key,
+        notUpdatedAfter: delivery.created_at,
+      });
+    }
   }
 }
 
@@ -18436,6 +18807,7 @@ async function resolveConversationDocketItemsCompletedByFamilyWork(
     ownerAdultId: string | null;
     candidateIds: readonly string[];
     resolutionSourceId: string;
+    workStartedAt: Date;
     resolvedAt: Date;
   },
 ): Promise<void> {
@@ -18459,6 +18831,7 @@ async function resolveConversationDocketItemsCompletedByFamilyWork(
   for (const row of rows) {
     const record = storedConversationDocketRecord(row.metadata);
     if (record?.status !== "unresolved" || !candidateIds.includes(record.candidateId)) continue;
+    if (instant(record.updatedAt) > input.workStartedAt) continue;
     const resolved: StoredConversationDocketRecord = {
       ...record,
       status: "resolved",
@@ -18469,6 +18842,226 @@ async function resolveConversationDocketItemsCompletedByFamilyWork(
     await sql`
       update sources set metadata=metadata||${sql.json({ conversationDocketItem: resolved })}
       where id=${row.id} and household_id=${input.householdId}
+    `;
+  }
+}
+
+function expandedInitialReviewDocketCandidateIds(
+  reviews: readonly ProactiveWorkRow[],
+  selectedCandidateIds: ReadonlySet<string>,
+): Set<string> {
+  const expanded = new Set(selectedCandidateIds);
+  const groups = rankedBriefingCandidateGroups(
+    reviews.flatMap((review) =>
+      review.owner_adult_id
+        ? storedBriefingCandidates(review.briefing_candidates).map((candidate) => ({
+            candidate,
+            ownerAdultId: review.owner_adult_id as string,
+          }))
+        : [],
+    ),
+  );
+  for (const group of groups) {
+    if (!group.members.some((candidate) => selectedCandidateIds.has(candidate.candidateId))) continue;
+    for (const candidate of group.members) expanded.add(candidate.candidateId);
+  }
+  return expanded;
+}
+
+function initialReviewDocketCandidateIdsChangedAfter(
+  reviews: readonly ProactiveWorkRow[],
+  selectedCandidateIds: ReadonlySet<string>,
+  workStartedAt: Date,
+): Set<string> {
+  const changed = new Set<string>();
+  const groups = rankedBriefingCandidateGroups(
+    reviews.flatMap((review) =>
+      review.owner_adult_id
+        ? storedBriefingCandidates(review.briefing_candidates).map((candidate) => ({
+            candidate,
+            ownerAdultId: review.owner_adult_id as string,
+          }))
+        : [],
+    ),
+  );
+  for (const group of groups) {
+    if (!group.members.some((candidate) => selectedCandidateIds.has(candidate.candidateId))) continue;
+    if (
+      group.members.some(
+        (candidate) =>
+          candidate.coordinationUpdatedAt !== null &&
+          instant(candidate.coordinationUpdatedAt) > workStartedAt,
+      )
+    ) {
+      for (const candidate of group.members) changed.add(candidate.candidateId);
+    }
+  }
+  for (const finding of reviews.flatMap((review) =>
+    storedPrivateReviewFindings(review.briefing_candidates),
+  )) {
+    if (
+      selectedCandidateIds.has(finding.candidateId) &&
+      finding.coordinationUpdatedAt !== null &&
+      instant(finding.coordinationUpdatedAt) > workStartedAt
+    ) {
+      changed.add(finding.candidateId);
+    }
+  }
+  return changed;
+}
+
+async function persistFamilyWorkTerminalDocketCoordination(
+  sql: postgres.TransactionSql,
+  input: {
+    householdId: string;
+    visibility: Visibility;
+    ownerAdultId: string | null;
+    candidateIds: readonly string[];
+    coordination: PrivateDocketCoordination;
+    workStartedAt: Date;
+    updatedAt: Date;
+  },
+): Promise<void> {
+  const candidateIds = unique(input.candidateIds);
+  if (candidateIds.length === 0) return;
+  const candidateIdSet = new Set(candidateIds);
+  const coordination = requiredPrivateDocketCoordination(
+    input.coordination,
+    "Family work terminal docket coordination",
+  );
+  const conversationRows = await sql<{ id: string; metadata: JsonValue }[]>`
+    select id,metadata from sources
+    where household_id=${input.householdId} and kind='linq_message'
+      and (
+        (${input.visibility}='household' and visibility='household' and owner_adult_id is null)
+        or (${input.visibility}='private' and (
+          (visibility='household' and owner_adult_id is null)
+          or (visibility='private' and owner_adult_id=${input.ownerAdultId})
+        ))
+      )
+      and metadata->'conversationDocketItem'->>'candidateId' in ${sql(candidateIds)}
+    order by id for update
+  `;
+  for (const row of conversationRows) {
+    const record = storedConversationDocketRecord(row.metadata);
+    if (record?.status !== "unresolved" || !candidateIdSet.has(record.candidateId)) continue;
+    if (instant(record.updatedAt) > input.workStartedAt) continue;
+    const updated: StoredConversationDocketRecord = {
+      ...record,
+      ...coordination,
+      updatedAt: input.updatedAt.toISOString(),
+    };
+    await sql`
+      update sources set metadata=metadata||${sql.json({ conversationDocketItem: updated })}
+      where id=${row.id} and household_id=${input.householdId}
+    `;
+  }
+
+  const reviews = await sql<ProactiveWorkRow[]>`
+    select * from proactive_work
+    where household_id=${input.householdId} and kind='initial_private_review' and status='completed'
+    order by created_at,id for update
+  `;
+  for (const candidateId of expandedInitialReviewDocketCandidateIds(reviews, candidateIdSet)) {
+    candidateIdSet.add(candidateId);
+  }
+  const changedAfterWorkStarted = initialReviewDocketCandidateIdsChangedAfter(
+    reviews,
+    candidateIdSet,
+    input.workStartedAt,
+  );
+  for (const review of reviews) {
+    let changed = false;
+    const candidates = storedBriefingCandidates(review.briefing_candidates).map((candidate) => {
+      if (!candidateIdSet.has(candidate.candidateId) || changedAfterWorkStarted.has(candidate.candidateId)) {
+        return candidate;
+      }
+      changed = true;
+      return privateReviewCandidate(
+        candidate.candidateId,
+        {
+          category: candidate.category,
+          summary: candidate.summary,
+          urgency: candidate.urgency,
+          dueAt: candidate.dueAt,
+          ...coordination,
+        },
+        candidate.sourceIds,
+        candidate.actionAnchorDigest,
+        candidate.actionKey,
+        input.updatedAt,
+      );
+    });
+    const privateFindings = storedPrivateReviewFindings(review.briefing_candidates).map((finding) => {
+      if (!candidateIdSet.has(finding.candidateId) || changedAfterWorkStarted.has(finding.candidateId)) {
+        return finding;
+      }
+      changed = true;
+      return privateReviewFinding(
+        finding.candidateId,
+        {
+          privateSummary: finding.summary,
+          privateDocket: coordination,
+          sourceIds: finding.sourceIds,
+          urgency: finding.urgency,
+          dueAt: finding.dueAt,
+        },
+        finding.actionAnchorDigest,
+        finding.actionKey,
+        input.updatedAt,
+      );
+    });
+    if (!changed) continue;
+    await sql`
+      update proactive_work set briefing_candidates=${sql.json(
+        completedPrivateReviewState(candidates, privateFindings),
+      )}
+      where id=${review.id} and kind='initial_private_review' and status='completed'
+    `;
+  }
+}
+
+async function removeInitialReviewDocketCandidatesCompletedByFamilyWork(
+  sql: postgres.TransactionSql,
+  input: { householdId: string; candidateIds: readonly string[]; workStartedAt: Date },
+): Promise<void> {
+  const candidateIds = unique(input.candidateIds);
+  if (candidateIds.length === 0) return;
+  const candidateIdSet = new Set(candidateIds);
+  const reviews = await sql<ProactiveWorkRow[]>`
+    select * from proactive_work
+    where household_id=${input.householdId} and kind='initial_private_review' and status='completed'
+    order by created_at,id for update
+  `;
+  const expandedCandidateIds = expandedInitialReviewDocketCandidateIds(reviews, candidateIdSet);
+  const changedAfterWorkStarted = initialReviewDocketCandidateIdsChangedAfter(
+    reviews,
+    expandedCandidateIds,
+    input.workStartedAt,
+  );
+  for (const review of reviews) {
+    const candidates = storedBriefingCandidates(review.briefing_candidates);
+    const privateFindings = storedPrivateReviewFindings(review.briefing_candidates);
+    const retainedCandidates = candidates.filter(
+      (candidate) =>
+        !expandedCandidateIds.has(candidate.candidateId) ||
+        changedAfterWorkStarted.has(candidate.candidateId),
+    );
+    const retainedPrivateFindings = privateFindings.filter(
+      (finding) =>
+        !expandedCandidateIds.has(finding.candidateId) || changedAfterWorkStarted.has(finding.candidateId),
+    );
+    if (
+      retainedCandidates.length === candidates.length &&
+      retainedPrivateFindings.length === privateFindings.length
+    ) {
+      continue;
+    }
+    await sql`
+      update proactive_work set briefing_candidates=${sql.json(
+        completedPrivateReviewState(retainedCandidates, retainedPrivateFindings),
+      )}
+      where id=${review.id} and kind='initial_private_review' and status='completed'
     `;
   }
 }
@@ -18529,7 +19122,9 @@ async function insertFamilyWorkOutbound(
   }
   const replyToSourceId = await familyWorkReplySourceId(sql, work, state, channel);
   const resolutionMetadata =
-    deliveryKind === "terminal" ? await proactiveFamilyWorkResolutionMetadata(sql, work.id) : null;
+    deliveryKind === "terminal"
+      ? await proactiveFamilyWorkResolutionMetadata(sql, work.id, state.terminal?.outcome === "succeeded")
+      : null;
   const selectedImages = deliveryKind === "terminal" ? (state.terminal?.selectedImages ?? []) : [];
   await insertProactiveOutbound(sql, {
     workId: work.id,
@@ -18594,6 +19189,7 @@ function proactiveFamilyWorkActionOwners(metadata: JsonValue): ProactiveFamilyWo
 async function proactiveFamilyWorkResolutionMetadata(
   sql: postgres.TransactionSql,
   workId: string,
+  resolved: boolean,
 ): Promise<JsonObject | null> {
   const [kickoff] = await sql<{ metadata: JsonValue }[]>`
     select source.metadata from proactive_work_sources link
@@ -18618,7 +19214,7 @@ async function proactiveFamilyWorkResolutionMetadata(
   }
   return {
     googleActionKeys: Object.keys(actionOwners).sort(),
-    googleActionTerminal: true,
+    ...(resolved ? { googleActionTerminal: true } : {}),
     proactiveFamilyWorkActionOwners: actionOwners,
   };
 }
@@ -18648,6 +19244,101 @@ function docketCandidateOwnerAdultIds(reviews: readonly ProactiveWorkRow[], cand
   ).sort();
 }
 
+async function proactiveGoogleHouseholdDocketCandidateIds(
+  sql: postgres.TransactionSql,
+  work: ProactiveWorkRow,
+  current: GooglePollDocketCandidate,
+  occurredAt: Date,
+): Promise<string[]> {
+  if (work.kind !== "personal_google_poll" || !work.owner_adult_id) return [];
+  assertDigest(current.actionKey, "Proactive Google family-work action key");
+  const reviews = await sql<ProactiveWorkRow[]>`
+    select * from proactive_work
+    where household_id=${work.household_id} and kind='initial_private_review' and status='completed'
+    order by created_at desc,id desc for share
+  `;
+  const review = reviews.find((candidate) => candidate.owner_adult_id === work.owner_adult_id);
+  if (!review) {
+    throw new FlorenceStoreConflict("A proactive household job lost its completed private review");
+  }
+  const candidateId = deterministicUuid(`briefing-candidate\0${review.id}\0${current.actionKey}`);
+  const currentCandidate = privateReviewCandidate(
+    candidateId,
+    {
+      category: current.category,
+      summary: current.summary,
+      urgency: current.urgency,
+      dueAt: current.dueAt,
+      needsAnswer: current.needsAnswer,
+      owner: current.owner,
+      nextAction: current.nextAction,
+      waitingOn: current.waitingOn,
+    },
+    current.sourceIds,
+    current.actionAnchorDigest,
+    current.actionKey,
+    occurredAt,
+  );
+  const groups = rankedBriefingCandidateGroups(
+    reviews.flatMap((candidateReview) =>
+      candidateReview.owner_adult_id
+        ? [
+            ...storedBriefingCandidates(candidateReview.briefing_candidates)
+              .filter((candidate) => candidate.candidateId !== candidateId)
+              .map((candidate) => ({
+                candidate,
+                ownerAdultId: candidateReview.owner_adult_id as string,
+              })),
+            ...(candidateReview.id === review.id
+              ? [{ candidate: currentCandidate, ownerAdultId: work.owner_adult_id as string }]
+              : []),
+          ]
+        : [],
+    ),
+  );
+  const group = groups.find((candidateGroup) =>
+    candidateGroup.members.some((candidate) => candidate.candidateId === candidateId),
+  );
+  return unique((group?.members ?? [currentCandidate]).map((candidate) => candidate.candidateId)).sort();
+}
+
+async function assertDocketCandidatesAvailableForFamilyWork(
+  sql: postgres.TransactionSql,
+  input: {
+    householdId: string;
+    candidateIds: readonly string[];
+    excludeWorkId: string | null;
+  },
+): Promise<void> {
+  const candidateIds = unique(input.candidateIds);
+  if (candidateIds.length === 0) return;
+  if (candidateIds.length !== input.candidateIds.length) {
+    throw new FlorenceStoreConflict("Family work cannot repeat a docket candidate");
+  }
+  for (const candidateId of candidateIds) assertUuid(candidateId, "Family work docket candidate ID");
+  const linked = await sql<{ id: string }[]>`
+    select work.id from proactive_work work
+    where work.household_id=${input.householdId} and work.kind='family_task'
+      and work.status in ('active','paused','delivering')
+      and (${input.excludeWorkId}::uuid is null or work.id<>${input.excludeWorkId})
+      and exists (
+        select 1
+        from jsonb_array_elements_text(
+          case
+            when jsonb_typeof(work.task_state->'docketCandidateIds')='array'
+            then work.task_state->'docketCandidateIds'
+            else '[]'::jsonb
+          end
+        ) linked(candidate_id)
+        where linked.candidate_id in ${sql(candidateIds)}
+      )
+    order by work.created_at,work.id for update of work
+  `;
+  if (linked.length > 0) {
+    throw new FlorenceStoreConflict("That docket item already has family work in progress");
+  }
+}
+
 async function stageProactiveFamilyWork(
   sql: postgres.TransactionSql,
   input: {
@@ -18659,12 +19350,20 @@ async function stageProactiveFamilyWork(
     objective: string;
     kickoffSourceId: string;
     actionOwners: readonly ProactiveFamilyWorkActionOwner[];
+    candidateIds: readonly string[];
     occurredAt: Date;
   },
 ): Promise<string> {
   assertUuid(input.householdId, "Proactive family-work household ID");
   assertUuid(input.executionAdultId, "Proactive family-work execution adult ID");
   assertUuid(input.kickoffSourceId, "Proactive family-work kickoff source ID");
+  const candidateIds = unique(input.candidateIds);
+  if (candidateIds.length !== input.candidateIds.length) {
+    throw new FlorenceStoreConflict("Proactive family work repeated a docket candidate");
+  }
+  for (const candidateId of candidateIds) {
+    assertUuid(candidateId, "Proactive family-work docket candidate ID");
+  }
   const objective = bounded(required(input.objective, "Proactive family-work objective"), 4_000);
   const workId = deterministicUuid(`proactive-family-work\0${required(input.basis, "Proactive work basis")}`);
   const [kickoff] = await sql<
@@ -18734,23 +19433,35 @@ async function stageProactiveFamilyWork(
   const [existing] = await sql<ProactiveWorkRow[]>`
     select * from proactive_work where id=${workId} for update
   `;
+  const existingCandidateIds = existing
+    ? [...(familyWorkState(existing.task_state).docketCandidateIds ?? [])]
+    : [];
   if (
     existing &&
     (existing.household_id !== input.householdId ||
       existing.kind !== "family_task" ||
       existing.visibility !== input.visibility ||
       existing.owner_adult_id !== input.ownerAdultId ||
-      existing.objective !== objective)
+      existing.objective !== objective ||
+      (existingCandidateIds.length > 0 &&
+        !sameStrings([...existingCandidateIds].sort(), [...candidateIds].sort())))
   ) {
     throw new FlorenceStoreConflict("A proactive family-work basis changed after it was staged");
   }
+  await assertDocketCandidatesAvailableForFamilyWork(sql, {
+    householdId: input.householdId,
+    candidateIds,
+    excludeWorkId: existing?.id ?? null,
+  });
   if (!existing) {
     await sql`
       insert into proactive_work (
         id,household_id,kind,visibility,owner_adult_id,objective,current_conclusion,
         task_state,status,next_check_at,created_at
       ) values (${workId},${input.householdId},'family_task',${input.visibility},
-        ${input.ownerAdultId},${objective},'Starting now.',${sql.json(initialFamilyWorkState())},
+        ${input.ownerAdultId},${objective},'Starting now.',${sql.json(
+          initialFamilyWorkState(null, candidateIds),
+        )},
         'active',${new Date(
           Math.max(input.occurredAt.getTime(), kickoff.not_before.getTime()) + FAMILY_WORK_INITIAL_DELAY_MS,
         )},${input.occurredAt})
@@ -18821,6 +19532,8 @@ type StoredBriefingCandidate = SharedBriefingCandidate & {
   sourceIds: readonly string[];
   actionAnchorDigest: string | null;
   actionKey: string | null;
+  /** Last Google-review change to this exact unresolved item; absent on legacy rows. */
+  coordinationUpdatedAt: string | null;
 };
 
 type StoredConversationDocketRecord = StoredBriefingCandidate & {
@@ -18848,7 +19561,7 @@ type StoredConversationDocketItem = {
  * source-backed lifecycle with household docket candidates, but is decoded separately so it can
  * never enter a group briefing or another adult's turn.
  */
-type StoredPrivateReviewFinding = {
+type StoredPrivateReviewFinding = PrivateDocketCoordination & {
   kind: "private_review_finding_v1";
   candidateId: string;
   summary: string;
@@ -18857,6 +19570,7 @@ type StoredPrivateReviewFinding = {
   sourceIds: readonly string[];
   actionAnchorDigest: string | null;
   actionKey: string | null;
+  coordinationUpdatedAt: string | null;
 };
 
 type StoredBriefingCandidateGroup = {
@@ -18897,6 +19611,11 @@ function storedConversationDocketRecord(metadata: JsonValue): StoredConversation
   if (typeof needsAnswer !== "boolean") {
     throw new FlorenceStoreConflict("Stored conversation docket answer state is invalid");
   }
+  const coordination = storedDocketCoordination(
+    record,
+    needsAnswer,
+    "Stored conversation docket coordination",
+  );
   const createdAt = instant(requiredStringField(record, "createdAt", "Conversation docket creation time"));
   const updatedAt = instant(requiredStringField(record, "updatedAt", "Conversation docket update time"));
   if (updatedAt < createdAt) {
@@ -18924,6 +19643,7 @@ function storedConversationDocketRecord(metadata: JsonValue): StoredConversation
       urgency: briefingUrgency(record.urgency),
       dueAt,
       needsAnswer,
+      ...coordination,
     },
     sourceIds as string[],
     requiredStringField(record, "actionAnchorDigest", "Conversation docket action anchor"),
@@ -18987,9 +19707,13 @@ async function readConversationDocketItems(
           urgency: record.urgency,
           dueAt: record.dueAt,
           needsAnswer: record.needsAnswer,
+          owner: record.owner,
+          nextAction: record.nextAction,
+          waitingOn: record.waitingOn,
           sourceIds: record.sourceIds,
           actionAnchorDigest: record.actionAnchorDigest,
           actionKey: record.actionKey,
+          coordinationUpdatedAt: record.coordinationUpdatedAt,
         },
         record,
         metadata: row.metadata,
@@ -19710,28 +20434,24 @@ function briefingCandidateIdentity(candidate: StoredBriefingCandidate): string {
 
 function compareBriefingCandidates(left: StoredBriefingCandidate, right: StoredBriefingCandidate): number {
   const urgencyRank = { now: 0, soon: 1, watch: 2 } as const;
-  const categoryRank = { deadline: 0, conflict: 1, handoff: 2, loose_end: 3, family_date: 4 } as const;
   const leftDue = left.dueAt ? Date.parse(left.dueAt) : Number.POSITIVE_INFINITY;
   const rightDue = right.dueAt ? Date.parse(right.dueAt) : Number.POSITIVE_INFINITY;
   return (
     urgencyRank[left.urgency] - urgencyRank[right.urgency] ||
     leftDue - rightDue ||
     Number(right.needsAnswer) - Number(left.needsAnswer) ||
-    categoryRank[left.category] - categoryRank[right.category] ||
     left.candidateId.localeCompare(right.candidateId)
   );
 }
 
-function isCurrentDocketCandidate(candidate: StoredBriefingCandidate, now: Date, timeZone: string): boolean {
-  if (
-    (candidate.category !== "family_date" && candidate.category !== "conflict") ||
-    candidate.dueAt === null
-  ) {
-    return true;
-  }
-  return (
-    calendarDateInTimeZone(candidate.dueAt, timeZone) >= calendarDateInTimeZone(now.toISOString(), timeZone)
-  );
+function isCurrentDocketCandidate(
+  _candidate: StoredBriefingCandidate,
+  _now: Date,
+  _timeZone: string,
+): boolean {
+  // A date passing does not prove that the underlying family obligation is resolved. Google
+  // reconciliation or an explicit family outcome closes it; presentation facets never do.
+  return true;
 }
 
 function mergedBriefingCandidates(candidates: readonly StoredBriefingCandidate[]): StoredBriefingCandidate[] {
@@ -19760,12 +20480,102 @@ function isSharedBriefingCategory(value: string): value is SharedBriefingCandida
   return ["deadline", "conflict", "handoff", "family_date", "loose_end"].includes(value);
 }
 
+// Adapted from Hermes 6dcebea7 hermes_cli/kanban_db.py:1052-1144,1329-1421,6260-6495:
+// keep a task's assignee and concrete blocking reason beside its durable identity, and update them
+// without changing that identity. Hermes's assignee is a worker profile, so Florence deliberately
+// keeps a natural responsible party instead of reusing privacy/source ownership or claim ownership.
+function docketCoordination(
+  input: DocketCoordination,
+  name: string,
+  needsAnswer: boolean,
+): DocketCoordination {
+  const visibleLine = (value: string, field: string, maximum: number): string => {
+    const text = required(value, `${name} ${field}`);
+    if (text.length > maximum || /[\r\n]/u.test(text)) {
+      throw new FlorenceStoreConflict(`${name} ${field} must fit on one visible line`);
+    }
+    return text;
+  };
+  const owner = input.owner === null ? null : visibleLine(input.owner, "owner", 500);
+  const nextAction = visibleLine(input.nextAction, "next action", 2_000);
+  const waitingOn = input.waitingOn === null ? null : visibleLine(input.waitingOn, "waiting reason", 2_000);
+  if (needsAnswer && waitingOn === null) {
+    throw new FlorenceStoreConflict(`${name} must say what answer it is waiting on`);
+  }
+  return { owner, nextAction, waitingOn };
+}
+
+function requiredDocketCoordination(
+  input: DocketCoordination | null,
+  name: string,
+  needsAnswer: boolean,
+): DocketCoordination {
+  if (input === null) throw new FlorenceStoreConflict(`${name} is required`);
+  return docketCoordination(input, name, needsAnswer);
+}
+
+function requiredPrivateDocketCoordination(
+  input: PrivateDocketCoordination | null,
+  name: string,
+): PrivateDocketCoordination {
+  if (input === null || typeof input.needsAnswer !== "boolean") {
+    throw new FlorenceStoreConflict(`${name} is required`);
+  }
+  return {
+    ...docketCoordination(input, name, input.needsAnswer),
+    needsAnswer: input.needsAnswer,
+  };
+}
+
+function storedDocketCoordination(
+  record: Record<string, JsonValue>,
+  needsAnswer: boolean,
+  name: string,
+): DocketCoordination {
+  const ownerValue = record.owner;
+  const nextActionValue = record.nextAction;
+  const waitingOnValue = record.waitingOn;
+  if (ownerValue !== undefined && ownerValue !== null && typeof ownerValue !== "string") {
+    throw new FlorenceStoreConflict(`${name} owner is invalid`);
+  }
+  if (nextActionValue !== undefined && typeof nextActionValue !== "string") {
+    throw new FlorenceStoreConflict(`${name} next action is invalid`);
+  }
+  if (waitingOnValue !== undefined && waitingOnValue !== null && typeof waitingOnValue !== "string") {
+    throw new FlorenceStoreConflict(`${name} waiting reason is invalid`);
+  }
+  return docketCoordination(
+    {
+      owner: ownerValue === undefined || ownerValue === null ? null : ownerValue,
+      nextAction:
+        nextActionValue === undefined
+          ? needsAnswer
+            ? "Make the needed decision."
+            : "Decide the next step."
+          : nextActionValue,
+      waitingOn: waitingOnValue === undefined ? (needsAnswer ? "A family answer" : null) : waitingOnValue,
+    },
+    name,
+    needsAnswer,
+  );
+}
+
+function storedDocketCoordinationUpdatedAt(record: Record<string, JsonValue>, name: string): string | null {
+  const value = record.coordinationUpdatedAt;
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string") {
+    throw new FlorenceStoreConflict(`${name} revision is invalid`);
+  }
+  return instant(value).toISOString();
+}
+
 function privateReviewCandidate(
   candidateId: string,
   candidate: Omit<SharedBriefingCandidate, "candidateId">,
   sourceIds: readonly string[],
   actionAnchorDigest: string | null = null,
   actionKey: string | null = null,
+  coordinationUpdatedAt: string | Date | null = null,
 ): StoredBriefingCandidate {
   assertUuid(candidateId, "Briefing candidate ID");
   const category = candidate.category;
@@ -19788,6 +20598,11 @@ function privateReviewCandidate(
   for (const sourceId of cited) assertUuid(sourceId, "Briefing source ID");
   if (actionAnchorDigest !== null) assertDigest(actionAnchorDigest, "Briefing action anchor");
   if (actionKey !== null) assertDigest(actionKey, "Briefing Google action key");
+  const coordination = docketCoordination(
+    candidate,
+    "Household-safe briefing coordination",
+    candidate.needsAnswer,
+  );
   return {
     candidateId,
     category,
@@ -19795,18 +20610,30 @@ function privateReviewCandidate(
     urgency,
     dueAt: candidate.dueAt === null ? null : instant(candidate.dueAt).toISOString(),
     needsAnswer: candidate.needsAnswer,
+    ...coordination,
     sourceIds: cited,
     actionAnchorDigest,
     actionKey,
+    coordinationUpdatedAt:
+      coordinationUpdatedAt === null
+        ? null
+        : coordinationUpdatedAt instanceof Date
+          ? coordinationUpdatedAt.toISOString()
+          : instant(coordinationUpdatedAt).toISOString(),
   };
 }
 
 function privateReviewFinding(
   candidateId: string,
-  finding: Pick<PrivateReviewFinding, "privateSummary" | "sourceIds" | "urgency" | "dueAt">,
+  finding: Pick<PrivateReviewFinding, "privateSummary" | "privateDocket" | "sourceIds" | "urgency" | "dueAt">,
   actionAnchorDigest: string | null = null,
   actionKey: string | null = null,
+  coordinationUpdatedAt: string | Date | null = null,
 ): StoredPrivateReviewFinding {
+  const coordination = requiredPrivateDocketCoordination(
+    finding.privateDocket,
+    "Private review docket coordination",
+  );
   const candidate = privateReviewCandidate(
     candidateId,
     {
@@ -19814,11 +20641,15 @@ function privateReviewFinding(
       summary: finding.privateSummary,
       urgency: finding.urgency ?? "soon",
       dueAt: finding.dueAt ?? null,
-      needsAnswer: true,
+      needsAnswer: coordination.needsAnswer,
+      owner: coordination.owner,
+      nextAction: coordination.nextAction,
+      waitingOn: coordination.waitingOn,
     },
     finding.sourceIds,
     actionAnchorDigest,
     actionKey,
+    coordinationUpdatedAt,
   );
   return {
     kind: "private_review_finding_v1",
@@ -19826,9 +20657,14 @@ function privateReviewFinding(
     summary: candidate.summary,
     urgency: candidate.urgency,
     dueAt: candidate.dueAt,
+    owner: candidate.owner,
+    nextAction: candidate.nextAction,
+    waitingOn: candidate.waitingOn,
+    needsAnswer: candidate.needsAnswer,
     sourceIds: candidate.sourceIds,
     actionAnchorDigest: candidate.actionAnchorDigest,
     actionKey: candidate.actionKey,
+    coordinationUpdatedAt: candidate.coordinationUpdatedAt,
   };
 }
 
@@ -19839,10 +20675,14 @@ function privateFindingAsDocketCandidate(finding: StoredPrivateReviewFinding): S
     summary: finding.summary,
     urgency: finding.urgency,
     dueAt: finding.dueAt,
-    needsAnswer: true,
+    needsAnswer: finding.needsAnswer,
+    owner: finding.owner,
+    nextAction: finding.nextAction,
+    waitingOn: finding.waitingOn,
     sourceIds: finding.sourceIds,
     actionAnchorDigest: finding.actionAnchorDigest,
     actionKey: finding.actionKey,
+    coordinationUpdatedAt: finding.coordinationUpdatedAt,
   };
 }
 
@@ -19889,6 +20729,7 @@ function storedBriefingCandidates(value: JsonValue): StoredBriefingCandidate[] {
     if (typeof needsAnswer !== "boolean") {
       throw new FlorenceStoreConflict("Stored briefing answer state is invalid");
     }
+    const coordination = storedDocketCoordination(record, needsAnswer, "Stored briefing coordination");
     return [
       privateReviewCandidate(
         requiredStringField(record, "candidateId", "Stored briefing candidate ID"),
@@ -19898,6 +20739,7 @@ function storedBriefingCandidates(value: JsonValue): StoredBriefingCandidate[] {
           urgency: briefingUrgency(record.urgency),
           dueAt,
           needsAnswer,
+          ...coordination,
         },
         sourceIds as string[],
         record.actionAnchorDigest === undefined || record.actionAnchorDigest === null
@@ -19906,6 +20748,7 @@ function storedBriefingCandidates(value: JsonValue): StoredBriefingCandidate[] {
         record.actionKey === undefined || record.actionKey === null
           ? null
           : requiredStringField(record, "actionKey", "Stored briefing Google action key"),
+        storedDocketCoordinationUpdatedAt(record, "Stored briefing coordination"),
       ),
     ];
   });
@@ -19924,11 +20767,17 @@ function storedPrivateReviewFindings(value: JsonValue): StoredPrivateReviewFindi
     if (dueAt !== null && typeof dueAt !== "string") {
       throw new FlorenceStoreConflict("Stored private review finding due date is invalid");
     }
+    const needsAnswer = record.needsAnswer === undefined ? true : record.needsAnswer;
+    if (typeof needsAnswer !== "boolean") {
+      throw new FlorenceStoreConflict("Stored private review finding answer state is invalid");
+    }
+    const coordination = storedDocketCoordination(record, needsAnswer, "Stored private review coordination");
     return [
       privateReviewFinding(
         requiredStringField(record, "candidateId", "Stored private review finding ID"),
         {
           privateSummary: requiredStringField(record, "summary", "Stored private review finding summary"),
+          privateDocket: { ...coordination, needsAnswer },
           urgency: briefingUrgency(record.urgency),
           dueAt,
           sourceIds: sourceIds as string[],
@@ -19939,6 +20788,7 @@ function storedPrivateReviewFindings(value: JsonValue): StoredPrivateReviewFindi
         record.actionKey === undefined || record.actionKey === null
           ? null
           : requiredStringField(record, "actionKey", "Stored private review finding action key"),
+        storedDocketCoordinationUpdatedAt(record, "Stored private review coordination"),
       ),
     ];
   });
@@ -20229,6 +21079,11 @@ function initialGoogleScanFinding(value: JsonValue): InitialGoogleScanFinding {
               urgency: briefingUrgency(record.urgency),
               dueAt,
               needsAnswer: record.needsAnswer,
+              ...storedDocketCoordination(
+                record,
+                record.needsAnswer,
+                "Initial Google scan candidate coordination",
+              ),
             },
             sourceIds,
           );
@@ -20244,6 +21099,33 @@ function initialGoogleScanFinding(value: JsonValue): InitialGoogleScanFinding {
   if (familyRelevance === "owner_private" && (householdCandidate !== null || familyCalendar !== null)) {
     throw new FlorenceStoreConflict("An owner-private Google finding cannot create household output");
   }
+  const privateDocketValue = finding.privateDocket;
+  const privateDocket =
+    privateDocketValue === undefined
+      ? familyRelevance === "owner_private" && finding.surfaceNow === false
+        ? {
+            owner: null,
+            nextAction: "Decide the next step.",
+            waitingOn: "A family answer",
+            needsAnswer: true,
+          }
+        : null
+      : privateDocketValue === null
+        ? null
+        : (() => {
+            const record = jsonRecord(privateDocketValue);
+            if (typeof record.needsAnswer !== "boolean") {
+              throw new FlorenceStoreConflict("Initial Google scan private docket answer state is invalid");
+            }
+            return {
+              ...storedDocketCoordination(
+                record,
+                record.needsAnswer,
+                "Initial Google scan private docket coordination",
+              ),
+              needsAnswer: record.needsAnswer,
+            };
+          })();
   return {
     privateSummary: requiredStringField(finding, "privateSummary", "Initial Google scan finding summary"),
     ...(finding.actionAnchorDigest === undefined || finding.actionAnchorDigest === null
@@ -20260,6 +21142,7 @@ function initialGoogleScanFinding(value: JsonValue): InitialGoogleScanFinding {
           })(),
         }),
     sourceIds,
+    privateDocket,
     householdCandidate,
     monitor,
     familyCalendar,

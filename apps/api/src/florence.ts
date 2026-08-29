@@ -1967,6 +1967,7 @@ export class Florence {
       visibleFamilyWork: turn.visibleFamilyWork.map((work) => ({
         workId: work.workId,
         objective: work.objective,
+        candidateIds: [...work.candidateIds],
         currentProgress: work.currentProgress,
         schedule:
           work.schedule?.kind === "weekly"
@@ -3501,6 +3502,7 @@ export class Florence {
       bubbles,
       findings: finalizedFindings.map((finding) => ({
         privateSummary: finding.privateSummary,
+        privateDocket: finding.privateDocket,
         ...(finding.actionAnchorDigest ? { actionAnchorDigest: finding.actionAnchorDigest } : {}),
         sourceIds: finding.sourceIds,
         familyRelevance: finding.familyRelevance,
@@ -3632,6 +3634,7 @@ export class Florence {
             calendarSources,
             timeZone: work.household.timeZone,
           }),
+          privateDocket: finding.privateDocket,
           actionAnchorDigest: googleFindingActionAnchorDigest(
             finding.sourceIds,
             finding.actionAnchor,
@@ -5326,7 +5329,17 @@ export class Florence {
           settledAt,
           result: {
             type: "terminal",
-            state: { ...step.state, browserSession: null, activePhoneCall: null },
+            state: {
+              ...step.state,
+              browserSession: null,
+              activePhoneCall: null,
+              terminal: step.state.terminal
+                ? {
+                    ...step.state.terminal,
+                    docket: step.docket ?? step.state.terminal.docket ?? null,
+                  }
+                : null,
+            },
             terminalText: step.text,
           },
         });
@@ -5631,7 +5644,15 @@ export class Florence {
           outcome: result.outcome,
           privateDetail: work.visibility === "private" ? result.privateDetail : null,
           householdConclusion: householdConclusion?.summary ?? null,
+          householdDocket: householdConclusion
+            ? {
+                owner: householdConclusion.owner,
+                nextAction: householdConclusion.nextAction,
+                waitingOn: householdConclusion.waitingOn,
+              }
+            : null,
           householdCategory: householdConclusion?.category ?? null,
+          householdNeedsAnswer: householdConclusion?.needsAnswer ?? false,
           sourceIds: result.sourceIds,
           currentConclusion:
             work.visibility === "household" && householdConclusion
@@ -5643,6 +5664,7 @@ export class Florence {
               ? "Florence is watching this family coordination item."
               : result.why,
           googleEvidence: [...googleEvidence.values()],
+          reviewStartedAt: currentTime,
           deliverNotBefore: proactiveDeliveryAt(
             completedAt,
             work.household.timeZone,
@@ -6133,7 +6155,15 @@ export class Florence {
                     timeZone: work.household.timeZone,
                   })
                 : null,
+            privateDocket: work.visibility === "private" ? finding.privateDocket : null,
             householdConclusion: finding.householdConclusion?.summary ?? null,
+            householdDocket: finding.householdConclusion
+              ? {
+                  owner: finding.householdConclusion.owner,
+                  nextAction: finding.householdConclusion.nextAction,
+                  waitingOn: finding.householdConclusion.waitingOn,
+                }
+              : null,
             householdCategory: finding.householdConclusion?.category ?? null,
             householdNeedsAnswer: finding.householdConclusion?.needsAnswer ?? false,
             sourceIds: finding.sourceIds,
@@ -9102,7 +9132,15 @@ function gmailBackedFamilyCalendarProposal(
 }
 
 function privateCalendarSafeBackgroundSharing<
-  TConclusion extends { category: string; summary: string; dueAt: string | null },
+  TConclusion extends {
+    category: string;
+    summary: string;
+    dueAt: string | null;
+    needsAnswer: boolean;
+    owner: string | null;
+    nextAction: string;
+    waitingOn: string | null;
+  },
 >(input: {
   familyRelevance: string;
   conclusion: TConclusion | null;
@@ -9178,7 +9216,15 @@ function familyCalendarProposalMatchesSource(
 }
 
 function privateCalendarSafeHouseholdConclusion<
-  T extends { category: string; summary: string; dueAt: string | null },
+  T extends {
+    category: string;
+    summary: string;
+    dueAt: string | null;
+    needsAnswer: boolean;
+    owner: string | null;
+    nextAction: string;
+    waitingOn: string | null;
+  },
 >(input: {
   conclusion: T | null;
   sourceIds: readonly string[];
@@ -9201,6 +9247,14 @@ function privateCalendarSafeHouseholdConclusion<
     ...input.conclusion,
     summary: `${input.adultFirstName} has a calendar conflict then.`,
     dueAt: earliestCalendarStart(privateCalendarSources),
+    owner: "Family",
+    nextAction: `Coordinate around ${input.adultFirstName}’s calendar conflict.`,
+    waitingOn:
+      input.conclusion.waitingOn === null
+        ? null
+        : input.conclusion.needsAnswer
+          ? "A family scheduling decision"
+          : "The schedule conflict to be resolved",
   };
 }
 

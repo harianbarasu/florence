@@ -1546,13 +1546,12 @@ function DocketList({
         <article className="docket-row" key={item.candidateId}>
           <strong>{item.summary}</strong>
           {item.dueAt && <p>{docketDateLabel(item.dueAt, timeZone, item.category)}</p>}
+          <p className="docket-coordination">{docketCoordinationLabel(item)}</p>
           <div className="docket-badges">
             <span className="docket-badge">{docketCategoryLabel(item.category)}</span>
             <span className={`docket-badge urgency-${item.urgency}`}>{docketUrgencyLabel(item.urgency)}</span>
             {item.needsAnswer && <span className="docket-badge">Answer needed</span>}
-            <span className="docket-badge">
-              {item.visibility === "private" ? "Private to you" : "Shared with the household"}
-            </span>
+            <span className="docket-badge">{item.visibility === "private" ? "Only you" : "Family"}</span>
           </div>
         </article>
       ))}
@@ -2644,6 +2643,20 @@ function docketUrgencyLabel(urgency: VaultDocket["items"][number]["urgency"]): s
     case "watch":
       return "Worth watching";
   }
+}
+
+function docketCoordinationLabel(item: VaultDocket["items"][number]): string {
+  const owner = docketOwnerLabel(item.owner);
+  const dependency = item.waitingOn ? ` · Waiting on ${item.waitingOn}` : "";
+  return `${owner}${dependency} · ${item.nextAction}`;
+}
+
+function docketOwnerLabel(owner: string | null): string {
+  if (!owner) return "Needs an owner";
+  if (owner.localeCompare("Florence", undefined, { sensitivity: "accent" }) === 0) {
+    return "Florence is handling this";
+  }
+  return owner;
 }
 
 function docketDateLabel(

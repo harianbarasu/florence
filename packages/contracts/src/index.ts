@@ -243,6 +243,9 @@ export const vaultDocketItemSchema = z
     dueAt: timestampSchema.nullable(),
     needsAnswer: z.boolean(),
     visibility: vaultVisibilitySchema,
+    owner: nonempty(2_000).nullable(),
+    nextAction: nonempty(2_000),
+    waitingOn: nonempty(2_000).nullable(),
   })
   .strict();
 export type VaultDocketItem = z.infer<typeof vaultDocketItemSchema>;

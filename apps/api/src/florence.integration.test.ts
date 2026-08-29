@@ -107,9 +107,14 @@ const NATIVE_TEXT = "Forwarded from school: Maya’s field-trip form is due Tues
 const NATIVE_LINK = "https://school.example/fall-field-trip";
 const VOICE_TRANSCRIPT = "The teacher said the form still needs one parent signature.";
 const NATIVE_DOCKET_SUMMARY = "Maya’s field-trip form needs one parent signature by Tuesday.";
+const NATIVE_DOCKET_OWNER = "Parents";
+const NATIVE_DOCKET_NEXT_ACTION = "Choose who will sign and return Maya’s field-trip form.";
+const NATIVE_DOCKET_WAITING_ON = "A parent to claim the signature";
 const NATIVE_DOCKET_CORRECTION =
   "Correction: Maya’s field-trip form needs one parent signature by Wednesday, not Tuesday.";
 const NATIVE_DOCKET_UPDATED_SUMMARY = "Maya’s field-trip form needs one parent signature by Wednesday.";
+const NATIVE_DOCKET_UPDATED_NEXT_ACTION =
+  "Choose who will sign and return Maya’s field-trip form by Wednesday.";
 const NATIVE_DOCKET_WORK_REQUEST = "Please handle that updated field-trip form from the docket.";
 const NATIVE_DOCKET_WORK_OBJECTIVE =
   "Use the exact family Message and its photo, link, voice note, and PDF to handle Maya’s updated field-trip form.";
@@ -118,6 +123,8 @@ const NATIVE_DOCKET_WORK_RESULT = "I handled the updated field-trip form from th
 const PRIVATE_CONVERSATION_DOCKET_REQUEST =
   "Keep this private: I still need to decide whether I can volunteer at Maya’s school.";
 const PRIVATE_CONVERSATION_DOCKET_SUMMARY = "Decide whether to volunteer at Maya’s school.";
+const PRIVATE_CONVERSATION_DOCKET_NEXT_ACTION = "Decide whether you can volunteer at Maya’s school.";
+const PRIVATE_CONVERSATION_DOCKET_WAITING_ON = "Your decision";
 const PRIVATE_CONVERSATION_DOCKET_HANDLED = "I decided about the private school volunteer note.";
 const PRIVATE_CONVERSATION_DOCKET_HANDLED_ACK = "Got it—I’ll take that private decision off your docket.";
 const INTEREST_REQUEST = "Maya likes soccer. Keep an eye out for a good family match we could attend.";
@@ -258,7 +265,11 @@ const PRIVATE_DOCKET_HANDLED_REPLY = "Got it—I’ll take that off your private
 const SHARED_DUPLICATE_CONFLICT_SUMMARY = "Fall activity registration needs a family decision.";
 const PARTNER_DUPLICATE_CONFLICT_SUMMARY = "The family still needs to decide on fall registration.";
 const FOUNDER_FORM_SUMMARY = "Maya’s field-trip form still needs a parent response.";
+const FOUNDER_FORM_NEXT_ACTION = "Choose who will sign and return Maya’s field-trip form.";
+const FOUNDER_FORM_WAITING_ON = "A parent response";
 const PARTNER_PERMISSION_SUMMARY = "Maya’s permission-slip deadline still needs family attention.";
+const PARTNER_PERMISSION_NEXT_ACTION = "Confirm and return Maya’s permission slip.";
+const PARTNER_PERMISSION_WAITING_ON = "Alex’s confirmation";
 const FAMILY_MEETING_SUMMARY = "The family meeting is Tuesday at 8:00 PM.";
 const SCHOOL_HANDOFF_SUMMARY = "Friday’s school pickup handoff still needs an owner.";
 const HOUSEHOLD_DOCKET_REQUEST = "What’s on the docket?";
@@ -3740,6 +3751,8 @@ release("Florence parent journeys", () => {
       "Use the retained source for Maya’s field-trip form to determine and complete the next useful family action.";
     const docketWorkAcknowledgement = "I’m on it—I’ll work from the form already on the docket.";
     const docketWorkResult = "I opened the exact school-form source and worked from that family deadline.";
+    const docketWorkNextAction = "Choose who will sign and return Maya’s field-trip form.";
+    const docketWorkWaitingOn = "A parent to take the remaining signature step";
     let docketWorkReadExactLinkedSource = false;
     let nativeDocketWorkReadExactEvidence = false;
     let nativeDocketWorkOriginStayedCurrent = false;
@@ -3908,6 +3921,9 @@ release("Florence parent journeys", () => {
               urgency: "soon",
               dueAt: new Date(Date.parse(input.currentMessage.occurredAt) + 60 * 60_000).toISOString(),
               needsAnswer: true,
+              owner: NATIVE_DOCKET_OWNER,
+              nextAction: NATIVE_DOCKET_UPDATED_NEXT_ACTION,
+              waitingOn: NATIVE_DOCKET_WAITING_ON,
             },
             sourceIds: [input.currentMessage.sourceId, input.currentMessage.replyTo.sourceId],
           },
@@ -3944,6 +3960,9 @@ release("Florence parent journeys", () => {
               urgency: "watch",
               dueAt: null,
               needsAnswer: true,
+              owner: "You",
+              nextAction: PRIVATE_CONVERSATION_DOCKET_NEXT_ACTION,
+              waitingOn: PRIVATE_CONVERSATION_DOCKET_WAITING_ON,
             },
             sourceIds: [input.currentMessage.sourceId],
           },
@@ -4118,6 +4137,9 @@ release("Florence parent journeys", () => {
             urgency: "soon",
             dueAt: new Date(Date.parse(input.currentMessage.occurredAt) + 60 * 60_000).toISOString(),
             needsAnswer: true,
+            owner: NATIVE_DOCKET_OWNER,
+            nextAction: NATIVE_DOCKET_NEXT_ACTION,
+            waitingOn: NATIVE_DOCKET_WAITING_ON,
           },
           sourceIds: [input.currentMessage.sourceId],
         },
@@ -4195,6 +4217,7 @@ release("Florence parent journeys", () => {
         expect(input.visibility).toBe("household");
         expect(input.ownerAdultId).toBeNull();
         expect(input.initiatingAdultId).toBe(harness.partnerAdultId);
+        expect(input.state.docketCandidateIds).toHaveLength(1);
         expect(reads.searchSources).toBeUndefined();
         expect(input.visibleSources?.some((source) => source.kind === "gmail")).toBe(false);
         expect(input.linkedSources).toEqual([
@@ -4220,10 +4243,26 @@ release("Florence parent journeys", () => {
             phase: "terminal",
             claim: null,
             pendingCall: null,
-            terminal: { outcome: "succeeded", text: docketWorkResult },
+            waitingDocket: null,
+            terminal: {
+              outcome: "partial",
+              text: docketWorkResult,
+              docket: {
+                owner: "Parents",
+                nextAction: docketWorkNextAction,
+                waitingOn: docketWorkWaitingOn,
+                needsAnswer: true,
+              },
+            },
           },
-          outcome: "succeeded",
+          outcome: "partial",
           text: docketWorkResult,
+          docket: {
+            owner: "Parents",
+            nextAction: docketWorkNextAction,
+            waitingOn: docketWorkWaitingOn,
+            needsAnswer: true,
+          },
         };
       },
     });
@@ -4323,6 +4362,22 @@ release("Florence parent journeys", () => {
       "handoff",
       "family_date",
     ]);
+    expect(
+      incompleteWork.candidates.find((candidate) => candidate.summary === FOUNDER_FORM_SUMMARY),
+    ).toMatchObject({
+      owner: "Hari",
+      nextAction: FOUNDER_FORM_NEXT_ACTION,
+      waitingOn: FOUNDER_FORM_WAITING_ON,
+      needsAnswer: true,
+    });
+    expect(
+      incompleteWork.candidates.find((candidate) => candidate.summary === PARTNER_PERMISSION_SUMMARY),
+    ).toMatchObject({
+      owner: "Alex",
+      nextAction: PARTNER_PERMISSION_NEXT_ACTION,
+      waitingOn: PARTNER_PERMISSION_WAITING_ON,
+      needsAnswer: true,
+    });
     const unknownCandidateId = "99999999-9999-4999-8999-999999999999";
     await expect(
       harness.store.completeHouseholdInitialBriefing({
@@ -4486,10 +4541,22 @@ release("Florence parent journeys", () => {
     expect(founderVaultDocket?.totalItems).toBe(founderPrivateDocket.totalItems);
     expect(
       founderVaultDocket?.items.find((candidate) => candidate.summary === PRIVATE_INITIAL_ONLY_FINDING),
-    ).toMatchObject({ visibility: "private" });
+    ).toMatchObject({
+      visibility: "private",
+      owner: "You",
+      nextAction: "Confirm the school office contact details.",
+      waitingOn: "Your confirmation",
+      needsAnswer: true,
+    });
     expect(
       founderVaultDocket?.items.find((candidate) => candidate.summary === FOUNDER_FORM_SUMMARY),
-    ).toMatchObject({ visibility: "household" });
+    ).toMatchObject({
+      visibility: "household",
+      owner: "Hari",
+      nextAction: FOUNDER_FORM_NEXT_ACTION,
+      waitingOn: FOUNDER_FORM_WAITING_ON,
+      needsAnswer: true,
+    });
     const partnerVaultDocket = (await harness.florence.workspaceForAdult(harness.partnerAdultId)).vault
       ?.docket;
     expect(partnerVaultDocket?.items.map((candidate) => candidate.summary)).not.toContain(
@@ -4520,6 +4587,16 @@ release("Florence parent journeys", () => {
       "loose_end",
       "conflict",
     ]);
+    expect(
+      observedHouseholdDocket.value?.items.find(
+        (candidate) => candidate.summary === PARTNER_PERMISSION_SUMMARY,
+      ),
+    ).toMatchObject({
+      owner: "Alex",
+      nextAction: PARTNER_PERMISSION_NEXT_ACTION,
+      waitingOn: PARTNER_PERMISSION_WAITING_ON,
+      needsAnswer: true,
+    });
     expect(harness.linq.messages.some((message) => message.text === HOUSEHOLD_DOCKET_REPLY)).toBe(true);
     await harness.accept("group", "docket-grounded-family-work", docketWorkRequest, "partner");
     await harness.drain();
@@ -4528,6 +4605,20 @@ release("Florence parent journeys", () => {
     await harness.drain();
     expect(docketWorkReadExactLinkedSource).toBe(true);
     expect(harness.linq.messages.some((message) => message.text === docketWorkResult)).toBe(true);
+    expect(
+      (
+        await harness.store.readHouseholdDocket({
+          householdId: incompleteWork.household.householdId,
+          limit: 20,
+          now: harness.iso(),
+        })
+      ).items.find((candidate) => candidate.summary === FOUNDER_FORM_SUMMARY),
+    ).toMatchObject({
+      owner: "Parents",
+      nextAction: docketWorkNextAction,
+      waitingOn: docketWorkWaitingOn,
+      needsAnswer: true,
+    });
     await harness.assertDatabase(
       "Docket-grounded household work lost its exact Message/source lineage or attached unrelated evidence",
       `exists (
@@ -5060,7 +5151,13 @@ release("Florence parent journeys", () => {
       (candidate) => candidate.summary === NATIVE_DOCKET_SUMMARY,
     );
     expect(nativeCreatedItems).toHaveLength(1);
-    expect(nativeCreatedItems[0]).toMatchObject({ visibility: "household" });
+    expect(nativeCreatedItems[0]).toMatchObject({
+      visibility: "household",
+      owner: NATIVE_DOCKET_OWNER,
+      nextAction: NATIVE_DOCKET_NEXT_ACTION,
+      waitingOn: NATIVE_DOCKET_WAITING_ON,
+      needsAnswer: true,
+    });
     const nativeDocketCandidateId = nativeCreatedItems[0]?.candidateId;
     if (!nativeDocketCandidateId) throw new Error("The native Message created no durable docket identity");
     expect(await harness.vault.purgeExpired(new Date(Date.now() + 48 * 60 * 60_000))).toBe(0);
@@ -5102,6 +5199,10 @@ release("Florence parent journeys", () => {
         candidateId: nativeDocketCandidateId,
         summary: NATIVE_DOCKET_UPDATED_SUMMARY,
         visibility: "household",
+        owner: NATIVE_DOCKET_OWNER,
+        nextAction: NATIVE_DOCKET_UPDATED_NEXT_ACTION,
+        waitingOn: NATIVE_DOCKET_WAITING_ON,
+        needsAnswer: true,
       }),
     ]);
     await harness.assertDatabase(
@@ -5126,6 +5227,21 @@ release("Florence parent journeys", () => {
     await harness.accept("group", "native-docket-work", NATIVE_DOCKET_WORK_REQUEST, "partner");
     await harness.drain();
     expect(harness.linq.messages.some((message) => message.text === NATIVE_DOCKET_WORK_ACK)).toBe(true);
+    const nativeDocketDuringWork = await harness.store.readHouseholdDocket({
+      householdId: incompleteWork.household.householdId,
+      limit: null,
+      now: harness.iso(),
+    });
+    expect(
+      nativeDocketDuringWork.items.find((candidate) => candidate.candidateId === nativeDocketCandidateId),
+    ).toMatchObject({
+      summary: NATIVE_DOCKET_UPDATED_SUMMARY,
+      visibility: "household",
+      owner: "Florence",
+      nextAction: NATIVE_DOCKET_WORK_OBJECTIVE,
+      waitingOn: null,
+      needsAnswer: false,
+    });
     harness.state.now += 24 * 60 * 60_000 + 1_001;
     await harness.drain();
     expect(nativeDocketWorkOriginStayedCurrent).toBe(true);
@@ -5197,7 +5313,13 @@ release("Florence parent journeys", () => {
       founderConversationDocket?.find(
         (candidate) => candidate.summary === PRIVATE_CONVERSATION_DOCKET_SUMMARY,
       ),
-    ).toMatchObject({ visibility: "private" });
+    ).toMatchObject({
+      visibility: "private",
+      owner: "You",
+      nextAction: PRIVATE_CONVERSATION_DOCKET_NEXT_ACTION,
+      waitingOn: PRIVATE_CONVERSATION_DOCKET_WAITING_ON,
+      needsAnswer: true,
+    });
     expect(
       partnerConversationDocket?.some(
         (candidate) => candidate.summary === PRIVATE_CONVERSATION_DOCKET_SUMMARY,
@@ -8070,6 +8192,7 @@ function createReasoner(
           findings: [
             {
               privateSummary: PAGINATED_CALENDAR_FOLLOW_UP,
+              privateDocket: null,
               actionAnchor: PAGINATED_CALENDAR_TITLE,
               familyRelevance: "household" as const,
               sourceIds: [paginatedCalendarSource.sourceId],
@@ -8105,6 +8228,7 @@ function createReasoner(
           findings: [
             {
               privateSummary: PRIVATE_CALENDAR_GENERIC_TODAY_REPLY,
+              privateDocket: null,
               actionAnchor: PRIVATE_INITIAL_CALENDAR_ONLY_EVENT.title,
               familyRelevance: "household" as const,
               sourceIds: calendar.map((source) => source.sourceId),
@@ -8164,6 +8288,7 @@ function createReasoner(
             findings: [
               {
                 privateSummary: UNRELATED_ACCOUNT_EMAIL_ALERT,
+                privateDocket: null,
                 actionAnchor: "password changed",
                 familyRelevance: "owner_private" as const,
                 sourceIds: [ownerPrivateSource.sourceId],
@@ -8198,6 +8323,7 @@ function createReasoner(
             ? "The school form is still waiting on Hari’s side."
             : "Hari’s private school email has the original form."
           : "Alex’s private school email has the permission-slip deadline.",
+        privateDocket: null,
         actionAnchor: founder ? "field-trip form" : "permission-slip deadline",
         familyRelevance: "household" as const,
         sourceIds: [source.sourceId],
@@ -8214,6 +8340,9 @@ function createReasoner(
           urgency: "soon" as const,
           dueAt: "2026-08-19T16:00:00.000Z",
           needsAnswer: true,
+          owner: founder ? "Hari" : "Alex",
+          nextAction: founder ? FOUNDER_FORM_NEXT_ACTION : PARTNER_PERMISSION_NEXT_ACTION,
+          waitingOn: founder ? FOUNDER_FORM_WAITING_ON : PARTNER_PERMISSION_WAITING_ON,
         },
         monitor: null,
         familyCalendar: founder
@@ -8236,6 +8365,7 @@ function createReasoner(
               privateSummary: sameSubjectRescan
                 ? "The school form still needs confirmation on Hari’s side."
                 : "Florence is watching for confirmation that Maya’s field-trip form is signed.",
+              privateDocket: null,
               actionAnchor: "Muir Elementary",
               familyRelevance: "household" as const,
               sourceIds: [source.sourceId],
@@ -8261,6 +8391,7 @@ function createReasoner(
             ...(monitorFinding ? [monitorFinding] : []),
             {
               privateSummary: "The fall activity registration window opens Wednesday.",
+              privateDocket: null,
               actionAnchor: "activity registration window",
               familyRelevance: "household" as const,
               sourceIds: [source.sourceId],
@@ -8273,12 +8404,16 @@ function createReasoner(
                 urgency: "soon" as const,
                 dueAt: "2026-08-20T16:00:00.000Z",
                 needsAnswer: true,
+                owner: "Parents",
+                nextAction: "Decide whether to register for the fall activity.",
+                waitingOn: "A family decision",
               },
               monitor: null,
               familyCalendar: null,
             },
             {
               privateSummary: "Friday’s pickup handoff has not been assigned.",
+              privateDocket: null,
               actionAnchor: "pickup handoff",
               familyRelevance: "household" as const,
               sourceIds: [source.sourceId],
@@ -8291,6 +8426,9 @@ function createReasoner(
                 urgency: "soon" as const,
                 dueAt: "2026-08-21T21:45:00.000Z",
                 needsAnswer: true,
+                owner: null,
+                nextAction: "Assign Friday’s school pickup.",
+                waitingOn: "A parent to take pickup",
               },
               monitor: null,
               familyCalendar: null,
@@ -8299,6 +8437,12 @@ function createReasoner(
               privateSummary: sameSubjectRescan
                 ? "One more private school detail remains unresolved."
                 : PRIVATE_INITIAL_ONLY_FINDING,
+              privateDocket: {
+                owner: "You",
+                nextAction: "Confirm the school office contact details.",
+                waitingOn: "Your confirmation",
+                needsAnswer: true,
+              },
               actionAnchor: "private school detail",
               familyRelevance: "owner_private" as const,
               sourceIds: [source.sourceId],
@@ -8314,6 +8458,7 @@ function createReasoner(
             primaryFinding,
             {
               privateSummary: "The fall activity registration window is also on Alex’s side.",
+              privateDocket: null,
               actionAnchor: "activity registration window",
               familyRelevance: "household" as const,
               sourceIds: [source.sourceId],
@@ -8326,12 +8471,16 @@ function createReasoner(
                 urgency: "soon" as const,
                 dueAt: "2026-08-20T16:00:00.000Z",
                 needsAnswer: true,
+                owner: "Parents",
+                nextAction: "Decide whether to register for the fall activity.",
+                waitingOn: "A family decision",
               },
               monitor: null,
               familyCalendar: null,
             },
             {
               privateSummary: "The family meeting is on Alex’s calendar for Tuesday evening.",
+              privateDocket: null,
               actionAnchor: "family meeting",
               familyRelevance: "household" as const,
               sourceIds: [source.sourceId],
@@ -8344,6 +8493,9 @@ function createReasoner(
                 urgency: "watch" as const,
                 dueAt: "2026-09-01T15:00:00.000Z",
                 needsAnswer: false,
+                owner: "Family",
+                nextAction: "Review Tuesday’s family-meeting plan.",
+                waitingOn: null,
               },
               monitor: null,
               familyCalendar: null,
@@ -8481,6 +8633,7 @@ function createReasoner(
           ? [
               {
                 privateDetail: null,
+                privateDocket: null,
                 actionAnchor: FAMILY_CALENDAR_MIXED_CHANGE_TITLE,
                 familyRelevance: "household" as const,
                 householdConclusion: {
@@ -8489,6 +8642,9 @@ function createReasoner(
                   urgency: "soon" as const,
                   dueAt: FAMILY_CALENDAR_MIXED_CHANGE_EVENT.startsAt,
                   needsAnswer: false,
+                  owner: "Family",
+                  nextAction: "Review the updated family-calendar plan.",
+                  waitingOn: null,
                 },
                 sourceIds: [
                   ...(privateCalendarAnniversarySource ? [privateCalendarAnniversarySource.sourceId] : []),
@@ -8505,6 +8661,7 @@ function createReasoner(
             ? [
                 {
                   privateDetail: `${PRIVATE_CALENDAR_ADULT_TITLE} is on Tuesday.`,
+                  privateDocket: null,
                   actionAnchor: PRIVATE_CALENDAR_ADULT_TITLE,
                   familyRelevance: "household" as const,
                   householdConclusion: {
@@ -8513,6 +8670,9 @@ function createReasoner(
                     urgency: "watch" as const,
                     dueAt: PRIVATE_CALENDAR_ADULT_EVENT.startsAt,
                     needsAnswer: false,
+                    owner: "Family",
+                    nextAction: `Review Tuesday’s plan for ${PRIVATE_CALENDAR_ADULT_TITLE}.`,
+                    waitingOn: null,
                   },
                   sourceIds: [
                     privateCalendarAdultSource.sourceId,
@@ -8540,6 +8700,7 @@ function createReasoner(
               ? [
                   {
                     privateDetail: `${PRIVATE_CALENDAR_ANNIVERSARY_TITLE} is on Monday.`,
+                    privateDocket: null,
                     actionAnchor: PRIVATE_CALENDAR_ANNIVERSARY_TITLE,
                     familyRelevance: "household" as const,
                     householdConclusion: {
@@ -8548,6 +8709,9 @@ function createReasoner(
                       urgency: "watch" as const,
                       dueAt: PRIVATE_CALENDAR_ANNIVERSARY_EVENT.startsAt,
                       needsAnswer: false,
+                      owner: "Family",
+                      nextAction: `Review Monday’s plan for ${PRIVATE_CALENDAR_ANNIVERSARY_TITLE}.`,
+                      waitingOn: null,
                     },
                     sourceIds: [privateCalendarAnniversarySource.sourceId],
                     urgency: "watch" as const,
@@ -8572,6 +8736,7 @@ function createReasoner(
                 ? [
                     {
                       privateDetail: UNRELATED_ACCOUNT_EMAIL_ALERT,
+                      privateDocket: null,
                       actionAnchor: "password changed",
                       familyRelevance: "owner_private" as const,
                       householdConclusion: null,
@@ -8595,6 +8760,7 @@ function createReasoner(
                   ? [
                       {
                         privateDetail: PRIVATE_CALENDAR_GENERIC_TODAY_REPLY,
+                        privateDocket: null,
                         actionAnchor: PRIVATE_CALENDAR_ONLY_TITLE,
                         familyRelevance: "household" as const,
                         householdConclusion: {
@@ -8603,6 +8769,9 @@ function createReasoner(
                           urgency: "now" as const,
                           dueAt: PRIVATE_CALENDAR_ONLY_EVENT.startsAt,
                           needsAnswer: true,
+                          owner: "Parents",
+                          nextAction: "Decide how to cover the overlapping calendar events.",
+                          waitingOn: "A parent decision",
                         },
                         sourceIds: calendarOnlySources.map((source) => source.sourceId),
                         urgency: "now" as const,
@@ -8616,6 +8785,7 @@ function createReasoner(
                     ? [
                         {
                           privateDetail: GOOGLE_DELETION_PRIVATE_ALERT,
+                          privateDocket: null,
                           actionAnchor: "emergency card",
                           familyRelevance: "household" as const,
                           householdConclusion: null,
@@ -8636,6 +8806,7 @@ function createReasoner(
                         },
                         {
                           privateDetail: null,
+                          privateDocket: null,
                           actionAnchor: GOOGLE_DELETION_FAMILY_DATE.title,
                           familyRelevance: "household" as const,
                           householdConclusion: null,
@@ -8775,6 +8946,9 @@ function createReasoner(
             urgency: "soon" as const,
             dueAt: input.currentTime,
             needsAnswer: false,
+            owner: "School office",
+            nextAction: "Wait for the school to finish checking the signature.",
+            waitingOn: "The school’s signature check",
           },
           sourceIds: [source.sourceId],
           currentConclusion: summary,
@@ -8793,6 +8967,9 @@ function createReasoner(
           urgency: "now" as const,
           dueAt: input.currentTime,
           needsAnswer: false,
+          owner: null,
+          nextAction: "No further action is needed.",
+          waitingOn: null,
         },
         sourceIds: [source.sourceId],
         currentConclusion: "The form is signed.",

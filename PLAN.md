@@ -143,6 +143,8 @@ The current useful reuse targets are:
 
 Ollie's public family-assistant examples are additional product evidence, summarized with first-party citations in `docs/research/ollie-product-capabilities.md`. Use them to test observable household behavior—cross-source judgment, reusable artifacts, ownership, proactive follow-through, and natural closure—not as evidence for Ollie's undocumented architecture or as a list of runtime categories.
 
+Primary-source evidence about parents' recurring coordination load is summarized in `docs/research/family-coordination-primary-source-brief.md`. Use its general notice → understand → reconcile → decide → act → confirm → remember loop and acceptance scenarios as product rehearsals, never as vertical routing categories or separate mini-products.
+
 Keep the small typed tool-execution kernel already ported from Pi/Hermes. Remove speculative registry versions, generic policy/evidence envelopes, fake facades, and framework-only tests. Progressive discovery or a connector catalog can be reconsidered only after the real tool set makes either one necessary.
 
 ## Implementation rules

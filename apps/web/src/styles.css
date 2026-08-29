@@ -1111,6 +1111,10 @@ a {
   line-height: 1.45;
 }
 
+.docket-row .docket-coordination {
+  color: var(--text);
+}
+
 .docket-badges {
   display: flex;
   flex-wrap: wrap;

@@ -25,6 +25,9 @@ import {
   FlorenceReasoner,
   type FlorenceReasonerInput,
   florenceGoogleChangesAssessmentDecisionSchema,
+  florenceHouseholdBriefingInputSchema,
+  florenceHouseholdSafeCandidateSchema,
+  florencePrivateDocketCoordinationSchema,
   florencePrivateGoogleBatchDecisionSchema,
 } from "./reasoner.js";
 import type { FlorenceTelephonyOperation, FlorenceTelephonyResult } from "./telephony.js";
@@ -193,6 +196,9 @@ describe("Florence reasoner capability cutover", () => {
         summary: "The field-trip form still needs a signature.",
         urgency: "soon",
         dueAt: "2026-08-29T20:00:00.000Z",
+        owner: "Hari",
+        nextAction: "Sign the field-trip form.",
+        waitingOn: "Hari's signature",
         needsAnswer: true,
       },
       sourceIds: ["turn-1"],
@@ -230,6 +236,75 @@ describe("Florence reasoner capability cutover", () => {
       code: "invalid_output",
       message: expect.stringContaining("already doing or tracking"),
     });
+
+    const missingDependency = ordinaryDecision();
+    missingDependency.docketUpsert = {
+      operation: "create",
+      candidateId: null,
+      candidate: {
+        category: "deadline",
+        summary: "The field-trip form still needs a signature.",
+        urgency: "soon",
+        dueAt: "2026-08-29T20:00:00.000Z",
+        owner: "Hari",
+        nextAction: "Sign the field-trip form.",
+        waitingOn: null,
+        needsAnswer: true,
+      },
+      sourceIds: ["turn-1"],
+    };
+    const missingDependencyReasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        stream: () => fakeStream({ status: "completed", output_parsed: missingDependency, output: [] }),
+      },
+    } as never);
+
+    await expect(missingDependencyReasoner.decide(foregroundInput(), inertReads())).rejects.toMatchObject({
+      code: "invalid_output",
+      message: expect.stringContaining("must name what it is waiting on"),
+    });
+  });
+
+  test("docket coordination schemas require the exact dependency behind a needed answer", () => {
+    const unresolved = {
+      owner: "Jackson",
+      nextAction: "Choose which after-school option works.",
+      waitingOn: null,
+      needsAnswer: true,
+    };
+
+    expect(florencePrivateDocketCoordinationSchema.safeParse(unresolved).success).toBe(false);
+    expect(
+      florenceHouseholdSafeCandidateSchema.safeParse({
+        ...unresolved,
+        category: "loose_end",
+        summary: "The after-school plan still needs a choice.",
+        urgency: "soon",
+        dueAt: null,
+      }).success,
+    ).toBe(false);
+    expect(
+      florencePrivateDocketCoordinationSchema.parse({
+        ...unresolved,
+        waitingOn: "Jackson's choice of after-school option",
+      }),
+    ).toMatchObject({ owner: "Jackson", nextAction: expect.stringContaining("Choose") });
+  });
+
+  test("household briefing accepts the complete unresolved docket without an item ceiling", () => {
+    const candidates = Array.from({ length: 101 }, (_, index) => ({
+      candidateId: `candidate-${index + 1}`,
+      category: "loose_end" as const,
+      summary: `Family item ${index + 1} still needs follow-through.`,
+      urgency: "watch" as const,
+      dueAt: null,
+      needsAnswer: false,
+      owner: null,
+      nextAction: `Move family item ${index + 1} forward.`,
+      waitingOn: null,
+    }));
+
+    expect(florenceHouseholdBriefingInputSchema.shape.candidates.safeParse(candidates).success).toBe(true);
   });
 
   test("a natural text mention can acknowledge work Florence starts in the family group", async () => {
@@ -264,6 +339,61 @@ describe("Florence reasoner capability cutover", () => {
     await expect(reasoner.decide(input, inertReads())).resolves.toMatchObject({
       conversation: { bubbles: [], nativeMoves: decision.conversation.nativeMoves },
       familyWork: { operation: "create" },
+    });
+  });
+
+  test("family work cannot start twice from the same open docket item", async () => {
+    const decision = ordinaryDecision();
+    decision.familyWork = {
+      operation: "create",
+      workId: null,
+      objective: "Make sure the school form is submitted.",
+      schedule: null,
+      instruction: null,
+      candidateIds: ["candidate-1"],
+    };
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        stream: () => fakeStream({ status: "completed", output_parsed: decision, output: [] }),
+      },
+    } as never);
+    const input = foregroundInput();
+    input.householdDocket = {
+      totalItems: 1,
+      items: [
+        {
+          candidateId: "candidate-1",
+          visibility: "household",
+          category: "deadline",
+          summary: "The school form still needs to be submitted.",
+          urgency: "soon",
+          dueAt: null,
+          owner: "Florence",
+          nextAction: "Submit the school form.",
+          waitingOn: null,
+          needsAnswer: false,
+        },
+      ],
+    };
+    input.visibleFamilyWork = [
+      {
+        workId: "work-1",
+        objective: "Handle the school paperwork.",
+        candidateIds: ["candidate-1"],
+        currentProgress: null,
+        schedule: null,
+        paused: false,
+        status: "active",
+        nextAt: null,
+        lastRunAt: null,
+        lastResult: null,
+        createdAt: NOW,
+      },
+    ];
+
+    await expect(reasoner.decide(input, inertReads())).rejects.toMatchObject({
+      code: "invalid_output",
+      message: expect.stringContaining("already in progress"),
     });
   });
 
@@ -642,6 +772,193 @@ describe("Florence reasoner capability cutover", () => {
     expect(JSON.stringify(modelRequests[1]?.input)).toContain("Parent signature required");
     expect(JSON.stringify(modelRequests[1]?.input)).toContain('"type":"input_image"');
     expect(JSON.stringify(modelRequests[1]?.input)).toContain('"type":"input_file"');
+  });
+
+  test("partial and failed family work leave honest terminal docket coordination", async () => {
+    const requests: Record<string, unknown>[] = [];
+    const terminalDecision = {
+      outcome: "partial",
+      text: "I found the form, but the school portal is unavailable, so I couldn't submit it.",
+      docket: {
+        owner: "Florence",
+        nextAction: "Submit the form when the school portal is available.",
+        waitingOn: "The school portal to become available",
+        needsAnswer: false,
+      },
+    } as const;
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        parse(request: Record<string, unknown>) {
+          requests.push(request);
+          return { status: "completed", output_parsed: terminalDecision, output: [] };
+        },
+      },
+    } as never);
+    const state: FamilyWorkStateV1 = {
+      kind: "family_work_v1",
+      version: 1,
+      generation: 0,
+      docketCandidateIds: ["candidate-1"],
+      phase: "ready",
+      claim: null,
+      activePhoneCall: null,
+      activeTextMessage: null,
+      browserSession: null,
+      continuationItems: [],
+      pendingCall: null,
+      steering: [],
+      progressRevision: 0,
+      terminal: null,
+    };
+    const input = {
+      workId: "family-work-partial",
+      scheduledOccurrence: null,
+      objective: "Submit the school form.",
+      visibility: "household" as const,
+      ownerAdultId: null,
+      initiatingAdultId: "adult-1",
+      origin: familyWorkOrigin("Submit the school form."),
+      household: {
+        householdId: "household-1",
+        familyLabel: "Test family",
+        timeZone: "America/Los_Angeles",
+        postalCode: "90045",
+        adults: [{ adultId: "adult-1", firstName: "Hari", displayName: "Hari Anbarasu" }],
+        children: [],
+      },
+      state,
+      currentTime: NOW,
+    };
+
+    const result = await reasoner.continueFamilyWork(input, {} as never);
+
+    expect(result).toMatchObject({
+      kind: "terminal",
+      outcome: "partial",
+      docket: terminalDecision.docket,
+      state: { terminal: { docket: terminalDecision.docket } },
+    });
+    expect(String(requests[0]?.instructions)).toContain(
+      "For waiting, partial, or failed, docket must describe",
+    );
+
+    for (const invalidDecision of [
+      { ...terminalDecision, docket: null },
+      { ...terminalDecision, outcome: "succeeded" as const },
+    ]) {
+      const invalidReasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+        responses: {
+          parse: () => ({ status: "completed", output_parsed: invalidDecision, output: [] }),
+        },
+      } as never);
+      await expect(invalidReasoner.continueFamilyWork(input, {} as never)).rejects.toMatchObject({
+        code: "invalid_output",
+        message: expect.stringContaining("docket coordination"),
+      });
+    }
+  });
+
+  test("waiting family work persists exact coordination and clears it after the answer", async () => {
+    const waitingDecision = {
+      outcome: "waiting",
+      text: "Which pickup time should I confirm, 2:45 or 3:15?",
+      docket: {
+        owner: "Hari",
+        nextAction: "Choose the pickup time.",
+        waitingOn: "Hari's choice between 2:45 and 3:15",
+        needsAnswer: true,
+      },
+    } as const;
+    const baseState: FamilyWorkStateV1 = {
+      kind: "family_work_v1",
+      version: 1,
+      generation: 0,
+      docketCandidateIds: ["candidate-1"],
+      phase: "ready",
+      claim: null,
+      activePhoneCall: null,
+      activeTextMessage: null,
+      browserSession: null,
+      continuationItems: [],
+      pendingCall: null,
+      steering: [],
+      progressRevision: 0,
+      terminal: null,
+    };
+    const input = {
+      workId: "family-work-waiting",
+      scheduledOccurrence: null,
+      objective: "Confirm the children's pickup time.",
+      visibility: "household" as const,
+      ownerAdultId: null,
+      initiatingAdultId: "adult-1",
+      origin: familyWorkOrigin("Please confirm pickup."),
+      household: {
+        householdId: "household-1",
+        familyLabel: "Test family",
+        timeZone: "America/Los_Angeles",
+        postalCode: "90045",
+        adults: [{ adultId: "adult-1", firstName: "Hari", displayName: "Hari Anbarasu" }],
+        children: [],
+      },
+      state: baseState,
+      currentTime: NOW,
+    };
+    const waitingReasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        parse: () => ({ status: "completed", output_parsed: waitingDecision, output: [] }),
+      },
+    } as never);
+
+    const waiting = await waitingReasoner.continueFamilyWork(input, {} as never);
+
+    expect(waiting).toMatchObject({
+      kind: "waiting",
+      state: { phase: "waiting", waitingDocket: waitingDecision.docket },
+    });
+
+    const succeededReasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        parse: () => ({
+          status: "completed",
+          output_parsed: {
+            outcome: "succeeded",
+            text: "Pickup is confirmed for 2:45 PM.",
+            docket: null,
+          },
+          output: [],
+        }),
+      },
+    } as never);
+    if (waiting.kind !== "waiting") throw new Error("Expected family work to wait");
+
+    const succeeded = await succeededReasoner.continueFamilyWork(
+      { ...input, state: { ...waiting.state, phase: "ready" } },
+      {} as never,
+    );
+
+    expect(succeeded).toMatchObject({
+      kind: "terminal",
+      outcome: "succeeded",
+      state: { waitingDocket: null, terminal: { docket: null } },
+    });
+
+    const invalidWaitingReasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        parse: () => ({
+          status: "completed",
+          output_parsed: {
+            ...waitingDecision,
+            docket: { ...waitingDecision.docket, needsAnswer: false },
+          },
+          output: [],
+        }),
+      },
+    } as never);
+    await expect(invalidWaitingReasoner.continueFamilyWork(input, {} as never)).rejects.toMatchObject({
+      code: "invalid_output",
+      message: expect.stringContaining("needs an answer"),
+    });
   });
 
   test("durable household work calls a business and reports the transcript-backed outcome", async () => {
@@ -1444,6 +1761,12 @@ describe("Florence reasoner capability cutover", () => {
         output_parsed: {
           outcome: "waiting",
           text: `Please sign in here, then tell me when you’re done: ${liveViewUrl}`,
+          docket: {
+            owner: "Hari",
+            nextAction: "Sign in to the camp portal.",
+            waitingOn: "Hari to finish signing in",
+            needsAnswer: true,
+          },
         },
         output: [],
       },
@@ -1517,6 +1840,12 @@ describe("Florence reasoner capability cutover", () => {
         output_parsed: {
           outcome: "waiting",
           text: "Violet’s Adventure Camp registration for June 15–19, 2027 is ready, including her medical form. The fee is $425. Should I submit it?",
+          docket: {
+            owner: "Hari",
+            nextAction: "Decide whether to submit the camp registration.",
+            waitingOn: "Hari's approval of the $425 registration",
+            needsAnswer: true,
+          },
         },
         output: [],
       },
@@ -4661,6 +4990,9 @@ Compare the useful family options.
     for (const firstRequest of [requests[0], requests[2]]) {
       expect(JSON.stringify(firstRequest)).not.toContain("private-google-connection");
       expect(JSON.stringify(firstRequest)).not.toContain("connectionId");
+      expect(String(firstRequest?.instructions)).toContain("privateDocket");
+      expect(String(firstRequest?.instructions)).toContain("nextAction is the smallest concrete move");
+      expect(String(firstRequest?.instructions)).toContain("account ownership");
       expect(((firstRequest?.tools as { name: string }[]) ?? []).map((tool) => tool.name)).toEqual([
         "read_private_gmail_attachment",
       ]);
@@ -4680,6 +5012,63 @@ Compare the useful family options.
       expect(serialized).toContain(gmail.sourceId);
       expect(serialized).toContain("input_file");
     }
+  });
+
+  test("both private Google decisions carry owner-private docket coordination", () => {
+    const privateDocket = {
+      owner: "Hari",
+      nextAction: "Choose whether to send the permission form.",
+      waitingOn: "Hari's decision about the permission form",
+      needsAnswer: true,
+    };
+    const shared = {
+      privateDocket,
+      actionAnchor: "Permission form",
+      familyRelevance: "owner_private" as const,
+      sourceIds: ["gmail-source-1"],
+      urgency: "soon" as const,
+      dueAt: null,
+    };
+    const initial = {
+      privateSummary: "The permission form still needs a decision.",
+      ...shared,
+      surfaceNow: false,
+      candidate: null,
+      monitor: null,
+      familyCalendar: null,
+    };
+    const incremental = {
+      privateDetail: "The permission form still needs a decision.",
+      ...shared,
+      householdConclusion: null,
+      materialChange: true,
+      monitor: null,
+      familyCalendar: null,
+    };
+
+    expect(
+      florencePrivateGoogleBatchDecisionSchema.parse({
+        findings: [initial],
+        facts: [],
+        dismissedSourceIds: [],
+      }).findings[0]?.privateDocket,
+    ).toEqual(privateDocket);
+    expect(
+      florenceGoogleChangesAssessmentDecisionSchema.parse({
+        findings: [incremental],
+        facts: [],
+        dismissedSourceIds: [],
+        nextJob: null,
+      }).findings[0]?.privateDocket,
+    ).toEqual(privateDocket);
+    const { privateDocket: _privateDocket, ...withoutPrivateDocket } = initial;
+    expect(
+      florencePrivateGoogleBatchDecisionSchema.safeParse({
+        findings: [withoutPrivateDocket],
+        facts: [],
+        dismissedSourceIds: [],
+      }).success,
+    ).toBe(false);
   });
 
   test("keeps every durable fact supported by one Google transport batch", async () => {

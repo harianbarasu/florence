@@ -4789,6 +4789,24 @@ export class Florence {
                   const uploadFile =
                     operation.kind === "upload" && pendingCall.attempt === 1
                       ? await (async () => {
+                          if (operation.sourceId) {
+                            if (!google || !familyWorkExecutionAdultId) {
+                              throw new Error("The Gmail attachment is unavailable for browser upload");
+                            }
+                            const indexed = familyWorkGmailAttachmentIndex.get(
+                              `${operation.sourceId}\0${operation.attachmentRef}`,
+                            );
+                            if (!indexed) {
+                              throw new Error("The Gmail attachment changed before browser upload");
+                            }
+                            const read = await google.readGmailAttachment({
+                              householdId: work.household.householdId,
+                              ownerAdultId: familyWorkExecutionAdultId,
+                              connectionId: indexed.connectionId,
+                              attachment: indexed.attachment,
+                            });
+                            return { filename: read.filename, bytes: read.bytes };
+                          }
                           if (!this.#imageVault) {
                             throw new Error("Florence attachment upload is not configured");
                           }

@@ -39,6 +39,7 @@ import { Florence } from "./florence.js";
 import { createLinqIngress } from "./linq-ingress.js";
 import {
   type FlorenceDecision,
+  type FlorenceReadTools,
   FlorenceReasoner,
   FlorenceReasonerError,
   type FlorenceReasonerInput,
@@ -3445,7 +3446,7 @@ release("Florence parent journeys", () => {
     );
   }, 20_000);
 
-  test("runs authenticated browser work from the initiating parent in the family thread", async () => {
+  test("carries an exact Gmail attachment into authenticated browser work once", async () => {
     const browserRuns: Parameters<FlorenceBrowserClient["run"]>[0][] = [];
     const closedSessions: Parameters<FlorenceBrowserClient["close"]>[0][] = [];
     const browser: FlorenceBrowserClient = {
@@ -3472,14 +3473,19 @@ release("Florence parent journeys", () => {
       },
       closeAll: async () => undefined,
     };
+    const gmailIdentity = {
+      messageId: SCHOOL_ATTACHMENT.messageId,
+      threadId: SCHOOL_ATTACHMENT.threadId,
+      historyId: SCHOOL_ATTACHMENT.historyId,
+    };
     const harness = await createHarness(
       async (input) =>
-        input.currentMessage.text === "Open the camp registration for us."
+        input.currentMessage.text === "Find Maya's field-trip form in Gmail and upload it for us."
           ? decision({
               familyWork: {
                 operation: "create",
                 workId: null,
-                objective: "Open the camp registration form.",
+                objective: "Upload Maya's field-trip form from Gmail.",
                 schedule: null,
                 instruction: null,
               },
@@ -3488,11 +3494,18 @@ release("Florence parent journeys", () => {
       {
         browser,
         continueFamilyWork: async (input, reads) => {
+          const internalReads = reads as unknown as Pick<FlorenceReadTools, "readWorkspaceGmailSource">;
+          if (!internalReads.readWorkspaceGmailSource) {
+            throw new Error("The family task did not receive exact Gmail reading");
+          }
+          const source = await internalReads.readWorkspaceGmailSource(gmailIdentity);
+          const attachment = source.attachments[0];
+          if (!attachment) throw new Error("The exact Gmail message lost its attachment");
           if (input.state.phase === "ready") {
             expect(input.origin.message).toMatchObject({
               speaker: expect.any(String),
-              text: "Open the camp registration for us.",
-              authoredText: "Open the camp registration for us.",
+              text: "Find Maya's field-trip form in Gmail and upload it for us.",
+              authoredText: "Find Maya's field-trip form in Gmail and upload it for us.",
               voiceTranscriptPresent: false,
             });
             return {
@@ -3502,13 +3515,15 @@ release("Florence parent journeys", () => {
                 phase: "tool_pending",
                 claim: null,
                 pendingCall: {
-                  callId: "open-camp-registration",
+                  callId: "upload-field-trip-form",
                   name: "browser_work",
                   argumentsJson: JSON.stringify({
-                    operation: "navigate",
-                    url: "https://camp.example/register",
+                    operation: "upload",
+                    ref: "e7",
+                    sourceId: source.sourceId,
+                    attachmentRef: attachment.attachmentRef,
                   }),
-                  attempt: 0,
+                  attempt: 1,
                 },
               },
               progressText: null,
@@ -3517,12 +3532,28 @@ release("Florence parent journeys", () => {
           }
           if (!reads.runBrowser)
             throw new Error("The family task did not receive authenticated browser work");
-          const observation = await reads.runBrowser({
-            kind: "navigate",
-            url: "https://camp.example/register",
-          });
+          const operation = {
+            kind: "upload" as const,
+            ref: "e7",
+            sourceId: source.sourceId,
+            attachmentRef: attachment.attachmentRef,
+          };
+          const observation = await reads.runBrowser(operation);
           expect(observation.title).toBe("Camp registration");
-          const terminalText = "I opened the camp registration form.";
+          if (input.state.pendingCall?.attempt === 1) {
+            return {
+              kind: "continue",
+              state: {
+                ...input.state,
+                phase: "tool_pending",
+                claim: null,
+                pendingCall: { ...input.state.pendingCall, attempt: 2 },
+              },
+              progressText: null,
+              nextCheckDelayMs: 0,
+            };
+          }
+          const terminalText = "I uploaded Maya's field-trip form.";
           return {
             kind: "terminal",
             state: {
@@ -3540,16 +3571,28 @@ release("Florence parent journeys", () => {
     );
     await harness.readyHousehold();
 
-    await harness.accept("group", "group-browser-work", "Open the camp registration for us.", "partner");
+    await harness.accept(
+      "group",
+      "group-browser-work",
+      "Find Maya's field-trip form in Gmail and upload it for us.",
+      "partner",
+    );
     await harness.drain();
     harness.state.now += 1_001;
     await harness.drain();
 
-    expect(browserRuns).toHaveLength(1);
+    expect(browserRuns).toHaveLength(2);
     expect(browserRuns[0]).toMatchObject({
       ownerAdultId: harness.partnerAdultId,
-      operation: { kind: "navigate", url: "https://camp.example/register" },
+      operation: {
+        kind: "upload",
+        ref: "e7",
+        sourceId: expect.any(String),
+        attachmentRef: expect.any(String),
+      },
+      uploadFile: { filename: SCHOOL_ATTACHMENT.filename, bytes: PDF_BYTES },
     });
+    expect(browserRuns[1]?.uploadFile).toBeUndefined();
     expect(closedSessions).toEqual([expect.objectContaining({ sessionId: "browserbase-family-session" })]);
   }, 20_000);
 
@@ -8494,6 +8537,24 @@ function createGoogle(store: PostgresFlorenceStore, state: HarnessState): Google
     readGmailMessage: async (input: Parameters<GoogleConnection["readGmailMessage"]>[0]) => {
       await activeCredential(input);
       state.exactGmailReads.push(input);
+      if (
+        input.messageId === SCHOOL_ATTACHMENT.messageId &&
+        input.threadId === SCHOOL_ATTACHMENT.threadId &&
+        input.historyId === SCHOOL_ATTACHMENT.historyId
+      ) {
+        return {
+          messageId: input.messageId,
+          threadId: input.threadId,
+          historyId: input.historyId,
+          from: "school@muir.example.test",
+          subject: "Maya field-trip form",
+          sentAt: new Date(NOW - 1_000).toISOString(),
+          text: "Please upload Maya's attached field-trip form.",
+          textStatus: "complete" as const,
+          attachmentsStatus: "complete" as const,
+          attachments: [SCHOOL_ATTACHMENT],
+        };
+      }
       if (
         input.messageId !== "gmail-initial-unrelated-retail-account-alert" ||
         input.threadId !== "thread-gmail-initial-unrelated-retail-account-alert" ||

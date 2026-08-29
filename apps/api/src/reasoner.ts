@@ -4005,6 +4005,7 @@ const browserWorkArguments = z
     url: z.string().trim().url().max(4_096).nullable(),
     ref: z.string().trim().min(1).max(100).nullable(),
     text: z.string().max(20_000).nullable(),
+    sourceId: z.string().trim().min(1).max(500).nullable(),
     attachmentRef: z.string().trim().min(1).max(500).nullable(),
     values: z.array(z.string().max(20_000)).max(20),
     checked: z.boolean().nullable(),
@@ -4192,6 +4193,9 @@ const BROWSER_WORK_PARAMETERS = {
     url: { anyOf: [{ type: "string", minLength: 1, maxLength: 4_096 }, { type: "null" }] },
     ref: { anyOf: [{ type: "string", minLength: 1, maxLength: 100 }, { type: "null" }] },
     text: { anyOf: [{ type: "string", maxLength: 20_000 }, { type: "null" }] },
+    sourceId: {
+      anyOf: [{ type: "string", minLength: 1, maxLength: 500 }, { type: "null" }],
+    },
     attachmentRef: {
       anyOf: [{ type: "string", minLength: 1, maxLength: 500 }, { type: "null" }],
     },
@@ -4239,6 +4243,7 @@ const BROWSER_WORK_PARAMETERS = {
     "url",
     "ref",
     "text",
+    "sourceId",
     "attachmentRef",
     "values",
     "checked",
@@ -5227,6 +5232,7 @@ function browserOperation(args: z.infer<typeof browserWorkArguments>): FlorenceB
         kind: "upload",
         ref: requiredWorkspaceValue(args.ref, "browser ref"),
         attachmentRef: requiredWorkspaceValue(args.attachmentRef, "browser attachment reference"),
+        ...(args.sourceId === null ? {} : { sourceId: args.sourceId }),
       };
     case "select":
       return {
@@ -5706,7 +5712,7 @@ function foregroundCapabilityRegistry(): CapabilityRegistry<ForegroundCapability
     defineCapability({
       name: "browser_work",
       description:
-        "Use Florence's persistent real browser for any interactive website during durable family work. Prefer one bounded Playwright program to inspect the current DOM, perform related actions, and verify the resulting state. Use native computer actions when visual or coordinate-level control is more reliable: batches can click, move, type, press, scroll, drag, show or hide the cursor, and read or write the clipboard; clipboard and mouse-position reads are returned in action order. Set screenshot true on that same call when temporary visual inspection is useful. Routine screenshot is temporary visual context for you. Capture is different: it deliberately preserves one user-visible browser image for the final conversation, from the viewport or region, full page, rendered element, or original image resource; use it only when the parent asked for an image or the image materially improves the result. The compatibility operations can navigate, read an accessibility snapshot, click, type, upload one exact image or PDF from the initiating message, choose options, check boxes, press keys, scroll, wait, go back, or hand the live session to the parent for sign-in/MFA. This is a general browser, not a task-specific workflow. Set fields unused by the chosen operation to null, false, or empty arrays.",
+        "Use Florence's persistent real browser for any interactive website during durable family work. Prefer one bounded Playwright program to inspect the current DOM, perform related actions, and verify the resulting state. Use native computer actions when visual or coordinate-level control is more reliable: batches can click, move, type, press, scroll, drag, show or hide the cursor, and read or write the clipboard; clipboard and mouse-position reads are returned in action order. Set screenshot true on that same call when temporary visual inspection is useful. Routine screenshot is temporary visual context for you. Capture is different: it deliberately preserves one user-visible browser image for the final conversation, from the viewport or region, full page, rendered element, or original image resource; use it only when the parent asked for an image or the image materially improves the result. The compatibility operations can navigate, read an accessibility snapshot, click, type, upload one exact image or PDF from the initiating message, upload one exact Gmail attachment returned by gmail_work gmail_get by copying both its sourceId and attachmentRef, choose options, check boxes, press keys, scroll, wait, go back, or hand the live session to the parent for sign-in/MFA. For an initiating-message attachment set sourceId null. This is a general browser, not a task-specific workflow. Set fields unused by the chosen operation to null, false, or empty arrays.",
       modelSchema: BROWSER_WORK_PARAMETERS,
       inputSchema: browserWorkArguments,
       outputSchema: browserObservationOutputSchema,
@@ -5715,7 +5721,26 @@ function foregroundCapabilityRegistry(): CapabilityRegistry<ForegroundCapability
       timeoutMs: 300_000,
       maxOutputBytes: 60_000,
       availability: (context) => context.mode === "family_work" && context.reads.runBrowser !== undefined,
-      admit: ({ context }) => context.mode === "family_work",
+      admit: ({ context, canonicalArguments }) => {
+        if (context.mode !== "family_work") return false;
+        if (
+          !isJsonRecord(canonicalArguments) ||
+          canonicalArguments.operation !== "upload" ||
+          canonicalArguments.sourceId === null
+        ) {
+          return true;
+        }
+        const sourceId = canonicalArguments.sourceId;
+        const attachmentRef = canonicalArguments.attachmentRef;
+        return (
+          context.reads.runGoogleWorkspace !== undefined &&
+          typeof sourceId === "string" &&
+          typeof attachmentRef === "string" &&
+          context.gmailSources
+            .get(sourceId)
+            ?.attachments.some((attachment) => attachment.attachmentRef === attachmentRef) === true
+        );
+      },
       execute: ({ callId, arguments: args, context, signal }) =>
         executeBrowserOperation(context, callId, browserOperation(args), signal),
     }),

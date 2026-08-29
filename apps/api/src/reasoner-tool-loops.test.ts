@@ -1278,9 +1278,41 @@ describe("Florence reasoner capability cutover", () => {
   test("durable work uploads a camp form, follows review scope, then submits once", async () => {
     const portalUrl = "https://camp.example/register";
     const liveViewUrl = "https://www.browserbase.com/sessions/session-1";
-    const medicalFormId = "00000000-0000-4000-8000-000000000010";
+    const gmail = conversationalGmailSource();
+    const gmailAttachmentRef = gmail.attachments[0]?.attachmentRef ?? "missing-attachment";
     const modelRequests: Record<string, unknown>[] = [];
     const modelResponses = [
+      {
+        status: "completed",
+        output_parsed: null,
+        output: [
+          functionCall("read-camp-form-message", "gmail_work", {
+            operation: "gmail_get",
+            query: null,
+            limit: null,
+            messageId: "gmail-school-message",
+            to: [],
+            cc: [],
+            bcc: [],
+            subject: null,
+            body: null,
+            bodyFormat: null,
+            threadId: null,
+            addLabelIds: [],
+            removeLabelIds: [],
+          }),
+        ],
+      },
+      {
+        status: "completed",
+        output_parsed: null,
+        output: [
+          functionCall("open-camp-form", "read_gmail_attachment", {
+            sourceId: gmail.sourceId,
+            attachmentRef: gmailAttachmentRef,
+          }),
+        ],
+      },
       {
         status: "completed",
         output_parsed: null,
@@ -1322,7 +1354,11 @@ describe("Florence reasoner capability cutover", () => {
           functionCall(
             "upload-medical-form",
             "browser_work",
-            browserArguments("upload", { ref: "e7", attachmentRef: medicalFormId }),
+            browserArguments("upload", {
+              ref: "e7",
+              sourceId: gmail.sourceId,
+              attachmentRef: gmailAttachmentRef,
+            }),
           ),
         ],
       },
@@ -1414,23 +1450,13 @@ describe("Florence reasoner capability cutover", () => {
     const input = {
       workId: "family-work-camp-registration",
       scheduledOccurrence: null,
-      objective: "Fill out Violet’s camp registration and get it ready for my final review.",
+      objective:
+        "Find Violet’s medical form in Gmail, fill out her camp registration, and get it ready for my final review.",
       visibility: "private" as const,
       ownerAdultId: "adult-1",
-      origin: {
-        ...familyWorkOrigin("Fill out Violet’s camp registration and get it ready for my final review."),
-        currentDocuments: [
-          {
-            id: medicalFormId,
-            parentSourceId: "source-adult-1",
-            filename: "violet-medical-form.pdf",
-            mimeType: "application/pdf" as const,
-            contentDigest: "a".repeat(64),
-            contentEnvelope: Uint8Array.from([1]),
-            discardAfter: "2026-08-29T20:00:00.000Z",
-          },
-        ],
-      },
+      origin: familyWorkOrigin(
+        "Find Violet’s medical form in Gmail, fill out her camp registration, and get it ready for my final review.",
+      ),
       household: {
         householdId: "household-1",
         familyLabel: "Test family",
@@ -1439,14 +1465,62 @@ describe("Florence reasoner capability cutover", () => {
         adults: [{ adultId: "adult-1", firstName: "Hari", displayName: "Hari Anbarasu" }],
         children: [],
       },
+      googleConnections: [
+        {
+          emailLabel: "Personal Google",
+          calendarAvailable: true,
+          kind: "personal" as const,
+          writesEnabled: true,
+        },
+      ],
       state: initialState,
       currentTime: NOW,
     };
     const browserOperations: FlorenceBrowserOperation[] = [];
+    const openedAttachmentRefs: string[] = [];
     const reads = {
-      async readCurrentPdf() {
+      async runGoogleWorkspace(operation: GoogleWorkspaceOperation): Promise<GoogleWorkspaceResult> {
+        if (operation.operation !== "gmail_get") {
+          throw new Error(`Unexpected Google operation ${operation.operation}`);
+        }
         return {
-          mimeType: "application/pdf" as const,
+          operation: operation.operation,
+          result: {
+            message: {
+              messageId: "gmail-school-message",
+              threadId: "gmail-thread-1",
+              historyId: "gmail-history-1",
+              subject: "Camp medical form",
+              body: "Please upload the attached medical form during camp registration.",
+              attachments: [
+                {
+                  attachmentId: "gmail-attachment-1",
+                  partId: "1",
+                  filename: gmail.attachments[0]?.filename ?? "form.pdf",
+                  mimeType: gmail.attachments[0]?.mimeType ?? "application/pdf",
+                  sizeBytes: gmail.attachments[0]?.sizeBytes ?? 5,
+                },
+              ],
+            },
+          },
+        };
+      },
+      async readWorkspaceGmailSource(identity: { messageId: string; threadId: string; historyId: string }) {
+        expect(identity).toEqual({
+          messageId: "gmail-school-message",
+          threadId: "gmail-thread-1",
+          historyId: "gmail-history-1",
+        });
+        return gmail;
+      },
+      async readGmailAttachment(input: { sourceId: string; attachment: (typeof gmail.attachments)[number] }) {
+        expect(input).toEqual({ sourceId: gmail.sourceId, attachment: gmail.attachments[0] });
+        openedAttachmentRefs.push(input.attachment.attachmentRef);
+        return {
+          sourceId: input.sourceId,
+          attachmentRef: input.attachment.attachmentRef,
+          filename: "violet-medical-form.pdf",
+          mimeType: input.attachment.mimeType,
           bytes: Uint8Array.from([0x25, 0x50, 0x44, 0x46]),
         };
       },
@@ -1477,7 +1551,10 @@ describe("Florence reasoner capability cutover", () => {
                 '- textbox "Child name" [ref=e5] value="Violet Williams"\n- button "Upload medical form" [ref=e7]\n- button Preview [ref=e9]',
             });
           case "upload":
-            expect(operation.attachmentRef).toBe(medicalFormId);
+            expect(operation).toMatchObject({
+              sourceId: gmail.sourceId,
+              attachmentRef: gmailAttachmentRef,
+            });
             return browserObservation({
               title: "Camp registration",
               url: portalUrl,
@@ -1541,7 +1618,7 @@ describe("Florence reasoner capability cutover", () => {
     });
     if (waiting.kind !== "waiting") throw new Error("Portal work did not wait for sign-in");
     expect(waiting.question).toContain(liveViewUrl);
-    expect(JSON.stringify(modelRequests[2]?.input)).toContain(liveViewUrl);
+    expect(JSON.stringify(modelRequests[4]?.input)).toContain(liveViewUrl);
 
     const signedInState = steerFamilyWorkState(waiting.state, {
       sourceId: "00000000-0000-4000-8000-000000000002",
@@ -1566,7 +1643,7 @@ describe("Florence reasoner capability cutover", () => {
 
     const reviewPlanned = await reasoner.continueFamilyWork({ ...input, state: inspected.state }, reads);
     if (reviewPlanned.kind !== "continue") throw new Error("Camp review was not planned");
-    expect(JSON.stringify(modelRequests[6]?.input)).toContain("input_image");
+    expect(JSON.stringify(modelRequests[8]?.input)).toContain("input_image");
     expect(JSON.stringify(reviewPlanned.state.continuationItems)).not.toContain("input_image");
     const reviewed = await reasoner.continueFamilyWork({ ...input, state: reviewPlanned.state }, reads);
     if (reviewed.kind !== "continue") throw new Error("Camp review did not settle");
@@ -1602,15 +1679,14 @@ describe("Florence reasoner capability cutover", () => {
     expect(
       browserOperations.filter((operation) => operation.kind === "click" && operation.ref === "e12"),
     ).toHaveLength(1);
-    expect(
-      modelRequests.every((request) => JSON.stringify(request.input).includes('"type":"input_file"')),
-    ).toBe(true);
-    expect(JSON.stringify(modelRequests[3]?.input)).toContain("I’m signed in—keep going.");
+    expect(openedAttachmentRefs).toEqual([gmailAttachmentRef]);
+    expect(JSON.stringify(modelRequests)).toContain(gmail.sourceId);
+    expect(JSON.stringify(modelRequests[5]?.input)).toContain("I’m signed in—keep going.");
     expect(awaitingApproval.question).toContain("June 15–19, 2027");
-    expect(JSON.stringify(modelRequests[8]?.input)).toContain("Yes—submit this exact registration now.");
-    expect(JSON.stringify(modelRequests[9]?.input)).toContain("uncertain_effect");
-    expect(JSON.stringify(modelRequests[9]?.input)).toContain("CAMP-20481");
-    expect(JSON.stringify(modelRequests[9]?.input)).toContain("Adventure Camp, June 15–19, 2027");
+    expect(JSON.stringify(modelRequests[10]?.input)).toContain("Yes—submit this exact registration now.");
+    expect(JSON.stringify(modelRequests[11]?.input)).toContain("uncertain_effect");
+    expect(JSON.stringify(modelRequests[11]?.input)).toContain("CAMP-20481");
+    expect(JSON.stringify(modelRequests[11]?.input)).toContain("Adventure Camp, June 15–19, 2027");
     expect(terminal).toMatchObject({
       kind: "terminal",
       outcome: "succeeded",
@@ -4615,6 +4691,7 @@ function browserArguments(operation: string, overrides: Record<string, unknown> 
     url: null,
     ref: null,
     text: null,
+    sourceId: null,
     attachmentRef: null,
     values: [],
     checked: null,

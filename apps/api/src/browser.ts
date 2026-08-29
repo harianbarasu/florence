@@ -55,7 +55,13 @@ export type FlorenceBrowserOperation =
   | { readonly kind: "snapshot"; readonly compact?: boolean }
   | { readonly kind: "click"; readonly ref: string }
   | { readonly kind: "type"; readonly ref: string; readonly text: string }
-  | { readonly kind: "upload"; readonly ref: string; readonly attachmentRef: string }
+  | {
+      readonly kind: "upload";
+      readonly ref: string;
+      readonly attachmentRef: string;
+      /** Exact Gmail source when the upload did not originate in Messages. */
+      readonly sourceId?: string;
+    }
   | { readonly kind: "select"; readonly ref: string; readonly values: readonly string[] }
   | { readonly kind: "check"; readonly ref: string; readonly checked: boolean }
   | { readonly kind: "press"; readonly key: string }

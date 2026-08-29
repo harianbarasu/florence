@@ -63,6 +63,40 @@ describe("VaultRecall", () => {
     ).toThrow("Vault changed while continuing this search");
   });
 
+  test("prefetch exposes only the current corrected meaning and revision", () => {
+    const original = fact(125, {
+      statement: "The family's noodle recipe uses soy sauce.",
+      title: "Weeknight noodles",
+      tags: ["noodles", "soy sauce"],
+    });
+    const corrected: FactRecord = {
+      ...original,
+      value: {
+        statement: "The family's noodle recipe uses tamari instead of soy sauce.",
+        memoryKind: "artifact",
+        artifactKind: "recipe",
+        title: "Weeknight noodles",
+        details: "Use tamari in place of soy sauce.",
+        tags: ["noodles", "tamari"],
+      },
+      correctedAt: "2026-08-29T18:00:00.000Z",
+      updatedAt: "2026-08-29T18:00:00.000Z",
+    };
+
+    const page = new VaultRecall([corrected]).search({ query: "weeknight noodle sauce" });
+    expect(page.results).toHaveLength(1);
+    expect(page.results[0]).toMatchObject({
+      uri: `vault://fact/${original.id}`,
+      abstract: "Weeknight noodles — The family's noodle recipe uses tamari instead of soy sauce.",
+      updatedAt: corrected.updatedAt,
+    });
+    expect(JSON.stringify(page)).not.toContain("recipe uses soy sauce.");
+    expect(
+      new VaultRecall([corrected]).read({ uri: `vault://fact/${original.id}`, level: "overview" })?.memory
+        .statement,
+    ).toBe("The family's noodle recipe uses tamari instead of soy sauce.");
+  });
+
   test("reads complete recipe details and every exact support at full depth", () => {
     const details = `Grandma's exact recipe\n${Array.from(
       { length: 280 },

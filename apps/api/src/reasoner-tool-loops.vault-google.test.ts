@@ -25,6 +25,36 @@ import {
 } from "./reasoner-tool-loops.test-kit.js";
 
 describe("Florence reasoner capability cutover", () => {
+  test("rewrites a family need into one contextual Vault query", async () => {
+    const requests: Record<string, unknown>[] = [];
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        parse(input: Record<string, unknown>) {
+          requests.push(input);
+          return {
+            status: "completed",
+            output_parsed: {
+              query:
+                "Which family dinner recipe and substitutions did we previously prefer for busy evenings?",
+            },
+            output: [],
+          };
+        },
+      },
+    } as never);
+
+    const query = await reasoner.rewriteMemoryQuery({
+      primary: "Make that one again for the busy night.",
+      context: ["Use the version Jackson liked, with our substitution."],
+    });
+
+    const request = requests[0];
+    expect(request).toBeDefined();
+    expect(query).toContain("recipe and substitutions");
+    expect(String(request?.instructions)).toContain("Resolve pronouns and elliptical references");
+    expect(JSON.stringify(request?.input)).toContain("Use the version Jackson liked");
+  });
+
   test("public place verification composes map candidates with direct web search", async () => {
     let modelTurn = 0;
     const modelRequests: Record<string, unknown>[] = [];
@@ -313,26 +343,12 @@ describe("Florence reasoner capability cutover", () => {
     expect(JSON.stringify(requests)).not.toContain("connectionId");
   });
 
-  test("durable private work composes visible memory and Gmail attachments inline", async () => {
+  test("durable private work composes prefetched Vault memory and Gmail attachments inline", async () => {
     const gmail = conversationalGmailSource();
     const memoryFactId = "11111111-1111-4111-8111-111111111111";
     const memoryUri = `vault://fact/${memoryFactId}`;
-    const memory = {
-      sourceId: "memory-pickup-source",
-      recordId: memoryFactId,
-      kind: "memory" as const,
-      visibility: "adult_private" as const,
-      label: "School pickup",
-      occurredAt: NOW,
-      text: "School pickup is normally at 2:45 PM.",
-    };
     const requests: Record<string, unknown>[] = [];
     const responses = [
-      {
-        status: "completed",
-        output_parsed: null,
-        output: [functionCall("memory-search", "search_vault", { query: "pickup", cursor: null })],
-      },
       {
         status: "completed",
         output_parsed: null,
@@ -394,7 +410,24 @@ describe("Florence reasoner capability cutover", () => {
           adults: [{ adultId: "adult-1", firstName: "Hari", displayName: "Hari Anbarasu" }],
           children: [],
         },
-        visibleSources: [memory],
+        prefetchedVault: {
+          query: "school pickup",
+          results: [
+            {
+              uri: memoryUri,
+              score: 1,
+              abstract: "School pickup is normally at 2:45 PM.",
+              memoryKind: "routine",
+              artifactKind: null,
+              title: "School pickup",
+              tags: ["school", "pickup"],
+              updatedAt: NOW,
+            },
+          ],
+          total: 1,
+          complete: true,
+          nextCursor: null,
+        },
         googleConnections: [
           {
             emailLabel: "Personal Google",
@@ -423,24 +456,7 @@ describe("Florence reasoner capability cutover", () => {
       },
       {
         async searchVault() {
-          return {
-            query: "pickup",
-            results: [
-              {
-                uri: memoryUri,
-                score: 1,
-                abstract: "School pickup is normally at 2:45 PM.",
-                memoryKind: "routine" as const,
-                artifactKind: null,
-                title: "School pickup",
-                tags: ["school", "pickup"],
-                updatedAt: NOW,
-              },
-            ],
-            total: 1,
-            complete: true,
-            nextCursor: null,
-          };
+          throw new Error("The prefetched Vault result should be directly readable");
         },
         async readVault() {
           return {
@@ -486,6 +502,8 @@ describe("Florence reasoner capability cutover", () => {
     expect(((requests[0]?.tools as { name: string }[]) ?? []).map((tool) => tool.name)).toEqual(
       expect.arrayContaining(["search_vault", "read_vault", "search_gmail", "read_gmail_attachment"]),
     );
+    expect(JSON.stringify(requests[0]?.input)).toContain("recalledMemory");
+    expect(JSON.stringify(requests[0]?.input)).toContain("School pickup is normally at 2:45 PM.");
     expect(JSON.stringify(requests.at(-1)?.input)).toContain("input_file");
     expect(JSON.stringify(requests)).not.toContain("connectionId");
   });
@@ -1117,6 +1135,17 @@ describe("Florence reasoner capability cutover", () => {
       familyRelevance: "household" as const,
       sourceIds: [gmail.sourceId],
     }));
+    const currentFacts = Array.from({ length: 125 }, (_, index) => ({
+      slot: `family:retained-context:${index + 1}`,
+      statement: `Retained family context ${index + 1} remains current.`,
+      memory: {
+        memoryKind: "fact" as const,
+        artifactKind: null,
+        title: null,
+        details: null,
+        tags: [],
+      },
+    }));
     const privateBatchDecision = florencePrivateGoogleBatchDecisionSchema.parse({
       findings: [],
       facts,
@@ -1146,13 +1175,29 @@ describe("Florence reasoner capability cutover", () => {
       },
     };
 
-    const initial = await reasoner.classifyPrivateGoogleBatch(privateBatchInput(gmail), reads);
-    const incremental = await reasoner.assessGoogleChanges(privateAssessmentInput(gmail), reads);
+    const initial = await reasoner.classifyPrivateGoogleBatch(
+      { ...privateBatchInput(gmail), currentFacts },
+      reads,
+    );
+    const incremental = await reasoner.assessGoogleChanges(
+      {
+        ...privateAssessmentInput(gmail),
+        currentFacts,
+        memory: currentFacts.map((fact) => ({
+          slot: fact.slot,
+          label: fact.statement,
+          text: fact.statement,
+        })),
+      },
+      reads,
+    );
 
     expect(initial.facts).toEqual(facts);
     expect(incremental.facts).toEqual(facts);
     expect(String(requests[0]?.instructions)).toContain("Return every eligible fact supported by this batch");
     expect(String(requests[1]?.instructions)).toContain("never omit one merely to satisfy an output count");
+    expect(JSON.stringify(requests[0]?.input)).toContain("Retained family context 125 remains current.");
+    expect(JSON.stringify(requests[1]?.input)).toContain("Retained family context 125 remains current.");
     expect(requests.map((request) => String(request.instructions))).not.toEqual(
       expect.arrayContaining([expect.stringContaining("up to twenty")]),
     );

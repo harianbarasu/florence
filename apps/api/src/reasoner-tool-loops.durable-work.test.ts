@@ -24,7 +24,7 @@ import {
 } from "./reasoner-tool-loops.test-kit.js";
 
 describe("Florence reasoner capability cutover", () => {
-  test("verified useful work searches before retaining reusable completion memory", async () => {
+  test("verified useful work can retain reusable completion memory after automatic Vault recall", async () => {
     const modelRequests: Record<string, unknown>[] = [];
     const completionMemory = {
       operation: "retain" as const,
@@ -47,25 +47,12 @@ describe("Florence reasoner capability cutover", () => {
         },
       ],
     };
-    let taskTurn = 0;
     const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
       responses: {
         parse(request: Record<string, unknown>) {
           const review = defaultFamilyWorkCompletionReview(request);
           if (review) return review;
           modelRequests.push(request);
-          if (taskTurn++ === 0) {
-            return {
-              status: "completed",
-              output_parsed: null,
-              output: [
-                functionCall("completion-memory-search", "search_vault", {
-                  query: "family weeknight noodle recipe",
-                  cursor: null,
-                }),
-              ],
-            };
-          }
           return {
             status: "completed",
             output_parsed: {
@@ -113,20 +100,17 @@ describe("Florence reasoner capability cutover", () => {
           adults: [{ adultId: "adult-1", firstName: "Hari", displayName: "Hari Anbarasu" }],
           children: [],
         },
+        prefetchedVault: {
+          query: "family weeknight noodle recipe",
+          results: [],
+          total: 0,
+          complete: true,
+          nextCursor: null,
+        },
         state,
         currentTime: NOW,
       },
-      {
-        async searchVault({ query }) {
-          return {
-            query,
-            results: [],
-            total: 0,
-            complete: true,
-            nextCursor: null,
-          };
-        },
-      },
+      {},
     );
 
     expect(result).toMatchObject({
@@ -137,9 +121,7 @@ describe("Florence reasoner capability cutover", () => {
     expect(String(modelRequests[0]?.instructions)).toContain("selective completionMemory decision");
     expect(String(modelRequests[0]?.instructions)).toContain("search the Vault");
     expect(JSON.stringify(modelRequests[0]?.text)).toContain('"completionMemory"');
-    expect(functionOutputEnvelopes(modelRequests[1])).toContainEqual(
-      expect.objectContaining({ callId: "completion-memory-search", outcome: "succeeded" }),
-    );
+    expect(JSON.stringify(modelRequests[0]?.input)).toContain("recalledMemory");
   });
 
   test("durable work compacts complete history and preserves its recent tail before continuing", async () => {

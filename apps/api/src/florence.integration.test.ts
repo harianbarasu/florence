@@ -3019,7 +3019,11 @@ release("Florence parent journeys", () => {
           authoredText: expect.stringContaining(PROACTIVE_FAMILY_WORK_KICKOFF),
           voiceTranscriptPresent: false,
         });
-        expect(input.visibleSources?.some((source) => source.text.includes(GOOGLE_RECIPE_TITLE))).toBe(true);
+        expect(
+          input.prefetchedVault?.results.some(
+            (result) => result.title === GOOGLE_RECIPE_TITLE || result.abstract.includes(GOOGLE_RECIPE_TITLE),
+          ),
+        ).toBe(true);
         return {
           kind: "terminal",
           state: {

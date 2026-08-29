@@ -10086,10 +10086,10 @@ export class PostgresFlorenceStore {
             assertUuid(candidateId, "Family work docket candidate ID");
           }
           if (expectedVisibility === "household") {
-            // Serialize explicit group work with the event-driven next-action settlement on the
-            // existing poll row, then recheck the one current household objective invariant.
+            // Serialize explicit group work with event-driven next-action settlement on the
+            // existing poll row. Parent-requested objectives may coexist; the autonomous path
+            // below still refuses to start while any household objective is already current.
             await lockHouseholdGooglePolls(sql, turn.household_id);
-            await assertNoCurrentHouseholdObjective(sql, turn.household_id);
           }
           let selectedDocketSourceIds: readonly string[] = [];
           let selectedDocketActionOwners: readonly ProactiveFamilyWorkActionOwner[] = [];

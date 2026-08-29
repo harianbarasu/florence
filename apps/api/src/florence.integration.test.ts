@@ -3486,7 +3486,7 @@ release("Florence parent journeys", () => {
     );
   }, 20_000);
 
-  test("an exact inline reply selects one of two waiting tasks in the same conversation", async () => {
+  test("two unrelated group tasks coexist and an exact inline reply advances only one", async () => {
     const firstRequest = "Compare the morning camp options and ask me which one to use.";
     const secondRequest = "Compare the afternoon camp options and ask me which one to use.";
     const firstObjective = "Use the parent's choice for the morning camp options.";
@@ -3594,17 +3594,17 @@ release("Florence parent journeys", () => {
     );
     await harness.readyHousehold();
 
-    await harness.accept("private", "two-waits-first", firstRequest);
+    await harness.accept("group", "two-waits-first", firstRequest);
     await harness.drain();
     harness.state.now += 1_000;
     await harness.drain();
-    await harness.accept("private", "two-waits-second", secondRequest);
+    await harness.accept("group", "two-waits-second", secondRequest);
     await harness.drain();
     harness.state.now += 1_000;
     await harness.drain();
     expect(harness.linq.messages.filter((message) => message.text === firstQuestion)).toHaveLength(1);
     const secondQuestionDelivery = harness.linq.messages.find(
-      (message) => message.providerConversationId === PRIVATE_FOUNDER && message.text === secondQuestion,
+      (message) => message.providerConversationId === FAMILY_GROUP && message.text === secondQuestion,
     );
     if (!secondQuestionDelivery) throw new Error("The second waiting question was not delivered");
     const secondQuestionReceipt = harness.linq.ledger.sent.get(secondQuestionDelivery.idempotencyKey);
@@ -3613,7 +3613,7 @@ release("Florence parent journeys", () => {
     }
 
     await harness.accept(
-      "private",
+      "group",
       "two-waits-answer-second",
       secondAnswer,
       "founder",
@@ -3623,7 +3623,7 @@ release("Florence parent journeys", () => {
     expect(answerReachedOrdinaryReasoner).toBe(false);
     expect(
       harness.linq.messages.filter(
-        (message) => message.providerConversationId === PRIVATE_FOUNDER && message.text === acknowledgement,
+        (message) => message.providerConversationId === FAMILY_GROUP && message.text === acknowledgement,
       ),
     ).toHaveLength(1);
     expect(harness.linq.messages.filter((message) => message.text === terminalText)).toHaveLength(1);
@@ -3631,9 +3631,10 @@ release("Florence parent journeys", () => {
       "The inline reply did not select only the exact waiting task",
       `(select count(*)=1 from proactive_work
           where kind='family_task' and objective=${sqlLiteral(firstObjective)} and status='paused'
-            and task_state->>'phase'='waiting')
+            and visibility='household' and owner_adult_id is null and task_state->>'phase'='waiting')
         and (select count(*)=1 from proactive_work
-          where kind='family_task' and objective=${sqlLiteral(secondObjective)} and status='completed')`,
+          where kind='family_task' and objective=${sqlLiteral(secondObjective)} and status='completed'
+            and visibility='household' and owner_adult_id is null)`,
     );
   }, 20_000);
 

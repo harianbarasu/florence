@@ -3840,50 +3840,86 @@ Compare the useful family options.
     expect(JSON.stringify(requests)).not.toContain("connectionId");
   });
 
-  test("calendar catalog references admit a selected window without hiding partial coverage", async () => {
+  test("a complete Family Calendar cursor chain retains an earlier-page target for update", async () => {
     const requests: Record<string, unknown>[] = [];
-    const calendarRefs = ["calendar-school", "calendar-work"];
-    const selectedRead = {
-      status: "partial" as const,
-      calendars: [
-        {
-          calendarRef: calendarRefs[0] ?? "missing-school",
-          label: "School",
-          timeZone: "America/Los_Angeles",
-          primary: false,
-          accessRole: "reader" as const,
-          status: "complete" as const,
-          eventCount: 1,
-        },
-        {
-          calendarRef: calendarRefs[1] ?? "missing-work",
-          label: "Work",
-          timeZone: "America/Los_Angeles",
-          primary: false,
-          accessRole: "owner" as const,
-          status: "unavailable" as const,
-          eventCount: 0,
-        },
-      ],
-      events: [
-        {
-          eventRef: "event-1",
-          providerUpdatedAt: "2026-08-27T19:00:00.000Z",
-          calendarRef: calendarRefs[0] ?? "missing-school",
-          calendarLabel: "School",
-          title: "Back-to-school night",
-          location: "Wish Charter",
-          status: "tentative" as const,
-          busy: true,
-          intervalKind: "timed" as const,
+    const calendarRef = "calendar-family";
+    const calendarEvents = Array.from({ length: 73 }, (_, index) => ({
+      eventRef: `event-${index.toString().padStart(2, "0")}`,
+      providerUpdatedAt: "2026-08-27T19:00:00.000Z",
+      calendarRef,
+      calendarLabel: "Family Calendar",
+      title: `Family event ${index + 1}`,
+      location: null,
+      status: "confirmed" as const,
+      busy: true,
+      intervalKind: "timed" as const,
+      startsAt: "2026-08-28T16:00:00.000Z",
+      endsAt: "2026-08-28T18:00:00.000Z",
+      timeZone: "America/Los_Angeles",
+    }));
+    const calendarCoverage = [
+      {
+        calendarRef,
+        label: "Family Calendar",
+        timeZone: "America/Los_Angeles",
+        primary: null,
+        accessRole: null,
+        status: "complete" as const,
+        eventCount: 73,
+      },
+    ];
+    const firstRead = {
+      status: "truncated" as const,
+      calendars: calendarCoverage,
+      events: calendarEvents.slice(0, 50),
+      totalCalendarCount: 1,
+      totalEventCount: 73,
+      nextCursor: "calendar-page-2",
+    };
+    const secondRead = {
+      status: "complete" as const,
+      calendars: calendarCoverage,
+      events: calendarEvents.slice(50),
+      totalCalendarCount: 1,
+      totalEventCount: 73,
+      nextCursor: null,
+    };
+    const calendarArguments = {
+      timeMin: "2026-08-28T00:00:00.000Z",
+      timeMax: "2026-08-29T00:00:00.000Z",
+      pageSize: 50,
+      cursor: null,
+      scope: "all",
+      calendarRefs: [],
+    };
+    const completedDecision = ordinaryDecision();
+    completedDecision.conversation.bubbles = [];
+    completedDecision.calendar = {
+      mode: "direct",
+      proposalId: null,
+      mutation: {
+        operation: "update",
+        event: {
+          intervalKind: "timed",
+          title: "Updated family event",
           startsAt: "2026-08-28T16:00:00.000Z",
           endsAt: "2026-08-28T18:00:00.000Z",
           timeZone: "America/Los_Angeles",
+          location: null,
         },
-      ],
-      totalCalendarCount: 2,
-      totalEventCount: 1,
-      nextCursor: null,
+        target: {
+          eventRef: calendarEvents[0]?.eventRef ?? "missing-event",
+          observedEvent: {
+            intervalKind: "timed",
+            title: calendarEvents[0]?.title ?? "Missing family event",
+            startsAt: "2026-08-28T16:00:00.000Z",
+            endsAt: "2026-08-28T18:00:00.000Z",
+            timeZone: "America/Los_Angeles",
+            location: null,
+          },
+        },
+      },
+      sourceIds: ["turn-1"],
     };
     const responses = [
       {
@@ -3894,18 +3930,19 @@ Compare the useful family options.
       {
         status: "completed",
         output_parsed: null,
+        output: [functionCall("calendar-window-1", "read_calendar_window", calendarArguments)],
+      },
+      {
+        status: "completed",
+        output_parsed: null,
         output: [
-          functionCall("calendar-window", "read_calendar_window", {
-            timeMin: "2026-08-28T00:00:00.000Z",
-            timeMax: "2026-08-29T00:00:00.000Z",
-            pageSize: 20,
-            cursor: null,
-            scope: "selected",
-            calendarRefs,
+          functionCall("calendar-window-2", "read_calendar_window", {
+            ...calendarArguments,
+            cursor: firstRead.nextCursor,
           }),
         ],
       },
-      { status: "completed", output_parsed: ordinaryDecision(), output: [] },
+      { status: "completed", output_parsed: completedDecision, output: [] },
     ];
     const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
       responses: {
@@ -3917,52 +3954,241 @@ Compare the useful family options.
         },
       },
     } as never);
-    let calendarInput: Record<string, unknown> | null = null;
+    const calendarInputs: Record<string, unknown>[] = [];
 
-    await reasoner.decide(foregroundInput(), {
+    const input = foregroundInput();
+    input.audience = "group";
+    input.googleConnections = [
+      { emailLabel: "Family Google", calendarAvailable: true, kind: "family", writesEnabled: true },
+    ];
+    const result = await reasoner.decide(input, {
       ...inertReads(),
       async listCalendars() {
         return {
           status: "complete",
           calendars: [
             {
-              calendarRef: calendarRefs[0] ?? "missing-school",
-              label: "School",
+              calendarRef,
+              label: "Family Calendar",
               timeZone: "America/Los_Angeles",
-              primary: false,
-              accessRole: "reader",
-              eventCoverage: "readable",
-            },
-            {
-              calendarRef: calendarRefs[1] ?? "missing-work",
-              label: "Work",
-              timeZone: "America/Los_Angeles",
-              primary: false,
-              accessRole: "owner",
+              primary: null,
+              accessRole: null,
               eventCoverage: "readable",
             },
           ],
-          totalCalendarCount: 2,
+          totalCalendarCount: 1,
         };
       },
       async readCalendarWindow(input) {
-        calendarInput = input;
-        return selectedRead;
+        calendarInputs.push(input);
+        return input.cursor === null ? firstRead : secondRead;
       },
     });
 
-    expect(calendarInput).toMatchObject({ scope: "selected", calendarRefs });
-    const windowEnvelope = functionOutputEnvelopes(requests[2]).find(
-      (envelope) => envelope.callId === "calendar-window",
+    expect(calendarInputs).toEqual([
+      calendarArguments,
+      { ...calendarArguments, cursor: firstRead.nextCursor },
+    ]);
+    const firstEnvelope = functionOutputEnvelopes(requests[2]).find(
+      (envelope) => envelope.callId === "calendar-window-1",
     );
-    expect(windowEnvelope?.output).toMatchObject({
-      status: "partial",
-      totalEventCount: 1,
-      calendars: [
-        expect.objectContaining({ label: "School", status: "complete", eventCount: 1 }),
-        expect.objectContaining({ label: "Work", status: "unavailable", eventCount: 0 }),
-      ],
-      events: [expect.objectContaining({ calendarLabel: "School", status: "tentative", busy: true })],
+    expect(firstEnvelope?.output).toMatchObject({
+      status: "truncated",
+      totalEventCount: 73,
+      nextCursor: firstRead.nextCursor,
+      events: { length: 50 },
+    });
+    const secondEnvelope = functionOutputEnvelopes(requests[3]).find(
+      (envelope) => envelope.callId === "calendar-window-2",
+    );
+    expect(secondEnvelope?.output).toMatchObject({
+      status: "complete",
+      totalEventCount: 73,
+      nextCursor: null,
+      events: { length: 23 },
+    });
+    const observedEvents = [firstEnvelope, secondEnvelope].flatMap((envelope) => {
+      const output = envelope?.output as { events?: readonly { eventRef?: unknown }[] } | undefined;
+      return output?.events?.map((event) => event.eventRef) ?? [];
+    });
+    expect(observedEvents).toEqual(calendarEvents.map((event) => event.eventRef));
+    expect(new Set(observedEvents).size).toBe(73);
+    expect(result.calendar).toEqual(completedDecision.calendar);
+  });
+
+  test("a truncated Calendar page cannot authorize a Family Calendar write", async () => {
+    const calendarEvent = {
+      eventRef: "event-existing",
+      providerUpdatedAt: "2026-08-27T19:00:00.000Z",
+      calendarRef: "calendar-family",
+      calendarLabel: "Family Calendar",
+      title: "Existing family event",
+      location: null,
+      status: "confirmed" as const,
+      busy: true,
+      intervalKind: "timed" as const,
+      startsAt: "2026-08-28T16:00:00.000Z",
+      endsAt: "2026-08-28T17:00:00.000Z",
+      timeZone: "America/Los_Angeles",
+    };
+    const decision = ordinaryDecision();
+    decision.conversation.bubbles = [];
+    decision.calendar = {
+      mode: "direct",
+      proposalId: null,
+      mutation: {
+        operation: "create",
+        event: {
+          intervalKind: "timed",
+          title: "New family event",
+          startsAt: "2026-08-28T18:00:00.000Z",
+          endsAt: "2026-08-28T19:00:00.000Z",
+          timeZone: "America/Los_Angeles",
+          location: null,
+        },
+        target: null,
+      },
+      sourceIds: ["turn-1"],
+    };
+    const responses = [
+      {
+        status: "completed",
+        output_parsed: null,
+        output: [
+          functionCall("calendar-window", "read_calendar_window", {
+            timeMin: "2026-08-28T00:00:00.000Z",
+            timeMax: "2026-08-29T00:00:00.000Z",
+            pageSize: 50,
+            cursor: null,
+            scope: "all",
+            calendarRefs: [],
+          }),
+        ],
+      },
+      { status: "completed", output_parsed: decision, output: [] },
+    ];
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        stream: () => {
+          const response = responses.shift();
+          if (!response) throw new Error("Unexpected model request");
+          return fakeStream(response);
+        },
+      },
+    } as never);
+    const input = foregroundInput();
+    input.audience = "group";
+    input.googleConnections = [
+      { emailLabel: "Family Google", calendarAvailable: true, kind: "family", writesEnabled: true },
+    ];
+
+    await expect(
+      reasoner.decide(input, {
+        ...inertReads(),
+        async readCalendarWindow() {
+          return {
+            status: "truncated",
+            calendars: [
+              {
+                calendarRef: "calendar-family",
+                label: "Family Calendar",
+                timeZone: "America/Los_Angeles",
+                primary: false,
+                accessRole: "owner",
+                status: "complete",
+                eventCount: 73,
+              },
+            ],
+            totalCalendarCount: 1,
+            events: [calendarEvent],
+            totalEventCount: 73,
+            nextCursor: "calendar-page-2",
+          };
+        },
+      }),
+    ).rejects.toMatchObject({
+      code: "invalid_output",
+      message: expect.stringContaining("complete covering family read"),
+    });
+  });
+
+  test("truncated Calendar metadata remains usable for a focused read", async () => {
+    const requests: Record<string, unknown>[] = [];
+    const responses = [
+      {
+        status: "completed",
+        output_parsed: null,
+        output: [
+          functionCall("calendar-window", "read_calendar_window", {
+            timeMin: "2026-08-28T00:00:00.000Z",
+            timeMax: "2026-08-29T00:00:00.000Z",
+            pageSize: 50,
+            cursor: null,
+            scope: "all",
+            calendarRefs: [],
+          }),
+        ],
+      },
+      {
+        status: "completed",
+        output_parsed: ordinaryDecision({ bubbleText: "I found the event you asked about." }),
+        output: [],
+      },
+    ];
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        stream: (request: Record<string, unknown>) => {
+          requests.push(request);
+          const response = responses.shift();
+          if (!response) throw new Error("Unexpected model request");
+          return fakeStream(response);
+        },
+      },
+    } as never);
+    const calendars = Array.from({ length: 100 }, (_, index) => ({
+      calendarRef: `calendar-${index}`,
+      label: `Calendar ${index + 1}`,
+      timeZone: "America/Los_Angeles",
+      primary: index === 0,
+      accessRole: "owner" as const,
+      status: "complete" as const,
+      eventCount: index === 0 ? 1 : 0,
+    }));
+
+    const result = await reasoner.decide(foregroundInput(), {
+      ...inertReads(),
+      async readCalendarWindow() {
+        return {
+          status: "truncated",
+          calendars,
+          totalCalendarCount: 101,
+          events: [
+            {
+              eventRef: "event-wanted",
+              providerUpdatedAt: "2026-08-27T19:00:00.000Z",
+              calendarRef: calendars[0]?.calendarRef ?? "missing-calendar",
+              calendarLabel: calendars[0]?.label ?? "Calendar",
+              title: "The event I wanted",
+              location: null,
+              status: "confirmed",
+              busy: true,
+              intervalKind: "timed",
+              startsAt: "2026-08-28T16:00:00.000Z",
+              endsAt: "2026-08-28T17:00:00.000Z",
+              timeZone: "America/Los_Angeles",
+            },
+          ],
+          totalEventCount: 1,
+          nextCursor: null,
+        };
+      },
+    });
+
+    expect(result.conversation.bubbles[0]?.text).toContain("found the event");
+    expect(functionOutputEnvelopes(requests[1])[0]?.output).toMatchObject({
+      status: "truncated",
+      totalCalendarCount: 101,
+      nextCursor: null,
     });
   });
 

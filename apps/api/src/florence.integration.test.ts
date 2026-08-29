@@ -9196,15 +9196,40 @@ function createGoogle(store: PostgresFlorenceStore, state: HarnessState): Google
           events: fullEvents,
         }),
       );
+      const cursorQueryDigest = digest(
+        JSON.stringify({
+          timeMin: input.timeMin,
+          timeMax: input.timeMax,
+          excludedFamilyCalendarId: input.excludedFamilyCalendarId,
+          calendarIds: input.calendarIds === undefined ? null : [...input.calendarIds].sort(),
+        }),
+      );
+      const cursorPrefix = `personal-calendar:${cursorQueryDigest}:${coverageDigest}:`;
+      const limit = input.limit ?? 50;
+      const offset = input.cursor
+        ? input.cursor.startsWith(cursorPrefix)
+          ? Number(input.cursor.slice(cursorPrefix.length))
+          : Number.NaN
+        : 0;
+      if (!Number.isInteger(offset) || offset < 0 || offset > fullEvents.length) {
+        throw new Error("Invalid personal Calendar test cursor");
+      }
+      const nextOffset = Math.min(offset + limit, fullEvents.length);
+      const nextCursor = nextOffset < fullEvents.length ? `${cursorPrefix}${nextOffset}` : null;
       return {
-        status: missingIds.length > 0 ? ("partial" as const) : ("complete" as const),
+        status:
+          missingIds.length > 0
+            ? ("partial" as const)
+            : nextCursor
+              ? ("truncated" as const)
+              : ("complete" as const),
         timeMin: input.timeMin,
         timeMax: input.timeMax,
         calendars,
         totalCalendarCount: calendars.length,
-        events: fullEvents.slice(0, input.limit ?? 50),
+        events: fullEvents.slice(offset, nextOffset),
         totalEventCount: fullEvents.length,
-        nextCursor: null,
+        nextCursor,
         coverageDigest,
         logicalCoverageDigest: digest(
           JSON.stringify({
@@ -9248,15 +9273,35 @@ function createGoogle(store: PostgresFlorenceStore, state: HarnessState): Google
         status: calendars[0]?.status,
         events: fullEvents,
       };
+      const logicalCoverageDigest = digest(JSON.stringify(logicalCoverage));
+      const cursorQueryDigest = digest(
+        JSON.stringify({
+          calendarId: input.calendarId,
+          timeMin: input.timeMin,
+          timeMax: input.timeMax,
+        }),
+      );
+      const cursorPrefix = `exact-calendar:${cursorQueryDigest}:${logicalCoverageDigest}:`;
+      const limit = input.limit ?? 50;
+      const offset = input.cursor
+        ? input.cursor.startsWith(cursorPrefix)
+          ? Number(input.cursor.slice(cursorPrefix.length))
+          : Number.NaN
+        : 0;
+      if (!Number.isInteger(offset) || offset < 0 || offset > fullEvents.length) {
+        throw new Error("Invalid exact Calendar test cursor");
+      }
+      const nextOffset = Math.min(offset + limit, fullEvents.length);
+      const nextCursor = nextOffset < fullEvents.length ? `${cursorPrefix}${nextOffset}` : null;
       return {
-        status: exists ? ("complete" as const) : ("partial" as const),
+        status: exists ? (nextCursor ? ("truncated" as const) : ("complete" as const)) : ("partial" as const),
         timeMin: input.timeMin,
         timeMax: input.timeMax,
         calendars,
         totalCalendarCount: 1,
-        events: fullEvents.slice(0, input.limit ?? 50),
+        events: fullEvents.slice(offset, nextOffset),
         totalEventCount: fullEvents.length,
-        nextCursor: null,
+        nextCursor,
         coverageDigest: digest(
           JSON.stringify({
             ...logicalCoverage,
@@ -9264,7 +9309,7 @@ function createGoogle(store: PostgresFlorenceStore, state: HarnessState): Google
             accessRole: calendars[0]?.accessRole,
           }),
         ),
-        logicalCoverageDigest: digest(JSON.stringify(logicalCoverage)),
+        logicalCoverageDigest,
       };
     },
     readCalendarWindow: async (input: CalendarReadInput) => {

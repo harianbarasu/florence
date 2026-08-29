@@ -4109,9 +4109,14 @@ export class Florence {
               : calendar.label,
           ]),
         );
+        const projectedCalendars = read.calendars.slice(0, 100);
+        const modelStatus =
+          read.status === "complete" && read.totalCalendarCount > projectedCalendars.length
+            ? "truncated"
+            : read.status;
         return {
-          status: read.status,
-          calendars: read.calendars.slice(0, 100).map((calendar) => ({
+          status: modelStatus,
+          calendars: projectedCalendars.map((calendar) => ({
             calendarRef: familyWorkCalendarRef(calendar.calendarId),
             label: labels.get(calendar.calendarId) ?? null,
             timeZone:
@@ -4370,22 +4375,55 @@ export class Florence {
         const maxWindowMs = 31 * 24 * 60 * 60_000;
         for (let cursor = intervalStart.getTime(); cursor < intervalEnd.getTime(); ) {
           const end = Math.min(cursor + maxWindowMs, intervalEnd.getTime());
-          const read: GooglePersonalCalendarWindowRead = (
-            await readFamilyWorkExactCalendarWindow({
-              calendarId,
-              timeMin: new Date(cursor).toISOString(),
-              timeMax: new Date(end).toISOString(),
-              limit: 50,
-              cursor: null,
-            })
-          ).read;
-          if (
-            (read.status !== "complete" && read.status !== "truncated") ||
-            read.calendars.length !== 1 ||
-            read.calendars[0]?.calendarId !== calendarId ||
-            read.calendars[0].status !== "complete"
-          ) {
-            throw new Error("The Family Calendar interval could not be completely re-read");
+          let pageCursor: string | null = null;
+          let expectedEventCount: number | null = null;
+          let observedEventCount = 0;
+          const seenCursors = new Set<string>();
+          const seenEventIds = new Set<string>();
+          do {
+            const read: GooglePersonalCalendarWindowRead = (
+              await readFamilyWorkExactCalendarWindow({
+                calendarId,
+                timeMin: new Date(cursor).toISOString(),
+                timeMax: new Date(end).toISOString(),
+                limit: 50,
+                cursor: pageCursor,
+              })
+            ).read;
+            if (
+              (read.status !== "complete" && read.status !== "truncated") ||
+              read.calendars.length !== 1 ||
+              read.calendars[0]?.calendarId !== calendarId ||
+              read.calendars[0].status !== "complete" ||
+              (read.status === "complete" && read.nextCursor !== null) ||
+              (read.status === "truncated" && read.nextCursor === null)
+            ) {
+              throw new Error("The Family Calendar interval could not be completely re-read");
+            }
+            if (expectedEventCount === null) expectedEventCount = read.totalEventCount;
+            if (expectedEventCount !== read.totalEventCount) {
+              throw new Error("The Family Calendar changed while it was being re-read");
+            }
+            for (const event of read.events) {
+              if (seenEventIds.has(event.providerEventId)) {
+                throw new Error("The Family Calendar repeated an event while it was being re-read");
+              }
+              seenEventIds.add(event.providerEventId);
+              observedEventCount += 1;
+            }
+            const nextCursor = read.nextCursor;
+            if (nextCursor === null) {
+              pageCursor = null;
+            } else {
+              if (seenCursors.has(nextCursor)) {
+                throw new Error("The Family Calendar repeated a continuation while it was being re-read");
+              }
+              seenCursors.add(nextCursor);
+              pageCursor = nextCursor;
+            }
+          } while (pageCursor !== null);
+          if (expectedEventCount !== observedEventCount) {
+            throw new Error("The Family Calendar interval was not completely re-read");
           }
           cursor = end;
         }

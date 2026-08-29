@@ -6773,7 +6773,8 @@ function foregroundCapabilityRegistry(): CapabilityRegistry<ForegroundCapability
           );
         }
         context.settlements.set(callId, () => {
-          context.pendingParticipantRequest.current = output;
+          const { status: _status, ...request } = output;
+          context.pendingParticipantRequest.current = request;
         });
         return { output };
       },
@@ -12612,9 +12613,6 @@ function validateDecision(
     !hasVisibleApplicationOutcome
   ) {
     throw invalidOutput("OpenAI returned no visible conversational move for an ordinary parent turn");
-  }
-  if (publicResearchUsed && researchUrls.length === 0) {
-    throw invalidOutput("OpenAI used web search without selecting verified source URLs");
   }
   if (
     publicResearchUsed &&

@@ -1362,6 +1362,10 @@ export class Florence {
     }
   }
 
+  hasPendingBackgroundWork(): boolean {
+    return this.#pendingInboundAccepts.size > 0 || this.#activeFamilyWork.size > 0;
+  }
+
   async #runCycle(): Promise<boolean> {
     let worked = false;
     let inboundPresence: InboundPresence | null = null;
@@ -5389,8 +5393,8 @@ export class Florence {
             searchMemorySources(familyWorkSearchableMemory, query).slice(0, limit),
           readSource: async ({ sourceId }) => {
             const indexed = familyWorkSourceIndex.get(sourceId);
-            if (indexed) return indexed;
             if (familyWorkLinkedGoogleSourceIds.has(sourceId)) {
+              if (indexed?.kind === "gmail" || indexed?.kind === "calendar") return indexed;
               const retained = await this.#store.readClaimedFamilyWorkLinkedGoogleSource({
                 workId: work.workId,
                 generation: work.generation,
@@ -5402,6 +5406,7 @@ export class Florence {
               familyWorkSourceIndex.set(source.sourceId, source);
               return source;
             }
+            if (indexed) return indexed;
             const retained =
               work.visibility === "private"
                 ? await this.#store.readClaimedFamilyWorkPrivateGoogleSource({
@@ -8023,10 +8028,9 @@ async function proactiveMemoryContext(
   });
   const factsByUri = new Map<string, FactRecord>(facts.map((fact) => [`vault://fact/${fact.id}`, fact]));
   const selected: { slot: string; label: string; text: string }[] = [];
+  const selectedFactIds = new Set<string>();
   let serializedBytes = Buffer.byteLength("[]", "utf8");
-  for (const result of page.results) {
-    const fact = factsByUri.get(result.uri);
-    if (!fact) continue;
+  const append = (fact: FactRecord): boolean => {
     const presentation = vaultMemoryFields(fact);
     const separatorBytes = selected.length > 0 ? 1 : 0;
     const fitted = fitSerializedText(
@@ -8039,9 +8043,22 @@ async function proactiveMemoryContext(
       PROACTIVE_MEMORY_TEXT_CHARACTER_LIMIT,
       VAULT_SEARCH_PAGE_BYTE_BUDGET - serializedBytes - separatorBytes,
     );
-    if (!fitted) break;
+    if (!fitted) return false;
     selected.push(fitted);
+    selectedFactIds.add(fact.id);
     serializedBytes += separatorBytes + Buffer.byteLength(JSON.stringify(fitted), "utf8");
+    return true;
+  };
+  for (const result of page.results) {
+    const fact = factsByUri.get(result.uri);
+    if (!fact) continue;
+    if (!append(fact)) break;
+  }
+  for (const fact of [...facts].sort(
+    (left, right) => right.updatedAt.localeCompare(left.updatedAt) || left.id.localeCompare(right.id),
+  )) {
+    if (selectedFactIds.has(fact.id)) continue;
+    append(fact);
   }
   return selected;
 }
@@ -8119,10 +8136,24 @@ function relevantGoogleFacts(
     occurredAt: null,
     text: memoryPresentationText(fact.statement, fact.memory),
   }));
-  return selectVisibleMemorySources(sources, query).flatMap((source) => {
+  const ranked = selectVisibleMemorySources(sources, query);
+  const rankedSlots = new Set(ranked.flatMap((source) => (source.recordId ? [source.recordId] : [])));
+  const ordered = [
+    ...ranked,
+    ...sources.filter((source) => !source.recordId || !rankedSlots.has(source.recordId)),
+  ];
+  const selected: GoogleStableFactContext[] = [];
+  let serializedBytes = Buffer.byteLength("[]", "utf8");
+  for (const source of ordered) {
     const fact = source.recordId ? bySlot.get(source.recordId) : null;
-    return fact ? [fact] : [];
-  });
+    if (!fact) continue;
+    const separatorBytes = selected.length > 0 ? 1 : 0;
+    const factBytes = Buffer.byteLength(JSON.stringify(fact), "utf8");
+    if (serializedBytes + separatorBytes + factBytes > VAULT_SEARCH_PAGE_BYTE_BUDGET) break;
+    selected.push(fact);
+    serializedBytes += separatorBytes + factBytes;
+  }
+  return selected;
 }
 
 function memorySources(facts: readonly FactRecord[]): FlorenceSource[] {

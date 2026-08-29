@@ -19,6 +19,9 @@ const cancelledFamilyTaskPhoneCleanupFile = fileURLToPath(
 const recurringFamilyWorkFile = fileURLToPath(
   new URL("../sql/008_recurring_family_work.sql", import.meta.url),
 );
+const durableFamilyWorkStateFile = fileURLToPath(
+  new URL("../sql/009_durable_family_work_state.sql", import.meta.url),
+);
 export const migrationFiles = [
   baselineFile,
   remindersFile,
@@ -28,6 +31,7 @@ export const migrationFiles = [
   generalFamilyWorkStateFile,
   cancelledFamilyTaskPhoneCleanupFile,
   recurringFamilyWorkFile,
+  durableFamilyWorkStateFile,
 ] as const;
 
 export async function migrateDatabase(connectionString: string, sqlFile?: string): Promise<void> {

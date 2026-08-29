@@ -3768,7 +3768,8 @@ export class PostgresFlorenceStore {
               and (briefing_candidates->>'dueAt')::timestamptz<=${now}
             )
           )
-        order by least(
+        order by case kind when 'reminder' then 0 else 1 end,
+        least(
           next_check_at,
           case when briefing_candidates->>'kind'='household_next_action_wake_v1'
             then (briefing_candidates->>'dueAt')::timestamptz else null end
@@ -3902,7 +3903,7 @@ export class PostgresFlorenceStore {
           const [pendingProgressDelivery] = await sql<{ next_delivery_at: Date | null }[]>`
             select max(coalesce(message.retry_at,message.not_before)) as next_delivery_at
             from messages message join sources source on source.id=message.source_id
-            where message.direction='outbound' and message.status in ('pending','sending')
+            where message.direction='outbound' and message.status='pending'
               and source.metadata->>'familyWorkId'=${familyTask.id}::text
               and source.metadata->>'familyWorkGeneration'=${String(state.generation)}
               and source.metadata->>'familyWorkProgressRevision'=${String(state.progressRevision)}
@@ -9357,7 +9358,6 @@ export class PostgresFlorenceStore {
         work.created_at,work.id
       limit ${turn.reply_to_source_id === null ? 2 : 1}
     `;
-
     const waitingWorks = await this.#sql<ReplyWorkRow[]>`
       select work.*,question.source_id as question_source_id,
         question.text as question_text,question_source.occurred_at as question_asked_at
@@ -9386,7 +9386,8 @@ export class PostgresFlorenceStore {
             and ${turn.audience}='private')
           or (work.visibility='household' and work.owner_adult_id is null
             and ${turn.audience}='group'
-            and (${turn.sender_adult_id}=turn.adult_one_id or ${turn.sender_adult_id}=turn.adult_two_id)))
+            and (${turn.sender_adult_id}=${turn.adult_one_id}
+              or ${turn.sender_adult_id}=${turn.adult_two_id})))
       order by question_source.occurred_at,work.created_at,work.id
       limit ${turn.reply_to_source_id === null ? 2 : 1}
     `;
@@ -9560,8 +9561,8 @@ export class PostgresFlorenceStore {
                 and ${turn.audience}='private')
               or (work.visibility='household' and work.owner_adult_id is null
                 and ${turn.audience}='group'
-                and (${turn.sender_adult_id}=turn.adult_one_id
-                  or ${turn.sender_adult_id}=turn.adult_two_id)))
+                and (${turn.sender_adult_id}=${turn.adult_one_id}
+                  or ${turn.sender_adult_id}=${turn.adult_two_id})))
         )
         select work_id,question_source_id,kind from candidates
         order by occurred_at,created_at,work_id limit 2
@@ -9790,11 +9791,11 @@ export class PostgresFlorenceStore {
           turn.audience !== "private" ||
           turn.visibility !== "private" ||
           turn.move_kind === "reaction" ||
-          !authorship.authoredText?.trim() ||
+          (!authorship.authoredText?.trim() && !authorship.voiceTranscriptPresent) ||
           input.householdUpdate.basisSourceId !== turn.source_id
         ) {
           throw new FlorenceStoreUnauthorized(
-            "A household update requires the current adult's typed private Message",
+            "A household update requires the current adult's private Message or voice note",
           );
         }
         if (input.outbound?.some((outbound) => outbound.moveKind !== "reaction")) {
@@ -13803,9 +13804,10 @@ async function persistGoogleEvidenceDrafts(
         }
         await sql`
           insert into sources (
-            id,household_id,kind,visibility,owner_adult_id,external_key,label,metadata,occurred_at
+            id,household_id,kind,visibility,owner_adult_id,external_key,label,metadata,occurred_at,created_at
           ) values (${draft.id},${draft.householdId},'gmail','private',${draft.ownerAdultId},
-            ${draft.externalKey},${draft.label},${sql.json(draft.metadata)},${instant(draft.occurredAt)})
+            ${draft.externalKey},${draft.label},${sql.json(draft.metadata)},${instant(draft.occurredAt)},
+            ${input.occurredAt})
           on conflict (household_id,kind,external_key) do update set
             label=excluded.label,metadata=excluded.metadata,occurred_at=excluded.occurred_at
         `;
@@ -13905,11 +13907,11 @@ async function persistGoogleEvidenceDrafts(
     }
     await sql`
       insert into sources (
-        id,household_id,kind,visibility,owner_adult_id,external_key,label,metadata,occurred_at
+        id,household_id,kind,visibility,owner_adult_id,external_key,label,metadata,occurred_at,created_at
       ) values (${draft.id},${draft.householdId},'calendar',${draft.visibility},${draft.ownerAdultId},
         ${draft.externalKey},
         ${bounded(title ?? (draft.status === "cancelled" ? "Cancelled calendar event" : "Private calendar event"), 500)},
-        ${sql.json(metadata)},${instant(occurredAt)})
+        ${sql.json(metadata)},${instant(occurredAt)},${input.occurredAt})
       on conflict (household_id,kind,external_key) do update set
         parent_source_id=null,label=excluded.label,metadata=excluded.metadata,occurred_at=excluded.occurred_at
     `;
@@ -14771,6 +14773,11 @@ async function reconcileReviewedGoogleSources(
       and exists (
         select 1 from jsonb_array_elements_text(outbound_source.metadata->'googleSourceIds') linked(id)
         where linked.id in ${sql(sourceIds)}
+      )
+      and not exists (
+        select 1 from calendar_actions action
+        where action.approval_prompt_source_id=message.source_id
+          and action.status='offered' and action.approval_source_id is null
       )
     order by message.source_id for update of message,outbound_source
   `;
@@ -18567,7 +18574,7 @@ async function familyWorkLinkedSources(
         or (${work.visibility}='private' and source.visibility='private'
           and source.owner_adult_id=${work.owner_adult_id})
       )
-    order by source.occurred_at,source.id
+    order by source.occurred_at desc,source.id desc
     for share of source
   `;
   const messageSources = await sql<(FamilyWorkOriginMessageRow & { visibility: Visibility })[]>`
@@ -26101,6 +26108,12 @@ async function insertInbound(
     `;
     requestedSupersedesSourceId = pendingCalendarTurn?.source_id ?? null;
   }
+  if (
+    requestedSupersedesSourceId &&
+    (await isSoleReceivedFamilyWorkReplyCandidate(sql, requestedSupersedesSourceId))
+  ) {
+    requestedSupersedesSourceId = null;
+  }
   if (requestedSupersedesSourceId === sourceId) {
     throw new FlorenceStoreConflict("An inbound message cannot supersede itself");
   }
@@ -26117,7 +26130,9 @@ async function insertInbound(
       `
     : [];
   const insertedSource = await sql<{ id: string }[]>`
-    insert into sources (id,household_id,kind,visibility,owner_adult_id,external_key,label,metadata,occurred_at)
+    insert into sources (
+      id,household_id,kind,visibility,owner_adult_id,external_key,label,metadata,occurred_at,created_at
+    )
     values (${sourceId},${channel.household_id},'linq_message',${visibility},${ownerAdultId},
       ${`inbound:${input.providerEventId}`},${bounded(input.text ?? "Family attachment", 500)},
       ${sql.json({
@@ -26126,7 +26141,7 @@ async function insertInbound(
         voiceTranscriptPresent,
         ...(input.providerPayloadDigest ? { providerPayloadDigest: input.providerPayloadDigest } : {}),
         ...(supersededSourceId ? { supersedesSourceId: supersededSourceId } : {}),
-      })},${occurredAt})
+      })},${occurredAt},${occurredAt})
     on conflict do nothing returning id
   `;
   if (insertedSource.length === 0) {
@@ -26159,10 +26174,11 @@ async function insertInbound(
     const discardAfter = instant(document.discardAfter);
     await sql`
       insert into sources (
-        id,household_id,kind,visibility,owner_adult_id,external_key,parent_source_id,label,metadata,occurred_at
+        id,household_id,kind,visibility,owner_adult_id,external_key,parent_source_id,label,metadata,
+        occurred_at,created_at
       ) values (${document.documentId},${channel.household_id},'document',${visibility},${ownerAdultId},
         ${document.externalKey},${sourceId},${required(document.filename, "Document filename")},
-        ${sql.json({ mimeType: document.mimeType })},${occurredAt})
+        ${sql.json({ mimeType: document.mimeType })},${occurredAt},${occurredAt})
     `;
     await sql`
       insert into documents (
@@ -26181,6 +26197,78 @@ async function insertInbound(
     householdId: channel.household_id,
     channelId: channel.id,
   };
+}
+
+async function isSoleReceivedFamilyWorkReplyCandidate(
+  sql: postgres.TransactionSql,
+  sourceId: string,
+): Promise<boolean> {
+  const candidates = await sql<{ work_id: string; question_source_id: string }[]>`
+    with turn as (
+      select channel.*,message.source_id,message.sender_adult_id,message.reply_to_source_id,
+        source.visibility,source.occurred_at
+      from messages message
+      join sources source on source.id=message.source_id
+      join linq_channels channel on channel.id=message.channel_id
+      where message.source_id=${sourceId} and message.direction='inbound'
+        and message.move_kind in ('message','reply') and message.status='received'
+    ), candidates as (
+      select work.id as work_id,question.source_id as question_source_id,
+        question_source.occurred_at,work.created_at
+      from turn
+      join proactive_work work on work.household_id=turn.household_id
+        and work.kind='family_task' and work.visibility='household'
+        and work.owner_adult_id is null and work.status='paused'
+        and work.task_state->>'phase'='waiting'
+      join messages question
+        on question.source_id=(work.task_state->'pendingParticipantRequest'->>'questionSourceId')::uuid
+      join sources question_source on question_source.id=question.source_id
+      where turn.audience='private' and turn.visibility='private'
+        and work.task_state->'pendingParticipantRequest'->>'targetAdultId'=turn.sender_adult_id::text
+        and work.task_state->'pendingParticipantRequest'->>'channelId'=turn.id::text
+        and question.channel_id=turn.id and question.direction='outbound'
+        and question.move_kind in ('message','reply') and question.status='sent'
+        and question.provider_message_id is not null
+        and question_source.metadata->>'familyWorkGeneration'=work.task_state->>'generation'
+        and question_source.metadata->>'familyWorkProgressRevision'=
+          work.task_state->>'progressRevision'
+        and question_source.metadata->>'participantRequestId'=
+          work.task_state->'pendingParticipantRequest'->>'requestId'
+        and (question_source.occurred_at,question_source.id)<(turn.occurred_at,turn.source_id)
+        and (turn.reply_to_source_id is null or question.source_id=turn.reply_to_source_id)
+      union all
+      select work.id as work_id,question.source_id as question_source_id,
+        question_source.occurred_at,work.created_at
+      from turn
+      join proactive_work work on work.household_id=turn.household_id
+        and work.kind='family_task' and work.status='paused'
+        and work.task_state->>'phase'='waiting'
+        and work.task_state->'pendingParticipantRequest'='null'::jsonb
+      join sources question_source
+        on question_source.metadata->>'familyWorkId'=work.id::text
+        and question_source.metadata->>'familyWorkDeliveryKind'='waiting'
+      join messages question on question.source_id=question_source.id
+      where question.channel_id=turn.id and question.direction='outbound'
+        and question.move_kind in ('message','reply') and question.status='sent'
+        and question.provider_message_id is not null
+        and question_source.visibility=work.visibility and turn.visibility=work.visibility
+        and question_source.owner_adult_id is not distinct from work.owner_adult_id
+        and question_source.metadata->>'familyWorkGeneration'=work.task_state->>'generation'
+        and question_source.metadata->>'familyWorkProgressRevision'=
+          work.task_state->>'progressRevision'
+        and (question_source.occurred_at,question_source.id)<(turn.occurred_at,turn.source_id)
+        and (turn.reply_to_source_id is null or question.source_id=turn.reply_to_source_id)
+        and ((work.visibility='private' and work.owner_adult_id=turn.sender_adult_id
+              and turn.audience='private')
+          or (work.visibility='household' and work.owner_adult_id is null
+              and turn.audience='group'
+              and (turn.sender_adult_id=turn.adult_one_id
+                or turn.sender_adult_id=turn.adult_two_id)))
+    )
+    select work_id,question_source_id from candidates
+    order by occurred_at,created_at,work_id limit 2
+  `;
+  return candidates.length === 1;
 }
 
 async function insertInboundReaction(
@@ -26286,7 +26374,9 @@ async function insertInboundReaction(
   const visibility: Visibility = channel.audience === "group" ? "household" : "private";
   const ownerAdultId = visibility === "private" ? senderAdultId : null;
   await sql`
-    insert into sources (id,household_id,kind,visibility,owner_adult_id,external_key,label,metadata,occurred_at)
+    insert into sources (
+      id,household_id,kind,visibility,owner_adult_id,external_key,label,metadata,occurred_at,created_at
+    )
     values (${sourceId},${channel.household_id},'linq_message',${visibility},${ownerAdultId},
       ${`inbound:${providerEventId}`},${bounded(`Reacted ${reaction}`, 500)},
       ${sql.json({
@@ -26295,7 +26385,7 @@ async function insertInboundReaction(
         partIndex: input.partIndex,
         authoredText: null,
         voiceTranscriptPresent: false,
-      })},${occurredAt})
+      })},${occurredAt},${occurredAt})
   `;
   await sql`
     insert into messages (
@@ -26368,7 +26458,8 @@ async function insertOutbound(sql: postgres.TransactionSql, input: OutboundInser
   const nativeMove = await providerNativeMove(sql, input);
   await sql`
     insert into sources (
-      id,household_id,kind,visibility,owner_adult_id,external_key,parent_source_id,label,metadata,occurred_at
+      id,household_id,kind,visibility,owner_adult_id,external_key,parent_source_id,label,metadata,
+      occurred_at,created_at
     )
     values (${input.sourceId},${input.householdId},'linq_message',${input.visibility},${input.ownerAdultId},
       ${`outbound:${idempotencyKey}`},${input.parentSourceId ?? null},
@@ -26378,7 +26469,7 @@ async function insertOutbound(sql: postgres.TransactionSql, input: OutboundInser
         ...(nativeMove ? { nativeMove } : {}),
         authoredText: input.moveKind === "reaction" ? null : (input.text ?? null),
         voiceTranscriptPresent: false,
-      })},${input.occurredAt})
+      })},${input.occurredAt},${input.occurredAt})
   `;
   await sql`
     insert into messages (

@@ -94,7 +94,6 @@ const PARTNER_SETUP_REFUSAL = "I don’t want to join this.";
 const PARTNER_SETUP_EXPLANATION =
   "That link sets up your own private side of Florence. Use the setup link just above when you’re ready.";
 const PARTNER_SETUP_HANDSHAKE_ACK = "Thanks—here’s your private setup link.";
-const PARTNER_SETUP_REFRESH_ACK = "Of course—here’s a fresh private setup link.";
 const PARTNER_SETUP_EXPIRED_NOTICE =
   "Alex’s Florence setup link expired, so I stopped the invitation. I won’t message them again unless you ask me to send a fresh one.";
 const PARTNER_SETUP_DELIVERY_FAILURE_NOTICE =
@@ -177,13 +176,13 @@ const INCOMPLETE_SETUP_FALSE_DENIAL =
   "I can’t resend a setup link from here. If you’re already on the setup page, keep going there.";
 const INCOMPLETE_SETUP_FRESH_LINK_ACKNOWLEDGEMENT = "Of course—here’s a fresh link to finish setup.";
 const PRIVATE_INITIAL_ALL_CLEAR =
-  "I finished reviewing the last 90 days of your Gmail and Calendar. Nothing needs attention right now.";
+  "I finished reviewing the last 90 days of the Gmail and Calendar details I can access. I don’t have anything to flag right now.";
 const PAGINATED_CALENDAR_TITLE = "Maya’s archived school open-house planning note";
 const PAGINATED_CALENDAR_FOLLOW_UP = "Maya’s school open-house plan still needs a family decision.";
 const HOUSEHOLD_INITIAL_ALL_CLEAR =
   "I finished reviewing both parents’ last 90 days of Gmail and Calendar. Nothing needs attention right now, and I’ll keep watching.";
 const CONVERSATION_RECOVERY_REPLY =
-  "I hit a snag answering that. I didn’t make or send any changes—please try once more.";
+  "Sorry—I hit a snag before I could answer. Try me again and I’ll take another run at it.";
 const TRANSIENT_RETRY_REQUEST = "Can you check in with me?";
 const TRANSIENT_RETRY_CUE = "One sec—I hit a snag, but I’m trying that again.";
 const TRANSIENT_RETRY_REPLY = "I’m back—what would you like me to check?";
@@ -934,12 +933,12 @@ release("Durable family work store", () => {
         ],
       },
       supersededMessages: [
-        expect.objectContaining({
+        {
           sourceId: "10000000-0000-4000-8000-000000000009",
           text: "Prepare the original camp form.",
-        }),
+        },
       ],
-      replyTarget: expect.objectContaining({
+      replyTarget: {
         sourceId: "10000000-0000-4000-8000-000000000010",
         speaker: "florence",
         text: "Which camp form should I use?",
@@ -949,24 +948,24 @@ release("Durable family work store", () => {
             mimeType: "image/png",
           },
         ],
-      }),
+      },
       currentDocuments: [
-        expect.objectContaining({
+        {
           id: "10000000-0000-4000-8000-000000000011",
           parentSourceId: "10000000-0000-4000-8000-000000000007",
           filename: "revised-camp-form.pdf",
           contentDigest: "a".repeat(64),
-        }),
-        expect.objectContaining({
+        },
+        {
           id: "10000000-0000-4000-8000-000000000015",
           parentSourceId: "10000000-0000-4000-8000-000000000010",
           filename: "original-camp-form.pdf",
           contentDigest: "b".repeat(64),
-        }),
+        },
       ],
     });
-    expect(first.origin.currentDocuments[0]?.contentEnvelope).toEqual(Uint8Array.from([1, 2, 3]));
-    expect(first.origin.currentDocuments[1]?.contentEnvelope).toEqual(Uint8Array.from([4, 5, 6]));
+    expect(Array.from(first.origin.currentDocuments[0]?.contentEnvelope ?? [])).toEqual([1, 2, 3]);
+    expect(Array.from(first.origin.currentDocuments[1]?.contentEnvelope ?? [])).toEqual([4, 5, 6]);
     const plannedState = {
       ...first.state,
       phase: "tool_pending" as const,
@@ -2102,8 +2101,10 @@ release("Florence parent journeys", () => {
       `(select count(*)=1 from proactive_work where kind='personal_google_poll' and status='active')`,
     );
     await harness.assertDatabase(
-      "The founder review did not retain both expected follow-throughs",
-      `(select count(*)=2 from proactive_work where kind='finite_monitor' and status='active')`,
+      "The founder review did not retain the real school-form follow-through",
+      `(select count(*)=1 from proactive_work
+        where kind='finite_monitor' and status='active'
+          and objective='Watch for confirmation that Maya’s field-trip form is signed.')`,
     );
     await harness.assertDatabase(
       "The founder review staged a family Calendar action before family activation",
@@ -2368,12 +2369,11 @@ release("Florence parent journeys", () => {
       PRIVATE_PARTNER,
       "partner",
     );
-    expect(
-      harness.linq.messages.filter(
-        (message) =>
-          message.providerConversationId === PRIVATE_PARTNER && message.text === PARTNER_SETUP_REFRESH_ACK,
-      ),
-    ).toHaveLength(1);
+    expect(harness.state.setupConversations.at(-1)).toMatchObject({
+      stage: "partner_invited",
+      currentMessage: { text: PARTNER_SETUP_QUESTION },
+      nextStep: "signed_link_will_follow",
+    });
     expect(harness.linq.partnerSetupLinkAttempts).toBe(linkAttemptsBeforeExpiry + 1);
     const refreshedPartnerSetupToken = harness.setupTokenFor(PRIVATE_PARTNER);
     expect(refreshedPartnerSetupToken).toMatch(/^ps1\./);
@@ -2639,12 +2639,11 @@ release("Florence parent journeys", () => {
             "I made the De la Cruz–Anbarasu Family calendar too. I’m checking both calendars and recent family email now, and I’ll be back with what’s on the docket.",
       ),
     ).toHaveLength(1);
-    expect(harness.state.briefings).toHaveLength(0);
+    expect(harness.state.briefings).toHaveLength(1);
     expect(
       harness.linq.messages.filter(
         (message) =>
-          message.providerConversationId === FAMILY_GROUP &&
-          message.text.startsWith("Here’s what’s on the docket:"),
+          message.providerConversationId === FAMILY_GROUP && message.text.startsWith("Here’s what I found:"),
       ),
     ).toHaveLength(1);
     expect(
@@ -3052,7 +3051,7 @@ release("Florence parent journeys", () => {
     expect(new Set(quietPrivateReviews.map((message) => message.providerConversationId))).toEqual(
       new Set([PRIVATE_FOUNDER, PRIVATE_PARTNER]),
     );
-    expect(resetHarness.state.briefings).toHaveLength(0);
+    expect(resetHarness.state.briefings).toHaveLength(1);
     await resetHarness.assertDatabase(
       "A quiet private review lost its private Google corpus or retained a family fact",
       `(select count(*)=2 from proactive_work
@@ -3128,10 +3127,14 @@ release("Florence parent journeys", () => {
             phase: "terminal",
             claim: null,
             pendingCall: null,
+            progressRevision: input.state.progressRevision + 1,
             terminal: {
               outcome: "succeeded",
               text: PROACTIVE_FAMILY_WORK_RESULT,
-              completionBasis: mockReasonedCompletionBasis(PROACTIVE_FAMILY_WORK_RESULT),
+              completionBasis: mockReasonedCompletionBasis(
+                PROACTIVE_FAMILY_WORK_RESULT,
+                input.state.completionCondition,
+              ),
             },
           },
           outcome: "succeeded",
@@ -3170,12 +3173,18 @@ release("Florence parent journeys", () => {
         move.parts.some((part) => part.type === "link" && part.url === PROACTIVE_FAMILY_WORK_RESULT_URL),
     );
     expect(proactiveLead).toBeDefined();
-    expect(proactiveResult).toBeDefined();
-    expect(proactiveResult?.replyTo).toBeUndefined();
     expect(proactiveNativeResult?.move).toEqual({
       type: "message",
       parts: [{ type: "link", url: PROACTIVE_FAMILY_WORK_RESULT_URL }],
     });
+    expect(proactiveResult).toBeUndefined();
+    harness.state.now += 700;
+    await harness.drain();
+    const pacedProactiveResult = harness.linq.messages.find(
+      (message) => message.text === PROACTIVE_FAMILY_WORK_RESULT,
+    );
+    expect(pacedProactiveResult).toBeDefined();
+    expect(pacedProactiveResult?.replyTo).toBeUndefined();
     await harness.assertDatabase(
       "A proactive household judgment did not produce exactly one completed family task from its kickoff",
       `(select count(*)=1 from proactive_work
@@ -3265,7 +3274,10 @@ release("Florence parent journeys", () => {
             terminal: {
               outcome: "succeeded",
               text: SOURCE_CHANGE_FAMILY_WORK_RESULT,
-              completionBasis: mockReasonedCompletionBasis(SOURCE_CHANGE_FAMILY_WORK_RESULT),
+              completionBasis: mockReasonedCompletionBasis(
+                SOURCE_CHANGE_FAMILY_WORK_RESULT,
+                input.state.completionCondition,
+              ),
             },
           },
           outcome: "succeeded",
@@ -3387,10 +3399,11 @@ release("Florence parent journeys", () => {
                 pendingCall: null,
                 pendingParticipantRequest: null,
                 waitingDocket: null,
+                progressRevision: input.state.progressRevision + 1,
                 terminal: {
                   outcome: "succeeded",
                   text: terminalText,
-                  completionBasis: mockReasonedCompletionBasis(terminalText),
+                  completionBasis: mockReasonedCompletionBasis(terminalText, input.state.completionCondition),
                 },
               },
               outcome: "succeeded",
@@ -3426,6 +3439,15 @@ release("Florence parent journeys", () => {
             targetAdultName: "Alex Anbarasu",
             question,
           });
+          const pendingParticipantRequest = {
+            requestId: queued.requestId,
+            targetAdultId: queued.targetAdultId,
+            targetAdultName: queued.targetAdultName,
+            channelId: queued.channelId,
+            questionSourceId: queued.questionSourceId,
+            question: queued.question,
+            askedAt: queued.askedAt,
+          };
           return {
             kind: "participant_waiting",
             state: {
@@ -3433,7 +3455,7 @@ release("Florence parent journeys", () => {
               phase: "waiting",
               claim: null,
               pendingCall: null,
-              pendingParticipantRequest: queued,
+              pendingParticipantRequest,
               waitingDocket: {
                 owner: "Alex Anbarasu",
                 nextAction: "Answer Florence's private question.",
@@ -3682,7 +3704,7 @@ release("Florence parent journeys", () => {
                 terminal: {
                   outcome: "succeeded",
                   text: terminalText,
-                  completionBasis: mockReasonedCompletionBasis(terminalText),
+                  completionBasis: mockReasonedCompletionBasis(terminalText, input.state.completionCondition),
                 },
               },
               outcome: "succeeded",
@@ -3886,7 +3908,7 @@ release("Florence parent journeys", () => {
                 terminal: {
                   outcome: "succeeded",
                   text: terminalText,
-                  completionBasis: mockReasonedCompletionBasis(terminalText),
+                  completionBasis: mockReasonedCompletionBasis(terminalText, input.state.completionCondition),
                 },
               },
               outcome: "succeeded",
@@ -4149,7 +4171,7 @@ release("Florence parent journeys", () => {
               terminal: {
                 outcome: "succeeded",
                 text,
-                completionBasis: mockReasonedCompletionBasis(text),
+                completionBasis: mockReasonedCompletionBasis(text, input.state.completionCondition),
               },
             },
             outcome: "succeeded",
@@ -4471,10 +4493,11 @@ release("Florence parent journeys", () => {
               phase: "terminal",
               claim: null,
               pendingCall: null,
+              progressRevision: input.state.progressRevision + 1,
               terminal: {
                 outcome: "succeeded",
                 text: terminalText,
-                completionBasis: mockReasonedCompletionBasis(terminalText),
+                completionBasis: mockReasonedCompletionBasis(terminalText, input.state.completionCondition),
               },
             },
             outcome: "succeeded",
@@ -4622,7 +4645,7 @@ release("Florence parent journeys", () => {
               terminal: {
                 outcome: "succeeded",
                 text: terminalText,
-                completionBasis: mockReasonedCompletionBasis(terminalText),
+                completionBasis: mockReasonedCompletionBasis(terminalText, input.state.completionCondition),
               },
             },
             outcome: "succeeded",
@@ -4818,7 +4841,7 @@ release("Florence parent journeys", () => {
               terminal: {
                 outcome: "succeeded",
                 text: terminalText,
-                completionBasis: mockReasonedCompletionBasis(terminalText),
+                completionBasis: mockReasonedCompletionBasis(terminalText, input.state.completionCondition),
                 selectedImages: [selectedImage],
               },
             },
@@ -5000,7 +5023,7 @@ release("Florence parent journeys", () => {
               terminal: {
                 outcome: "succeeded",
                 text: terminalText,
-                completionBasis: mockReasonedCompletionBasis(terminalText),
+                completionBasis: mockReasonedCompletionBasis(terminalText, input.state.completionCondition),
                 selectedFiles: [selectedFile],
               },
             },
@@ -5107,29 +5130,30 @@ release("Florence parent journeys", () => {
           publicResearchCapture.mainRequest ??= request;
           publicSearchTurns += 1;
           const currentInput = JSON.stringify(request.input);
-          const noResult = currentInput.includes(PUBLIC_NO_RESULT_REQUEST);
-          const shortIdentifier = currentInput.includes(PUBLIC_SHORT_IDENTIFIER_REQUEST);
           const publicConcept = currentInput.includes(PUBLIC_CONCEPT_REQUEST);
-          const query = noResult
-            ? "9780143127796 2026-08-27"
-            : publicConcept
-              ? `access token password managers confirmation code format ${PUBLIC_CONCEPT_URL}`
-              : shortIdentifier
-                ? "X public social platform identifier"
+          const shortIdentifier = !publicConcept && currentInput.includes(PUBLIC_SHORT_IDENTIFIER_REQUEST);
+          const noResult =
+            !publicConcept && !shortIdentifier && currentInput.includes(PUBLIC_NO_RESULT_REQUEST);
+          const query = publicConcept
+            ? `access token password managers confirmation code format ${PUBLIC_CONCEPT_URL}`
+            : shortIdentifier
+              ? "X public social platform identifier"
+              : noResult
+                ? "9780143127796 2026-08-27"
                 : "DL 747 live route status alternatives tonight";
-          const sourceUrl = noResult
-            ? PUBLIC_NO_RESULT_SOURCE
-            : publicConcept
-              ? PUBLIC_CONCEPT_URL
-              : shortIdentifier
-                ? PUBLIC_SHORT_IDENTIFIER_URL
+          const sourceUrl = publicConcept
+            ? PUBLIC_CONCEPT_URL
+            : shortIdentifier
+              ? PUBLIC_SHORT_IDENTIFIER_URL
+              : noResult
+                ? PUBLIC_NO_RESULT_SOURCE
                 : PUBLIC_RESEARCH_URL;
-          const finalReply = noResult
-            ? PUBLIC_NO_RESULT_REPLY
-            : publicConcept
-              ? PUBLIC_CONCEPT_REPLY
-              : shortIdentifier
-                ? PUBLIC_SHORT_IDENTIFIER_REPLY
+          const finalReply = publicConcept
+            ? PUBLIC_CONCEPT_REPLY
+            : shortIdentifier
+              ? PUBLIC_SHORT_IDENTIFIER_REPLY
+              : noResult
+                ? PUBLIC_NO_RESULT_REPLY
                 : PUBLIC_RESEARCH_REPLY;
           const finalUrls = noResult
             ? []
@@ -5550,7 +5574,10 @@ release("Florence parent journeys", () => {
               terminal: {
                 outcome: "succeeded",
                 text: NATIVE_DOCKET_WORK_RESULT,
-                completionBasis: mockReasonedCompletionBasis(NATIVE_DOCKET_COMPLETION_CONDITION),
+                completionBasis: mockReasonedCompletionBasis(
+                  NATIVE_DOCKET_COMPLETION_CONDITION,
+                  input.state.completionCondition,
+                ),
               },
             },
             outcome: "succeeded",
@@ -5566,7 +5593,7 @@ release("Florence parent journeys", () => {
         expect(input.initiatingAdultId).toBe(harness.partnerAdultId);
         expect(input.state.docketCandidateIds).toHaveLength(1);
         expect(reads.searchSources).toBeUndefined();
-        expect(input.visibleSources?.some((source) => source.kind === "gmail")).toBe(false);
+        expect(input.visibleSources?.some((source) => source.kind === "gmail") ?? false).toBe(false);
         expect(input.linkedSources).toEqual([
           expect.objectContaining({ kind: "gmail", sourceId: expect.any(String) }),
         ]);
@@ -6131,17 +6158,34 @@ release("Florence parent journeys", () => {
     ).toEqual(expect.objectContaining({ statement: GOOGLE_CORRECTED_FACT, visibility: "household" }));
 
     await harness.assertDatabase(
-      "Unused initial Gmail and Calendar evidence was retained",
-      `not exists (
-        select 1 from sources
-        where (kind='gmail' and metadata->>'messageId' in (
-          ${sqlLiteral(`gmail-${harness.founderAdultId}-false`)},
-          ${sqlLiteral(`gmail-${harness.partnerAdultId}-false`)}
-        )) or (kind='calendar' and metadata->>'providerEventId' in (
-          ${sqlLiteral(`private-event-${harness.founderAdultId}`)},
-          ${sqlLiteral(`private-event-${harness.partnerAdultId}`)}
-        ))
-      )`,
+      "The complete reviewed onboarding corpus was not retained for later private recall",
+      `(select count(*)=52 from sources
+          where kind='gmail' and visibility='private'
+            and owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid)
+        and (select count(*)=1 from sources
+          where kind='gmail' and visibility='private'
+            and owner_adult_id=${sqlLiteral(harness.partnerAdultId)}::uuid)
+        and (select count(*)=102 from sources
+          where kind='calendar' and visibility='private'
+            and owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid)
+        and (select count(*)=1 from sources
+          where kind='calendar' and visibility='private'
+            and owner_adult_id=${sqlLiteral(harness.partnerAdultId)}::uuid)
+        and exists (select 1 from sources
+          where kind='gmail' and metadata->>'messageId'='gmail-school-form'
+            and owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid)
+        and exists (select 1 from sources
+          where kind='gmail'
+            and metadata->>'messageId'=${sqlLiteral(`gmail-${harness.partnerAdultId}-true`)}
+            and owner_adult_id=${sqlLiteral(harness.partnerAdultId)}::uuid)
+        and exists (select 1 from sources
+          where kind='calendar'
+            and metadata->>'providerEventId'=${sqlLiteral(`private-event-${harness.founderAdultId}`)}
+            and owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid)
+        and exists (select 1 from sources
+          where kind='calendar'
+            and metadata->>'providerEventId'=${sqlLiteral(`private-event-${harness.partnerAdultId}`)}
+            and owner_adult_id=${sqlLiteral(harness.partnerAdultId)}::uuid)`,
     );
 
     const publicResearchReactionsBefore = harness.linq.reactions.length;
@@ -6490,10 +6534,10 @@ release("Florence parent journeys", () => {
       ]),
     );
     expect(
-      workspace.vault?.watches.some(
+      workspace.vault?.watches.filter(
         (watch) => watch.objective === "Watch for confirmation that Maya’s field-trip form is signed.",
       ),
-    ).toBe(false);
+    ).toHaveLength(1);
 
     const nativeDocketAfterCreate = await harness.store.readHouseholdDocket({
       householdId: incompleteWork.household.householdId,
@@ -6737,7 +6781,7 @@ release("Florence parent journeys", () => {
     );
 
     harness.state.monitorEvidenceExercise = true;
-    harness.state.now += 2 * 60 * 60_000;
+    harness.state.now = Date.parse("2026-08-23T18:00:00.000Z");
     await harness.drain();
     expect(harness.state.finiteReviews).toBe(1);
     if (!harness.state.silentMonitorSourceId) {
@@ -6753,10 +6797,10 @@ release("Florence parent journeys", () => {
     await harness.assertDatabase(
       "A silent monitor retained or linked the Calendar revision it read",
       `not exists (
-        select 1 from sources where id=${sqlLiteral(harness.state.silentMonitorSourceId)}::uuid
-      ) and not exists (
-        select 1 from proactive_work_sources
-        where source_id=${sqlLiteral(harness.state.silentMonitorSourceId)}::uuid
+        select 1 from proactive_work_sources link
+        join proactive_work work on work.id=link.work_id
+        where link.source_id=${sqlLiteral(harness.state.silentMonitorSourceId)}::uuid
+          and work.kind='finite_monitor'
       )`,
     );
     expect(harness.state.interestResearches).toBe(1);
@@ -6781,8 +6825,10 @@ release("Florence parent journeys", () => {
         select count(*)=1 from sources
         where id=${sqlLiteral(harness.state.voicedMonitorSourceId)}::uuid
       ) and (
-        select count(*)=1 from proactive_work_sources
-        where source_id=${sqlLiteral(harness.state.voicedMonitorSourceId)}::uuid
+        select count(*)=1 from proactive_work_sources link
+        join proactive_work work on work.id=link.work_id
+        where link.source_id=${sqlLiteral(harness.state.voicedMonitorSourceId)}::uuid
+          and work.kind='finite_monitor'
       )`,
     );
 
@@ -6797,32 +6843,30 @@ release("Florence parent journeys", () => {
     expect(
       harness.linq.messages.some(
         (message) =>
-          message.providerConversationId === FAMILY_GROUP &&
-          message.text === "Maya’s field-trip form is signed—nothing else to do.",
+          message.providerConversationId === PRIVATE_FOUNDER &&
+          message.text === "The school confirmed the form is signed.",
       ),
     ).toBe(true);
-    const monitoredEvent = [...harness.state.calendarEvents.values()].find(
-      (event) => event.title === AUTOMATIC_FAMILY_DATE.title,
-    );
-    if (!monitoredEvent) throw new Error("The monitored family Calendar event is missing");
+    const monitoredProviderEventId = `private-event-${harness.founderAdultId}`;
+    const monitoredProviderRevision = `private-revision-${harness.founderAdultId}`;
     await harness.assertDatabase(
       "The Calendar source did not converge in place to the current cancellation",
       `(
         select count(*)=1 from sources current
         where current.id=${sqlLiteral(harness.state.cancelledMonitorSourceId)}::uuid
           and current.kind='calendar' and current.parent_source_id is null
-          and current.metadata->>'providerEventId'=${sqlLiteral(monitoredEvent.providerEventId)}
-          and current.metadata->>'providerRevision'=${sqlLiteral(`${monitoredEvent.providerRevision}-cancelled`)}
+          and current.metadata->>'providerEventId'=${sqlLiteral(monitoredProviderEventId)}
+          and current.metadata->>'providerRevision'=${sqlLiteral(`${monitoredProviderRevision}-cancelled`)}
           and current.metadata->>'status'='cancelled'
-          and current.metadata->>'title'=${sqlLiteral(AUTOMATIC_FAMILY_DATE.title)}
+          and current.metadata->>'title'='Private calendar detail'
           and nullif(current.metadata->>'startsAt','') is not null
           and nullif(current.metadata->>'endsAt','') is not null
-          and current.metadata->>'allDay'='true'
+          and current.metadata->>'allDay'='false'
           and current.occurred_at=(current.metadata->>'startsAt')::timestamptz
       ) and (
         select count(*)=1 from sources
         where kind='calendar'
-          and metadata->>'providerEventId'=${sqlLiteral(monitoredEvent.providerEventId)}
+          and metadata->>'providerEventId'=${sqlLiteral(monitoredProviderEventId)}
       )`,
     );
     expect((await harness.florence.workspaceForAdult(harness.partnerAdultId)).vault?.watches).toEqual(
@@ -7284,24 +7328,23 @@ release("Florence parent journeys", () => {
         .map((execution) => execution.actionId),
     ).toEqual([preActivationActionId]);
     await harness.assertDatabase(
-      "A same-account reconnect duplicated a provider-stable watch",
-      `(select count(distinct work.id)<=2 from proactive_work work
+      "A same-account reconnect resurrected or dropped the completed provider-stable watch",
+      `(select count(distinct work.id)=1 from proactive_work work
+          join proactive_work_sources link on link.work_id=work.id
+          join sources source on source.id=link.source_id
+          where work.kind='finite_monitor' and work.status='completed'
+            and work.owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid
+            and source.kind='gmail'
+            and source.metadata->>'messageId'=${sqlLiteral(SCHOOL_ATTACHMENT.messageId)})
+        and not exists (
+          select 1 from proactive_work work
           join proactive_work_sources link on link.work_id=work.id
           join sources source on source.id=link.source_id
           where work.kind='finite_monitor' and work.status='active'
             and work.owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid
             and source.kind='gmail'
-            and source.metadata->>'messageId'=${sqlLiteral(SCHOOL_ATTACHMENT.messageId)})`,
-    );
-    await harness.assertDatabase(
-      "A same-account reconnect dropped a provider-stable watch",
-      `(select count(distinct work.id)>=2 from proactive_work work
-          join proactive_work_sources link on link.work_id=work.id
-          join sources source on source.id=link.source_id
-          where work.kind='finite_monitor' and work.status='active'
-            and work.owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid
-            and source.kind='gmail'
-            and source.metadata->>'messageId'=${sqlLiteral(SCHOOL_ATTACHMENT.messageId)})`,
+            and source.metadata->>'messageId'=${sqlLiteral(SCHOOL_ATTACHMENT.messageId)}
+        )`,
     );
     await harness.assertDatabase(
       "A same-account reconnect duplicated or dropped a handled Calendar action",
@@ -7432,7 +7475,7 @@ release("Florence parent journeys", () => {
       ) and exists (
         select 1 from messages
         where direction='outbound' and status='sent'
-          and text like 'Here’s what’s on the docket:%'
+          and idempotency_key like 'initial-household-briefing:%'
       ) and exists (
         select 1 from messages
         where direction='outbound' and status='sent'
@@ -8030,7 +8073,6 @@ release("Florence parent journeys", () => {
       expect.arrayContaining([
         expect.objectContaining({
           excludedFamilyCalendarId: FAMILY_CALENDAR,
-          calendarIds: undefined,
         }),
       ]),
     );
@@ -8958,7 +9000,8 @@ class Harness {
     let idle = 0;
     for (let index = 0; index < 500 && idle < 2; index += 1) {
       const worked = await this.florence.runOnce();
-      idle = worked ? 0 : idle + 1;
+      const backgroundWorkPending = this.florence.hasPendingBackgroundWork();
+      idle = worked || backgroundWorkPending ? 0 : idle + 1;
       if (!worked) await new Promise((resolve) => setTimeout(resolve, 0));
     }
   }
@@ -10063,11 +10106,13 @@ function createReasoner(
           {
             text: state.proactiveFamilyWorkExercise
               ? PROACTIVE_FAMILY_WORK_KICKOFF
-              : `Here’s what I found:\n${selected.map((candidate) => `– ${candidate.summary}`).join("\n")}${
-                  remaining > 0
-                    ? `\n\nI kept ${remaining} lower-priority items on the docket too. Ask me anytime.`
-                    : ""
-                }\n\nDid I get that right? If I missed something, tell me here.`,
+              : selected.length === 0
+                ? HOUSEHOLD_INITIAL_ALL_CLEAR
+                : `Here’s what I found:\n${selected.map((candidate) => `– ${candidate.summary}`).join("\n")}${
+                    remaining > 0
+                      ? `\n\nI kept ${remaining} lower-priority items on the docket too. Ask me anytime.`
+                      : ""
+                  }\n\nDid I get that right? If I missed something, tell me here.`,
             delayMs: 0,
           },
         ],
@@ -10426,8 +10471,8 @@ function createReasoner(
       };
     },
     reviewFiniteMonitor: async (input: Parameters<FlorenceReasoner["reviewFiniteMonitor"]>[0]) => {
-      state.finiteReviews += 1;
       if (state.linkedGmailMonitorExercise) {
+        state.finiteReviews += 1;
         if (input.monitor.objective !== UNRELATED_ACCOUNT_MONITOR_OBJECTIVE) {
           throw new Error("The due Gmail review selected another monitor");
         }
@@ -10450,7 +10495,27 @@ function createReasoner(
           why: input.monitor.why,
         };
       }
-      const source = input.evidence.calendar.events[0] ?? input.evidence.gmail.sources[0];
+      if (input.monitor.objective !== "Watch for confirmation that Maya’s field-trip form is signed.") {
+        return {
+          outcome: "silent" as const,
+          urgency: "watch" as const,
+          privateDetail: null,
+          householdConclusion: null,
+          sourceIds: [],
+          currentConclusion: input.monitor.currentConclusion,
+          nextCheck: new Date(Date.parse(input.currentTime) + 24 * 60 * 60_000).toISOString(),
+          why: input.monitor.why,
+        };
+      }
+      state.finiteReviews += 1;
+      const source =
+        input.evidence.calendar.events.find(
+          (candidate) =>
+            candidate.title === AUTOMATIC_FAMILY_DATE.title ||
+            candidate.sourceId === state.voicedMonitorSourceId,
+        ) ??
+        input.evidence.calendar.events[0] ??
+        input.evidence.gmail.sources[0];
       if (!source) throw new Error("Monitor review did not receive current evidence");
       if (state.finiteReviews === 1) {
         state.silentMonitorSourceId = source.sourceId;
@@ -10613,24 +10678,41 @@ function createGoogle(store: PostgresFlorenceStore, state: HarnessState): Google
                 providerUpdatedAt: new Date(state.now).toISOString(),
               }))
             : familyEvents
-        : state.initialCalendarOnlyReview && input.ownerAdultId === founderSetup().adultId
-          ? [PRIVATE_INITIAL_CALENDAR_ONLY_EVENT, PRIVATE_INITIAL_CALENDAR_CONFLICT_EVENT]
-          : [
+        : state.monitorCancellationActive && input.ownerAdultId === founderSetup().adultId
+          ? [
               {
                 providerEventId: `private-event-${input.ownerAdultId}`,
-                providerRevision: `private-revision-${input.ownerAdultId}`,
+                providerRevision: `private-revision-${input.ownerAdultId}-cancelled`,
                 providerUpdatedAt: new Date(state.now).toISOString(),
-                status: "confirmed" as const,
-                busy: true,
-                title: "Private calendar detail",
-                intervalKind: "timed" as const,
-                startsAt: "2026-08-18T17:00:00.000Z",
-                endsAt: "2026-08-18T18:00:00.000Z",
-                allDay: false,
-                timeZone: "America/Los_Angeles",
-                location: null,
+                status: "cancelled" as const,
+                busy: false,
+                title: null,
+                startsAt: null,
+                endsAt: null,
+                allDay: null,
+                timeZone: null,
+                startDate: null,
+                endDate: null,
               },
-            ];
+            ]
+          : state.initialCalendarOnlyReview && input.ownerAdultId === founderSetup().adultId
+            ? [PRIVATE_INITIAL_CALENDAR_ONLY_EVENT, PRIVATE_INITIAL_CALENDAR_CONFLICT_EVENT]
+            : [
+                {
+                  providerEventId: `private-event-${input.ownerAdultId}`,
+                  providerRevision: `private-revision-${input.ownerAdultId}`,
+                  providerUpdatedAt: new Date(state.now).toISOString(),
+                  status: "confirmed" as const,
+                  busy: true,
+                  title: "Private calendar detail",
+                  intervalKind: "timed" as const,
+                  startsAt: "2026-08-18T17:00:00.000Z",
+                  endsAt: "2026-08-18T18:00:00.000Z",
+                  allDay: false,
+                  timeZone: "America/Los_Angeles",
+                  location: null,
+                },
+              ];
     return {
       status: "complete" as const,
       events,
@@ -10797,11 +10879,15 @@ function createGoogle(store: PostgresFlorenceStore, state: HarnessState): Google
           attachments: [SCHOOL_ATTACHMENT],
         };
       }
-      if (
-        input.messageId !== "gmail-initial-unrelated-retail-account-alert" ||
-        input.threadId !== "thread-gmail-initial-unrelated-retail-account-alert" ||
-        input.historyId !== "101"
-      ) {
+      const initialAccountAlert =
+        input.messageId === "gmail-initial-unrelated-retail-account-alert" &&
+        input.threadId === "thread-gmail-initial-unrelated-retail-account-alert" &&
+        input.historyId === "101";
+      const incrementalAccountAlert =
+        input.messageId === "gmail-unrelated-retail-account-alert" &&
+        input.threadId === "gmail-unrelated-retail-account-alert-thread" &&
+        input.historyId === "102";
+      if (!initialAccountAlert && !incrementalAccountAlert) {
         throw new Error("The due monitor requested an unexpected Gmail source");
       }
       return {
@@ -10843,7 +10929,7 @@ function createGoogle(store: PostgresFlorenceStore, state: HarnessState): Google
           : `gmail-${input.ownerAdultId}-true`;
       const relevant = {
         messageId,
-        threadId: `thread-${messageId}`,
+        threadId: founder && !initialUnrelatedAccount ? SCHOOL_ATTACHMENT.threadId : `thread-${messageId}`,
         historyId: founder ? "101" : "201",
         from: initialUnrelatedAccount
           ? "account@example.test"
@@ -11113,7 +11199,10 @@ function createGoogle(store: PostgresFlorenceStore, state: HarnessState): Google
         messages: [
           {
             messageId,
-            threadId: `thread-${messageId}`,
+            threadId:
+              founder && recent && !initialUnrelatedAccount && !ordinaryUnused && !citedReply
+                ? SCHOOL_ATTACHMENT.threadId
+                : `thread-${messageId}`,
             historyId: citedReply ? "106" : founder ? "101" : "201",
             from: citedReply
               ? "office@muir.example"
@@ -11235,7 +11324,7 @@ function createGoogle(store: PostgresFlorenceStore, state: HarnessState): Google
                     ? SOURCE_CHANGE_GMAIL_MESSAGE_ID
                     : "gmail-maya-school-enrollment-update",
                   threadId: state.sourceChangeFamilyWorkExercise
-                    ? `thread-${SCHOOL_ATTACHMENT.messageId}`
+                    ? SCHOOL_ATTACHMENT.threadId
                     : "gmail-maya-school-enrollment-thread",
                   historyId: privateFactHistoryId,
                   from: "registrar@muir.example",
@@ -11752,9 +11841,9 @@ function fakeResponseStream(events: readonly unknown[], response: unknown) {
   };
 }
 
-function mockReasonedCompletionBasis(summary: string) {
+function mockReasonedCompletionBasis(summary: string, condition: string | null | undefined) {
   return {
-    condition: "The mocked family-work objective is complete.",
+    condition: condition ?? "The mocked family-work objective is complete.",
     summary,
     evidenceCallIds: [],
   };

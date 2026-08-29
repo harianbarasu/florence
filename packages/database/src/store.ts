@@ -851,6 +851,14 @@ export type FamilyWorkCompletionMemoryMutation =
       readonly expectedUpdatedAt: string;
     };
 
+export type FamilyWorkMessagePresentation = Readonly<{
+  bubbles: readonly Readonly<{ text: string; delayMs: number }>[];
+  nativeMoves: readonly (
+    | { readonly type: "rich_link"; readonly url: string }
+    | { readonly type: "media"; readonly url: string }
+  )[] | null;
+}>;
+
 export type SettleFamilyWorkClaimInput = {
   workId: string;
   generation: number;
@@ -862,13 +870,20 @@ export type SettleFamilyWorkClaimInput = {
         state: FamilyWorkStateV1;
         nextCheckAt: string;
         progressText?: string | null;
+        presentation?: FamilyWorkMessagePresentation;
       }
     | { type: "participant_waiting"; state: FamilyWorkStateV1 }
-    | { type: "waiting"; state: FamilyWorkStateV1; question: string }
+    | {
+        type: "waiting";
+        state: FamilyWorkStateV1;
+        question: string;
+        presentation?: FamilyWorkMessagePresentation;
+      }
     | {
         type: "terminal";
         state: FamilyWorkStateV1;
         terminalText: string;
+        presentation?: FamilyWorkMessagePresentation;
         completionMemoryMutations?: readonly FamilyWorkCompletionMemoryMutation[];
         completionEvidenceOutputs: readonly { readonly callId: string; readonly output: JsonValue }[];
       }
@@ -3877,6 +3892,31 @@ export class PostgresFlorenceStore {
             `;
             continue;
           }
+          const [pendingProgressDelivery] = await sql<{ next_delivery_at: Date | null }[]>`
+            select max(coalesce(message.retry_at,message.not_before)) as next_delivery_at
+            from messages message join sources source on source.id=message.source_id
+            where message.direction='outbound' and message.status in ('pending','sending')
+              and source.metadata->>'familyWorkId'=${familyTask.id}::text
+              and source.metadata->>'familyWorkGeneration'=${String(state.generation)}
+              and source.metadata->>'familyWorkProgressRevision'=${String(state.progressRevision)}
+              and (
+                source.metadata->>'familyWorkDeliveryKind'='progress'
+                or (source.metadata->>'familyWorkDeliveryKind'='presentation'
+                  and source.metadata->>'familyWorkPresentationFor'='progress')
+              )
+          `;
+          if (pendingProgressDelivery?.next_delivery_at) {
+            await sql`
+              update proactive_work set next_check_at=${new Date(
+                Math.max(
+                  pendingProgressDelivery.next_delivery_at.getTime(),
+                  now.getTime() + FAMILY_WORK_INITIAL_DELAY_MS,
+                ),
+              )}
+              where id=${familyTask.id} and kind='family_task' and status='active'
+            `;
+            continue;
+          }
           if (state.phase === "waiting" || state.phase === "terminal") {
             throw new FlorenceStoreConflict("Due family work has an invalid durable phase");
           }
@@ -4527,19 +4567,36 @@ export class PostgresFlorenceStore {
           input.result.progressText == null || queuedSteering
             ? null
             : bounded(required(input.result.progressText, "Family work progress"), 10_000);
+        const progressPresentation = progressText
+          ? familyWorkMessagePresentation(
+              input.result.presentation,
+              progressText,
+              "Family work progress",
+            )
+          : null;
+        const progressConclusion = progressText;
         if (progressText && nextState.progressRevision <= currentState.progressRevision) {
           throw new FlorenceStoreConflict("Family work progress must advance its revision");
         }
         const updated = await sql`
           update proactive_work set task_state=${sql.json(nextState)},status='active',
-            next_check_at=${nextCheckAt},current_conclusion=${progressText ?? work.current_conclusion},
+            next_check_at=${nextCheckAt},current_conclusion=${progressConclusion ?? work.current_conclusion},
             last_error=null where id=${work.id} and kind='family_task' and status='active'
             and task_state->>'generation'=${String(input.generation)}
             and task_state->'claim'->>'claimId'=${input.claimId} returning id
         `;
         if (updated.length !== 1) return "stale";
-        if (progressText) {
-          await insertFamilyWorkOutbound(sql, work, nextState, "progress", progressText, settledAt);
+        if (progressText && progressPresentation) {
+          await insertFamilyWorkOutbound(
+            sql,
+            work,
+            nextState,
+            "progress",
+            progressText,
+            settledAt,
+            [],
+            progressPresentation,
+          );
         }
         return "settled";
       }
@@ -4643,6 +4700,11 @@ export class PostgresFlorenceStore {
           throw new FlorenceStoreConflict("A family work question must advance its progress revision");
         }
         const question = bounded(required(input.result.question, "Family work question"), 10_000);
+        const presentation = familyWorkMessagePresentation(
+          input.result.presentation,
+          question,
+          "Family work question",
+        );
         const updated = await sql`
           update proactive_work set task_state=${sql.json(nextState)},status='paused',next_check_at=null,
             current_conclusion=${question},last_error=null
@@ -4651,12 +4713,26 @@ export class PostgresFlorenceStore {
             and task_state->'claim'->>'claimId'=${input.claimId} returning id
         `;
         if (updated.length !== 1) return "stale";
-        await insertFamilyWorkOutbound(sql, work, nextState, "waiting", question, settledAt);
+        await insertFamilyWorkOutbound(
+          sql,
+          work,
+          nextState,
+          "waiting",
+          question,
+          settledAt,
+          [],
+          presentation,
+        );
         return "settled";
       }
 
       if (input.result.type === "terminal") {
         const terminalText = bounded(required(input.result.terminalText, "Family work result"), 10_000);
+        const presentation = familyWorkMessagePresentation(
+          input.result.presentation,
+          terminalText,
+          "Family work result",
+        );
         const completionMemoryMutations = await validateFamilyWorkCompletionMemoryMutations(sql, {
           work,
           mutations: input.result.completionMemoryMutations ?? [],
@@ -4744,6 +4820,7 @@ export class PostgresFlorenceStore {
           terminalText,
           settledAt,
           completionMemoryMutations,
+          presentation,
         );
         return "settled";
       }
@@ -10865,6 +10942,14 @@ export class PostgresFlorenceStore {
               and earlier.direction='outbound' and earlier.status<>'sent'
           )
         )
+        and (
+          s.metadata->>'familyWorkPresentationPart' is null
+          or not exists (
+            select 1 from messages earlier
+            where earlier.turn_id=m.turn_id and earlier.turn_part<m.turn_part
+              and earlier.direction='outbound' and earlier.status in ('pending','sending')
+          )
+        )
       order by coalesce(m.retry_at,m.not_before),s.occurred_at,m.turn_part,m.source_id limit 1
     `;
     return row ? this.#readOutbound(row.source_id) : null;
@@ -10885,6 +10970,14 @@ export class PostgresFlorenceStore {
             select 1 from messages earlier
             where earlier.turn_id=m.turn_id and earlier.turn_part<m.turn_part
               and earlier.direction='outbound' and earlier.status<>'sent'
+          )
+        )
+        and (
+          s.metadata->>'familyWorkPresentationPart' is null
+          or not exists (
+            select 1 from messages earlier
+            where earlier.turn_id=m.turn_id and earlier.turn_part<m.turn_part
+              and earlier.direction='outbound' and earlier.status in ('pending','sending')
           )
         )
         and not exists (
@@ -10933,6 +11026,12 @@ export class PostgresFlorenceStore {
                 and (
                   (source.metadata->>'familyWorkDeliveryKind'='progress' and work.status='active')
                   or (source.metadata->>'familyWorkDeliveryKind'='waiting' and work.status='paused')
+                  or (source.metadata->>'familyWorkDeliveryKind'='presentation' and (
+                    (source.metadata->>'familyWorkPresentationFor'='progress' and work.status='active')
+                    or (source.metadata->>'familyWorkPresentationFor'='waiting' and work.status='paused')
+                    or (source.metadata->>'familyWorkPresentationFor'='terminal'
+                      and work.status='delivering')
+                  ))
                   or (source.metadata->>'familyWorkDeliveryKind'='participant_request'
                     and work.status='paused'
                     and work.task_state->'pendingParticipantRequest'->>'questionSourceId'=
@@ -22305,6 +22404,52 @@ async function familyWorkReplySourceId(
   );
 }
 
+function familyWorkMessagePresentation(
+  proposed: FamilyWorkMessagePresentation | undefined,
+  authoritativeText: string,
+  name: string,
+): FamilyWorkMessagePresentation {
+  const presentation = proposed ?? {
+    bubbles: [{ text: authoritativeText, delayMs: 0 }],
+    nativeMoves: null,
+  };
+  if (presentation.bubbles.length < 1 || presentation.bubbles.length > 3) {
+    throw new FlorenceStoreConflict(`${name} needs one to three iMessage bubbles`);
+  }
+  const bubbles = presentation.bubbles.map((bubble, index) => {
+    const text = bounded(required(bubble.text, `${name} bubble ${index + 1}`), 10_000);
+    if (!Number.isSafeInteger(bubble.delayMs) || bubble.delayMs < 0 || bubble.delayMs > 5_000) {
+      throw new FlorenceStoreConflict(`${name} has an invalid bubble delay`);
+    }
+    return { text, delayMs: bubble.delayMs };
+  });
+  if (
+    bubbles.at(-1)?.text !== authoritativeText ||
+    bubbles.filter((bubble) => bubble.text === authoritativeText).length !== 1
+  ) {
+    throw new FlorenceStoreConflict(`${name} lost its exact authoritative final bubble`);
+  }
+  const nativeMoves = (presentation.nativeMoves ?? []).map((move) => {
+    if (move.type !== "rich_link" && move.type !== "media") {
+      throw new FlorenceStoreConflict(`${name} contains an unsupported durable native move`);
+    }
+    let url: URL;
+    try {
+      url = new URL(move.url);
+    } catch {
+      throw new FlorenceStoreConflict(`${name} contains an invalid native URL`);
+    }
+    if (url.protocol !== "https:") {
+      throw new FlorenceStoreConflict(`${name} native previews must use HTTPS`);
+    }
+    return { ...move, url: url.toString() };
+  });
+  if (bubbles.length + nativeMoves.length > 3) {
+    throw new FlorenceStoreConflict(`${name} has more than three visible iMessage moves`);
+  }
+  return { bubbles, nativeMoves: nativeMoves.length > 0 ? nativeMoves : null };
+}
+
 async function insertFamilyWorkOutbound(
   sql: postgres.TransactionSql,
   work: ProactiveWorkRow,
@@ -22313,6 +22458,7 @@ async function insertFamilyWorkOutbound(
   text: string,
   occurredAt: Date,
   completionMemoryMutations: readonly FamilyWorkCompletionMemoryMutation[] = [],
+  proposedPresentation?: FamilyWorkMessagePresentation,
 ): Promise<void> {
   const channel = await activeReminderChannel(sql, work);
   if (!channel) {
@@ -22327,52 +22473,99 @@ async function insertFamilyWorkOutbound(
   const selectedImages = deliveryKind === "terminal" ? (state.terminal?.selectedImages ?? []) : [];
   const completionReceipt =
     deliveryKind === "terminal" ? familyWorkCompletionReceipt(state) : null;
-  const suffix = `family-work:${deliveryKind}:${state.generation}:${state.progressRevision}`;
-  await insertProactiveOutbound(sql, {
-    workId: work.id,
-    suffix,
-    householdId: work.household_id,
-    channel,
-    visibility: work.visibility,
-    ownerAdultId: work.owner_adult_id,
+  const presentation = familyWorkMessagePresentation(
+    proposedPresentation,
     text,
-    ...(replyToSourceId ? { replyToSourceId } : {}),
-    ...(selectedFiles.length > 0 || selectedImages.length > 0
-      ? {
-          nativeMove: {
-            type: "message" as const,
-            parts: [
-              { type: "text" as const, text },
-              ...selectedImages.map((image) => ({
-                type: "media" as const,
-                source: { type: "florence_artifact" as const, ...image },
-              })),
-              ...selectedFiles.map((file) => ({
-                type: "media" as const,
-                source: { type: "florence_file_artifact" as const, ...file },
-              })),
-            ],
-          },
-        }
-      : {}),
-    metadata: {
-      familyWorkId: work.id,
-      familyWorkGeneration: state.generation,
-      familyWorkProgressRevision: state.progressRevision,
-      familyWorkDeliveryKind: deliveryKind,
-      ...(deliveryKind === "terminal" && completionMemoryMutations.length > 0
+    `Family work ${deliveryKind}`,
+  );
+  const baseSuffix = `family-work:${deliveryKind}:${state.generation}:${state.progressRevision}`;
+  const turnId = deterministicUuid(`proactive-turn\0${work.id}\0${sha256(baseSuffix)}`);
+  const authoritativeBubble = presentation.bubbles.at(-1);
+  if (!authoritativeBubble) {
+    throw new FlorenceStoreConflict("Family work presentation lost its authoritative bubble");
+  }
+  const moves: readonly (
+    | { readonly kind: "bubble"; readonly text: string; readonly delayMs: number }
+    | {
+        readonly kind: "preview";
+        readonly text: string;
+        readonly nativeMove: OutboundNativeMoveDraft;
+      }
+    | { readonly kind: "authoritative"; readonly text: string; readonly delayMs: number }
+  )[] = [
+    ...presentation.bubbles.slice(0, -1).map((bubble) => ({ kind: "bubble" as const, ...bubble })),
+    ...(presentation.nativeMoves ?? []).map((move) => ({
+      kind: "preview" as const,
+      text: move.url,
+      nativeMove:
+        move.type === "rich_link"
+          ? ({ type: "message" as const, parts: [{ type: "link" as const, url: move.url }] })
+          : ({
+              type: "message" as const,
+              parts: [{ type: "media" as const, source: { type: "url" as const, url: move.url } }],
+            }),
+    })),
+    { kind: "authoritative" as const, ...authoritativeBubble },
+  ];
+  let delayMs = 0;
+  for (const [index, move] of moves.entries()) {
+    if (move.kind !== "preview") delayMs += move.delayMs;
+    const authoritative = move.kind === "authoritative";
+    const suffix = authoritative ? baseSuffix : `${baseSuffix}:presentation:${index}`;
+    const artifactParts = authoritative
+      ? [
+          ...selectedImages.map((image) => ({
+            type: "media" as const,
+            source: { type: "florence_artifact" as const, ...image },
+          })),
+          ...selectedFiles.map((file) => ({
+            type: "media" as const,
+            source: { type: "florence_file_artifact" as const, ...file },
+          })),
+        ]
+      : [];
+    await insertProactiveOutbound(sql, {
+      workId: work.id,
+      suffix,
+      householdId: work.household_id,
+      channel,
+      visibility: work.visibility,
+      ownerAdultId: work.owner_adult_id,
+      text: move.text,
+      ...(index === 0 && replyToSourceId ? { replyToSourceId } : {}),
+      ...(move.kind === "preview"
+        ? { nativeMove: move.nativeMove }
+        : artifactParts.length > 0
         ? {
-            familyWorkCompletionMemoryMutations: completionMemoryMutations.map(
-              familyWorkCompletionMemoryMutationJson,
-            ),
+            nativeMove: {
+              type: "message" as const,
+              parts: [{ type: "text" as const, text: move.text }, ...artifactParts],
+            },
           }
         : {}),
-      ...(completionReceipt ? { familyWorkCompletionReceipt: completionReceipt } : {}),
-      ...(resolutionMetadata ?? {}),
-    },
-    notBefore: occurredAt,
-    occurredAt,
-  });
+      metadata: {
+        familyWorkId: work.id,
+        familyWorkGeneration: state.generation,
+        familyWorkProgressRevision: state.progressRevision,
+        familyWorkDeliveryKind: authoritative ? deliveryKind : "presentation",
+        familyWorkPresentationFor: deliveryKind,
+        familyWorkPresentationPart: index,
+        ...(authoritative && deliveryKind === "terminal" && completionMemoryMutations.length > 0
+          ? {
+              familyWorkCompletionMemoryMutations: completionMemoryMutations.map(
+                familyWorkCompletionMemoryMutationJson,
+              ),
+            }
+          : {}),
+        ...(authoritative && completionReceipt ? { familyWorkCompletionReceipt: completionReceipt } : {}),
+        ...(authoritative ? (resolutionMetadata ?? {}) : {}),
+      },
+      turnId,
+      turnPart: index as 0 | 1 | 2,
+      notBefore: new Date(occurredAt.getTime() + delayMs),
+      occurredAt,
+    });
+  }
 }
 
 function familyWorkCompletionReceipt(state: FamilyWorkStateV1): JsonObject | null {
@@ -23100,6 +23293,8 @@ async function insertProactiveOutbound(
     replyToSourceId?: string | null;
     nativeMove?: OutboundNativeMoveDraft;
     metadata?: JsonObject;
+    turnId?: string;
+    turnPart?: 0 | 1 | 2;
     notBefore: Date;
     occurredAt: Date;
   },
@@ -23117,8 +23312,8 @@ async function insertProactiveOutbound(
       ? { replyToSourceId: input.replyToSourceId, parentSourceId: input.replyToSourceId }
       : {}),
     ...(input.nativeMove ? { nativeMove: input.nativeMove } : {}),
-    turnId: deterministicUuid(`proactive-turn\0${input.workId}\0${stable}`),
-    turnPart: 0,
+    turnId: input.turnId ?? deterministicUuid(`proactive-turn\0${input.workId}\0${stable}`),
+    turnPart: input.turnPart ?? 0,
     notBefore: input.notBefore.toISOString(),
     householdId: input.householdId,
     channelId: input.channel.id,

@@ -250,6 +250,8 @@ const PROACTIVE_FAMILY_WORK_KICKOFF =
   "I noticed Maya’s field-trip deadline on the family calendar and remembered your mild sesame-noodle recipe, so I’m putting together a practical plan for the week now.";
 const PROACTIVE_FAMILY_WORK_RESULT =
   "I put together a practical family plan from the Family Calendar and the useful details already in the Vault.";
+const PROACTIVE_FAMILY_WORK_RESULT_LEAD = "Okay, I pulled the useful pieces together.";
+const PROACTIVE_FAMILY_WORK_RESULT_URL = "https://example.com/family-plan";
 const SOURCE_CHANGE_FAMILY_WORK_OBJECTIVE =
   "Resolve Maya’s field-trip form using the school’s current instructions.";
 const SOURCE_CHANGE_FAMILY_WORK_KICKOFF =
@@ -3003,7 +3005,7 @@ release("Florence parent journeys", () => {
     );
   }, 20_000);
 
-  test("starts one memory-grounded proactive job through the existing family-work loop", async () => {
+  test("starts one memory-grounded proactive job and rejoins with a paced native result", async () => {
     let familyWorkRuns = 0;
     const harness = await createHarness(async () => decision(), {
       continueFamilyWork: async (input) => {
@@ -3033,6 +3035,13 @@ release("Florence parent journeys", () => {
           },
           outcome: "succeeded",
           text: PROACTIVE_FAMILY_WORK_RESULT,
+          presentation: {
+            bubbles: [
+              { text: PROACTIVE_FAMILY_WORK_RESULT_LEAD, delayMs: 0 },
+              { text: PROACTIVE_FAMILY_WORK_RESULT, delayMs: 700 },
+            ],
+            nativeMoves: [{ type: "rich_link", url: PROACTIVE_FAMILY_WORK_RESULT_URL }],
+          },
           completionEvidenceOutputs: [],
         };
       },
@@ -3051,8 +3060,21 @@ release("Florence parent journeys", () => {
     const proactiveResult = harness.linq.messages.find(
       (message) => message.text === PROACTIVE_FAMILY_WORK_RESULT,
     );
+    const proactiveLead = harness.linq.messages.find(
+      (message) => message.text === PROACTIVE_FAMILY_WORK_RESULT_LEAD,
+    );
+    const proactiveNativeResult = harness.linq.moves.find(
+      ({ move }) =>
+        move.type === "message" &&
+        move.parts.some((part) => part.type === "link" && part.url === PROACTIVE_FAMILY_WORK_RESULT_URL),
+    );
+    expect(proactiveLead).toBeDefined();
     expect(proactiveResult).toBeDefined();
     expect(proactiveResult?.replyTo).toBeUndefined();
+    expect(proactiveNativeResult?.move).toEqual({
+      type: "message",
+      parts: [{ type: "link", url: PROACTIVE_FAMILY_WORK_RESULT_URL }],
+    });
     await harness.assertDatabase(
       "A proactive household judgment did not produce exactly one completed family task from its kickoff",
       `(select count(*)=1 from proactive_work

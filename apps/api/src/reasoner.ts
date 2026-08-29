@@ -1048,6 +1048,20 @@ const googleActionAnchorSchema = z
   .max(160)
   .refine((value) => !/[\r\n]/u.test(value));
 
+const conversationBubbleSchema = z
+  .object({
+    text: shortText,
+    delayMs: z.number().int().min(0).max(5_000),
+  })
+  .strict();
+
+const conversationRichLinkMoveSchema = z
+  .object({ type: z.literal("rich_link"), url: z.string().trim().min(1).max(2_000) })
+  .strict();
+const conversationMediaMoveSchema = z
+  .object({ type: z.literal("media"), url: z.string().trim().min(1).max(2_000) })
+  .strict();
+
 const conversationNativeMoveSchema = z.discriminatedUnion("type", [
   z
     .object({
@@ -1056,8 +1070,8 @@ const conversationNativeMoveSchema = z.discriminatedUnion("type", [
       adultDisplayName: z.string().trim().min(1).max(500),
     })
     .strict(),
-  z.object({ type: z.literal("rich_link"), url: z.string().trim().min(1).max(2_000) }).strict(),
-  z.object({ type: z.literal("media"), url: z.string().trim().min(1).max(2_000) }).strict(),
+  conversationRichLinkMoveSchema,
+  conversationMediaMoveSchema,
   z
     .object({
       type: z.literal("reaction"),
@@ -1084,6 +1098,23 @@ const conversationNativeMoveSchema = z.discriminatedUnion("type", [
     .strict(),
 ]);
 
+const conversationPresentationSchema = z
+  .object({
+    bubbles: z.array(conversationBubbleSchema).max(3),
+    nativeMoves: z.array(conversationNativeMoveSchema).max(3).nullable(),
+  })
+  .strict();
+
+const familyWorkPresentationSchema = z
+  .object({
+    bubbles: z.array(conversationBubbleSchema).min(1).max(3),
+    nativeMoves: z
+      .array(z.discriminatedUnion("type", [conversationRichLinkMoveSchema, conversationMediaMoveSchema]))
+      .max(3)
+      .nullable(),
+  })
+  .strict();
+
 export const florenceDecisionSchema = z
   .object({
     policy: z
@@ -1097,17 +1128,7 @@ export const florenceDecisionSchema = z
       .object({
         replyToCurrentMessage: z.boolean(),
         reaction: z.enum(["love", "like", "dislike", "laugh", "emphasize", "question"]).nullable(),
-        bubbles: z
-          .array(
-            z
-              .object({
-                text: shortText,
-                delayMs: z.number().int().min(0).max(5_000),
-              })
-              .strict(),
-          )
-          .max(3),
-        nativeMoves: z.array(conversationNativeMoveSchema).max(3).nullable(),
+        ...conversationPresentationSchema.shape,
       })
       .strict(),
     facts: z.array(factDecisionSchema),
@@ -1931,6 +1952,7 @@ const familyWorkTerminalDecisionSchema = z
     selectedFileAssetIds: z.array(z.string().uuid()).default([]),
     docket: florencePrivateDocketCoordinationSchema.nullable().default(null),
     completionMemory: familyWorkCompletionMemoryDecisionSchema,
+    presentation: familyWorkPresentationSchema.nullable().default(null),
   })
   .strict();
 
@@ -1944,6 +1966,7 @@ const familyWorkTerminalDecisionWithoutProgressSchema = z
     selectedFileAssetIds: z.array(z.string().uuid()).default([]),
     docket: florencePrivateDocketCoordinationSchema.nullable().default(null),
     completionMemory: familyWorkTerminalDecisionSchema.shape.completionMemory,
+    presentation: familyWorkTerminalDecisionSchema.shape.presentation,
   })
   .strict();
 
@@ -1957,6 +1980,7 @@ const familyWorkUnverifiedTerminalDecisionSchema = z
     selectedFileAssetIds: z.array(z.string().uuid()).default([]),
     docket: florencePrivateDocketCoordinationSchema.nullable().default(null),
     completionMemory: familyWorkNoCompletionMemoryDecisionSchema.default({ operation: "no_change" }),
+    presentation: familyWorkTerminalDecisionSchema.shape.presentation,
   })
   .strict();
 
@@ -2099,6 +2123,7 @@ export type FlorenceVaultWorkResult = z.infer<typeof vaultWorkResultSchema>;
 export type FlorenceFamilyWorkCompletionMemory = z.infer<
   typeof familyWorkTerminalDecisionSchema
 >["completionMemory"];
+export type FlorenceFamilyWorkPresentation = z.infer<typeof familyWorkPresentationSchema>;
 export type FlorenceReminderWorkRequest = z.infer<typeof reminderDecisionSchema>;
 export type FlorenceReminderWorkResult = z.infer<typeof reminderWorkResultSchema>;
 export type FlorenceFamilyCalendarWorkRequest = z.infer<typeof familyCalendarMutationSchema>;
@@ -2163,6 +2188,7 @@ export type FlorenceFamilyWorkStep =
       kind: "continue";
       state: FamilyWorkStateV1;
       progressText: string | null;
+      presentation?: FlorenceFamilyWorkPresentation;
       nextCheckDelayMs: number;
     }>
   | Readonly<{
@@ -2170,11 +2196,13 @@ export type FlorenceFamilyWorkStep =
       state: FamilyWorkStateV1;
       resumeAt: string;
       progressText: string | null;
+      presentation?: FlorenceFamilyWorkPresentation;
     }>
   | Readonly<{
       kind: "waiting";
       state: FamilyWorkStateV1;
       question: string;
+      presentation?: FlorenceFamilyWorkPresentation;
     }>
   | Readonly<{
       kind: "participant_waiting";
@@ -2188,6 +2216,7 @@ export type FlorenceFamilyWorkStep =
       docket?: FlorencePrivateDocketCoordination | null;
       selectedImages?: readonly FamilyWorkSelectedImage[];
       selectedFiles?: readonly FamilyWorkSelectedFile[];
+      presentation?: FlorenceFamilyWorkPresentation;
       completionMemory?: FlorenceFamilyWorkCompletionMemory;
       completionEvidenceOutputs: readonly {
         readonly callId: string;
@@ -2660,7 +2689,7 @@ Keep choosing and chaining useful read or investigation tools in the current rea
 
 If useful work genuinely depends on outside state that cannot reasonably have changed yet, return outcome deferred with a proportionate absolute future resumeAt. Deferred work remains the same task and will wake automatically at that instant. It is not a substitute for using an available tool now, asking a genuinely blocking parent question, or returning a finished result. Use progressText only the first time Florence has something useful to say about the wait; use null on unchanged later checks so the family does not receive repeated status messages. A useful progress note tells the family what materially changed or what Florence is now waiting on in ordinary conversational language; it is not a provider-status translation.
 
-The result object always contains outcome, text, resumeAt, progressText, selectedImageAssetIds, selectedFileAssetIds, docket, and completionMemory. For waiting, partial, or failed, docket must describe the linked unfinished item's current coordination: name who or what is naturally responsible for moving it next, give the smallest concrete next action, say whether a family answer is needed, and name the exact blocker or dependency in waitingOn when one exists. Keep docket to minimum family-safe coordination even when this task and its terminal chat text are private: never put private email or Calendar titles, source wording, or unrelated personal detail in it. A waiting result always needs a family answer, so set needsAnswer true and waitingOn to the exact choice or information requested by the one focused question in text. For partial or failed, needsAnswer is true only when a family answer is actually the next dependency; an outside blocker may instead have needsAnswer false while still being named in waitingOn. Use one supplied parent's exact name, Family, Florence, a plainly named outside person or organization, or null only when responsibility is genuinely unassigned. Derive all coordination from the task's actual current meaning, never from task category, origin or source ownership, private versus household visibility, the initiating parent, or which parent or worker claimed it. For succeeded, deferred, and progress, docket must be null. For outcome progress, text and resumeAt must be null, progressText must contain the useful update, and both selected asset-ID arrays must be empty. For outcome deferred, text must be null, resumeAt must be the absolute future instant, progressText may be useful text or null, and both selected asset-ID arrays must be empty. For every other outcome, text must contain the result or question and both resumeAt and progressText must be null. A browser capture marked user-visible returns an opaque selected image asset ID. A successful browser download returns an opaque selected file asset ID. Copy exact IDs into the matching array only when that image or original file materially helps the finished result. Routine browser screenshots are for your own inspection and must not be selected. Do not invent an asset ID. Selected images and files are currently delivered only with a succeeded or partial result, so waiting and failed results leave both arrays empty.
+The result object always contains outcome, text, resumeAt, progressText, selectedImageAssetIds, selectedFileAssetIds, docket, completionMemory, and presentation. presentation uses the foreground iMessage surface: one to three short paced bubbles plus optional exact rich-link or public-media previews. The checkpoint's exact text or progressText must appear unchanged as exactly one bubble and must be the final bubble; that bubble remains the authoritative question, progress note, or terminal receipt. Preceding bubbles may make Florence's return feel natural. Native URLs must be exact public URLs still established by the task's uncompacted tool history and must not be repeated in bubble prose; if compaction retired that exact evidence, re-open the selected public page before presenting it instead of relying on summary prose. Durable mentions, reactions, and polls are not available in this checkpoint; use bubbles instead. If another bubble or preview does not improve the moment, use one bubble with delayMs 0. A deferred result with null progressText must use null presentation because nothing will be sent. For waiting, partial, or failed, docket must describe the linked unfinished item's current coordination: name who or what is naturally responsible for moving it next, give the smallest concrete next action, say whether a family answer is needed, and name the exact blocker or dependency in waitingOn when one exists. Keep docket to minimum family-safe coordination even when this task and its terminal chat text are private: never put private email or Calendar titles, source wording, or unrelated personal detail in it. A waiting result always needs a family answer, so set needsAnswer true and waitingOn to the exact choice or information requested by the one focused question in text. For partial or failed, needsAnswer is true only when a family answer is actually the next dependency; an outside blocker may instead have needsAnswer false while still being named in waitingOn. Use one supplied parent's exact name, Family, Florence, a plainly named outside person or organization, or null only when responsibility is genuinely unassigned. Derive all coordination from the task's actual current meaning, never from task category, origin or source ownership, private versus household visibility, the initiating parent, or which parent or worker claimed it. For succeeded, deferred, and progress, docket must be null. For outcome progress, text and resumeAt must be null, progressText must contain the useful update, and both selected asset-ID arrays must be empty. For outcome deferred, text must be null, resumeAt must be the absolute future instant, progressText may be useful text or null, and both selected asset-ID arrays must be empty. For every other outcome, text must contain the result or question and both resumeAt and progressText must be null. A browser capture marked user-visible returns an opaque selected image asset ID. A successful browser download returns an opaque selected file asset ID. Copy exact IDs into the matching array only when that image or original file materially helps the finished result. Routine browser screenshots are for your own inspection and must not be selected. Do not invent an asset ID. Selected images and files are currently delivered only with a succeeded or partial result, so waiting and failed results leave both arrays empty.
 
 When completionCondition in the task context is non-null, that exact condition is the definition of done. Copy it unchanged into any non-null docket result, and do not weaken, replace, or reinterpret it.
 
@@ -7851,6 +7880,44 @@ function selectedBrowserFilesFromFamilyWork(
   return selected;
 }
 
+function familyWorkPresentation(
+  proposed: z.infer<typeof familyWorkPresentationSchema> | null,
+  authoritativeText: string,
+  publicResearchUrls: ReadonlySet<string>,
+): FlorenceFamilyWorkPresentation {
+  const presentation = proposed ?? {
+    bubbles: [{ text: authoritativeText, delayMs: 0 }],
+    nativeMoves: null,
+  };
+  if (
+    presentation.bubbles.length < 1 ||
+    presentation.bubbles.at(-1)?.text !== authoritativeText ||
+    presentation.bubbles.filter((bubble) => bubble.text === authoritativeText).length !== 1
+  ) {
+    throw invalidOutput("A durable iMessage presentation needs one exact authoritative final bubble");
+  }
+  const nativeMoves = (presentation.nativeMoves ?? []).map((move) => {
+    if (move.type !== "rich_link" && move.type !== "media") {
+      throw invalidOutput("Durable iMessage presentation currently supports only links and public media");
+    }
+    const url = normalizeResearchUrl(move.url);
+    if (new URL(url).protocol !== "https:" || !publicResearchUrls.has(url)) {
+      throw invalidOutput("A durable native preview must use one exact HTTPS public result URL");
+    }
+    if (presentation.bubbles.some((bubble) => bubble.text.includes(url))) {
+      throw invalidOutput("A durable native preview URL cannot be repeated in bubble prose");
+    }
+    return { ...move, url };
+  });
+  if (presentation.bubbles.length + nativeMoves.length > 3) {
+    throw invalidOutput("A durable Florence update can make at most three visible iMessage moves");
+  }
+  return {
+    bubbles: presentation.bubbles,
+    nativeMoves: nativeMoves.length > 0 ? nativeMoves : null,
+  };
+}
+
 function familyWorkProgressWasAlreadyReported(input: FlorenceFamilyWorkInput, progressText: string): boolean {
   const normalizedProgress = progressText.trim().replace(/\s+/g, " ").toLocaleLowerCase();
   if (input.lastDeliveredProgress?.trim().replace(/\s+/g, " ").toLocaleLowerCase() === normalizedProgress) {
@@ -7867,10 +7934,11 @@ function familyWorkProgressWasAlreadyReported(input: FlorenceFamilyWorkInput, pr
         if (
           isJsonRecord(result) &&
           (result.outcome === "deferred" || result.outcome === "progress") &&
-          typeof result.progressText === "string" &&
-          result.progressText.trim().replace(/\s+/g, " ").toLocaleLowerCase() === normalizedProgress
+          typeof result.progressText === "string"
         ) {
-          return true;
+          if (result.progressText.trim().replace(/\s+/g, " ").toLocaleLowerCase() === normalizedProgress) {
+            return true;
+          }
         }
       } catch {
         // Ordinary assistant text is not a structured family-work checkpoint.
@@ -9641,6 +9709,7 @@ export class FlorenceReasoner {
     );
     const storedContinuation = storedResponseItems(checkpointInput.state.continuationItems);
     await rehydrateWorkspaceGmailSources(storedContinuation, reads, gmailSources, signal);
+    rehydrateFamilyWorkPublicResearch(storedContinuation, publicResearchUrls, publicResearchState);
     const modelInput: ResponseInput = [
       {
         role: "user",
@@ -10130,6 +10199,11 @@ export class FlorenceReasoner {
         ) {
           throw invalidOutput("A family-work progress checkpoint needs only useful progress text");
         }
+        const presentation = familyWorkPresentation(
+          terminal.presentation,
+          terminal.progressText,
+          publicResearchUrls,
+        );
         const deliverProgress =
           (checkpointInput.state.progressBlocked !== true || workAdvanced) &&
           !familyWorkProgressWasAlreadyReported(checkpointInput, terminal.progressText) &&
@@ -10164,6 +10238,7 @@ export class FlorenceReasoner {
           kind: "continue",
           state,
           progressText: deliverProgress ? terminal.progressText : null,
+          ...(deliverProgress ? { presentation } : {}),
           nextCheckDelayMs: 0,
         };
       }
@@ -10179,6 +10254,12 @@ export class FlorenceReasoner {
         const resumeAtMs = Date.parse(terminal.resumeAt);
         if (resumeAtMs <= Date.parse(checkpointInput.currentTime)) {
           throw invalidOutput("Deferred family work must resume at a future instant");
+        }
+        const presentation = terminal.progressText
+          ? familyWorkPresentation(terminal.presentation, terminal.progressText, publicResearchUrls)
+          : null;
+        if (terminal.progressText === null && terminal.presentation !== null) {
+          throw invalidOutput("Deferred family work cannot present a message without progress text");
         }
         const progressText =
           terminal.progressText &&
@@ -10218,6 +10299,7 @@ export class FlorenceReasoner {
           state,
           resumeAt: new Date(resumeAtMs).toISOString(),
           progressText,
+          ...(progressText && presentation ? { presentation } : {}),
         };
       }
       if (terminal.text === null || terminal.resumeAt !== null || terminal.progressText !== null) {
@@ -10227,6 +10309,7 @@ export class FlorenceReasoner {
         throw invalidOutput("Succeeded durable family work has no verified completion basis");
       }
       const terminalText = terminal.text;
+      const presentation = familyWorkPresentation(terminal.presentation, terminalText, publicResearchUrls);
       if (terminal.outcome === "waiting") {
         const state = await this.#compactFamilyWorkState(
           checkpointInput,
@@ -10252,6 +10335,7 @@ export class FlorenceReasoner {
           kind: "waiting",
           state,
           question: terminalText,
+          presentation,
         };
       }
       const terminalState: FamilyWorkStateV1 = {
@@ -10305,6 +10389,7 @@ export class FlorenceReasoner {
         docket: terminal.docket,
         selectedImages,
         selectedFiles,
+        presentation,
         completionMemory: terminal.completionMemory,
         completionEvidenceOutputs:
           terminal.outcome === "succeeded"
@@ -11682,14 +11767,35 @@ function accountPublicWebOutput(
   publicResearchUrls: Set<string>,
   publicResearchState: { used: boolean },
 ): void {
+  accountPublicWebItems(output, publicResearchUrls, publicResearchState);
+}
+
+function accountPublicWebItems(
+  items: readonly unknown[],
+  publicResearchUrls: Set<string>,
+  publicResearchState: { used: boolean },
+): void {
   let addedSource = false;
-  for (const item of output) {
-    if (item.type !== "web_search_call" || item.status !== "completed") continue;
+  for (const item of items) {
+    if (
+      !isJsonRecord(item) ||
+      item.type !== "web_search_call" ||
+      item.status !== "completed" ||
+      !isJsonRecord(item.action)
+    ) {
+      continue;
+    }
     const urls =
       item.action.type === "search"
-        ? (item.action.sources ?? []).map((source) => source.url)
+        ? Array.isArray(item.action.sources)
+          ? item.action.sources.flatMap((source) =>
+              isJsonRecord(source) && typeof source.url === "string" ? [source.url] : [],
+            )
+          : []
         : item.action.url
-          ? [item.action.url]
+          ? typeof item.action.url === "string"
+            ? [item.action.url]
+            : []
           : [];
     for (const url of urls) {
       publicResearchUrls.add(normalizeResearchUrl(url));
@@ -11697,6 +11803,48 @@ function accountPublicWebOutput(
     }
   }
   publicResearchState.used ||= addedSource;
+}
+
+function rehydrateFamilyWorkPublicResearch(
+  items: readonly unknown[],
+  publicResearchUrls: Set<string>,
+  publicResearchState: { used: boolean },
+): void {
+  accountPublicWebItems(items, publicResearchUrls, publicResearchState);
+  const publicPageRequests = new Map<string, string>();
+  for (const item of items) {
+    if (
+      !isJsonRecord(item) ||
+      item.type !== "function_call" ||
+      item.name !== "read_public_page" ||
+      typeof item.call_id !== "string" ||
+      typeof item.arguments !== "string"
+    ) {
+      continue;
+    }
+    try {
+      const args = JSON.parse(item.arguments) as unknown;
+      if (isJsonRecord(args) && typeof args.url === "string") {
+        publicPageRequests.set(item.call_id, normalizeResearchUrl(args.url));
+      }
+    } catch {
+      // The normal continuation parser reports malformed stored calls.
+    }
+  }
+  for (const item of items) {
+    if (!isJsonRecord(item) || item.type !== "function_call_output" || typeof item.call_id !== "string") {
+      continue;
+    }
+    const requestedUrl = publicPageRequests.get(item.call_id);
+    if (!requestedUrl) continue;
+    const envelope = familyWorkCapabilityEnvelope(item.output);
+    if (envelope?.outcome !== "succeeded" || !isJsonRecord(envelope.output)) continue;
+    const finalUrl = envelope.output.finalUrl;
+    if (typeof finalUrl !== "string") continue;
+    publicResearchUrls.add(requestedUrl);
+    publicResearchUrls.add(normalizeResearchUrl(finalUrl));
+    publicResearchState.used = true;
+  }
 }
 
 function validateSelectedResearchUrls(

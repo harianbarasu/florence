@@ -5757,6 +5757,7 @@ export class Florence {
             state: { ...step.state, browserSession },
             nextCheckAt: later(new Date(settledAt), step.nextCheckDelayMs),
             ...(step.progressText ? { progressText: step.progressText } : {}),
+            ...(step.presentation ? { presentation: step.presentation } : {}),
           },
         });
         if (settlement === "stale") {
@@ -5778,6 +5779,7 @@ export class Florence {
             state: { ...step.state, browserSession: null },
             nextCheckAt: resumeAt,
             ...(step.progressText ? { progressText: step.progressText } : {}),
+            ...(step.presentation ? { presentation: step.presentation } : {}),
           },
         });
         if (settlement === "settled" && deferredBrowserSession) {
@@ -5814,6 +5816,7 @@ export class Florence {
             type: "waiting",
             state: { ...step.state, browserSession },
             question: step.question,
+            ...(step.presentation ? { presentation: step.presentation } : {}),
           },
         });
         if (settlement === "stale") {
@@ -5875,6 +5878,7 @@ export class Florence {
                 : null,
             },
             terminalText: step.text,
+            ...(step.presentation ? { presentation: step.presentation } : {}),
             completionMemoryMutations,
             completionEvidenceOutputs: step.completionEvidenceOutputs,
           },

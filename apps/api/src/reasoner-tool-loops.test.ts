@@ -2958,7 +2958,7 @@ Compare the useful family options.
     });
   });
 
-  test("durable private work preserves a Gmail attachment reference across a draft checkpoint", async () => {
+  test("durable household work opens and preserves a Gmail attachment across a draft checkpoint", async () => {
     const gmail = conversationalGmailSource();
     const modelResponses = [
       {
@@ -2979,6 +2979,16 @@ Compare the useful family options.
             threadId: null,
             addLabelIds: [],
             removeLabelIds: [],
+          }),
+        ],
+      },
+      {
+        status: "completed",
+        output_parsed: null,
+        output: [
+          functionCall("open-school-form", "read_gmail_attachment", {
+            sourceId: gmail.sourceId,
+            attachmentRef: gmail.attachments[0]?.attachmentRef,
           }),
         ],
       },
@@ -3048,9 +3058,11 @@ Compare the useful family options.
         output: [],
       },
     ];
+    const modelRequests: Record<string, unknown>[] = [];
     const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
       responses: {
-        parse() {
+        parse(request: Record<string, unknown>) {
+          modelRequests.push(request);
           const response = modelResponses.shift();
           if (!response) throw new Error("Unexpected Gmail draft model turn");
           return response;
@@ -3061,8 +3073,8 @@ Compare the useful family options.
       workId: "family-work-forward-school-form",
       scheduledOccurrence: null,
       objective: "Forward the school email and its form attachment to Jackson.",
-      visibility: "private" as const,
-      ownerAdultId: "adult-hari",
+      visibility: "household" as const,
+      ownerAdultId: null,
       initiatingAdultId: "adult-hari",
       origin: familyWorkOrigin("Forward the school email and its form attachment to Jackson.", "adult-hari"),
       household: {
@@ -3078,9 +3090,9 @@ Compare the useful family options.
       },
       googleConnections: [
         {
-          emailLabel: "Personal Google",
+          emailLabel: "Family Calendar",
           calendarAvailable: true,
-          kind: "personal" as const,
+          kind: "family" as const,
           writesEnabled: true,
         },
       ],
@@ -3163,11 +3175,23 @@ Compare the useful family options.
       throw new Error(`Unexpected Google operation ${operation.operation}`);
     };
     const workspaceReads: Array<{ messageId: string; threadId: string; historyId: string }> = [];
+    const openedAttachmentRefs: string[] = [];
     const reads = {
       runGoogleWorkspace,
       async readWorkspaceGmailSource(identity: { messageId: string; threadId: string; historyId: string }) {
         workspaceReads.push(identity);
         return gmail;
+      },
+      async readGmailAttachment(input: { sourceId: string; attachment: (typeof gmail.attachments)[number] }) {
+        expect(input).toEqual({ sourceId: gmail.sourceId, attachment: gmail.attachments[0] });
+        openedAttachmentRefs.push(input.attachment.attachmentRef);
+        return {
+          sourceId: input.sourceId,
+          attachmentRef: input.attachment.attachmentRef,
+          filename: input.attachment.filename,
+          mimeType: input.attachment.mimeType,
+          bytes: new Uint8Array(Buffer.from("%PDF-")),
+        };
       },
       async resolveWorkspaceGmailAttachment(input: { sourceId: string; attachmentRef: string }) {
         expect(input).toEqual({
@@ -3188,6 +3212,9 @@ Compare the useful family options.
     });
     if (draftPlanned.kind !== "continue") throw new Error("Gmail forward draft was not planned");
     expect(operations.map((operation) => operation.operation)).toEqual(["gmail_get"]);
+    expect(openedAttachmentRefs).toEqual([gmail.attachments[0]?.attachmentRef]);
+    expect(JSON.stringify(modelRequests)).toContain('"type":"input_file"');
+    expect(JSON.stringify(modelRequests)).toContain('"filename":"form.pdf"');
     expect(JSON.stringify(draftPlanned.state.continuationItems)).toContain("draftAttachmentAccess");
     expect(JSON.stringify(draftPlanned.state.continuationItems)).toContain("gmail-docx-1");
 

@@ -162,6 +162,10 @@ const GOOGLE_WORKSPACE_ACTION_SCOPES = [
   "https://www.googleapis.com/auth/tasks",
   "https://www.googleapis.com/auth/contacts",
 ] as const;
+const GOOGLE_GMAIL_READ_SCOPES = [
+  "https://www.googleapis.com/auth/gmail.modify",
+  "https://www.googleapis.com/auth/gmail.readonly",
+] as const;
 const GOOGLE_CALENDAR_READ_SCOPES = [
   "https://www.googleapis.com/auth/calendar.events.readonly",
   "https://www.googleapis.com/auth/calendar.calendarlist",
@@ -3776,6 +3780,11 @@ export class Florence {
           connection.status === "active" &&
           GOOGLE_WORKSPACE_ACTION_SCOPES.every((scope) => connection.grantedScopes.includes(scope)),
       );
+      const familyWorkGmailConnection = familyWorkGoogleConnections.find(
+        (connection) =>
+          connection.status === "active" &&
+          GOOGLE_GMAIL_READ_SCOPES.some((scope) => connection.grantedScopes.includes(scope)),
+      );
       const familyWorkGoogleModelConnections =
         work.visibility === "household"
           ? familyWorkFamilyCalendarCredentials.length > 0 && familyWorkHousehold.familyCalendarId
@@ -4642,20 +4651,20 @@ export class Florence {
                   }),
               }
             : {}),
-          ...(google && familyWorkCalendarConnection && familyWorkExecutionAdultId
+          ...(google && familyWorkGmailConnection && familyWorkExecutionAdultId
             ? {
                 searchGmail: async ({ query, after, before, limit }) => {
                   const evidence = await google.searchGmail({
                     householdId: work.household.householdId,
                     ownerAdultId: familyWorkExecutionAdultId,
-                    connectionId: familyWorkCalendarConnection.connectionId,
+                    connectionId: familyWorkGmailConnection.connectionId,
                     query,
                     ...(after === null ? {} : { after }),
                     ...(before === null ? {} : { before }),
                     limit,
                   });
                   const sources = evidence.messages.map((message) =>
-                    indexFamilyWorkGmailMessage(message, familyWorkCalendarConnection.connectionId),
+                    indexFamilyWorkGmailMessage(message, familyWorkGmailConnection.connectionId),
                   );
                   return { status: evidence.status, sources };
                 },
@@ -4685,22 +4694,26 @@ export class Florence {
                     bytes: read.bytes,
                   };
                 },
-                resolveWorkspaceGmailAttachment: async ({
-                  sourceId,
-                  attachmentRef,
-                }: {
-                  sourceId: string;
-                  attachmentRef: string;
-                }) => {
-                  const indexed = familyWorkGmailAttachmentIndex.get(`${sourceId}\0${attachmentRef}`);
-                  if (!indexed || indexed.connectionId !== familyWorkWorkspaceConnection?.connectionId) {
-                    throw new Error("The Gmail attachment is not in the active Workspace account");
-                  }
-                  return {
-                    messageId: indexed.attachment.messageId,
-                    attachmentId: indexed.attachment.attachmentId,
-                  };
-                },
+                ...(familyWorkWorkspaceConnection
+                  ? {
+                      resolveWorkspaceGmailAttachment: async ({
+                        sourceId,
+                        attachmentRef,
+                      }: {
+                        sourceId: string;
+                        attachmentRef: string;
+                      }) => {
+                        const indexed = familyWorkGmailAttachmentIndex.get(`${sourceId}\0${attachmentRef}`);
+                        if (!indexed || indexed.connectionId !== familyWorkWorkspaceConnection.connectionId) {
+                          throw new Error("The Gmail attachment is not in the active Workspace account");
+                        }
+                        return {
+                          messageId: indexed.attachment.messageId,
+                          attachmentId: indexed.attachment.attachmentId,
+                        };
+                      },
+                    }
+                  : {}),
               }
             : {}),
           ...(publicPages
@@ -4942,10 +4955,7 @@ export class Florence {
               now: this.#now(),
             });
           },
-          ...(google &&
-          familyWorkGoogleAdultId &&
-          familyWorkWorkspaceConnection &&
-          work.visibility === "private"
+          ...(google && familyWorkGoogleAdultId && familyWorkWorkspaceConnection
             ? {
                 runGoogleWorkspace: (operation: GoogleWorkspaceOperation, taskSignal?: AbortSignal) =>
                   google.runWorkspace(

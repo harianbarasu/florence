@@ -4509,7 +4509,7 @@ async function gmailDraftAttachments(
           !source?.attachments.some((candidate) => candidate.attachmentRef === attachment.attachmentRef) ||
           !context.reads.resolveWorkspaceGmailAttachment
         ) {
-          throw unsafeRead("The Gmail attachment is no longer available to this private task");
+          throw unsafeRead("The Gmail attachment is no longer available to this task");
         }
         return {
           source: "gmail",
@@ -4828,7 +4828,7 @@ async function executeGoogleWorkspaceOperation(
     }
     if (
       operation.operation !== "gmail_get" ||
-      context.input.audience !== "private" ||
+      (context.input.audience !== "private" && context.mode !== "family_work") ||
       !context.reads.readWorkspaceGmailSource
     ) {
       return { output: result };
@@ -5878,7 +5878,7 @@ function foregroundCapabilityRegistry(): CapabilityRegistry<ForegroundCapability
     defineCapability({
       name: "gmail_draft_work",
       description:
-        "Create, inspect, or send an exact Gmail provider draft through the Google account of the parent who started this private durable task. Drafts can be new messages, replies, or forwards. For a PDF/image, pass the sourceId/attachmentRef pair returned by gmail_work; for any returned Gmail file type, pass the messageId/attachmentId pair from draftAttachmentAccess. Drive attachments use fileId from drive_work. A forward can preserve every source attachment. Creation returns draftId and messageHeaderId; pass both unchanged to send so retries reconcile against the exact Drafts/Sent item. Set unused fields to null, false, or empty arrays.",
+        "Create, inspect, or send an exact Gmail provider draft through the Google account of the parent who started this durable task. Drafts can be new messages, replies, or forwards. For a PDF/image, pass the sourceId/attachmentRef pair returned by gmail_work; for any returned Gmail file type, pass the messageId/attachmentId pair from draftAttachmentAccess. Drive attachments use fileId from drive_work. A forward can preserve every source attachment. Creation returns draftId and messageHeaderId; pass both unchanged to send so retries reconcile against the exact Drafts/Sent item. Set unused fields to null, false, or empty arrays.",
       modelSchema: GMAIL_DRAFT_WORK_PARAMETERS,
       inputSchema: gmailDraftWorkArguments,
       outputSchema: googleWorkspaceResultSchema,
@@ -6079,12 +6079,15 @@ function foregroundCapabilityRegistry(): CapabilityRegistry<ForegroundCapability
       timeoutMs: 30_000,
       maxOutputBytes: 4_096,
       availability: (context) =>
-        context.input.audience === "private" &&
-        context.input.googleConnections.some((connection) => connection.kind === "personal") &&
-        context.reads.readGmailAttachment !== undefined,
+        context.reads.readGmailAttachment !== undefined &&
+        (context.mode === "family_work" ||
+          (context.input.audience === "private" &&
+            context.input.googleConnections.some((connection) => connection.kind === "personal"))),
       admit: ({ context, canonicalArguments }) =>
-        context.input.audience === "private" &&
         context.input.currentMessage.moveKind !== "reaction" &&
+        (context.mode === "family_work" ||
+          (context.input.audience === "private" &&
+            context.input.googleConnections.some((connection) => connection.kind === "personal"))) &&
         isJsonRecord(canonicalArguments) &&
         typeof canonicalArguments.sourceId === "string" &&
         typeof canonicalArguments.attachmentRef === "string" &&
@@ -6100,7 +6103,7 @@ function foregroundCapabilityRegistry(): CapabilityRegistry<ForegroundCapability
             (attachment) => attachment.attachmentRef === args.attachmentRef,
           );
           if (!source || !reference || !context.reads.readGmailAttachment) {
-            throw unsafeRead("The Gmail attachment is unavailable in this private turn");
+            throw unsafeRead("The Gmail attachment is unavailable in this task");
           }
           const verified = await readVerifiedForegroundGmailAttachment(
             source,
@@ -8549,7 +8552,11 @@ function prepareCalendarReadSettlement(
 }
 
 function accountSources(sources: readonly FlorenceSource[], context: ForegroundCapabilityContext): void {
-  if (context.input.audience === "group" && sources.some((source) => source.visibility !== "shared")) {
+  if (
+    context.mode !== "family_work" &&
+    context.input.audience === "group" &&
+    sources.some((source) => source.visibility !== "shared")
+  ) {
     throw unsafeRead("A private source cannot enter a group turn");
   }
   for (const source of sources) {

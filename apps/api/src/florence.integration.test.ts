@@ -3390,6 +3390,7 @@ release("Florence parent journeys", () => {
               phase: "terminal",
               claim: null,
               pendingCall: null,
+              progressRevision: input.state.progressRevision + 1,
               terminal: { outcome: "succeeded", text: terminalText },
             },
             outcome: "succeeded",
@@ -3440,7 +3441,7 @@ release("Florence parent journeys", () => {
           where terminal.direction='outbound' and terminal.status='sent'
             and terminal.text=${sqlLiteral(terminalText)}
             and channel.audience='group'
-            and source.visibility='shared' and source.owner_adult_id is null)`,
+            and source.visibility='household' and source.owner_adult_id is null)`,
     );
   }, 20_000);
 

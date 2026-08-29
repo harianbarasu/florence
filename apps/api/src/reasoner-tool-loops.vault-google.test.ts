@@ -126,26 +126,34 @@ describe("Florence reasoner capability cutover", () => {
     expect(workStarts).toBe(1);
   });
 
-  test("a foreground Workspace Gmail get can open its app-scoped verified attachment", async () => {
+  test("a foreground Workspace Gmail thread read preserves every source and opens its verified attachment", async () => {
     const gmail = conversationalGmailSource();
+    const earlierGmail = {
+      ...gmail,
+      sourceId: "gmail-private-0",
+      sentAt: "2026-08-27T18:00:00.000Z",
+      subject: "Earlier school question",
+      text: "Can your child attend?",
+      attachments: [],
+    };
     const requests: Record<string, unknown>[] = [];
     const responses = [
       {
         status: "completed",
         output_parsed: null,
         output: [
-          functionCall("gmail-get", "gmail_work", {
-            operation: "gmail_get",
+          functionCall("gmail-thread-get", "gmail_work", {
+            operation: "gmail_thread_get",
             query: null,
             limit: null,
-            messageId: "gmail-message-1",
+            messageId: null,
             to: [],
             cc: [],
             bcc: [],
             subject: null,
             body: null,
             bodyFormat: null,
-            threadId: null,
+            threadId: "gmail-thread-1",
             addLabelIds: [],
             removeLabelIds: [],
           }),
@@ -178,29 +186,44 @@ describe("Florence reasoner capability cutover", () => {
       },
     } as never);
     let attachmentInput: { sourceId: string; attachmentRef: string } | null = null;
-    let workspaceIdentity: { messageId: string; threadId: string; historyId: string } | null = null;
+    const workspaceIdentities: Array<{ messageId: string; threadId: string; historyId: string }> = [];
 
     await reasoner.decide(foregroundInput(), {
       ...inertReads(),
       async runGoogleWorkspace(operation) {
-        expect(operation).toEqual({ operation: "gmail_get", messageId: "gmail-message-1" });
+        expect(operation).toEqual({ operation: "gmail_thread_get", threadId: "gmail-thread-1" });
         return {
-          operation: "gmail_get",
+          operation: "gmail_thread_get",
           result: {
-            message: {
-              messageId: "gmail-message-1",
+            thread: {
               threadId: "gmail-thread-1",
-              historyId: "gmail-history-1",
-              from: "School",
-              subject: "School form",
-              body: "Please review the attached form.",
-              attachments: [
+              historyId: "gmail-history-thread",
+              messages: [
                 {
-                  attachmentId: "provider-attachment-1",
-                  partId: "1",
-                  filename: "form.pdf",
-                  mimeType: "application/pdf",
-                  sizeBytes: 5,
+                  messageId: "gmail-message-0",
+                  threadId: "gmail-thread-1",
+                  historyId: "gmail-history-0",
+                  from: "School",
+                  subject: "Earlier school question",
+                  body: "Can your child attend?",
+                  attachments: [],
+                },
+                {
+                  messageId: "gmail-message-1",
+                  threadId: "gmail-thread-1",
+                  historyId: "gmail-history-1",
+                  from: "School",
+                  subject: "School form",
+                  body: "Please review the attached form.",
+                  attachments: [
+                    {
+                      attachmentId: "provider-attachment-1",
+                      partId: "1",
+                      filename: "form.pdf",
+                      mimeType: "application/pdf",
+                      sizeBytes: 5,
+                    },
+                  ],
                 },
               ],
             },
@@ -208,8 +231,8 @@ describe("Florence reasoner capability cutover", () => {
         };
       },
       async readWorkspaceGmailSource(identity) {
-        workspaceIdentity = identity;
-        return gmail;
+        workspaceIdentities.push(identity);
+        return identity.messageId === "gmail-message-0" ? earlierGmail : gmail;
       },
       async readGmailAttachment(input) {
         attachmentInput = {
@@ -236,28 +259,46 @@ describe("Florence reasoner capability cutover", () => {
     expect(
       (requests[0]?.tools as Array<{ name?: string }> | undefined)?.map((tool) => tool.name),
     ).not.toContain("search_gmail");
-    expect(workspaceIdentity).toEqual({
-      messageId: "gmail-message-1",
-      threadId: "gmail-thread-1",
-      historyId: "gmail-history-1",
-    });
+    expect(workspaceIdentities).toEqual([
+      {
+        messageId: "gmail-message-0",
+        threadId: "gmail-thread-1",
+        historyId: "gmail-history-0",
+      },
+      {
+        messageId: "gmail-message-1",
+        threadId: "gmail-thread-1",
+        historyId: "gmail-history-1",
+      },
+    ]);
     const getEnvelope = functionOutputEnvelopes(requests[1]).find(
-      (envelope) => envelope.callId === "gmail-get",
+      (envelope) => envelope.callId === "gmail-thread-get",
     );
     expect(getEnvelope?.output).toMatchObject({
-      operation: "gmail_get",
+      operation: "gmail_thread_get",
       result: {
-        message: {
-          sourceId: gmail.sourceId,
-          body: gmail.text,
-          bodyFormat: "plain",
-          textStatus: "complete",
-          attachments: gmail.attachments,
-        },
-        attachmentAccess: {
-          sourceId: gmail.sourceId,
-          attachments: gmail.attachments,
-          attachmentsStatus: "complete",
+        thread: {
+          messages: [
+            {
+              sourceId: earlierGmail.sourceId,
+              body: earlierGmail.text,
+              attachmentAccess: {
+                sourceId: earlierGmail.sourceId,
+              },
+            },
+            {
+              sourceId: gmail.sourceId,
+              body: gmail.text,
+              bodyFormat: "plain",
+              textStatus: "complete",
+              attachments: gmail.attachments,
+              attachmentAccess: {
+                sourceId: gmail.sourceId,
+                attachments: gmail.attachments,
+                attachmentsStatus: "complete",
+              },
+            },
+          ],
         },
       },
     });

@@ -3651,6 +3651,7 @@ const attachmentCapabilityOutputSchema = z
 const googleWorkspaceOperationNames = [
   "gmail_search",
   "gmail_get",
+  "gmail_thread_get",
   "gmail_send",
   "gmail_reply",
   "gmail_draft_create",
@@ -3725,6 +3726,7 @@ const gmailWorkArguments = z
     operation: z.enum([
       "gmail_search",
       "gmail_get",
+      "gmail_thread_get",
       "gmail_send",
       "gmail_reply",
       "gmail_labels",
@@ -3752,6 +3754,9 @@ const gmailWorkArguments = z
     if (["gmail_get", "gmail_reply", "gmail_modify"].includes(args.operation)) {
       requireWorkspaceArgument(args.messageId, "messageId", args.operation, context);
     }
+    if (args.operation === "gmail_thread_get") {
+      requireWorkspaceArgument(args.threadId, "threadId", args.operation, context);
+    }
     if (args.operation === "gmail_send") {
       if (args.to.length === 0) {
         context.addIssue({ code: "custom", path: ["to"], message: "to is required for gmail_send" });
@@ -3772,7 +3777,15 @@ const GMAIL_WORK_PARAMETERS = {
   properties: {
     operation: {
       type: "string",
-      enum: ["gmail_search", "gmail_get", "gmail_send", "gmail_reply", "gmail_labels", "gmail_modify"],
+      enum: [
+        "gmail_search",
+        "gmail_get",
+        "gmail_thread_get",
+        "gmail_send",
+        "gmail_reply",
+        "gmail_labels",
+        "gmail_modify",
+      ],
     },
     query: { anyOf: [{ type: "string", minLength: 1, maxLength: 50_000 }, { type: "null" }] },
     limit: { anyOf: [{ type: "integer", minimum: 1, maximum: 100 }, { type: "null" }] },
@@ -5168,6 +5181,8 @@ function gmailWorkspaceOperation(
       };
     case "gmail_get":
       return { operation: args.operation, messageId: requiredWorkspaceValue(args.messageId, "messageId") };
+    case "gmail_thread_get":
+      return { operation: args.operation, threadId: requiredWorkspaceValue(args.threadId, "threadId") };
     case "gmail_labels":
       return { operation: args.operation };
     case "gmail_send": {
@@ -5550,69 +5565,129 @@ async function executeGoogleWorkspaceOperation(
       );
     }
     if (
-      operation.operation !== "gmail_get" ||
+      (operation.operation !== "gmail_get" && operation.operation !== "gmail_thread_get") ||
       (context.input.audience !== "private" && context.mode !== "family_work") ||
       !context.reads.readWorkspaceGmailSource
     ) {
       return { output: result };
     }
-    if (!callId) throw unsafeRead("Gmail message reading lost its settled tool identity");
-    const identity = workspaceGmailMessageIdentity(result, operation.messageId);
-    const source = florenceConversationalGmailSourceSchema.parse(
-      await context.reads.readWorkspaceGmailSource(identity),
-    );
-    throwIfAborted(signal);
-    const message = result.result.message;
-    if (!isJsonRecord(message)) {
-      throw new CapabilityAdapterError("invalid_response", "Google Workspace returned no Gmail message.");
-    }
-    const draftAttachmentAccess = workspaceGmailDraftAttachmentAccess(message, identity.messageId);
-    const output = googleWorkspaceResultSchema.parse({
-      ...result,
-      result: {
-        ...result.result,
-        message: {
-          ...message,
-          sourceId: source.sourceId,
-          from: source.sender,
-          subject: source.subject,
-          body: source.text,
-          bodyFormat: source.textStatus === "unavailable" ? "unknown" : "plain",
-          textStatus: source.textStatus,
-          attachments: source.attachments,
-        },
+    if (!callId) throw unsafeRead("Gmail reading lost its settled tool identity");
+    const messages = workspaceGmailMessages(result, operation);
+    const settledMessages = [];
+    const sources: FlorenceConversationalGmailSource[] = [];
+    for (const { message, identity } of messages) {
+      const source = florenceConversationalGmailSourceSchema.parse(
+        await context.reads.readWorkspaceGmailSource(identity),
+      );
+      throwIfAborted(signal);
+      sources.push(source);
+      settledMessages.push({
+        ...message,
+        sourceId: source.sourceId,
+        from: source.sender,
+        subject: source.subject,
+        body: source.text,
+        bodyFormat: source.textStatus === "unavailable" ? "unknown" : "plain",
+        textStatus: source.textStatus,
+        attachments: source.attachments,
         attachmentAccess: {
           sourceId: source.sourceId,
           attachments: source.attachments,
           attachmentsStatus: source.attachmentsStatus,
         },
-        ...(context.mode === "family_work" ? { draftAttachmentAccess } : {}),
-      },
+        ...(context.mode === "family_work"
+          ? { draftAttachmentAccess: workspaceGmailDraftAttachmentAccess(message, identity.messageId) }
+          : {}),
+      });
+    }
+    const first = settledMessages[0];
+    if (!first) {
+      throw new CapabilityAdapterError("invalid_response", "Google Workspace returned no Gmail messages.");
+    }
+    const output = googleWorkspaceResultSchema.parse({
+      ...result,
+      result:
+        operation.operation === "gmail_get"
+          ? {
+              ...result.result,
+              message: first,
+              attachmentAccess: first.attachmentAccess,
+              ...(context.mode === "family_work"
+                ? { draftAttachmentAccess: first.draftAttachmentAccess }
+                : {}),
+            }
+          : {
+              ...result.result,
+              thread: {
+                ...(isJsonRecord(result.result.thread) ? result.result.thread : {}),
+                messages: settledMessages,
+              },
+            },
     });
     context.settlements.set(callId, () => {
-      context.gmailSources.set(source.sourceId, source);
-      accountSources([conversationalGmailAsSource(source)], context);
+      for (const source of sources) context.gmailSources.set(source.sourceId, source);
+      accountSources(sources.map(conversationalGmailAsSource), context);
     });
     return { output };
   }, signal);
 }
 
-function workspaceGmailMessageIdentity(
+function workspaceGmailMessages(
   result: z.infer<typeof googleWorkspaceResultSchema>,
-  expectedMessageId: string,
-): { messageId: string; threadId: string; historyId: string } {
-  const message = result.result.message;
-  if (!isJsonRecord(message)) {
-    throw new CapabilityAdapterError("invalid_response", "Google Workspace returned no Gmail message.");
+  operation: Extract<GoogleWorkspaceOperation, { operation: "gmail_get" | "gmail_thread_get" }>,
+): readonly Readonly<{
+  message: Record<string, unknown>;
+  identity: { messageId: string; threadId: string; historyId: string };
+}>[] {
+  if (operation.operation === "gmail_get") {
+    const message = result.result.message;
+    if (!isJsonRecord(message)) {
+      throw new CapabilityAdapterError("invalid_response", "Google Workspace returned no Gmail message.");
+    }
+    return [{ message, identity: workspaceGmailMessageIdentity(message, operation.messageId, null) }];
   }
+  const thread = result.result.thread;
+  if (!isJsonRecord(thread) || thread.threadId !== operation.threadId || !Array.isArray(thread.messages)) {
+    throw new CapabilityAdapterError(
+      "invalid_response",
+      "Google Workspace returned a different Gmail thread.",
+    );
+  }
+  const seen = new Set<string>();
+  return thread.messages.map((message) => {
+    if (!isJsonRecord(message)) {
+      throw new CapabilityAdapterError(
+        "invalid_response",
+        "Google Workspace returned an invalid Gmail thread.",
+      );
+    }
+    const identity = workspaceGmailMessageIdentity(message, null, operation.threadId);
+    if (seen.has(identity.messageId)) {
+      throw new CapabilityAdapterError(
+        "invalid_response",
+        "Google Workspace repeated a Gmail thread message.",
+      );
+    }
+    seen.add(identity.messageId);
+    return { message, identity };
+  });
+}
+
+function workspaceGmailMessageIdentity(
+  message: Record<string, unknown>,
+  expectedMessageId: string | null,
+  expectedThreadId: string | null,
+): { messageId: string; threadId: string; historyId: string } {
   const messageId = message.messageId;
   const threadId = message.threadId;
   const historyId = message.historyId;
   if (
     typeof messageId !== "string" ||
-    messageId !== expectedMessageId ||
+    !messageId ||
+    (expectedMessageId !== null && messageId !== expectedMessageId) ||
     typeof threadId !== "string" ||
     !threadId ||
+    (expectedThreadId !== null && threadId !== expectedThreadId) ||
     typeof historyId !== "string" ||
     !historyId
   ) {
@@ -6777,7 +6852,7 @@ function foregroundCapabilityRegistry(): CapabilityRegistry<ForegroundCapability
     defineCapability({
       name: "gmail_work",
       description:
-        "Work with the Google account of the parent who started the request. A private chat or durable task may search, get an exact message body with textStatus and app-scoped attachmentAccess references, or list labels. Open a relevant supported PDF/image with read_gmail_attachment using attachmentAccess.sourceId and attachmentRef. In durable work, draftAttachmentAccess separately returns every attachment that gmail_draft_work can reuse, including other file types. Durable work may also send or reply with a plain/HTML body, or change labels, when that advances the objective. Use gmail_draft_work for forwards, provider drafts, or outgoing attachments. Set fields unused by the chosen operation to null or empty arrays.",
+        "Work with the Google account of the parent who started the request. A private chat or durable task may search, get one exact message, read every message in one exact thread, or list labels. Exact reads include textStatus and app-scoped attachmentAccess references; open a relevant supported PDF/image with read_gmail_attachment using its sourceId and attachmentRef. In durable work, draftAttachmentAccess separately returns every attachment that gmail_draft_work can reuse, including other file types. Durable work may also send or reply with a plain/HTML body, or change labels, when that advances the objective. Use gmail_draft_work for forwards, provider drafts, or outgoing attachments. Set fields unused by the chosen operation to null or empty arrays.",
       modelSchema: GMAIL_WORK_PARAMETERS,
       inputSchema: gmailWorkArguments,
       outputSchema: googleWorkspaceResultSchema,
@@ -6790,8 +6865,8 @@ function foregroundCapabilityRegistry(): CapabilityRegistry<ForegroundCapability
         workspaceReadPresentation(
           context,
           baseModelSchema,
-          ["gmail_search", "gmail_get", "gmail_labels"],
-          "Search the current parent's Gmail, get one exact message with textStatus and app-scoped attachmentAccess references, or list labels. Open a relevant supported attachment with read_gmail_attachment using attachmentAccess.sourceId and attachmentRef. Set fields unused by the chosen operation to null or empty arrays.",
+          ["gmail_search", "gmail_get", "gmail_thread_get", "gmail_labels"],
+          "Search the current parent's Gmail, get one exact message, read every message in one exact thread, or list labels. Exact reads include textStatus and per-message app-scoped attachmentAccess references. Open a relevant supported attachment with read_gmail_attachment using its sourceId and attachmentRef. Set fields unused by the chosen operation to null or empty arrays.",
         ),
       admit: ({ context, canonicalArguments }) => workspaceCapabilityAdmitted(context, canonicalArguments),
       execute: ({ callId, arguments: args, context, signal }) =>
@@ -7641,37 +7716,51 @@ async function rehydrateWorkspaceGmailSources(
         continue;
       }
       const workspace = parsed.output;
-      if (workspace.operation !== "gmail_get" || !isJsonRecord(workspace.result)) continue;
-      const message = workspace.result.message;
-      const access = workspace.result.attachmentAccess;
-      if (!isJsonRecord(message) || !isJsonRecord(access)) continue;
-      const sourceId = message.sourceId;
-      const messageId = message.messageId;
-      const threadId = message.threadId;
-      const historyId = message.historyId;
-      if (
-        typeof sourceId !== "string" ||
-        sourceId !== access.sourceId ||
-        typeof messageId !== "string" ||
-        typeof threadId !== "string" ||
-        typeof historyId !== "string"
-      ) {
-        continue;
-      }
-      const identityKey = `${sourceId}\0${messageId}\0${threadId}\0${historyId}`;
-      if (seen.has(identityKey)) continue;
-      seen.add(identityKey);
-      throwIfAborted(signal);
-      try {
-        const source = florenceConversationalGmailSourceSchema.parse(
-          await reads.readWorkspaceGmailSource({ messageId, threadId, historyId }),
-        );
+      if (!isJsonRecord(workspace.result)) continue;
+      const candidates: readonly unknown[] =
+        workspace.operation === "gmail_get"
+          ? [workspace.result.message]
+          : workspace.operation === "gmail_thread_get" &&
+              isJsonRecord(workspace.result.thread) &&
+              Array.isArray(workspace.result.thread.messages)
+            ? workspace.result.thread.messages
+            : [];
+      for (const message of candidates) {
+        if (!isJsonRecord(message)) continue;
+        const attachmentAccess = isJsonRecord(message.attachmentAccess)
+          ? message.attachmentAccess
+          : workspace.operation === "gmail_get" && isJsonRecord(workspace.result.attachmentAccess)
+            ? workspace.result.attachmentAccess
+            : null;
+        if (!attachmentAccess) continue;
+        const sourceId = message.sourceId;
+        const messageId = message.messageId;
+        const threadId = message.threadId;
+        const historyId = message.historyId;
+        if (
+          typeof sourceId !== "string" ||
+          sourceId !== attachmentAccess.sourceId ||
+          typeof messageId !== "string" ||
+          typeof threadId !== "string" ||
+          typeof historyId !== "string"
+        ) {
+          continue;
+        }
+        const identityKey = `${sourceId}\0${messageId}\0${threadId}\0${historyId}`;
+        if (seen.has(identityKey)) continue;
+        seen.add(identityKey);
         throwIfAborted(signal);
-        if (source.sourceId === sourceId) sources.set(sourceId, source);
-      } catch (error) {
-        if (error instanceof APIUserAbortError || isAbortError(error)) throw error;
-        // A changed or unavailable message leaves the old reference unusable. The model can fetch
-        // the exact message again and receive a fresh source rather than acting on stale bytes.
+        try {
+          const source = florenceConversationalGmailSourceSchema.parse(
+            await reads.readWorkspaceGmailSource({ messageId, threadId, historyId }),
+          );
+          throwIfAborted(signal);
+          if (source.sourceId === sourceId) sources.set(sourceId, source);
+        } catch (error) {
+          if (error instanceof APIUserAbortError || isAbortError(error)) throw error;
+          // A changed or unavailable message leaves the old reference unusable. The model can fetch
+          // the exact message again and receive a fresh source rather than acting on stale bytes.
+        }
       }
     }
   }

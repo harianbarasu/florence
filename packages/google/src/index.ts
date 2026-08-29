@@ -6,6 +6,9 @@ import {
 } from "./workspace.js";
 
 export type {
+  GoogleWorkspaceGmailAttachment,
+  GoogleWorkspaceGmailMessage,
+  GoogleWorkspaceGmailThread,
   GoogleWorkspaceJsonValue,
   GoogleWorkspaceMailAttachment,
   GoogleWorkspaceOperation,

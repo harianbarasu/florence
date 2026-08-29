@@ -11,6 +11,10 @@ import { createHash } from "node:crypto";
  * multipart/attachment composition, and provider readback follow the same pinned
  * source's Himalaya composition and inbox-triage practices. Florence keeps those
  * useful contracts while adding bounded pagination and replay reconciliation.
+ * Exact Gmail thread reads adapt Merit Systems' OpenInstinct implementation at
+ * commit 480045dbc63008e7f99313d1683858cd8657b35a: use threads.get with the full
+ * format and project each message. Florence deliberately preserves every
+ * provider-returned message rather than inheriting its fixed twenty-message slice.
  */
 
 const GMAIL_API = "https://gmail.googleapis.com/gmail/v1/users/me";
@@ -47,8 +51,42 @@ export type GoogleWorkspaceMailAttachment =
       fileId: string;
     }>;
 
+export type GoogleWorkspaceGmailAttachment = Readonly<{
+  attachmentId: string;
+  partId: string;
+  filename: string;
+  mimeType: string;
+  sizeBytes: number;
+}>;
+
+export type GoogleWorkspaceGmailMessage = Readonly<{
+  messageId: string;
+  threadId: string;
+  historyId: string | null;
+  from: string;
+  to: string;
+  cc: string;
+  bcc: string;
+  replyTo: string;
+  subject: string;
+  date: string;
+  messageHeaderId: string;
+  labelIds: readonly string[];
+  snippet: string;
+  body: string;
+  bodyFormat: "plain" | "html" | "unknown";
+  attachments: readonly GoogleWorkspaceGmailAttachment[];
+}>;
+
+export type GoogleWorkspaceGmailThread = Readonly<{
+  threadId: string;
+  historyId: string | null;
+  messages: readonly GoogleWorkspaceGmailMessage[];
+}>;
+
 export type GoogleWorkspaceOperation =
   | Readonly<{ operation: "gmail_get"; messageId: string }>
+  | Readonly<{ operation: "gmail_thread_get"; threadId: string }>
   | Readonly<{ operation: "gmail_search"; query: string; limit: number }>
   | Readonly<{
       operation: "gmail_send";
@@ -269,6 +307,8 @@ export async function executeGoogleWorkspaceOperation(input: {
   switch (operation.operation) {
     case "gmail_get":
       return envelope(operation.operation, await gmailGet(context, operation.messageId));
+    case "gmail_thread_get":
+      return envelope(operation.operation, await gmailThreadGet(context, operation.threadId));
     case "gmail_search":
       return envelope(operation.operation, await gmailSearch(context, operation.query, operation.limit));
     case "gmail_send":
@@ -355,6 +395,25 @@ async function gmailGet(
     `${GMAIL_API}/messages/${encodeURIComponent(messageId)}?format=full`,
   );
   return { message: normalizeGmailMessage(message) };
+}
+
+async function gmailThreadGet(
+  context: ExecutionContext,
+  threadIdInput: string,
+): Promise<{ readonly thread: GoogleWorkspaceGmailThread }> {
+  const threadId = identifier(threadIdInput, "Gmail thread ID");
+  const thread = await googleJson(
+    context,
+    "Gmail",
+    `${GMAIL_API}/threads/${encodeURIComponent(threadId)}?format=full`,
+  );
+  return {
+    thread: {
+      threadId: optionalString(thread.id) ?? threadId,
+      historyId: optionalString(thread.historyId),
+      messages: recordArray(thread.messages, "Gmail thread messages").map(normalizeGmailMessage),
+    },
+  };
 }
 
 async function gmailSearch(
@@ -1076,7 +1135,7 @@ function sentResult(
   };
 }
 
-function normalizeGmailMessage(message: JsonRecord): { readonly [key: string]: GoogleWorkspaceJsonValue } {
+function normalizeGmailMessage(message: JsonRecord): GoogleWorkspaceGmailMessage {
   const payload = recordField(message, "payload");
   const headers = gmailHeaders(payload);
   const extracted = extractGmailBody(payload);

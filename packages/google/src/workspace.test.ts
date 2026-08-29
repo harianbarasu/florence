@@ -230,6 +230,89 @@ describe("Gmail draft provider journey", () => {
 });
 
 describe("Gmail inbound attachment reads", () => {
+  test("reads every message and source identity in an exact thread", async () => {
+    const threadId = "thread-school-planning";
+    const messages = Array.from({ length: 25 }, (_, index) => ({
+      id: `message-${index}`,
+      threadId,
+      historyId: `message-history-${index}`,
+      labelIds: index === 24 ? ["INBOX", "STARRED"] : ["INBOX"],
+      snippet: `Planning update ${index}`,
+      payload: {
+        mimeType: "text/plain",
+        headers: [
+          { name: "From", value: `Family member ${index} <person-${index}@example.com>` },
+          { name: "To", value: "Parent <parent@example.com>" },
+          { name: "Subject", value: `School planning ${index}` },
+          { name: "Date", value: `Fri, 28 Aug 2026 ${String(index).padStart(2, "0")}:00:00 -0700` },
+          { name: "Message-ID", value: `<message-${index}@example.com>` },
+        ],
+        body: {
+          size: Buffer.byteLength(`Thread message ${index}; verification code 123456.`),
+          data: Buffer.from(`Thread message ${index}; verification code 123456.`, "utf8").toString(
+            "base64url",
+          ),
+        },
+        parts:
+          index === 24
+            ? [
+                {
+                  partId: "school-form",
+                  filename: "school-form.pdf",
+                  mimeType: "application/pdf",
+                  body: { attachmentId: "provider-attachment-24", size: 4_096 },
+                },
+              ]
+            : [],
+      },
+    }));
+    const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
+      const url = new URL(String(input));
+      expect(init?.headers).toMatchObject({ authorization: "Bearer google-access-token" });
+      expect(url.pathname).toBe(`/gmail/v1/users/me/threads/${threadId}`);
+      expect(url.searchParams.get("format")).toBe("full");
+      return jsonResponse({ id: threadId, historyId: "thread-history-25", messages });
+    });
+
+    const result = await executeGoogleWorkspaceOperation({
+      fetch: fetchMock,
+      accessToken: "google-access-token",
+      operation: { operation: "gmail_thread_get", threadId },
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(result.operation).toBe("gmail_thread_get");
+    expect(result.result.thread).toMatchObject({
+      threadId,
+      historyId: "thread-history-25",
+    });
+    const thread = result.result.thread as {
+      messages: Array<Record<string, unknown>>;
+    };
+    expect(thread.messages).toHaveLength(25);
+    expect(thread.messages[0]).toMatchObject({
+      messageId: "message-0",
+      threadId,
+      historyId: "message-history-0",
+      body: "Thread message 0; verification code 123456.",
+    });
+    expect(thread.messages[24]).toMatchObject({
+      messageId: "message-24",
+      threadId,
+      historyId: "message-history-24",
+      labelIds: ["INBOX", "STARRED"],
+      attachments: [
+        {
+          attachmentId: "provider-attachment-24",
+          partId: "school-form",
+          filename: "school-form.pdf",
+          mimeType: "application/pdf",
+          sizeBytes: 4_096,
+        },
+      ],
+    });
+  });
+
   test("returns and reads every supported attachment when a message contains more than twenty", async () => {
     const connectionId = "connection-attachments";
     const householdId = "household-attachments";

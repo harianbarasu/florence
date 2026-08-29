@@ -207,7 +207,10 @@ export interface AgentLoopInput<TContext, TParsed = unknown, TSuspension = never
   ) => AgentLoopSuspension<TSuspension> | undefined | Promise<AgentLoopSuspension<TSuspension> | undefined>;
   /** Formats one terminal result; calls are made in assistant source order. */
   readonly formatToolResult?: AgentLoopToolResultFormatter<TContext>;
-  readonly isUsableFinal?: (response: ParsedResponse<TParsed>) => boolean | Promise<boolean>;
+  readonly isUsableFinal?: (
+    response: ParsedResponse<TParsed>,
+    transcript: readonly ResponseInputItem[],
+  ) => boolean | Promise<boolean>;
   /** One bounded chance to replace the transcript after a live provider model error. */
   readonly recoverModelError?: (
     error: unknown,
@@ -445,7 +448,7 @@ export async function runAgentLoop<TContext, const TRequest extends AgentLoopReq
     }
 
     const usableFinal = input.isUsableFinal
-      ? await input.isUsableFinal(response)
+      ? await input.isUsableFinal(response, [...transcript])
       : defaultUsableFinal(response);
     if (!usableFinal) {
       if (emptyFinalRetries >= maxEmptyFinalRetries) {

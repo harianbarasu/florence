@@ -25,6 +25,8 @@ const HOUSEHOLD_NEXT_ACTION_CLAIM_LEASE_MS = 2 * 60_000;
 const MAX_FAMILY_WORK_STATE_BYTES = 256 * 1024;
 const MAX_FAMILY_WORK_FILE_BYTES = 100 * 1024 * 1024;
 const MAX_FAMILY_WORK_COUNTER = 999_999_999;
+const MAX_FAMILY_WORK_COMPLETION_FACT_BYTES = 16 * 1024;
+const MAX_FAMILY_WORK_COMPLETION_WITNESS_BYTES = 64 * 1024;
 const CONVERSATION_HISTORY_PAGE_BYTE_BUDGET = 80_000;
 const CONVERSATION_HISTORY_FETCH_BATCH = 64;
 const CONVERSATION_HISTORY_TOKEN_VERSION = 1;
@@ -703,6 +705,26 @@ export type FamilyWorkSelectedFile = {
   readonly sha256: string;
 };
 
+export type FamilyWorkCompletionEvidence = {
+  readonly callId: string;
+  readonly capabilityName: string;
+  readonly arguments: JsonValue;
+  readonly recordedAt: string;
+  /** SHA-256 of the canonical successful capability output inspected by the completion reviewer. */
+  readonly outputDigest: string;
+  /** Exact runtime-validated output fragments that establish the completion condition. */
+  readonly facts: readonly {
+    readonly pointer: string;
+    readonly value: JsonValue;
+  }[];
+};
+
+export type FamilyWorkCompletionBasis = {
+  readonly condition: string;
+  readonly summary: string;
+  readonly evidenceCallIds: readonly string[];
+};
+
 export type FamilyWorkStateV1 = {
   readonly kind: "family_work_v1";
   readonly version: 1;
@@ -750,6 +772,13 @@ export type FamilyWorkStateV1 = {
     readonly attempt: number;
     readonly receipt?: FamilyWorkCapabilityReceipt | null;
   } | null;
+  /** Exact successful results eligible while their exact call/result remains uncompacted. */
+  readonly completionEvidence?: readonly FamilyWorkCompletionEvidence[];
+  /** One semantic completion rejection retained until the evidence frontier advances. */
+  readonly completionRejection?: {
+    readonly condition: string;
+    readonly reason: string;
+  } | null;
   readonly steering: readonly {
     readonly sourceId: string;
     readonly text: string;
@@ -764,6 +793,8 @@ export type FamilyWorkStateV1 = {
   readonly terminal: {
     readonly outcome: "succeeded" | "partial" | "failed" | "cancelled";
     readonly text: string;
+    /** Exact reason or successful capability results that established completion. */
+    readonly completionBasis?: FamilyWorkCompletionBasis | null;
     readonly docket?: PrivateDocketCoordination | null;
     readonly selectedImages?: readonly FamilyWorkSelectedImage[];
     readonly selectedFiles?: readonly FamilyWorkSelectedFile[];
@@ -820,7 +851,12 @@ export type SettleFamilyWorkClaimInput = {
       }
     | { type: "participant_waiting"; state: FamilyWorkStateV1 }
     | { type: "waiting"; state: FamilyWorkStateV1; question: string }
-    | { type: "terminal"; state: FamilyWorkStateV1; terminalText: string }
+    | {
+        type: "terminal";
+        state: FamilyWorkStateV1;
+        terminalText: string;
+        completionEvidenceOutputs: readonly { readonly callId: string; readonly output: JsonValue }[];
+      }
     | { type: "retry"; state: FamilyWorkStateV1; retryAt: string; error: string };
 };
 
@@ -3790,6 +3826,8 @@ export class PostgresFlorenceStore {
               ...state,
               phase: "terminal",
               claim: null,
+              completionEvidence: [],
+              completionRejection: null,
               pendingCall: null,
               pendingParticipantRequest: null,
               waitingDocket: null,
@@ -4368,6 +4406,12 @@ export class PostgresFlorenceStore {
           currentState.browserFiles ?? [],
           proposedNextState.browserFiles ?? [],
         ),
+        completionEvidence: reconcileFamilyWorkCompletionEvidence(
+          currentState,
+          currentState.completionEvidence ?? [],
+          proposedNextState,
+          proposedNextState.completionEvidence ?? [],
+        ),
       });
       const queuedSteering = strictFamilyWorkSteeringSuffix(nextState.steering, currentState.steering);
       const sameDocketLinkage = sameStrings(
@@ -4590,6 +4634,47 @@ export class PostgresFlorenceStore {
           nextState.terminal?.text !== terminalText
         ) {
           throw new FlorenceStoreConflict("Terminal family work needs its exact terminal checkpoint");
+        }
+        if (
+          nextState.terminal.outcome === "succeeded" &&
+          !nextState.terminal.completionBasis
+        ) {
+          throw new FlorenceStoreConflict(
+            "Newly succeeded family work needs a verified completion basis",
+          );
+        }
+        if (nextState.terminal.outcome === "succeeded") {
+          const recordedEvidence = new Map(
+            (nextState.completionEvidence ?? []).map((entry) => [entry.callId, entry] as const),
+          );
+          const basisCallIds = nextState.terminal.completionBasis?.evidenceCallIds ?? [];
+          for (const callId of basisCallIds) {
+            if (!recordedEvidence.has(callId)) {
+              throw new FlorenceStoreConflict(
+                "Family-work terminal completion basis names an unrecorded capability result",
+              );
+            }
+          }
+          if (
+            basisCallIds.length !== recordedEvidence.size ||
+            !basisCallIds.every((callId) => recordedEvidence.has(callId))
+          ) {
+            throw new FlorenceStoreConflict(
+              "Family-work terminal completion evidence must exactly match its selected basis",
+            );
+          }
+          validateFamilyWorkTerminalEvidenceOutputs(
+            nextState.completionEvidence ?? [],
+            input.result.completionEvidenceOutputs,
+          );
+        } else if ((nextState.completionEvidence ?? []).length > 0) {
+          throw new FlorenceStoreConflict(
+            "Only succeeded family work may retain terminal completion evidence",
+          );
+        } else if (input.result.completionEvidenceOutputs.length > 0) {
+          throw new FlorenceStoreConflict(
+            "Only succeeded family work may supply terminal completion outputs",
+          );
         }
         if (nextState.progressRevision <= currentState.progressRevision) {
           throw new FlorenceStoreConflict("A family work result must advance its progress revision");
@@ -10353,6 +10438,8 @@ export class PostgresFlorenceStore {
               generation,
               phase: "terminal",
               claim: null,
+              completionEvidence: [],
+              completionRejection: null,
               pendingCall: null,
               pendingParticipantRequest: null,
               waitingDocket: null,
@@ -19813,6 +19900,8 @@ const FAMILY_WORK_STATE_KEYS = [
   "browserImages",
   "browserSession",
   "claim",
+  "completionEvidence",
+  "completionRejection",
   "continuationItems",
   "docketCandidateIds",
   "evidenceRevisionAt",
@@ -19849,6 +19938,8 @@ function initialFamilyWorkState(
     browserFiles: [],
     browserImages: [],
     browserSession: null,
+    completionEvidence: [],
+    completionRejection: null,
     continuationItems: [],
     pendingCall: null,
     steering: [],
@@ -19980,6 +20071,310 @@ function familyWorkSelectedFiles(value: JsonValue, name: string): readonly Famil
   return files;
 }
 
+function familyWorkCompletionBasis(value: JsonValue, name: string): FamilyWorkCompletionBasis {
+  const basis = strictJsonRecord(value, name);
+  assertExactJsonKeys(basis, ["condition", "evidenceCallIds", "summary"], name);
+  const condition = limitedRequiredString(
+    requiredStringField(basis, "condition", `${name} condition`),
+    2_000,
+    `${name} condition`,
+  );
+  const summary = limitedRequiredString(
+    requiredStringField(basis, "summary", `${name} summary`),
+    2_000,
+    `${name} summary`,
+  );
+  const evidenceCallIds = jsonArrayField(basis, "evidenceCallIds", `${name} evidence call IDs`).map(
+    (callId) =>
+      limitedRequiredString(
+        typeof callId === "string" ? callId : "",
+        200,
+        `${name} evidence call ID`,
+      ),
+  );
+  if (unique(evidenceCallIds).length !== evidenceCallIds.length) {
+    throw new FlorenceStoreConflict(`${name} contains a duplicate evidence call`);
+  }
+  return { condition, summary, evidenceCallIds };
+}
+
+function familyWorkCompletionEvidence(
+  value: JsonValue,
+  name: string,
+): readonly FamilyWorkCompletionEvidence[] {
+  if (!Array.isArray(value)) {
+    throw new FlorenceStoreConflict(`${name} is invalid`);
+  }
+  const evidence = value.map((value, index) => {
+    const entryName = `${name} ${index + 1}`;
+    const entry = strictJsonRecord(value, entryName);
+    assertExactJsonKeys(
+      entry,
+      ["arguments", "callId", "capabilityName", "facts", "outputDigest", "recordedAt"],
+      entryName,
+    );
+    if (entry.arguments === undefined) {
+      throw new FlorenceStoreConflict(`${entryName} payload is invalid`);
+    }
+    const outputDigest = requiredStringField(entry, "outputDigest", `${entryName} output digest`);
+    assertDigest(outputDigest, `${entryName} output digest`);
+    const facts = jsonArrayField(entry, "facts", `${entryName} facts`).map((value, factIndex) => {
+      const factName = `${entryName} fact ${factIndex + 1}`;
+      const fact = strictJsonRecord(value, factName);
+      assertExactJsonKeys(fact, ["pointer", "value"], factName);
+      if (fact.value === undefined) {
+        throw new FlorenceStoreConflict(`${factName} value is invalid`);
+      }
+      const pointer = limitedRequiredString(
+        requiredStringField(fact, "pointer", `${factName} pointer`),
+        2_000,
+        `${factName} pointer`,
+      );
+      if (!pointer.startsWith("/") || /~(?![01])/u.test(pointer)) {
+        throw new FlorenceStoreConflict(`${factName} pointer is invalid`);
+      }
+      if (fact.value !== null && typeof fact.value === "object") {
+        throw new FlorenceStoreConflict(`${factName} must select one exact scalar value`);
+      }
+      const parsedFact = { pointer, value: fact.value };
+      if (
+        Buffer.byteLength(canonicalConversationHistoryJson(parsedFact), "utf8") >
+        MAX_FAMILY_WORK_COMPLETION_FACT_BYTES
+      ) {
+        throw new FlorenceStoreConflict(`${factName} is too large to be a completion witness`);
+      }
+      return parsedFact;
+    });
+    if (unique(facts.map((fact) => fact.pointer)).length !== facts.length) {
+      throw new FlorenceStoreConflict(`${entryName} contains a duplicate fact pointer`);
+    }
+    return {
+      callId: limitedRequiredString(
+        requiredStringField(entry, "callId", `${entryName} call ID`),
+        200,
+        `${entryName} call ID`,
+      ),
+      capabilityName: limitedRequiredString(
+        requiredStringField(entry, "capabilityName", `${entryName} capability name`),
+        200,
+        `${entryName} capability name`,
+      ),
+      arguments: entry.arguments,
+      recordedAt: instant(
+        requiredStringField(entry, "recordedAt", `${entryName} recording time`),
+      ).toISOString(),
+      outputDigest,
+      facts,
+    };
+  });
+  if (
+    Buffer.byteLength(
+      canonicalConversationHistoryJson(evidence.flatMap((entry) => entry.facts)),
+      "utf8",
+    ) > MAX_FAMILY_WORK_COMPLETION_WITNESS_BYTES
+  ) {
+    throw new FlorenceStoreConflict(`${name} facts are too large to be a completion witness`);
+  }
+  if (unique(evidence.map((entry) => entry.callId)).length !== evidence.length) {
+    throw new FlorenceStoreConflict(`${name} contains a duplicate call`);
+  }
+  return evidence;
+}
+
+function sameFamilyWorkCompletionEvidence(
+  left: FamilyWorkCompletionEvidence,
+  right: FamilyWorkCompletionEvidence,
+): boolean {
+  return (
+    sameFamilyWorkCompletionReceiptIdentity(left, right) &&
+    canonicalConversationHistoryJson(left.facts) === canonicalConversationHistoryJson(right.facts)
+  );
+}
+
+function sameFamilyWorkCompletionReceiptIdentity(
+  left: FamilyWorkCompletionEvidence,
+  right: FamilyWorkCompletionEvidence,
+): boolean {
+  return (
+    left.callId === right.callId &&
+    left.capabilityName === right.capabilityName &&
+    left.recordedAt === right.recordedAt &&
+    left.outputDigest === right.outputDigest &&
+    canonicalConversationHistoryJson(left.arguments) ===
+      canonicalConversationHistoryJson(right.arguments)
+  );
+}
+
+function familyWorkCompletionOutputDigest(output: JsonValue): string {
+  return createHash("sha256").update(canonicalConversationHistoryJson(output)).digest("hex");
+}
+
+function familyWorkCompletionPointerValue(output: JsonValue, pointer: string): JsonValue {
+  if (!pointer.startsWith("/") || /~(?![01])/u.test(pointer)) {
+    throw new FlorenceStoreConflict("Family-work completion fact pointer is invalid");
+  }
+  let current: JsonValue = output;
+  for (const encoded of pointer.slice(1).split("/")) {
+    const segment = encoded.replace(/~1/gu, "/").replace(/~0/gu, "~");
+    if (Array.isArray(current)) {
+      if (!/^(?:0|[1-9]\d*)$/u.test(segment)) {
+        throw new FlorenceStoreConflict("Family-work completion fact pointer is invalid");
+      }
+      const index = Number(segment);
+      if (!Number.isSafeInteger(index) || index >= current.length) {
+        throw new FlorenceStoreConflict("Family-work completion fact pointer is missing");
+      }
+      current = current[index] as JsonValue;
+      continue;
+    }
+    if (current === null || typeof current !== "object" || current instanceof Date) {
+      throw new FlorenceStoreConflict("Family-work completion fact pointer is missing");
+    }
+    const record = current as Record<string, JsonValue | undefined>;
+    if (!Object.prototype.hasOwnProperty.call(record, segment) || record[segment] === undefined) {
+      throw new FlorenceStoreConflict("Family-work completion fact pointer is missing");
+    }
+    current = record[segment] as JsonValue;
+  }
+  return current;
+}
+
+function validateFamilyWorkTerminalEvidenceOutputs(
+  evidence: readonly FamilyWorkCompletionEvidence[],
+  outputs: readonly { readonly callId: string; readonly output: JsonValue }[],
+): void {
+  if (unique(outputs.map((entry) => entry.callId)).length !== outputs.length) {
+    throw new FlorenceStoreConflict("Family-work completion outputs contain a duplicate call");
+  }
+  const byCallId = new Map(outputs.map((entry) => [entry.callId, entry.output] as const));
+  if (byCallId.size !== evidence.length) {
+    throw new FlorenceStoreConflict(
+      "Family-work completion outputs must exactly match the selected evidence",
+    );
+  }
+  for (const entry of evidence) {
+    const output = byCallId.get(entry.callId);
+    if (!byCallId.has(entry.callId) || familyWorkCompletionOutputDigest(output as JsonValue) !== entry.outputDigest) {
+      throw new FlorenceStoreConflict("Family-work completion output does not match its exact receipt");
+    }
+    if (entry.facts.length < 1) {
+      throw new FlorenceStoreConflict("Selected family-work completion evidence needs an exact fact");
+    }
+    for (const fact of entry.facts) {
+      const actual = familyWorkCompletionPointerValue(output as JsonValue, fact.pointer);
+      if (canonicalConversationHistoryJson(actual) !== canonicalConversationHistoryJson(fact.value)) {
+        throw new FlorenceStoreConflict("Family-work completion fact does not match its exact output");
+      }
+    }
+  }
+}
+
+function familyWorkContinuationCallIds(items: readonly JsonValue[]): ReadonlySet<string> {
+  const callIds = new Set<string>();
+  for (const item of items) {
+    if (item === null || typeof item !== "object" || Array.isArray(item) || item instanceof Date) {
+      continue;
+    }
+    const record = item as { readonly type?: unknown; readonly call_id?: unknown };
+    if (
+      (record.type === "function_call" || record.type === "function_call_output") &&
+      typeof record.call_id === "string"
+    ) {
+      callIds.add(record.call_id);
+    }
+  }
+  return callIds;
+}
+
+function familyWorkContinuationCompactionSummary(items: readonly JsonValue[]): string | null {
+  const first = items[0];
+  if (first === null || typeof first !== "object" || Array.isArray(first) || first instanceof Date) {
+    return null;
+  }
+  const record = first as {
+    readonly type?: unknown;
+    readonly role?: unknown;
+    readonly content?: unknown;
+  };
+  if (
+    record.type !== "message" ||
+    record.role !== "user" ||
+    !Array.isArray(record.content) ||
+    record.content.length !== 1
+  ) {
+    return null;
+  }
+  const part = record.content[0];
+  if (
+    part !== null &&
+    typeof part === "object" &&
+    !Array.isArray(part) &&
+    (part as { readonly type?: unknown }).type === "input_text" &&
+    typeof (part as { readonly text?: unknown }).text === "string" &&
+    (part as { readonly text: string }).text.startsWith(
+      "The task history before this point was compacted into the following summary:",
+    )
+  ) {
+    return (part as { readonly text: string }).text;
+  }
+  return null;
+}
+
+function reconcileFamilyWorkCompletionEvidence(
+  currentState: FamilyWorkStateV1,
+  current: readonly FamilyWorkCompletionEvidence[],
+  nextState: FamilyWorkStateV1,
+  next: readonly FamilyWorkCompletionEvidence[],
+): readonly FamilyWorkCompletionEvidence[] {
+  const byCallId = new Map(current.map((entry) => [entry.callId, entry] as const));
+  for (const entry of next) {
+    const existing = byCallId.get(entry.callId);
+    if (existing && !sameFamilyWorkCompletionEvidence(existing, entry)) {
+      if (
+        nextState.phase === "terminal" &&
+        existing.facts.length === 0 &&
+        entry.facts.length > 0 &&
+        sameFamilyWorkCompletionReceiptIdentity(existing, entry)
+      ) {
+        continue;
+      }
+      throw new FlorenceStoreConflict("Family-work completion evidence changed after it was recorded");
+    }
+  }
+  const nextCallIds = new Set(next.map((entry) => entry.callId));
+  const currentContinuationCallIds = familyWorkContinuationCallIds(currentState.continuationItems);
+  const nextContinuationCallIds = familyWorkContinuationCallIds(nextState.continuationItems);
+  const previousCompactionSummary = familyWorkContinuationCompactionSummary(
+    currentState.continuationItems,
+  );
+  const nextCompactionSummary = familyWorkContinuationCompactionSummary(nextState.continuationItems);
+  const compactedThisTransition =
+    nextCompactionSummary !== null && nextCompactionSummary !== previousCompactionSummary;
+  if (nextState.phase !== "terminal") {
+    for (const entry of next) {
+      if (!nextContinuationCallIds.has(entry.callId)) {
+        throw new FlorenceStoreConflict(
+          "Active family-work completion evidence needs its exact continuation call",
+        );
+      }
+    }
+  }
+  for (const entry of current) {
+    if (nextCallIds.has(entry.callId)) continue;
+    if (
+      nextState.phase !== "terminal" &&
+      (!compactedThisTransition ||
+        !currentContinuationCallIds.has(entry.callId) ||
+        nextContinuationCallIds.has(entry.callId))
+    ) {
+      throw new FlorenceStoreConflict(
+        "Family-work completion evidence may be retired only with its compacted exact call",
+      );
+    }
+  }
+  return next;
+}
+
 function mergeFamilyWorkSelectedFiles(
   current: readonly FamilyWorkSelectedFile[],
   next: readonly FamilyWorkSelectedFile[],
@@ -20028,6 +20423,8 @@ function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWor
   if (state.browserFiles === undefined) state.browserFiles = [];
   if (state.browserImages === undefined) state.browserImages = [];
   if (state.browserSession === undefined) state.browserSession = null;
+  if (state.completionEvidence === undefined) state.completionEvidence = [];
+  if (state.completionRejection === undefined) state.completionRejection = null;
   if (state.docketCandidateIds === undefined) state.docketCandidateIds = [];
   if (state.evidenceRevisionAt === undefined) state.evidenceRevisionAt = null;
   if (state.evidenceRevisionKey === undefined) state.evidenceRevisionKey = null;
@@ -20244,6 +20641,38 @@ function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWor
   }
 
   const continuationItems = jsonArrayField(state, "continuationItems", "Family work continuation");
+  const completionEvidence = familyWorkCompletionEvidence(
+    state.completionEvidence as JsonValue,
+    "Family work completion evidence",
+  );
+  let completionRejection: FamilyWorkStateV1["completionRejection"] = null;
+  if (state.completionRejection !== null) {
+    const storedRejection = strictJsonRecord(
+      state.completionRejection,
+      "Family work completion rejection",
+    );
+    assertExactJsonKeys(
+      storedRejection,
+      ["condition", "reason"],
+      "Family work completion rejection",
+    );
+    completionRejection = {
+      condition: limitedRequiredString(
+        requiredStringField(
+          storedRejection,
+          "condition",
+          "Family work completion rejection condition",
+        ),
+        2_000,
+        "Family work completion rejection condition",
+      ),
+      reason: limitedRequiredString(
+        requiredStringField(storedRejection, "reason", "Family work completion rejection reason"),
+        2_000,
+        "Family work completion rejection reason",
+      ),
+    };
+  }
   const browserFiles = familyWorkSelectedFiles(
     state.browserFiles as JsonValue,
     "Family work browser files",
@@ -20342,6 +20771,7 @@ function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWor
   }
   if (state.terminal !== null) {
     const storedTerminal = strictJsonRecord(state.terminal, "Family work terminal result");
+    const hasCompletionBasis = storedTerminal.completionBasis !== undefined;
     const hasSelectedFiles = storedTerminal.selectedFiles !== undefined;
     const hasSelectedImages = storedTerminal.selectedImages !== undefined;
     const storedTerminalDocket = storedTerminal.docket;
@@ -20349,6 +20779,7 @@ function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWor
     assertExactJsonKeys(
       storedTerminal,
       [
+        ...(hasCompletionBasis ? ["completionBasis"] : []),
         "outcome",
         "text",
         ...(hasSelectedFiles ? ["selectedFiles"] : []),
@@ -20360,6 +20791,16 @@ function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWor
     const outcome = storedTerminal.outcome;
     if (outcome !== "succeeded" && outcome !== "partial" && outcome !== "failed" && outcome !== "cancelled") {
       throw new FlorenceStoreConflict("Family work terminal outcome is invalid");
+    }
+    const completionBasis =
+      !hasCompletionBasis || storedTerminal.completionBasis === null
+        ? null
+        : familyWorkCompletionBasis(
+            storedTerminal.completionBasis as JsonValue,
+            "Family work completion basis",
+          );
+    if (completionBasis !== null && outcome !== "succeeded") {
+      throw new FlorenceStoreConflict("Only succeeded family work may retain a completion basis");
     }
     const docket =
       storedTerminalDocket === undefined && (outcome === "partial" || outcome === "failed")
@@ -20404,6 +20845,7 @@ function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWor
         10_000,
         "Family work terminal text",
       ),
+      ...(hasCompletionBasis ? { completionBasis } : {}),
       docket,
       ...(hasSelectedFiles
         ? {
@@ -20429,6 +20871,9 @@ function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWor
   if ((phase === "terminal") !== (terminal !== null)) {
     throw new FlorenceStoreConflict("Family work terminal state is inconsistent");
   }
+  if (phase === "terminal" && completionRejection !== null) {
+    throw new FlorenceStoreConflict("Terminal family work cannot retain a completion rejection");
+  }
   if ((phase === "waiting" || phase === "terminal") && claim !== null) {
     throw new FlorenceStoreConflict("Waiting or terminal family work cannot remain claimed");
   }
@@ -20453,6 +20898,8 @@ function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWor
     browserFiles,
     browserImages,
     browserSession,
+    completionEvidence,
+    completionRejection,
     continuationItems: [...continuationItems],
     pendingCall,
     steering,
@@ -20547,6 +20994,7 @@ export function steerFamilyWorkState(
     phase: "ready",
     claim: null,
     continuationItems: familyWorkContinuationWithoutPendingCall(state),
+    completionRejection: null,
     pendingCall: null,
     pendingParticipantRequest: null,
     steering: [...state.steering, steering],

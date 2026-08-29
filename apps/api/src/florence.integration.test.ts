@@ -1007,6 +1007,17 @@ release("Durable family work store", () => {
       }),
     ).toBe("stale");
 
+    const campCompletionOutput = { title: "Camp registration", snapshot: "Review registration" };
+    const campCompletionEvidence = {
+      callId: "camp-portal",
+      capabilityName: "browser_work",
+      arguments: { operation: "navigate", url: "https://camp.example/register" },
+      recordedAt: at(120_200),
+      outputDigest: createHash("sha256")
+        .update(JSON.stringify({ snapshot: "Review registration", title: "Camp registration" }))
+        .digest("hex"),
+      facts: [],
+    };
     const completedCallState = {
       ...takeover.state,
       phase: "ready" as const,
@@ -1020,9 +1031,10 @@ release("Durable family work store", () => {
         {
           type: "function_call_output",
           call_id: "camp-portal",
-          output: '{"title":"Camp registration","snapshot":"Review registration"}',
+          output: JSON.stringify({ outcome: "succeeded", output: campCompletionOutput, error: null }),
         },
       ],
+      completionEvidence: [...(takeover.state.completionEvidence ?? []), campCompletionEvidence],
       pendingCall: null,
       progressRevision: 1,
     };
@@ -1067,22 +1079,69 @@ release("Durable family work store", () => {
       browserSession: null,
       continuationItems: [],
       pendingCall: null,
+      completionEvidence: (finalClaim.state.completionEvidence ?? []).map((evidence) =>
+        evidence.callId === campCompletionEvidence.callId
+          ? { ...evidence, facts: [{ pointer: "/title", value: "Camp registration" }] }
+          : evidence,
+      ),
       progressRevision: 2,
-      terminal: { outcome: "succeeded" as const, text: terminalText },
+      terminal: {
+        outcome: "succeeded" as const,
+        text: terminalText,
+        completionBasis: {
+          condition: "The camp registration is filled through the final review page.",
+          summary: "The browser result shows the completed registration review page.",
+          evidenceCallIds: [campCompletionEvidence.callId],
+        },
+      },
     };
+    await expect(
+      store.settleFamilyWorkClaim({
+        workId: finalClaim.workId,
+        generation: finalClaim.generation,
+        claimId: finalClaim.claimId,
+        settledAt: at(120_300),
+        result: {
+          type: "terminal",
+          state: terminalState,
+          terminalText,
+          completionEvidenceOutputs: [
+            {
+              callId: campCompletionEvidence.callId,
+              output: { ...campCompletionOutput, title: "A different provider result" },
+            },
+          ],
+        },
+      }),
+    ).rejects.toThrow(/completion output does not match its exact receipt/u);
     expect(
       await store.settleFamilyWorkClaim({
         workId: finalClaim.workId,
         generation: finalClaim.generation,
         claimId: finalClaim.claimId,
         settledAt: at(120_300),
-        result: { type: "terminal", state: terminalState, terminalText },
+        result: {
+          type: "terminal",
+          state: terminalState,
+          terminalText,
+          completionEvidenceOutputs: [
+            { callId: campCompletionEvidence.callId, output: campCompletionOutput },
+          ],
+        },
       }),
     ).toBe("settled");
     await assertDatabase(
       "Family work completed before its terminal receipt",
       `exists (select 1 from proactive_work where id='10000000-0000-4000-8000-000000000003'
-        and status='delivering' and task_state->>'phase'='terminal')`,
+        and status='delivering' and task_state->>'phase'='terminal'
+        and task_state->'terminal'->'completionBasis'->>'condition'=
+          'The camp registration is filled through the final review page.'
+        and task_state->'terminal'->'completionBasis'->'evidenceCallIds'->>0='camp-portal'
+        and task_state->'completionEvidence'->0->>'capabilityName'='browser_work'
+        and task_state->'completionEvidence'->0->>'outputDigest'=
+          '${campCompletionEvidence.outputDigest}'
+        and task_state->'completionEvidence'->0->'facts'->0->>'pointer'='/title'
+        and task_state->'completionEvidence'->0->'facts'->0->>'value'='Camp registration')`,
     );
     const terminalDue = await store.readNextOutbound(at(120_300));
     if (!terminalDue) throw new Error("Transactional terminal outbound was not staged");
@@ -2886,10 +2945,15 @@ release("Florence parent journeys", () => {
             phase: "terminal",
             claim: null,
             pendingCall: null,
-            terminal: { outcome: "succeeded", text: PROACTIVE_FAMILY_WORK_RESULT },
+            terminal: {
+              outcome: "succeeded",
+              text: PROACTIVE_FAMILY_WORK_RESULT,
+              completionBasis: mockReasonedCompletionBasis(PROACTIVE_FAMILY_WORK_RESULT),
+            },
           },
           outcome: "succeeded",
           text: PROACTIVE_FAMILY_WORK_RESULT,
+          completionEvidenceOutputs: [],
         };
       },
     });
@@ -2990,10 +3054,15 @@ release("Florence parent journeys", () => {
             pendingCall: null,
             waitingDocket: null,
             progressRevision: input.state.progressRevision + 1,
-            terminal: { outcome: "succeeded", text: SOURCE_CHANGE_FAMILY_WORK_RESULT },
+            terminal: {
+              outcome: "succeeded",
+              text: SOURCE_CHANGE_FAMILY_WORK_RESULT,
+              completionBasis: mockReasonedCompletionBasis(SOURCE_CHANGE_FAMILY_WORK_RESULT),
+            },
           },
           outcome: "succeeded",
           text: SOURCE_CHANGE_FAMILY_WORK_RESULT,
+          completionEvidenceOutputs: [],
         };
       },
     });
@@ -3108,10 +3177,15 @@ release("Florence parent journeys", () => {
                 pendingCall: null,
                 pendingParticipantRequest: null,
                 waitingDocket: null,
-                terminal: { outcome: "succeeded", text: terminalText },
+                terminal: {
+                  outcome: "succeeded",
+                  text: terminalText,
+                  completionBasis: mockReasonedCompletionBasis(terminalText),
+                },
               },
               outcome: "succeeded",
               text: terminalText,
+              completionEvidenceOutputs: [],
             };
           }
           if (input.state.phase === "ready") {
@@ -3386,10 +3460,15 @@ release("Florence parent journeys", () => {
                 pendingCall: null,
                 waitingDocket: null,
                 progressRevision: input.state.progressRevision + 1,
-                terminal: { outcome: "succeeded", text: terminalText },
+                terminal: {
+                  outcome: "succeeded",
+                  text: terminalText,
+                  completionBasis: mockReasonedCompletionBasis(terminalText),
+                },
               },
               outcome: "succeeded",
               text: terminalText,
+              completionEvidenceOutputs: [],
             };
           }
           const first = input.objective === firstObjective;
@@ -3579,10 +3658,15 @@ release("Florence parent journeys", () => {
                 claim: null,
                 pendingCall: null,
                 progressRevision: input.state.progressRevision + 1,
-                terminal: { outcome: "succeeded", text: terminalText },
+                terminal: {
+                  outcome: "succeeded",
+                  text: terminalText,
+                  completionBasis: mockReasonedCompletionBasis(terminalText),
+                },
               },
               outcome: "succeeded",
               text: terminalText,
+              completionEvidenceOutputs: [],
             };
           }
           if (input.state.phase === "ready" && input.state.progressRevision === 0) {
@@ -3835,10 +3919,15 @@ release("Florence parent journeys", () => {
               claim: null,
               pendingCall: null,
               progressRevision: input.state.progressRevision + 1,
-              terminal: { outcome: "succeeded", text },
+              terminal: {
+                outcome: "succeeded",
+                text,
+                completionBasis: mockReasonedCompletionBasis(text),
+              },
             },
             outcome: "succeeded",
             text,
+            completionEvidenceOutputs: [],
           };
         },
       },
@@ -4128,10 +4217,15 @@ release("Florence parent journeys", () => {
               phase: "terminal",
               claim: null,
               pendingCall: null,
-              terminal: { outcome: "succeeded", text: terminalText },
+              terminal: {
+                outcome: "succeeded",
+                text: terminalText,
+                completionBasis: mockReasonedCompletionBasis(terminalText),
+              },
             },
             outcome: "succeeded",
             text: terminalText,
+            completionEvidenceOutputs: [],
           };
         },
       },
@@ -4267,10 +4361,15 @@ release("Florence parent journeys", () => {
               claim: null,
               pendingCall: null,
               progressRevision: input.state.progressRevision + 1,
-              terminal: { outcome: "succeeded", text: terminalText },
+              terminal: {
+                outcome: "succeeded",
+                text: terminalText,
+                completionBasis: mockReasonedCompletionBasis(terminalText),
+              },
             },
             outcome: "succeeded",
             text: terminalText,
+            completionEvidenceOutputs: [],
           };
         },
       },
@@ -4456,11 +4555,17 @@ release("Florence parent journeys", () => {
               claim: null,
               pendingCall: null,
               progressRevision: input.state.progressRevision + 1,
-              terminal: { outcome: "succeeded", text: terminalText, selectedImages: [selectedImage] },
+              terminal: {
+                outcome: "succeeded",
+                text: terminalText,
+                completionBasis: mockReasonedCompletionBasis(terminalText),
+                selectedImages: [selectedImage],
+              },
             },
             outcome: "succeeded",
             text: terminalText,
             selectedImages: [selectedImage],
+            completionEvidenceOutputs: [],
           };
         },
       },
@@ -4630,11 +4735,17 @@ release("Florence parent journeys", () => {
               claim: null,
               pendingCall: null,
               progressRevision: input.state.progressRevision + 1,
-              terminal: { outcome: "succeeded", text: terminalText, selectedFiles: [selectedFile] },
+              terminal: {
+                outcome: "succeeded",
+                text: terminalText,
+                completionBasis: mockReasonedCompletionBasis(terminalText),
+                selectedFiles: [selectedFile],
+              },
             },
             outcome: "succeeded",
             text: terminalText,
             selectedFiles: [selectedFile],
+            completionEvidenceOutputs: [],
           };
         },
       },
@@ -5166,10 +5277,15 @@ release("Florence parent journeys", () => {
               phase: "terminal",
               claim: null,
               pendingCall: null,
-              terminal: { outcome: "succeeded", text: NATIVE_DOCKET_WORK_RESULT },
+              terminal: {
+                outcome: "succeeded",
+                text: NATIVE_DOCKET_WORK_RESULT,
+                completionBasis: mockReasonedCompletionBasis(NATIVE_DOCKET_WORK_RESULT),
+              },
             },
             outcome: "succeeded",
             text: NATIVE_DOCKET_WORK_RESULT,
+            completionEvidenceOutputs: [],
           };
         }
         if (input.objective !== docketWorkObjective) {
@@ -5224,6 +5340,7 @@ release("Florence parent journeys", () => {
             waitingOn: docketWorkWaitingOn,
             needsAnswer: true,
           },
+          completionEvidenceOutputs: [],
         };
       },
     });
@@ -11235,6 +11352,14 @@ function fakeResponseStream(events: readonly unknown[], response: unknown) {
     async finalResponse() {
       return response;
     },
+  };
+}
+
+function mockReasonedCompletionBasis(summary: string) {
+  return {
+    condition: "The mocked family-work objective is complete.",
+    summary,
+    evidenceCallIds: [],
   };
 }
 

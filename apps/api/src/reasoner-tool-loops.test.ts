@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { access, readFile, stat } from "node:fs/promises";
 import {
   type FamilyWorkOriginContext,
@@ -37,6 +38,18 @@ import type { FlorenceTelephonyOperation, FlorenceTelephonyResult } from "./tele
 
 const NOW = "2026-08-27T20:00:00.000Z";
 const PUBLIC_URL = "https://example.com/current-result";
+
+function completionOutputDigest(value: unknown): string {
+  const canonical = (item: unknown): string => {
+    if (item === null || typeof item !== "object") return JSON.stringify(item);
+    if (Array.isArray(item)) return `[${item.map((entry) => canonical(entry)).join(",")}]`;
+    return `{${Object.entries(item)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, field]) => `${JSON.stringify(key)}:${canonical(field)}`)
+      .join(",")}}`;
+  };
+  return createHash("sha256").update(canonical(value)).digest("hex");
+}
 const admittedReadAccounting = {
   settleSources() {},
 };
@@ -907,6 +920,8 @@ describe("Florence reasoner capability cutover", () => {
     const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
       responses: {
         parse(request: Record<string, unknown>) {
+          const review = defaultFamilyWorkCompletionReview(request);
+          if (review) return review;
           modelRequests.push(request);
           const response = modelResponses.shift();
           if (!response) throw new Error("Unexpected durable PDF model turn");
@@ -1122,7 +1137,12 @@ describe("Florence reasoner capability cutover", () => {
     ]) {
       const invalidReasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
         responses: {
-          parse: () => ({ status: "completed", output_parsed: invalidDecision, output: [] }),
+          parse: (request: Record<string, unknown>) =>
+            defaultFamilyWorkCompletionReview(request) ?? {
+              status: "completed",
+              output_parsed: invalidDecision,
+              output: [],
+            },
         },
       } as never);
       await expect(invalidReasoner.continueFamilyWork(input, {} as never)).rejects.toMatchObject({
@@ -1194,15 +1214,16 @@ describe("Florence reasoner capability cutover", () => {
 
     const succeededReasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
       responses: {
-        parse: () => ({
-          status: "completed",
-          output_parsed: {
-            outcome: "succeeded",
-            text: "Pickup is confirmed for 2:45 PM.",
-            docket: null,
+        parse: (request: Record<string, unknown>) =>
+          defaultFamilyWorkCompletionReview(request) ?? {
+            status: "completed",
+            output_parsed: {
+              outcome: "succeeded",
+              text: "Pickup is confirmed for 2:45 PM.",
+              docket: null,
+            },
+            output: [],
           },
-          output: [],
-        }),
       },
     } as never);
     if (waiting.kind !== "waiting") throw new Error("Expected family work to wait");
@@ -1337,6 +1358,8 @@ describe("Florence reasoner capability cutover", () => {
     const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
       responses: {
         parse(request: Record<string, unknown>) {
+          const review = defaultFamilyWorkCompletionReview(request);
+          if (review) return review;
           modelRequests.push(request);
           const response = modelResponses.shift();
           if (!response) throw new Error("Unexpected dentist-call model turn");
@@ -1817,7 +1840,9 @@ describe("Florence reasoner capability cutover", () => {
     ];
     const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
       responses: {
-        parse() {
+        parse(request: Record<string, unknown>) {
+          const review = defaultFamilyWorkCompletionReview(request);
+          if (review) return review;
           const response = modelResponses.shift();
           if (!response) throw new Error("Unexpected dentist-text model turn");
           return response;
@@ -2147,6 +2172,8 @@ describe("Florence reasoner capability cutover", () => {
     const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
       responses: {
         parse(request: Record<string, unknown>) {
+          const review = defaultFamilyWorkCompletionReview(request);
+          if (review) return review;
           modelRequests.push(request);
           const response = modelResponses.shift();
           if (!response) throw new Error("Unexpected family portal model turn");
@@ -3214,6 +3241,8 @@ describe("Florence reasoner capability cutover", () => {
     const resumedReasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
       responses: {
         parse(request: Record<string, unknown>) {
+          const review = defaultFamilyWorkCompletionReview(request);
+          if (review) return review;
           resumedRequests.push(request);
           const response = resumedResponses.shift();
           if (!response) throw new Error("Unexpected resumed durable-work request");
@@ -3364,6 +3393,8 @@ describe("Florence reasoner capability cutover", () => {
     const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
       responses: {
         parse(request: Record<string, unknown>) {
+          const review = defaultFamilyWorkCompletionReview(request);
+          if (review) return review;
           modelRequests.push(request);
           const response = responses.shift();
           if (!response) throw new Error("Unexpected household-work request");
@@ -3880,6 +3911,8 @@ Compare the useful family options.
           };
         },
         parse(request: Record<string, unknown>) {
+          const review = defaultFamilyWorkCompletionReview(request);
+          if (review) return review;
           continuationRequests.push(request);
           return {
             status: "completed",
@@ -3980,6 +4013,7 @@ Compare the useful family options.
     ).toBe(false);
     const compactionRequests: Record<string, unknown>[] = [];
     const continuationRequests: Record<string, unknown>[] = [];
+    const completionReviewRequests: Record<string, unknown>[] = [];
     let modelAttempt = 0;
     const compactionSummary = `## Goal
 Compare the family options.
@@ -4012,13 +4046,28 @@ Compare the family options.
           return { status: "completed", output_text: compactionSummary, output: [] };
         },
         parse(request: Record<string, unknown>) {
+          if (JSON.stringify(request.text).includes("florence_family_work_completion_review")) {
+            completionReviewRequests.push(request);
+            throw new Error("The model provider failed again after compaction");
+          }
           continuationRequests.push(request);
           modelAttempt += 1;
-          throw new Error(
-            modelAttempt === 1
-              ? "Your input exceeds the context window of this model"
-              : "The model provider failed again after compaction",
-          );
+          if (modelAttempt === 1) {
+            throw new Error("Your input exceeds the context window of this model");
+          }
+          return {
+            status: "completed",
+            output_parsed: {
+              outcome: "succeeded",
+              text: "The comparison is complete.",
+              resumeAt: null,
+              progressText: null,
+              selectedImageAssetIds: [],
+              selectedFileAssetIds: [],
+              docket: null,
+            },
+            output: [],
+          };
         },
       },
     } as never);
@@ -4030,7 +4079,11 @@ Compare the family options.
     const recentOutput = {
       type: "function_call_output" as const,
       call_id: "recent-read",
-      output: JSON.stringify({ observation: "recent evidence", details: "y".repeat(4_000) }),
+      output: JSON.stringify({
+        outcome: "succeeded",
+        output: { observation: "recent evidence", details: "y".repeat(4_000) },
+        error: null,
+      }),
     };
     const state: FamilyWorkStateV1 = {
       kind: "family_work_v1",
@@ -4042,6 +4095,38 @@ Compare the family options.
       activeTextMessage: null,
       pendingParticipantRequest: null,
       browserSession: null,
+      completionEvidence: [
+        {
+          callId: "older-read",
+          capabilityName: "read_public_page",
+          arguments: {
+            url: "https://example.com/older",
+            offset: 0,
+            contentFingerprint: null,
+          },
+          recordedAt: NOW,
+          outputDigest: completionOutputDigest({
+            observation: "older evidence",
+            details: "x".repeat(60_000),
+          }),
+          facts: [],
+        },
+        {
+          callId: "recent-read",
+          capabilityName: "read_public_page",
+          arguments: {
+            url: "https://example.com/recent",
+            offset: 0,
+            contentFingerprint: null,
+          },
+          recordedAt: NOW,
+          outputDigest: completionOutputDigest({
+            observation: "recent evidence",
+            details: "y".repeat(4_000),
+          }),
+          facts: [],
+        },
+      ],
       continuationItems: [
         functionCall("older-read", "read_public_page", {
           url: "https://example.com/older",
@@ -4051,7 +4136,11 @@ Compare the family options.
         {
           type: "function_call_output",
           call_id: "older-read",
-          output: JSON.stringify({ observation: "older evidence", details: "x".repeat(60_000) }),
+          output: JSON.stringify({
+            outcome: "succeeded",
+            output: { observation: "older evidence", details: "x".repeat(60_000) },
+            error: null,
+          }),
         },
         recentCall,
         recentOutput,
@@ -4091,6 +4180,7 @@ Compare the family options.
 
     expect(compactionRequests).toHaveLength(1);
     expect(continuationRequests).toHaveLength(2);
+    expect(completionReviewRequests).toHaveLength(1);
     const firstInput = JSON.stringify(continuationRequests[0]?.input);
     const retryInput = JSON.stringify(continuationRequests[1]?.input);
     expect(Buffer.byteLength(firstInput, "utf8")).toBeLessThan(240 * 1024);
@@ -4103,17 +4193,31 @@ Compare the family options.
       retryItems?.find((item) => item.type === "function_call_output" && item.call_id === recentCall.call_id),
     ).toEqual(recentOutput);
     expect(retryInput).not.toContain("x".repeat(10_000));
+    const completionReviewInput = completionReviewRequests[0]?.input as
+      | { content?: { text?: string }[] }[]
+      | undefined;
+    const completionReviewPayload = JSON.parse(completionReviewInput?.[0]?.content?.[0]?.text ?? "{}") as {
+      successfulCapabilityResults?: { callId?: string; output?: unknown }[];
+    };
+    expect(completionReviewPayload.successfulCapabilityResults).toEqual([
+      expect.objectContaining({
+        callId: "recent-read",
+        output: { observation: "recent evidence", details: "y".repeat(4_000) },
+      }),
+    ]);
     expect(failure).toBeInstanceOf(FlorenceReasonerError);
     if (!(failure instanceof FlorenceReasonerError)) throw new Error("Expected a reasoner failure");
     expect(failure.familyWorkCheckpoint).toMatchObject({
       generation: 3,
       claim: { claimId: "claim-overflow" },
+      completionEvidence: [expect.objectContaining({ callId: "recent-read" })],
       continuationItems: [
         expect.objectContaining({ type: "message", role: "user" }),
         expect.objectContaining({ type: "function_call", call_id: recentCall.call_id }),
         expect.objectContaining({ type: "function_call_output", call_id: recentCall.call_id }),
       ],
     });
+    expect(failure.familyWorkCheckpoint?.completionEvidence).toHaveLength(1);
   });
 
   test("foreground Workspace reads hand real send requests to durable work", async () => {
@@ -4273,7 +4377,9 @@ Compare the family options.
     ];
     const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
       responses: {
-        parse() {
+        parse(request: Record<string, unknown>) {
+          const review = defaultFamilyWorkCompletionReview(request);
+          if (review) return review;
           const response = modelResponses.shift();
           if (!response) throw new Error("Unexpected durable Workspace model turn");
           return response;
@@ -4506,6 +4612,8 @@ Compare the family options.
     const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
       responses: {
         parse(request: Record<string, unknown>) {
+          const review = defaultFamilyWorkCompletionReview(request);
+          if (review) return review;
           modelRequests.push(request);
           const response = modelResponses.shift();
           if (!response) throw new Error("Unexpected Gmail draft model turn");
@@ -4724,7 +4832,7 @@ Compare the family options.
     });
   });
 
-  test("durable work composes Calendar reads and replans a transient read inline", async () => {
+  test("durable work rejects premature success, replans inline, and retains exact completion evidence", async () => {
     const calendarRef = "calendar-school";
     const calendarWindowArguments = {
       timeMin: "2026-08-28T00:00:00.000Z",
@@ -4735,11 +4843,25 @@ Compare the family options.
       calendarRefs: [calendarRef],
     };
     const modelRequests: Record<string, unknown>[] = [];
+    const reviewRequests: Record<string, unknown>[] = [];
+    const prematureResult = {
+      outcome: "succeeded",
+      text: "Back-to-school night is tomorrow from 4 to 6 PM.",
+    };
+    const verifiedResult = {
+      outcome: "succeeded",
+      text: "Back-to-school night is tomorrow from 4 to 6 PM.",
+    };
     const modelResponses = [
       {
         status: "completed",
         output_parsed: null,
         output: [functionCall("list-work-calendars", "list_calendars", {})],
+      },
+      {
+        status: "completed",
+        output_parsed: prematureResult,
+        output: [familyWorkResultMessage("premature-calendar-success", prematureResult)],
       },
       {
         status: "completed",
@@ -4753,9 +4875,38 @@ Compare the family options.
       },
       {
         status: "completed",
+        output_parsed: verifiedResult,
+        output: [familyWorkResultMessage("verified-calendar-success", verifiedResult)],
+      },
+    ];
+    const reviewResponses = [
+      {
+        status: "completed",
         output_parsed: {
-          outcome: "succeeded",
-          text: "Back-to-school night is tomorrow from 4 to 6 PM.",
+          verdict: "continue",
+          reason: "The Calendar was listed, but tomorrow's event window was not read.",
+          condition: "Establish tomorrow's School Calendar schedule from a successful Calendar-window read.",
+          basisKind: null,
+          summary: null,
+          evidenceCallIds: [],
+        },
+        output: [],
+      },
+      {
+        status: "completed",
+        output_parsed: {
+          verdict: "verified",
+          reason: null,
+          condition: "Tomorrow's School Calendar schedule is established.",
+          basisKind: "capability_evidence",
+          summary: "The successful Calendar-window read confirms Back-to-school night from 4 to 6 PM.",
+          evidenceCallIds: ["read-work-calendar-retry"],
+          evidenceSelections: [
+            {
+              callId: "read-work-calendar-retry",
+              pointers: ["/events/0/eventRef", "/events/0/startsAt", "/events/0/endsAt"],
+            },
+          ],
         },
         output: [],
       },
@@ -4763,6 +4914,12 @@ Compare the family options.
     const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
       responses: {
         parse(request: Record<string, unknown>) {
+          if (JSON.stringify(request.text).includes("florence_family_work_completion_review")) {
+            reviewRequests.push(request);
+            const response = reviewResponses.shift();
+            if (!response) throw new Error("Unexpected durable Calendar completion review");
+            return response;
+          }
           modelRequests.push(request);
           const response = modelResponses.shift();
           if (!response) throw new Error("Unexpected durable Calendar model turn");
@@ -4884,13 +5041,367 @@ Compare the family options.
       expect.objectContaining({ scope: "selected", calendarRefs: [calendarRef] }),
       expect.objectContaining({ scope: "selected", calendarRefs: [calendarRef] }),
     ]);
+    expect(modelRequests).toHaveLength(5);
+    expect(reviewRequests).toHaveLength(2);
     expect(JSON.stringify(modelRequests[1]?.input)).toContain(calendarRef);
-    expect(JSON.stringify(modelRequests[2]?.input)).toContain('\\"retryable\\":true');
+    expect(JSON.stringify(modelRequests[2]?.input)).toContain("premature-calendar-success");
+    expect(JSON.stringify(modelRequests[2]?.input)).toContain("family_work_completion_repair");
+    expect(JSON.stringify(modelRequests[2]?.input)).toContain("event window was not read");
+    expect(JSON.stringify(modelRequests[3]?.input)).toContain('\\"retryable\\":true');
+    expect(JSON.stringify(reviewRequests[1]?.input)).toContain("read-work-calendar-retry");
+    expect(JSON.stringify(reviewRequests[1]?.input)).toContain("event-school-night");
     expect(terminal).toMatchObject({
       kind: "terminal",
       outcome: "succeeded",
       text: expect.stringContaining("Back-to-school night"),
+      state: {
+        terminal: {
+          completionBasis: {
+            condition: "Tomorrow's School Calendar schedule is established.",
+            summary: "The successful Calendar-window read confirms Back-to-school night from 4 to 6 PM.",
+            evidenceCallIds: ["read-work-calendar-retry"],
+          },
+        },
+        completionEvidence: [
+          expect.objectContaining({
+            callId: "read-work-calendar-retry",
+            capabilityName: "read_calendar_window",
+            arguments: calendarWindowArguments,
+            recordedAt: NOW,
+          }),
+        ],
+      },
     });
+    if (terminal.kind !== "terminal") throw new Error("Durable Calendar work did not finish");
+    const confirmed = functionOutputEnvelopes(modelRequests[4]).find(
+      (entry) => entry.callId === "read-work-calendar-retry",
+    );
+    expect(terminal.state.completionEvidence?.[0]?.outputDigest).toBe(
+      completionOutputDigest(confirmed?.output),
+    );
+    expect(terminal.state.completionEvidence?.[0]).not.toHaveProperty("output");
+  });
+
+  test("persisted completion rejection closes unchanged success with one truthful disposition", async () => {
+    const modelRequests: Record<string, unknown>[] = [];
+    const reviewRequests: Record<string, unknown>[] = [];
+    const dispositionRequests: Record<string, unknown>[] = [];
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        parse(request: Record<string, unknown>) {
+          const format = JSON.stringify(request.text);
+          if (format.includes("florence_family_work_completion_review")) {
+            reviewRequests.push(request);
+            return {
+              status: "completed",
+              output_parsed: {
+                verdict: "continue",
+                reason: "No successful capability result establishes that the requested outcome happened.",
+                condition: "The requested family outcome is established.",
+                basisKind: null,
+                summary: null,
+                evidenceCallIds: [],
+              },
+              output: [],
+            };
+          }
+          if (format.includes("florence_family_work_unverified_disposition")) {
+            dispositionRequests.push(request);
+            return {
+              status: "completed",
+              output_parsed: {
+                outcome: "partial",
+                text: "I found the relevant details, but I couldn't verify that the outside action was completed.",
+                resumeAt: null,
+                progressText: null,
+                selectedImageAssetIds: [],
+                selectedFileAssetIds: [],
+                docket: {
+                  owner: "Florence",
+                  nextAction: "Verify the outside action through an available source.",
+                  waitingOn: "A source that confirms the resulting state.",
+                  needsAnswer: false,
+                },
+              },
+              output: [],
+            };
+          }
+          modelRequests.push(request);
+          return {
+            status: "completed",
+            output_parsed: {
+              outcome: "succeeded",
+              text: "Everything is done.",
+              resumeAt: null,
+              progressText: null,
+              selectedImageAssetIds: [],
+              selectedFileAssetIds: [],
+              docket: null,
+            },
+            output: [],
+          };
+        },
+      },
+    } as never);
+    const state: FamilyWorkStateV1 = {
+      kind: "family_work_v1",
+      version: 1,
+      generation: 2,
+      phase: "ready",
+      claim: null,
+      activePhoneCall: null,
+      activeTextMessage: null,
+      pendingParticipantRequest: null,
+      browserSession: null,
+      completionEvidence: [],
+      completionRejection: {
+        condition: "The requested family outcome is established.",
+        reason: "The earlier success claim had no confirming result.",
+      },
+      continuationItems: [
+        {
+          type: "message",
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text: "The task history before this point was compacted into the following summary:\n\n<summary>\nThe previous completion claim was unverified.\n</summary>",
+            },
+          ],
+        },
+      ],
+      pendingCall: null,
+      steering: [],
+      progressRevision: 0,
+      terminal: null,
+    };
+
+    const result = await reasoner.continueFamilyWork(
+      {
+        workId: "family-work-fixed-point",
+        scheduledOccurrence: null,
+        objective: "Take care of the requested family outcome.",
+        visibility: "household",
+        ownerAdultId: null,
+        origin: familyWorkOrigin("Take care of the requested family outcome."),
+        household: {
+          householdId: "household-1",
+          familyLabel: "Test family",
+          timeZone: "America/Los_Angeles",
+          postalCode: "90045",
+          adults: [{ adultId: "adult-1", firstName: "Hari", displayName: "Hari Anbarasu" }],
+          children: [],
+        },
+        state: JSON.parse(JSON.stringify(state)) as FamilyWorkStateV1,
+        currentTime: NOW,
+      },
+      {},
+    );
+
+    expect(modelRequests).toHaveLength(1);
+    expect(reviewRequests).toHaveLength(1);
+    expect(dispositionRequests).toHaveLength(1);
+    expect(JSON.stringify(modelRequests[0]?.input)).toContain("completionRejection");
+    expect(JSON.stringify(dispositionRequests[0]?.text)).toContain(
+      "florence_family_work_unverified_disposition",
+    );
+    const dispositionOutcomes = (
+      dispositionRequests[0]?.text as
+        | { format?: { schema?: { properties?: { outcome?: { enum?: unknown } } } } }
+        | undefined
+    )?.format?.schema?.properties?.outcome?.enum;
+    expect(dispositionOutcomes).toEqual(["partial", "waiting", "failed"]);
+    expect(dispositionRequests[0]?.tools).toEqual([]);
+    expect(
+      JSON.stringify(
+        [...modelRequests, ...reviewRequests, ...dispositionRequests].map((request) => request.input),
+      ),
+    ).not.toContain("family_work_completion_repair");
+    expect(result).toMatchObject({
+      kind: "terminal",
+      outcome: "partial",
+      state: {
+        phase: "terminal",
+        completionEvidence: [],
+        completionRejection: null,
+      },
+    });
+    if (result.kind !== "terminal") throw new Error("Unverified fixed point did not close");
+    expect(result.state.terminal?.completionBasis).toBeUndefined();
+    expect(result).not.toHaveProperty("resumeAt");
+    expect(result).not.toHaveProperty("nextCheckDelayMs");
+  });
+
+  test("large Workspace evidence finishes with one exact digest receipt instead of a copied payload", async () => {
+    const uniqueClause = "Parents must submit the signed field-trip form by Friday at 3 PM.";
+    const workspaceResult: GoogleWorkspaceResult = {
+      operation: "gmail_search",
+      result: {
+        messages: [
+          {
+            messageId: "school-policy-message",
+            subject: "Field trip paperwork",
+            relevantClause: uniqueClause,
+            providerPayload: "x".repeat(300 * 1024),
+          },
+        ],
+      },
+    };
+    const modelResponses = [
+      {
+        status: "completed",
+        output_parsed: null,
+        output: [
+          functionCall("large-school-search", "gmail_work", {
+            operation: "gmail_search",
+            query: "field trip paperwork",
+            limit: 20,
+            messageId: null,
+            to: [],
+            cc: [],
+            bcc: [],
+            subject: null,
+            body: null,
+            bodyFormat: null,
+            threadId: null,
+            addLabelIds: [],
+            removeLabelIds: [],
+          }),
+        ],
+      },
+      {
+        status: "completed",
+        output_parsed: {
+          outcome: "succeeded",
+          text: uniqueClause,
+          resumeAt: null,
+          progressText: null,
+          selectedImageAssetIds: [],
+          selectedFileAssetIds: [],
+          docket: null,
+        },
+        output: [],
+      },
+    ];
+    const reviewRequests: Record<string, unknown>[] = [];
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        parse(request: Record<string, unknown>) {
+          if (JSON.stringify(request.text).includes("florence_family_work_completion_review")) {
+            reviewRequests.push(request);
+            return {
+              status: "completed",
+              output_parsed: {
+                verdict: "verified",
+                reason: null,
+                condition:
+                  "The matching school messages were read and their actionable deadline was reported.",
+                basisKind: "capability_evidence",
+                summary: "The Gmail search result contains the field-trip form deadline.",
+                evidenceCallIds: ["large-school-search"],
+                evidenceSelections: [
+                  {
+                    callId: "large-school-search",
+                    pointers: ["/result/messages/0/relevantClause"],
+                  },
+                ],
+              },
+              output: [],
+            };
+          }
+          const response = modelResponses.shift();
+          if (!response) throw new Error("Unexpected large-evidence model turn");
+          return response;
+        },
+      },
+    } as never);
+    const state: FamilyWorkStateV1 = {
+      kind: "family_work_v1",
+      version: 1,
+      generation: 0,
+      phase: "ready",
+      claim: null,
+      activePhoneCall: null,
+      activeTextMessage: null,
+      pendingParticipantRequest: null,
+      browserSession: null,
+      completionEvidence: [],
+      completionRejection: null,
+      continuationItems: [],
+      pendingCall: null,
+      steering: [],
+      progressRevision: 0,
+      terminal: null,
+    };
+
+    const result = await reasoner.continueFamilyWork(
+      {
+        workId: "family-work-large-workspace-evidence",
+        scheduledOccurrence: null,
+        objective: "Compile the actionable field-trip requirements from the school messages.",
+        visibility: "private",
+        ownerAdultId: "adult-1",
+        origin: familyWorkOrigin("Compile the actionable field-trip requirements from the school messages."),
+        household: {
+          householdId: "household-1",
+          familyLabel: "Test family",
+          timeZone: "America/Los_Angeles",
+          postalCode: "90045",
+          adults: [{ adultId: "adult-1", firstName: "Hari", displayName: "Hari Anbarasu" }],
+          children: [],
+        },
+        googleConnections: [
+          {
+            emailLabel: "Personal Google",
+            calendarAvailable: true,
+            kind: "personal",
+            writesEnabled: false,
+          },
+        ],
+        state,
+        currentTime: NOW,
+      },
+      {
+        async runGoogleWorkspace() {
+          return workspaceResult;
+        },
+      },
+    );
+
+    expect(reviewRequests).toHaveLength(1);
+    const reviewInput = reviewRequests[0]?.input as
+      | { content?: { type?: string; text?: string }[] }[]
+      | undefined;
+    const reviewPayload = JSON.parse(reviewInput?.[0]?.content?.[0]?.text ?? "{}") as {
+      successfulCapabilityResults?: { output?: unknown }[];
+    };
+    expect(reviewPayload.successfulCapabilityResults?.[0]?.output).toEqual(workspaceResult);
+    expect(result).toMatchObject({
+      kind: "terminal",
+      outcome: "succeeded",
+      state: {
+        terminal: { completionBasis: { evidenceCallIds: ["large-school-search"] } },
+        completionEvidence: [
+          expect.objectContaining({
+            callId: "large-school-search",
+            outputDigest: completionOutputDigest(workspaceResult),
+            facts: [
+              {
+                pointer: "/result/messages/0/relevantClause",
+                value: uniqueClause,
+              },
+            ],
+          }),
+        ],
+      },
+    });
+    if (result.kind !== "terminal") throw new Error("Large Workspace evidence did not finish");
+    expect(result.completionEvidenceOutputs).toEqual([
+      { callId: "large-school-search", output: workspaceResult },
+    ]);
+    expect(result.state.completionEvidence?.[0]).not.toHaveProperty("output");
+    expect(JSON.stringify(result.state)).not.toContain("x".repeat(10_000));
+    expect(Buffer.byteLength(JSON.stringify(result.state), "utf8")).toBeLessThan(240 * 1024);
   });
 
   test("public place verification composes map candidates with direct web search", async () => {
@@ -5192,6 +5703,8 @@ Compare the family options.
     const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
       responses: {
         parse(request: Record<string, unknown>) {
+          const review = defaultFamilyWorkCompletionReview(request);
+          if (review) return review;
           requests.push(request);
           const response = responses.shift();
           if (!response) throw new Error("Unexpected durable private-read model turn");
@@ -6171,6 +6684,51 @@ function functionOutputEnvelopes(request: Record<string, unknown> | undefined) {
       error: { code: string } | null;
     }),
   }));
+}
+
+function defaultFamilyWorkCompletionReview(request: Record<string, unknown>) {
+  if (!JSON.stringify(request.text).includes("florence_family_work_completion_review")) return null;
+  const input = request.input as Array<{ content?: Array<{ type?: string; text?: string }> }> | undefined;
+  const text = input?.[0]?.content?.find((part) => part.type === "input_text")?.text ?? "{}";
+  const context = JSON.parse(text) as {
+    taskContext?: { objective?: string };
+    proposedResult?: { text?: string | null };
+    successfulCapabilityResults?: Array<{ callId?: string; output?: unknown }>;
+  };
+  const selectedEvidence = context.successfulCapabilityResults?.at(-1);
+  const evidenceCallId = selectedEvidence?.callId ?? null;
+  const evidencePointer = selectedEvidence ? firstCompletionEvidencePointer(selectedEvidence.output) : null;
+  return {
+    status: "completed",
+    output_parsed: {
+      verdict: "verified",
+      reason: null,
+      condition: context.taskContext?.objective ?? "The requested test objective is complete.",
+      basisKind: evidenceCallId ? "capability_evidence" : "reasoned_result",
+      summary: context.proposedResult?.text ?? "The requested test objective is complete.",
+      evidenceCallIds: evidenceCallId ? [evidenceCallId] : [],
+      evidenceSelections:
+        evidenceCallId && evidencePointer ? [{ callId: evidenceCallId, pointers: [evidencePointer] }] : [],
+    },
+    output: [],
+  };
+}
+
+function firstCompletionEvidencePointer(value: unknown, prefix = ""): string | null {
+  if (value === null || typeof value !== "object") return prefix || null;
+  if (Array.isArray(value)) {
+    for (const [index, item] of value.entries()) {
+      const pointer = firstCompletionEvidencePointer(item, `${prefix}/${index}`);
+      if (pointer) return pointer;
+    }
+    return null;
+  }
+  for (const [key, item] of Object.entries(value)) {
+    const escaped = key.replace(/~/gu, "~0").replace(/\//gu, "~1");
+    const pointer = firstCompletionEvidencePointer(item, `${prefix}/${escaped}`);
+    if (pointer) return pointer;
+  }
+  return null;
 }
 
 function privateGmailSource() {

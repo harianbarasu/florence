@@ -5877,6 +5877,7 @@ export class Florence {
                 : null,
             },
             terminalText: step.text,
+            completionEvidenceOutputs: step.completionEvidenceOutputs,
           },
         });
         if (settlement === "settled" && terminalBrowserSession) {

@@ -68,6 +68,8 @@ type CalendarMonthCell = {
   date: string | null;
 };
 
+type VaultDocket = NonNullable<WorkspaceView["vault"]>["docket"];
+
 export function AppShell() {
   const directEntry = onboardingEntry.setupToken !== null || onboardingEntry.accessToken !== null;
   const session = useSession(!directEntry);
@@ -1395,6 +1397,72 @@ export function VaultPage() {
         />
       )}
 
+      <VaultSection label="On the docket">
+        <DocketList
+          docket={vault.docket}
+          timeZone={vault.timeZone}
+          reviewState={view.workspace.setup.initialBriefing}
+        />
+      </VaultSection>
+
+      {library.length > 0 && (
+        <VaultSection label="Library">
+          <ArtifactList
+            artifacts={library}
+            isSaving={patchFact.isPending || deleteFact.isPending}
+            onCorrect={(factId, input) => patchFact.mutateAsync({ factId, input })}
+            onDelete={(factId) => deleteFact.mutateAsync(factId)}
+          />
+        </VaultSection>
+      )}
+
+      {ordinaryFacts.length > 0 && (
+        <VaultSection label="Facts">
+          <FactList
+            facts={ordinaryFacts}
+            emptyTitle="No facts visible yet"
+            emptyDetail="Useful household knowledge Florence learns will appear here."
+            isSaving={patchFact.isPending || deleteFact.isPending}
+            onCorrect={(factId, input) => patchFact.mutateAsync({ factId, input })}
+            onDelete={(factId) => deleteFact.mutateAsync(factId)}
+          />
+        </VaultSection>
+      )}
+
+      {preferencesAndRoutines.length > 0 && (
+        <VaultSection label="Preferences & routines">
+          <FactList
+            facts={preferencesAndRoutines}
+            emptyTitle="No preferences or routines yet"
+            emptyDetail="Family preferences, constraints, and recurring routines Florence learns will appear here."
+            isSaving={patchFact.isPending || deleteFact.isPending}
+            onCorrect={(factId, input) => patchFact.mutateAsync({ factId, input })}
+            onDelete={(factId) => deleteFact.mutateAsync(factId)}
+          />
+        </VaultSection>
+      )}
+
+      {library.length === 0 && ordinaryFacts.length === 0 && preferencesAndRoutines.length === 0 && (
+        <VaultSection label="Saved knowledge">
+          <EmptyVaultRow
+            title={
+              view.workspace.setup.initialBriefing === "preparing"
+                ? "Florence is still learning what matters"
+                : view.workspace.setup.initialBriefing === "not_ready"
+                  ? "Saved knowledge isn’t ready yet"
+                  : "Nothing saved yet"
+            }
+            detail={
+              view.workspace.setup.initialBriefing === "preparing"
+                ? "Recipes, facts, preferences, and routines will appear here as the first review finishes."
+                : view.workspace.setup.initialBriefing === "not_ready"
+                  ? "Florence will fill this after household setup and the first review are complete."
+                  : "Recipes, facts, preferences, and routines Florence remembers will appear here."
+            }
+          />
+        </VaultSection>
+      )}
+
       <VaultSection label="Home">
         <HomePostalCode
           postalCode={vault.postalCode}
@@ -1433,38 +1501,67 @@ export function VaultPage() {
       >
         <PeopleList members={children} onEdit={setEditing} />
       </VaultSection>
-
-      <VaultSection label="Facts">
-        <FactList
-          facts={ordinaryFacts}
-          emptyTitle="No facts visible yet"
-          emptyDetail="Useful household knowledge Florence learns will appear here."
-          isSaving={patchFact.isPending || deleteFact.isPending}
-          onCorrect={(factId, input) => patchFact.mutateAsync({ factId, input })}
-          onDelete={(factId) => deleteFact.mutateAsync(factId)}
-        />
-      </VaultSection>
-
-      <VaultSection label="Preferences & routines">
-        <FactList
-          facts={preferencesAndRoutines}
-          emptyTitle="No preferences or routines yet"
-          emptyDetail="Family preferences, constraints, and recurring routines Florence learns will appear here."
-          isSaving={patchFact.isPending || deleteFact.isPending}
-          onCorrect={(factId, input) => patchFact.mutateAsync({ factId, input })}
-          onDelete={(factId) => deleteFact.mutateAsync(factId)}
-        />
-      </VaultSection>
-
-      <VaultSection label="Library">
-        <ArtifactList
-          artifacts={library}
-          isSaving={patchFact.isPending || deleteFact.isPending}
-          onCorrect={(factId, input) => patchFact.mutateAsync({ factId, input })}
-          onDelete={(factId) => deleteFact.mutateAsync(factId)}
-        />
-      </VaultSection>
     </Page>
+  );
+}
+
+function DocketList({
+  docket,
+  timeZone,
+  reviewState,
+}: {
+  docket: VaultDocket;
+  timeZone: string;
+  reviewState: WorkspaceView["workspace"]["setup"]["initialBriefing"];
+}) {
+  if (docket.items.length === 0) {
+    if (reviewState === "preparing") {
+      return (
+        <EmptyVaultRow
+          title="Florence is reviewing your household"
+          detail="Your docket will update here as soon as the first pass is ready."
+        />
+      );
+    }
+    if (reviewState === "not_ready") {
+      return (
+        <EmptyVaultRow
+          title="Your docket isn’t ready yet"
+          detail="Florence will fill it after household setup and the first review are complete."
+        />
+      );
+    }
+    return (
+      <EmptyVaultRow
+        title="Nothing needs attention right now."
+        detail="New household to-dos and decisions will appear here."
+      />
+    );
+  }
+
+  const remaining = Math.max(docket.totalItems - docket.items.length, 0);
+  return (
+    <div className="docket-list">
+      {docket.items.map((item) => (
+        <article className="docket-row" key={item.candidateId}>
+          <strong>{item.summary}</strong>
+          {item.dueAt && <p>{docketDateLabel(item.dueAt, timeZone, item.category)}</p>}
+          <div className="docket-badges">
+            <span className="docket-badge">{docketCategoryLabel(item.category)}</span>
+            <span className={`docket-badge urgency-${item.urgency}`}>{docketUrgencyLabel(item.urgency)}</span>
+            {item.needsAnswer && <span className="docket-badge">Answer needed</span>}
+            <span className="docket-badge">
+              {item.visibility === "private" ? "Private to you" : "Shared with the household"}
+            </span>
+          </div>
+        </article>
+      ))}
+      {remaining > 0 && (
+        <p className="docket-remaining">
+          {remaining} more {remaining === 1 ? "item is" : "items are"} still on the docket.
+        </p>
+      )}
+    </div>
   );
 }
 
@@ -2531,6 +2628,54 @@ function LoadError({ error }: { error: Error }) {
 
 function sourceSummary(visibility: "private" | "household", source: string) {
   return `${visibility === "private" ? "Private to you" : "Shared with the household"} · ${source}`;
+}
+
+function docketCategoryLabel(category: string): string {
+  const label = category.replaceAll(/[_-]+/g, " ").trim();
+  return label ? `${label[0]?.toUpperCase() ?? ""}${label.slice(1)}` : "Household";
+}
+
+function docketUrgencyLabel(urgency: VaultDocket["items"][number]["urgency"]): string {
+  switch (urgency) {
+    case "now":
+      return "Needs attention now";
+    case "soon":
+      return "Coming up";
+    case "watch":
+      return "Worth watching";
+  }
+}
+
+function docketDateLabel(
+  value: string,
+  timeZone: string,
+  category: VaultDocket["items"][number]["category"],
+): string {
+  const date = new Date(value);
+  const timeParts = new Intl.DateTimeFormat("en-US", {
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+    timeZone,
+  }).formatToParts(date);
+  const hour = timeParts.find((part) => part.type === "hour")?.value;
+  const minute = timeParts.find((part) => part.type === "minute")?.value;
+  const dateOnly = hour === "00" && minute === "00";
+  const formatted = new Intl.DateTimeFormat(undefined, {
+    dateStyle: "medium",
+    ...(!dateOnly && { timeStyle: "short" as const }),
+    timeZone,
+  }).format(date);
+  switch (category) {
+    case "family_date":
+      return `On ${formatted}`;
+    case "conflict":
+      return `Conflict on ${formatted}`;
+    case "handoff":
+      return `Handoff ${formatted}`;
+    default:
+      return `Due ${formatted}`;
+  }
 }
 
 function watchTime(value: string | null, timeZone: string) {

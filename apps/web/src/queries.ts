@@ -55,7 +55,13 @@ export function useDeleteSession() {
 }
 
 export function useWorkspace(enabled = true) {
-  return useQuery({ queryKey: queryKeys.workspace, queryFn: getWorkspace, enabled });
+  return useQuery({
+    queryKey: queryKeys.workspace,
+    queryFn: getWorkspace,
+    enabled,
+    refetchInterval: (query) =>
+      query.state.data?.workspace.setup.initialBriefing === "preparing" ? 2_000 : 5_000,
+  });
 }
 
 export function useFamilyCalendarMonth(month: string) {

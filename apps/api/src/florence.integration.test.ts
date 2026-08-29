@@ -4113,6 +4113,20 @@ release("Florence parent journeys", () => {
     expect(partnerPrivateDocket.items.map((candidate) => candidate.summary)).not.toContain(
       PRIVATE_INITIAL_ONLY_FINDING,
     );
+    const founderVaultDocket = (await harness.florence.workspaceForAdult(harness.founderAdultId)).vault
+      ?.docket;
+    expect(founderVaultDocket?.totalItems).toBe(founderPrivateDocket.totalItems);
+    expect(
+      founderVaultDocket?.items.find((candidate) => candidate.summary === PRIVATE_INITIAL_ONLY_FINDING),
+    ).toMatchObject({ visibility: "private" });
+    expect(
+      founderVaultDocket?.items.find((candidate) => candidate.summary === FOUNDER_FORM_SUMMARY),
+    ).toMatchObject({ visibility: "household" });
+    const partnerVaultDocket = (await harness.florence.workspaceForAdult(harness.partnerAdultId)).vault
+      ?.docket;
+    expect(partnerVaultDocket?.items.map((candidate) => candidate.summary)).not.toContain(
+      PRIVATE_INITIAL_ONLY_FINDING,
+    );
     await harness.accept("private", "private-docket-recall", PRIVATE_DOCKET_RECALL_REQUEST);
     await harness.drain();
     expect(harness.linq.messages.some((message) => message.text === PRIVATE_DOCKET_RECALL_REPLY)).toBe(true);
@@ -4152,6 +4166,11 @@ release("Florence parent journeys", () => {
       PARTNER_PERMISSION_SUMMARY,
     );
     expect(docketAfterCompletion.items.map((candidate) => candidate.summary)).toContain(FOUNDER_FORM_SUMMARY);
+    expect(
+      (await harness.florence.workspaceForAdult(harness.partnerAdultId)).vault?.docket.items.map(
+        (candidate) => candidate.summary,
+      ),
+    ).not.toContain(PARTNER_PERMISSION_SUMMARY);
     await harness.assertDatabase(
       "The handled docket item did not retain its durable Google action identity",
       `exists (

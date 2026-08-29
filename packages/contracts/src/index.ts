@@ -234,6 +234,30 @@ export const vaultWatchSchema = z.discriminatedUnion("kind", [
 ]);
 export type VaultWatch = z.infer<typeof vaultWatchSchema>;
 
+export const vaultDocketItemSchema = z
+  .object({
+    candidateId: idSchema,
+    category: z.enum(["deadline", "conflict", "handoff", "family_date", "loose_end"]),
+    summary: nonempty(4_000),
+    urgency: z.enum(["now", "soon", "watch"]),
+    dueAt: timestampSchema.nullable(),
+    needsAnswer: z.boolean(),
+    visibility: vaultVisibilitySchema,
+  })
+  .strict();
+export type VaultDocketItem = z.infer<typeof vaultDocketItemSchema>;
+
+export const vaultDocketSchema = z
+  .object({
+    totalItems: z.number().int().min(0),
+    items: z.array(vaultDocketItemSchema),
+  })
+  .strict()
+  .refine((docket) => docket.totalItems === docket.items.length, {
+    message: "The complete Vault docket count must match its visible items.",
+  });
+export type VaultDocket = z.infer<typeof vaultDocketSchema>;
+
 export const googleConnectionSummarySchema = z
   .object({
     connectionId: idSchema,
@@ -274,6 +298,7 @@ export const householdVaultSchema = z
     timeZone: nonempty(100),
     postalCode: postalCodeSchema.nullable(),
     members: z.array(familyMemberProfileSchema).max(100),
+    docket: vaultDocketSchema,
     facts: z.array(vaultFactSchema),
     watches: z.array(vaultWatchSchema).max(100),
   })

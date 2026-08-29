@@ -254,7 +254,10 @@ export class Florence {
 
   async workspaceForAdult(adultId: string): Promise<WorkspaceView> {
     const household = await this.#householdForAdultOrNull(adultId);
-    return workspaceViewSchema.parse(workspace(adultId, household, this.#messagesUrl));
+    const docket = household
+      ? await workspaceDocket(this.#store, household.id, adultId, this.#now().toISOString())
+      : { totalItems: 0, items: [] };
+    return workspaceViewSchema.parse(workspace(adultId, household, docket, this.#messagesUrl));
   }
 
   async familyCalendarMonthForAdult(
@@ -6661,6 +6664,7 @@ export class Florence {
 function workspace(
   adultId: string,
   household: HouseholdRecord | null,
+  docket: NonNullable<WorkspaceView["vault"]>["docket"],
   messagesUrl: string | null,
 ): WorkspaceView {
   const viewer = household?.members.find((member) => member.id === adultId) ?? null;
@@ -6727,6 +6731,7 @@ function workspace(
           timeZone: household.timeZone,
           postalCode: founder ? profileString(founder.profile, "postalCode") : null,
           members: household.members.map(memberView),
+          docket,
           facts: household.facts.flatMap((fact) => {
             const source = fact.sources[0];
             if (fact.kind === "address" || fact.kind === "phone") return [];
@@ -6757,6 +6762,26 @@ function workspace(
         }
       : null,
     preferences: preferences(viewer?.preferences),
+  };
+}
+
+async function workspaceDocket(
+  store: PostgresFlorenceStore,
+  householdId: string,
+  adultId: string,
+  now: string,
+): Promise<NonNullable<WorkspaceView["vault"]>["docket"]> {
+  const [householdDocket, visibleDocket] = await Promise.all([
+    store.readHouseholdDocket({ householdId, limit: null, now }),
+    store.readHouseholdDocket({ householdId, viewerAdultId: adultId, limit: null, now }),
+  ]);
+  const householdCandidateIds = new Set(householdDocket.items.map((item) => item.candidateId));
+  return {
+    totalItems: visibleDocket.totalItems,
+    items: visibleDocket.items.map((item) => ({
+      ...item,
+      visibility: householdCandidateIds.has(item.candidateId) ? "household" : "private",
+    })),
   };
 }
 

@@ -2076,14 +2076,14 @@ export class PostgresFlorenceStore {
   async readHouseholdDocket(input: {
     householdId: string;
     viewerAdultId?: string | null;
-    limit?: number;
+    limit?: number | null;
     now?: string;
   }): Promise<HouseholdDocket> {
     assertUuid(input.householdId, "Household ID");
     if (input.viewerAdultId) assertUuid(input.viewerAdultId, "Household docket viewer ID");
     const now = instant(input.now ?? new Date().toISOString());
-    const limit = input.limit ?? 20;
-    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+    const limit = input.limit === undefined ? 20 : input.limit;
+    if (limit !== null && (!Number.isSafeInteger(limit) || limit < 1 || limit > 100)) {
       throw new FlorenceStoreConflict("A household docket limit must be between one and one hundred");
     }
     const [household] = await this.#sql<{ time_zone: string }[]>`
@@ -2132,16 +2132,14 @@ export class PostgresFlorenceStore {
     );
     return {
       totalItems: ranked.length,
-      items: ranked
-        .slice(0, limit)
-        .map(
-          ({
-            sourceIds: _sourceIds,
-            actionAnchorDigest: _actionAnchorDigest,
-            actionKey: _actionKey,
-            ...item
-          }) => item,
-        ),
+      items: (limit === null ? ranked : ranked.slice(0, limit)).map(
+        ({
+          sourceIds: _sourceIds,
+          actionAnchorDigest: _actionAnchorDigest,
+          actionKey: _actionKey,
+          ...item
+        }) => item,
+      ),
     };
   }
 

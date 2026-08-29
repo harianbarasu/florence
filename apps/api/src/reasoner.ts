@@ -742,14 +742,14 @@ const vaultWorkDecisionSchema = z
 const followUpDecisionSchema = z.discriminatedUnion("operation", [
   z
     .object({
-      operation: z.literal("schedule"),
+      operation: z.literal("list"),
       followUpId: z.null(),
-      objective: shortText,
-      currentConclusion: shortText,
-      endCondition: shortText,
-      nextCheck: timestamp,
-      why: shortText,
-      sourceIds,
+      objective: z.null(),
+      currentConclusion: z.null(),
+      endCondition: z.null(),
+      nextCheck: z.null(),
+      why: z.null(),
+      sourceIds: z.array(opaqueId).max(0),
     })
     .strict(),
   z
@@ -821,6 +821,7 @@ const familyWorkDecisionSchema = z.discriminatedUnion("operation", [
       operation: z.literal("create"),
       workId: z.null(),
       objective: shortText,
+      completionCondition: shortText,
       schedule: reminderScheduleSchema.nullable(),
       instruction: z.null(),
       candidateIds: z.array(opaqueId),
@@ -840,6 +841,7 @@ const familyWorkDecisionSchema = z.discriminatedUnion("operation", [
       operation: z.literal("update"),
       workId: opaqueId,
       objective: shortText.nullable(),
+      completionCondition: shortText.nullable(),
       schedule: reminderScheduleSchema.nullable(),
       instruction: z.null(),
     })
@@ -849,6 +851,7 @@ const familyWorkDecisionSchema = z.discriminatedUnion("operation", [
       operation: z.literal("steer"),
       workId: opaqueId,
       objective: z.null(),
+      completionCondition: shortText.nullable(),
       schedule: z.null(),
       instruction: shortText,
     })
@@ -2430,21 +2433,21 @@ Calendar intervals are explicit. Use intervalKind timed only for an event with e
 
 Before returning a create, read a family-Calendar window that completely covers the proposed event. Before an update or delete, read a complete family-Calendar window and copy the target's app-scoped eventRef and observedEvent exactly from one returned event; never invent or reconstruct a target. An update's read must cover both the observed and replacement intervals. If any necessary read is truncated or unavailable, return null and explain briefly. The general conversation model can never approve a previously offered Calendar event. The application interprets that approval in a separate isolated decision using only the current parent Message and the immutable event Florence already showed. Never put an unverified success claim in conversation bubbles; the application reports a direct Calendar result after execution and provider verification.
 
-Facts may be remembered or corrected only when policy.retain is true. Forgetting an existing fact is allowed when retain is false. A reminder, finite monitor, durable interest discovery, Calendar offer, direct Calendar decision, or scheduled familyWork create, update, pause, resume, or run requires policy.schedule true. Immediate familyWork represents doing or steering the task the parent requested now and remains available even if the parent declines reminders, future scheduling, or retention. Cancelling supplied work remains available. Never claim that an external state changed unless the responsible tool returned evidence that it did.
+Facts may be remembered or corrected only when policy.retain is true. Forgetting an existing fact is allowed when retain is false. A reminder, legacy finite-monitor update, durable interest discovery, Calendar offer, direct Calendar decision, or scheduled familyWork create, update, pause, resume, or run requires policy.schedule true. Immediate familyWork represents doing or steering the task the parent requested now and remains available even if the parent declines reminders, future scheduling, or retention. Listing and cancelling supplied work remain available. Never claim that an external state changed unless the responsible tool returned evidence that it did.
 
 Useful household memory is broader than logistics. Remember durable, reusable context when the parent asks or the conversation clearly establishes it: recipes and their key details or canonical source, food and shopping preferences, routines, recurring plans, prior successful choices, important relationships, and other knowledge that can make future help more specific. Every remember or correct decision includes a concise retrieval statement plus memory presentation. Use memoryKind preference or routine for those durable meanings. Use memoryKind artifact for a reusable editable resource; artifactKind is a presentation facet, not a workflow router. For an artifact, supply a natural title and enough structured plain-text details to use or revise it later—such as a recipe's ingredients, method, family substitutions, and source—and useful retrieval tags. For non-artifacts, artifactKind must be null; title, details, and tags may be used only when they add real retrieval value. Store enough meaning to use it later, not merely a vague label. Do not turn every one-off remark, temporary choice, or passing observation into memory. When existing memory is relevant, use it as working context for the next useful action rather than reciting it back as trivia.
 
-The reminder, followUp, and familyWork fields are different general capabilities. A reminder is a fixed notification telling the parent the supplied action at its due time; it does not investigate or do the action. A followUp is a finite monitor that rereads changing evidence until its explicit end condition. Immediate familyWork has schedule null and starts the same general agent now for an objective that needs continued model/tool turns, waiting on outside state, or an external action checkpoint. Scheduled familyWork has a supplied schedule and wakes that same general agent at each occurrence with the current Vault, Calendar, conversation tools, and other available capabilities; it performs fresh judgment and work rather than replaying canned text. Do not turn these distinctions into task categories or scenario gates.
+The reminder, followUp, and familyWork fields are different general capabilities. A reminder is a fixed notification telling the parent the supplied action at its due time; it does not investigate or do the action. followUp is legacy finite-monitor state and may only list, update, or cancel a supplied pendingFollowUp; never create a new followUp. Immediate familyWork has schedule null and starts the same general agent now for an objective that needs continued model/tool turns, waiting on outside state, monitoring changing external state, or an external action checkpoint. Scheduled familyWork has a supplied schedule and wakes that same general agent at each occurrence with the current Vault, Calendar, conversation tools, and other available capabilities; it performs fresh judgment and work rather than replaying canned text. Do not turn these distinctions into task categories or scenario gates.
 
-currentTime is the authoritative current instant for resolving all new schedules; currentMessage.occurredAt is only when the parent sent the Message. Create familyWork with the parent's actual objective and either schedule null for work starting now or a resolved schedule for future or recurring work. Use the same once, interval, daily, weekly, monthly, and yearly schedule meanings as reminders. list answers from visibleFamilyWork, including the natural objective, schedule, paused state, last result, and next occurrence when useful; never expose work IDs. update changes a supplied scheduled series definition and is patch-only: objective null preserves the objective and schedule null preserves the schedule, and at least one field must change. Immediate one-off work is steered instead of updated. Prefer updating a supplied matching scheduled familyWork over creating a duplicate. pause and resume control only scheduled familyWork; use its paused boolean even while a current occurrence is active or waiting. run starts one occurrence now without changing its cadence, and a paused series stays paused after that one run. cancel ends the supplied work and future occurrences.
+currentTime is the authoritative current instant for resolving all new schedules; currentMessage.occurredAt is only when the parent sent the Message. Create familyWork with the parent's actual objective and either schedule null for work starting now or a resolved schedule for future or recurring work. A request such as “keep checking,” “watch this until,” or “tell me when this changes” always starts immediate familyWork with schedule null: the general agent checks now, defers proportionately when the condition is not yet met, and resumes with its normal tools and retained context. Do not turn that request into a recurring schedule or a new followUp. Use the same once, interval, daily, weekly, monthly, and yearly schedule meanings as reminders. list answers from visibleFamilyWork, including the natural objective, schedule, paused state, last result, and next occurrence when useful; never expose work IDs. update changes a supplied scheduled series definition and is patch-only: objective null preserves the objective, schedule null preserves the schedule, and completionCondition null preserves the authoritative end state; at least one field must change. Set a non-null completionCondition only when the current verified parent's typed text or voice note explicitly changes the requested end state. Immediate one-off work is steered instead of updated. Prefer updating a supplied matching scheduled familyWork over creating a duplicate. pause and resume control only scheduled familyWork; use its paused boolean even while a current occurrence is active or waiting. run starts one occurrence now without changing its cadence, and a paused series stays paused after that one run. cancel ends the supplied work and future occurrences.
 
-For familyWork create, candidateIds is structured provenance beside the natural-language objective. Include each supplied householdDocket candidateId that directly grounds the work Florence is starting, with no duplicates, and include no merely similar or background item. Use an empty array when the objective is not grounded in a supplied docket item. If any exact candidateId is already linked to visible non-finished familyWork, steer or otherwise control that existing work instead of creating another task for it, regardless of objective wording. Never copy candidate IDs into conversation text.
+For every familyWork create, completionCondition is the concrete, observable result that makes the parent's actual objective done. It is authoritative across deferral and resumed turns: describe the end state, not an action, check cadence, vague “handled,” or merely finding some information. For a monitor-until/change request, state exactly what external change or resolved condition ends the watch. When candidateIds contains a supplied householdDocket item, copy that item's completionCondition unchanged; the application retains the canonical docket condition. When candidateIds is empty, derive the condition directly from the parent's request and persist it with the work. candidateIds is structured provenance beside the natural-language objective. Include each supplied householdDocket candidateId that directly grounds the work Florence is starting, with no duplicates, and include no merely similar or background item. Use an empty array when the objective is not grounded in a supplied docket item. If any exact candidateId is already linked to visible non-finished familyWork, steer or otherwise control that existing work instead of creating another task for it, regardless of objective wording. Never copy candidate IDs into conversation text.
 
-steer changes only the current occurrence, never the recurring definition or a future occurrence. Use it only while an immediate task or one scheduled occurrence is actually active or waiting on the parent. If a scheduled occurrence is already in flight, steer it rather than updating its series definition; update can be used when no occurrence is in flight. Resolve every list, update, steer, pause, resume, run, or cancel against visibleFamilyWork, and ask one focused question instead of guessing when more than one item plausibly matches. Return one immediate natural acknowledgement bubble for every familyWork mutation that names the work Florence is actually starting or changing; a brief reaction may accompany it when that feels natural, but cannot replace the acknowledgement. Never say the work is complete at acceptance. Report a real result, useful partial findings plus one blocking question, or an exact honest failure.
+steer changes only the current occurrence, never the recurring definition or a future occurrence. completionCondition null preserves the current occurrence's authoritative end state. Replace it only when the current verified parent's typed text or voice note explicitly changes what result should end this occurrence; copy that revised concrete end state completely rather than weakening it. Use steer only while an immediate task or one scheduled occurrence is actually active or waiting on the parent. If a scheduled occurrence is already in flight, steer it rather than updating its series definition; update can be used when no occurrence is in flight. Resolve every list, update, steer, pause, resume, run, or cancel against visibleFamilyWork, and ask one focused question instead of guessing when more than one item plausibly matches. Return one immediate natural acknowledgement bubble for every familyWork mutation that names the work Florence is actually starting or changing; a brief reaction may accompany it when that feels natural, but cannot replace the acknowledgement. Never say the work is complete at acceptance. Report a real result, useful partial findings plus one blocking question, or an exact honest failure.
 
 householdDocket is the complete ranked unresolved backlog from parent Messages and connected family evidence. Treat it as current structured context, not a reason to volunteer every item. Each supplied item says whether it is household-visible or private to this adult, who or what is naturally responsible for moving it next, the smallest concrete next action, the exact blocker or dependency when one exists, and the observable completionCondition that must become true before the item is done. When a parent asks what is on the docket, what needs attention, or what the family is waiting on, reconcile it with visible reminders, active or waiting family work, paused scheduled family work, pending follow-ups, pending Calendar offers, and a near-term family-Calendar read when timing could change the answer. Rank by consequence and time, not source or message count. Lead with at most three unfinished items. For each, use summary, owner, nextAction, waitingOn, completionCondition, dueAt, and needsAnswer to say naturally what it is, who can move it, what happens next, and—only when useful—what confirmed result closes it. Do not infer responsibility from category, visibility, evidence ownership, who mentioned the item, or which account or worker currently holds it. If householdDocket.totalItems exceeds what you show, say how many lower-priority items remain instead of dumping them.
 
-docketUpsert retains at most one concrete unresolved item from this ordinary parent turn for later. Use create when the current Message, link, photo, or PDF establishes a real unfinished decision, deadline, handoff, plan, or loose end that will make a later “what’s on the docket?” useful. Use update only to reconcile one supplied existing item with new evidence, and only when its visibility matches this conversation: household in the family group, private in a private adult thread. For every create or update, set owner to the natural responsible party—one supplied parent's exact name, Family, Florence, a plainly named outside person or organization, or null only when responsibility is genuinely unassigned. Set nextAction to the smallest concrete move that advances the item. Set waitingOn to the exact answer, event, handoff, or outside response blocking progress, otherwise null; needsAnswer true requires a non-null waitingOn. Set completionCondition to one concrete, observable result that would let the family confidently call this exact item done; it must describe the finished outcome, not merely restate nextAction, “handled,” “reviewed,” “submitted,” or another intermediate step. Recompute all five coordination fields from the current meaning on every update rather than copying stale state. Never derive them mechanically from category, source ownership, conversation visibility, who mentioned the item, or which parent, account, or worker claimed it. For docketUpsert sourceIds, always cite the current Message sourceId; when this is a natural reply and the exact replied Message materially grounds the item, cite that replyTo sourceId too, and cite no other source. The application derives and retains the cited Messages’ complete edit-chain, photo, PDF, and link evidence without coupling a conversational item to provider-data cleanup. Keep category, urgency, dueAt, and needsAnswer as general presentation and ranking details, never as a task router. Do not save casual chat, a resolved outcome, an ordinary reminder request, a fact with no unfinished follow-through, or something Florence is already doing or monitoring now. A docket change always needs one natural acknowledgement bubble that tells the parent what Florence retained or changed; a reaction cannot replace it. If the parent asks Florence to act now, create familyWork for the actual outcome and return docketUpsert null; if Florence creates or changes a reminder or finite follow-up, return docketUpsert null. Never create a second backlog item for work already underway or separately tracked. If a supplied unresolved item is merely corrected or clarified for later, update it instead of creating a duplicate. Return docketUpsert null when no unresolved item should change.
+docketUpsert retains at most one concrete unresolved item from this ordinary parent turn for later. Use create when the current Message, link, photo, or PDF establishes a real unfinished decision, deadline, handoff, plan, or loose end that will make a later “what’s on the docket?” useful. Use update only to reconcile one supplied existing item with new evidence, and only when its visibility matches this conversation: household in the family group, private in a private adult thread. For every create or update, set owner to the natural responsible party—one supplied parent's exact name, Family, Florence, a plainly named outside person or organization, or null only when responsibility is genuinely unassigned. Set nextAction to the smallest concrete move that advances the item. Set waitingOn to the exact answer, event, handoff, or outside response blocking progress, otherwise null; needsAnswer true requires a non-null waitingOn. Set completionCondition to one concrete, observable result that would let the family confidently call this exact item done; it must describe the finished outcome, not merely restate nextAction, “handled,” “reviewed,” “submitted,” or another intermediate step. Recompute all five coordination fields from the current meaning on every update rather than copying stale state. Never derive them mechanically from category, source ownership, conversation visibility, who mentioned the item, or which parent, account, or worker claimed it. For docketUpsert sourceIds, always cite the current Message sourceId; when this is a natural reply and the exact replied Message materially grounds the item, cite that replyTo sourceId too, and cite no other source. The application derives and retains the cited Messages’ complete edit-chain, photo, PDF, and link evidence without coupling a conversational item to provider-data cleanup. Keep category, urgency, dueAt, and needsAnswer as general presentation and ranking details, never as a task router. Do not save casual chat, a resolved outcome, an ordinary reminder request, a fact with no unfinished follow-through, or something Florence is already doing or monitoring now. A docket change always needs one natural acknowledgement bubble that tells the parent what Florence retained or changed; a reaction cannot replace it. If the parent asks Florence to act now, create familyWork for the actual outcome and return docketUpsert null; if Florence creates or changes a reminder, starts familyWork, or changes a legacy finite follow-up, return docketUpsert null. Never create a second backlog item for work already underway or separately tracked. If a supplied unresolved item is merely corrected or clarified for later, update it instead of creating a duplicate. Return docketUpsert null when no unresolved item should change.
 
 When a parent asks Florence to take care of one or more supplied items and the work needs the durable agent, create familyWork for the actual outcome and put only those exact candidate IDs in familyWork.candidateIds so the retained evidence follows the work. Do not treat silence from another person as completion, and do not repeat an unchanged docket item unsolicited merely because it is still present. When the parent clearly says a supplied docket item is handled, finished, cancelled, or no longer relevant, put exactly that candidateId in docketCompletions and acknowledge it naturally. A reply or unambiguous recent referent may identify the item; if more than one supplied item plausibly matches, ask one focused question and return docketCompletions null. Return docketCompletions null when nothing was completed. Never infer completion from thanks, agreement, silence, or a reaction.
 
@@ -2460,7 +2463,7 @@ For update, pause, resume, run, or cancel, select only one supplied visibleRemin
 
 Reminder delivery copy is application-owned and will be “Reminder: <the parent's action>.” Never add a second command like “Confirm this is handled,” never imply the action happened, and never turn a reminder into an evidence monitor. Missed recurring occurrences collapse to at most one catch-up and then continue at the next legal local occurrence. Context can fill in what or when, but Florence creates or changes a reminder only when the parent is actually asking for that reminder operation.
 
-The followUp field is only for finite evidence monitoring. Use schedule only for a concrete unresolved decision, deadline, risk, or handoff whose evidence Florence must reread later, with a clear objective, currentConclusion, real endCondition, proportionate future nextCheck, and short why. Florence will reread current evidence when it is due and decide whether anything materially changed; do not use schedule for a reminder. Update a supplied pendingFollowUp when the parent corrects its objective, current conclusion, end condition, or timing; cite the current Message and return the complete corrected monitor. Do not create indefinite topic, news, or background-interest watches. Cancel only a supplied pendingFollowUp ID.
+The followUp field manages only legacy pendingFollowUps; it never creates new work. Use list to answer from the supplied pendingFollowUps and return empty sourceIds. Update a supplied pendingFollowUp when the parent corrects its objective, current conclusion, end condition, or timing; cite the current Message and return the complete corrected monitor. Cancel only a supplied pendingFollowUp ID. Use immediate familyWork with an exact completionCondition for every new request to watch, keep checking, or wait for changing evidence.
 
 The interest field represents one durable household interest discovery. Create it only when the parent clearly states a stable interest in typed text or a verified voice note, not from a casual mention, one-off plan, other provider content, attachment, quoted text, or inference. A private adult turn and a family-group turn may both create a household interest. If visibleInterests already contains the same household intent, do not create another discovery; return null when nothing changed, or update that supplied ID when the parent is correcting or resuming it. Correct, resume, or stop only a supplied visibleInterests ID, using update for a correction or resumption and ordinary conversational meaning rather than phrase gates. Search terms must be short generic concepts such as "soccer" or "children's theater": never include any person's name, contact detail, address, URL, private prose, or Calendar text. Keep objective and why concise and household-safe. Do not output ZIP, city, or any other location; the application adds coarse location separately. Creating or updating an interest requires both retention and scheduling, while stopping one remains allowed when either is disabled. Cite the current parent's Message for every interest change.
 
@@ -12006,7 +12009,7 @@ function validateDecision(
       decision.familyWork.operation === "run");
   if (
     !decision.policy.schedule &&
-    (decision.followUp !== null || decision.calendar !== null || scheduledFamilyWorkChange)
+    (decision.followUp?.operation === "update" || decision.calendar !== null || scheduledFamilyWorkChange)
   ) {
     throw invalidOutput("OpenAI scheduled work after declining scheduling authority");
   }
@@ -12130,10 +12133,13 @@ function validateDecision(
     throw invalidOutput("OpenAI changed an unknown finite monitor");
   }
   if (
-    (decision.followUp?.operation === "schedule" || decision.followUp?.operation === "update") &&
+    decision.followUp?.operation === "update" &&
     Date.parse(decision.followUp.nextCheck) <= Date.parse(input.currentTime)
   ) {
     throw invalidOutput("A finite monitor must schedule a future next check");
+  }
+  if (decision.followUp?.operation === "list" && decision.followUp.sourceIds.length > 0) {
+    throw invalidOutput("Listing finite monitors cannot cite unrelated evidence");
   }
   if (decision.reminder) {
     if (input.currentMessage.moveKind === "reaction" || !input.currentMessage.text.trim()) {
@@ -12243,8 +12249,14 @@ function validateDecision(
         visible.status === "delivering" ||
         (visible.status === "active" && visible.nextAt === null);
       if (familyWork.operation === "update") {
-        if (familyWork.objective === null && familyWork.schedule === null) {
-          throw invalidOutput("A family-work update must change its objective or schedule");
+        if (
+          familyWork.objective === null &&
+          familyWork.completionCondition === null &&
+          familyWork.schedule === null
+        ) {
+          throw invalidOutput(
+            "A family-work update must change its objective, completion condition, or schedule",
+          );
         }
         if (visible.schedule === null) {
           throw invalidOutput("Immediate family work must be steered instead of updated");
@@ -12263,6 +12275,16 @@ function validateDecision(
         if (!hasCurrentOccurrence) {
           throw invalidOutput("Only a current family-work occurrence can be steered");
         }
+      }
+      if (
+        (familyWork.operation === "update" || familyWork.operation === "steer") &&
+        familyWork.completionCondition !== null &&
+        !input.currentMessage.authoredText?.trim() &&
+        !input.currentMessage.voiceTranscriptPresent
+      ) {
+        throw invalidOutput(
+          "Changing a family-work completion condition requires the current parent's direction",
+        );
       }
       if (familyWork.operation === "pause") {
         if (visible.schedule === null || visible.paused) {

@@ -840,6 +840,7 @@ export type ScheduledFamilyWork = Readonly<{
   paused: boolean;
   occurrenceActive: boolean;
   previousResult: string | null;
+  completionCondition?: string | null;
 }>;
 
 export type SettleFamilyWorkClaimInput = {
@@ -1633,6 +1634,7 @@ export type FamilyWorkMutation =
       operation: "create";
       workId: string;
       objective: string;
+      completionCondition: string;
       acknowledgementText?: string;
       visibility: Visibility;
       ownerAdultId: string | null;
@@ -1643,9 +1645,16 @@ export type FamilyWorkMutation =
       operation: "update";
       workId: string;
       objective: string | null;
+      completionCondition: string | null;
       schedule: ReminderSchedule | null;
     }
-  | { operation: "steer"; workId: string; instruction: string; acknowledgementText?: string }
+  | {
+      operation: "steer";
+      workId: string;
+      instruction: string;
+      completionCondition: string | null;
+      acknowledgementText?: string;
+    }
   | { operation: "run"; workId: string; acknowledgementText?: string }
   | { operation: "pause" | "resume" | "cancel"; workId: string };
 
@@ -10059,7 +10068,15 @@ export class PostgresFlorenceStore {
           let selectedDocketSourceIds: readonly string[] = [];
           let selectedDocketActionOwners: readonly ProactiveFamilyWorkActionOwner[] = [];
           let linkedDocketCandidateIds: readonly string[] = [...mutation.candidateIds];
-          let completionCondition: string | null = null;
+          const suppliedCompletionCondition = normalizeFamilyWorkCompletionCondition(
+            mutation.completionCondition,
+          );
+          // Adapted from Pi 4e494929 packages/agent/src/agent-loop.ts:169-259, which resumes
+          // one general loop after tool and follow-up turns, and Hermes Agent 6dcebea7
+          // hermes_cli/goals.py:230-254,335-365, which preserves one authoritative completion
+          // contract. Direct work keeps the supplied end state; docket-backed work below keeps
+          // the docket's canonical definition instead of accepting a second model-authored one.
+          let completionCondition: string | null = suppliedCompletionCondition;
           if (mutation.candidateIds.length > 0) {
             if (expectedVisibility !== "household") {
               await lockHouseholdGooglePolls(sql, turn.household_id);
@@ -10148,6 +10165,10 @@ export class PostgresFlorenceStore {
             }
             selectedDocketActionOwners = uniqueProactiveFamilyWorkActionOwners(actionOwners);
           }
+          const persistedCompletionCondition = required(
+            completionCondition ?? "",
+            "Family work completion condition",
+          );
           const familyWorkEvidenceSourceIds = await retainFamilyWorkMessageEvidence(sql, {
             householdId: turn.household_id,
             channelId: turn.channel_id,
@@ -10171,9 +10192,11 @@ export class PostgresFlorenceStore {
           const state = initialFamilyWorkState(
             mutation.acknowledgementText ?? null,
             linkedDocketCandidateIds,
-            completionCondition,
+            persistedCompletionCondition,
           );
-          const scheduled = mutation.schedule ? newScheduledFamilyWork(mutation.schedule) : null;
+          const scheduled = mutation.schedule
+            ? newScheduledFamilyWork(mutation.schedule, persistedCompletionCondition)
+            : null;
           let nextCheckAt = new Date(handledAt.getTime() + FAMILY_WORK_INITIAL_DELAY_MS);
           if (scheduled) {
             const [household] = await sql<{ time_zone: string }[]>`
@@ -10258,7 +10281,11 @@ export class PostgresFlorenceStore {
             values (${work.id},${turn.source_id}) on conflict do nothing
           `;
           const state = familyWorkState(work.task_state);
-          const scheduled = scheduledFamilyWork(work.reminder_schedule);
+          const storedScheduled = scheduledFamilyWork(work.reminder_schedule);
+          const scheduled =
+            storedScheduled && storedScheduled.completionCondition === undefined
+              ? { ...storedScheduled, completionCondition: state.completionCondition ?? null }
+              : storedScheduled;
           if (mutation.operation === "update") {
             if (!scheduled) {
               throw new FlorenceStoreConflict("Only scheduled family work has a recurring definition");
@@ -10271,14 +10298,33 @@ export class PostgresFlorenceStore {
                 "A running family-work occurrence must finish before its series changes",
               );
             }
-            if (mutation.objective === null && mutation.schedule === null) {
-              throw new FlorenceStoreConflict("A family-work update must change its objective or schedule");
+            if (
+              mutation.objective === null &&
+              mutation.completionCondition === null &&
+              mutation.schedule === null
+            ) {
+              throw new FlorenceStoreConflict(
+                "A family-work update must change its objective, completion condition, or schedule",
+              );
             }
             const objective =
               mutation.objective === null
                 ? required(work.objective ?? "", "Family work objective")
                 : bounded(required(mutation.objective, "Family work objective"), 4_000);
+            const nextState =
+              mutation.completionCondition === null
+                ? state
+                : familyWorkStateWithCompletionCondition(
+                    state,
+                    normalizeFamilyWorkCompletionCondition(mutation.completionCondition),
+                  );
             let nextScheduled = scheduled;
+            if (mutation.completionCondition !== null) {
+              nextScheduled = {
+                ...nextScheduled,
+                completionCondition: normalizeFamilyWorkCompletionCondition(mutation.completionCondition),
+              };
+            }
             if (mutation.schedule !== null) {
               const schedule = validateReminderSchedule(mutation.schedule);
               const [household] = await sql<{ time_zone: string }[]>`
@@ -10290,7 +10336,7 @@ export class PostgresFlorenceStore {
               if (!nextConversationalOccurrence(schedule, turn.occurred_at, handledAt, household.time_zone)) {
                 throw new FlorenceStoreConflict("A one-time family task must still be in the future");
               }
-              nextScheduled = { ...scheduled, schedule };
+              nextScheduled = { ...nextScheduled, schedule };
             }
             let status = work.status;
             let nextCheckAt = work.next_check_at;
@@ -10322,7 +10368,8 @@ export class PostgresFlorenceStore {
             await sql`
               update proactive_work set objective=${objective},
                 reminder_schedule=${nextScheduled ? sql.json(nextScheduled) : null},status=${status},
-                next_check_at=${nextCheckAt},current_conclusion=${currentConclusion},last_error=null
+                task_state=${sql.json(nextState)},next_check_at=${nextCheckAt},
+                current_conclusion=${currentConclusion},last_error=null
               where id=${work.id}
             `;
           } else if (mutation.operation === "steer") {
@@ -10343,16 +10390,25 @@ export class PostgresFlorenceStore {
               text: instruction,
               occurredAt: turn.occurred_at.toISOString(),
             };
+            const stateWithCompletionCondition =
+              mutation.completionCondition === null
+                ? state
+                : familyWorkStateWithCompletionCondition(
+                    state,
+                    normalizeFamilyWorkCompletionCondition(mutation.completionCondition),
+                  );
             const pendingEffect =
-              state.phase === "tool_pending" && state.pendingCall !== null && state.claim !== null;
+              stateWithCompletionCondition.phase === "tool_pending" &&
+              stateWithCompletionCondition.pendingCall !== null &&
+              stateWithCompletionCondition.claim !== null;
             const nextState = pendingEffect
-              ? queueFamilyWorkSteeringDuringPendingEffect(state, steering)
-              : steerFamilyWorkState(state, steering);
+              ? queueFamilyWorkSteeringDuringPendingEffect(stateWithCompletionCondition, steering)
+              : steerFamilyWorkState(stateWithCompletionCondition, steering);
             const acknowledgedState = mutation.acknowledgementText
               ? familyWorkState({
                   ...nextState,
                   acknowledgementText: mergeFamilyWorkAcknowledgements(
-                    state.acknowledgementText,
+                    stateWithCompletionCondition.acknowledgementText,
                     mutation.acknowledgementText,
                   ),
                 })
@@ -10360,7 +10416,8 @@ export class PostgresFlorenceStore {
             if (pendingEffect) {
               await terminalizeUnsentFamilyWorkOutbounds(sql, work.id, "steering");
               await sql`
-                update proactive_work set task_state=${sql.json(acknowledgedState)},last_error=null
+                update proactive_work set task_state=${sql.json(acknowledgedState)},
+                  reminder_schedule=${scheduled ? sql.json(scheduled) : null},last_error=null
                 where id=${work.id} and status='active'
                   and task_state->>'generation'=${String(state.generation)}
                   and task_state->'claim'->>'claimId'=${state.claim?.claimId ?? ""}
@@ -10370,6 +10427,7 @@ export class PostgresFlorenceStore {
               await terminalizeUnsentFamilyWorkOutbounds(sql, work.id, "steering");
               await sql`
                 update proactive_work set task_state=${sql.json(acknowledgedState)},
+                  reminder_schedule=${scheduled ? sql.json(scheduled) : null},
                   status='active',next_check_at=${handledAt},
                   last_error=null where id=${work.id}
               `;
@@ -17162,9 +17220,17 @@ function validateReminderSchedule(value: ReminderSchedule): ReminderSchedule {
 function scheduledFamilyWork(value: JsonValue | null): ScheduledFamilyWork | null {
   if (value === null) return null;
   const stored = strictJsonRecord(value, "Scheduled family work");
+  const hasCompletionCondition = stored.completionCondition !== undefined;
   assertExactJsonKeys(
     stored,
-    ["occurrenceActive", "paused", "previousResult", "schedule", "version"],
+    [
+      ...(hasCompletionCondition ? ["completionCondition"] : []),
+      "occurrenceActive",
+      "paused",
+      "previousResult",
+      "schedule",
+      "version",
+    ],
     "Scheduled family work",
   );
   if (
@@ -17177,22 +17243,41 @@ function scheduledFamilyWork(value: JsonValue | null): ScheduledFamilyWork | nul
   if (stored.previousResult !== null && typeof stored.previousResult !== "string") {
     throw new FlorenceStoreConflict("Scheduled family work has an invalid previous result");
   }
+  if (
+    hasCompletionCondition &&
+    stored.completionCondition !== null &&
+    typeof stored.completionCondition !== "string"
+  ) {
+    throw new FlorenceStoreConflict("Scheduled family work has an invalid completion condition");
+  }
   return {
     version: 1,
     schedule: reminderSchedule(stored.schedule as JsonValue),
     paused: stored.paused,
     occurrenceActive: stored.occurrenceActive,
     previousResult: stored.previousResult,
+    ...(hasCompletionCondition
+      ? {
+          completionCondition:
+            stored.completionCondition === null
+              ? null
+              : normalizeFamilyWorkCompletionCondition(stored.completionCondition as string),
+        }
+      : {}),
   };
 }
 
-function newScheduledFamilyWork(schedule: ReminderSchedule): ScheduledFamilyWork {
+function newScheduledFamilyWork(
+  schedule: ReminderSchedule,
+  completionCondition: string,
+): ScheduledFamilyWork {
   return {
     version: 1,
     schedule: validateReminderSchedule(schedule),
     paused: false,
     occurrenceActive: false,
     previousResult: null,
+    completionCondition: normalizeFamilyWorkCompletionCondition(completionCondition),
   };
 }
 
@@ -21129,6 +21214,20 @@ export function steerFamilyWorkState(
   });
 }
 
+function familyWorkStateWithCompletionCondition(
+  stateInput: FamilyWorkStateV1,
+  completionCondition: string,
+): FamilyWorkStateV1 {
+  const state = familyWorkState(stateInput);
+  return familyWorkState({
+    ...state,
+    completionCondition,
+    completionRejection: null,
+    waitingDocket:
+      state.waitingDocket === null ? null : { ...state.waitingDocket, completionCondition },
+  });
+}
+
 /**
  * Pi injects messages only after the current tool batch has produced its results
  * (4e494929, packages/agent/src/agent-loop.ts:173-242). Hermes likewise closes
@@ -21440,7 +21539,9 @@ async function completeDeliveredFamilyWorkTerminal(
       ...initialFamilyWorkState(
         state.acknowledgementText ?? null,
         recurringCandidateIds,
-        state.completionCondition ?? null,
+        completedSchedule.completionCondition !== undefined
+          ? completedSchedule.completionCondition
+          : (state.completionCondition ?? null),
       ),
       generation: incrementFamilyWorkCounter(state.generation, "Family work generation"),
     });
@@ -26374,6 +26475,10 @@ function required(value: string, name: string): string {
   const trimmed = value.trim();
   if (!trimmed) throw new FlorenceStoreConflict(`${name} is required`);
   return trimmed;
+}
+
+function normalizeFamilyWorkCompletionCondition(value: string): string {
+  return required(value, "Family work completion condition").replace(/\r\n|\r|\n/gu, " ");
 }
 
 function maskPhoneNumber(value: string): string {

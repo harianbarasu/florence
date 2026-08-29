@@ -28,6 +28,7 @@ import {
   FlorenceReasoner,
   FlorenceReasonerError,
   type FlorenceReasonerInput,
+  florenceDecisionSchema,
   florenceGoogleChangesAssessmentDecisionSchema,
   florenceHouseholdBriefingInputSchema,
   florenceHouseholdSafeCandidateSchema,
@@ -182,6 +183,8 @@ describe("Florence reasoner capability cutover", () => {
       operation: "create",
       workId: null,
       objective: "Compare the supplied options and report the best one with the reasons.",
+      completionCondition:
+        "The supplied options are compared and the best one is identified with supporting reasons.",
       schedule: null,
       instruction: null,
       candidateIds: [],
@@ -248,9 +251,92 @@ describe("Florence reasoner capability cutover", () => {
     expect(firstReview).toContain(input.currentMessage.text);
     expect(firstReview).toContain(promised.conversation.bubbles[0]?.text);
     expect(firstReview).toContain('\\"familyWork\\":null');
+    if (!repaired.familyWork) throw new Error("Commitment repair did not create durable work");
     expect(secondReview).toContain(repaired.familyWork.objective);
     expect(String(reviewRequests[0]?.instructions)).toContain("An unrelated mutation never backs");
     expect(String(reviewRequests[0]?.instructions)).toContain("conditional offer or capability statement");
+  });
+
+  test("an exact changing-state request starts one immediate durable task instead of a finite follow-up", async () => {
+    const completionCondition = "The public status page explicitly says that\nregistration is open.";
+    const decision = ordinaryDecision({
+      bubbleText: "I’m on it—I’ll keep checking and let you know when registration opens.",
+    });
+    decision.familyWork = {
+      operation: "create",
+      workId: null,
+      objective:
+        "Keep checking the supplied public status page until it explicitly says that registration is open.",
+      completionCondition,
+      schedule: null,
+      instruction: null,
+      candidateIds: [],
+    };
+    decision.followUp = null;
+    const requests: Record<string, unknown>[] = [];
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        stream: (request: Record<string, unknown>) => {
+          requests.push(request);
+          return fakeStream({
+            status: "completed",
+            output_parsed: florenceDecisionSchema.parse(decision),
+            output: [],
+          });
+        },
+      },
+    } as never);
+    const input = foregroundInput();
+    input.currentMessage.text =
+      "Keep checking https://example.com/registration until it actually says registration is open.";
+    input.currentMessage.authoredText = input.currentMessage.text;
+
+    const result = await reasoner.decide(input, inertReads());
+
+    expect(result).toMatchObject({
+      followUp: null,
+      familyWork: {
+        operation: "create",
+        schedule: null,
+        completionCondition,
+      },
+    });
+    expect(String(requests[0]?.instructions)).toContain("changing external state");
+  });
+
+  test("family-work corrections can replace or preserve the completion condition", () => {
+    const replacement = "The corrected requested result is confirmed.";
+    const controls = [
+      {
+        operation: "update",
+        workId: "work-1",
+        objective: "Complete the corrected request.",
+        completionCondition: replacement,
+        schedule: null,
+        instruction: null,
+      },
+      {
+        operation: "steer",
+        workId: "work-1",
+        objective: null,
+        completionCondition: replacement,
+        schedule: null,
+        instruction: "Use the corrected requested result.",
+      },
+    ] as const;
+
+    for (const familyWork of controls) {
+      expect(florenceDecisionSchema.parse({ ...ordinaryDecision(), familyWork }).familyWork).toMatchObject({
+        operation: familyWork.operation,
+        completionCondition: replacement,
+      });
+      expect(
+        florenceDecisionSchema.parse({
+          ...ordinaryDecision(),
+          familyWork: { ...familyWork, completionCondition: null },
+        }).familyWork,
+      ).toMatchObject({ operation: familyWork.operation, completionCondition: null });
+    }
   });
 
   test("a still-unbacked commitment is rejected after the one semantic repair", async () => {
@@ -307,6 +393,7 @@ describe("Florence reasoner capability cutover", () => {
       operation: "create",
       workId: null,
       objective: "Find three good dinner options for Saturday and compare them.",
+      completionCondition: "Three suitable Saturday dinner options and their tradeoffs are reported.",
       schedule: null,
       instruction: null,
       candidateIds: [],
@@ -356,15 +443,14 @@ describe("Florence reasoner capability cutover", () => {
 
     const duplicateTracking = ordinaryDecision();
     duplicateTracking.docketUpsert = reactionOnly.docketUpsert;
-    duplicateTracking.followUp = {
-      operation: "schedule",
-      followUpId: null,
-      objective: "Watch for confirmation that the field-trip form was signed.",
-      currentConclusion: "The signature is still outstanding.",
-      endCondition: "A parent confirms the form was signed.",
-      nextCheck: "2026-08-28T21:00:00.000Z",
-      why: "The form has a deadline.",
-      sourceIds: ["turn-1"],
+    duplicateTracking.familyWork = {
+      operation: "create",
+      workId: null,
+      objective: "Keep checking until the signed field-trip form is confirmed received by the school.",
+      completionCondition: "The signed form is confirmed received by the school.",
+      schedule: null,
+      instruction: null,
+      candidateIds: [],
     };
     const duplicateReasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
       responses: {
@@ -611,6 +697,7 @@ describe("Florence reasoner capability cutover", () => {
       operation: "create",
       workId: null,
       objective: "Find three good dinner options for Saturday and compare them.",
+      completionCondition: "Three suitable Saturday dinner options and their tradeoffs are reported.",
       schedule: null,
       instruction: null,
       candidateIds: [],
@@ -638,6 +725,7 @@ describe("Florence reasoner capability cutover", () => {
       operation: "create",
       workId: null,
       objective: "Make sure the school form is submitted.",
+      completionCondition: "The school confirms the form was received.",
       schedule: null,
       instruction: null,
       candidateIds: ["candidate-1"],
@@ -1744,6 +1832,7 @@ describe("Florence reasoner capability cutover", () => {
   });
 
   test("durable work sends once, waits for a reply, and resumes the same text task", async () => {
+    const completionCondition = "The dentist confirms whether Violet’s Wednesday 3:30 PM cleaning is booked.";
     const firstDeferResult = {
       outcome: "deferred",
       text: null,
@@ -1852,7 +1941,12 @@ describe("Florence reasoner capability cutover", () => {
       responses: {
         parse(request: Record<string, unknown>) {
           const review = defaultFamilyWorkCompletionReview(request);
-          if (review) return review;
+          if (review) {
+            return {
+              ...review,
+              output_parsed: { ...review.output_parsed, condition: completionCondition },
+            };
+          }
           const response = modelResponses.shift();
           if (!response) throw new Error("Unexpected dentist-text model turn");
           return response;
@@ -1879,6 +1973,7 @@ describe("Florence reasoner capability cutover", () => {
         kind: "family_work_v1" as const,
         version: 1 as const,
         generation: 0,
+        completionCondition,
         phase: "ready" as const,
         claim: null,
         activePhoneCall: null,
@@ -1989,6 +2084,7 @@ describe("Florence reasoner capability cutover", () => {
       kind: "deferred",
       resumeAt: "2026-08-27T22:00:00.000Z",
       progressText: null,
+      state: { completionCondition },
     });
     if (deferredAgain.kind !== "deferred") throw new Error("Second dentist reply check was not deferred");
 

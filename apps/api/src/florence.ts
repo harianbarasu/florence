@@ -56,7 +56,6 @@ import type {
   FamilyWorkSelectedFile,
   FamilyWorkSelectedImage,
   FamilyWorkStateV1,
-  FiniteMonitorDraft,
   FiniteMonitorUpdate,
   GoogleEvidenceDraft,
   GoogleStableFactContext,
@@ -8114,7 +8113,8 @@ function enforcePolicy(decision: FlorenceDecision): FlorenceDecision {
     policy: decision.policy,
     conversation: decision.conversation,
     facts: retain ? decision.facts : decision.facts.filter((fact) => fact.operation === "forget"),
-    followUp: schedule ? decision.followUp : null,
+    followUp:
+      decision.followUp?.operation === "update" ? (schedule ? decision.followUp : null) : decision.followUp,
     reminder: decision.reminder,
     familyWork: decision.familyWork,
     docketUpsert: retain ? decision.docketUpsert : null,
@@ -8286,22 +8286,7 @@ function decisionCommit(
           : change.sourceIds,
     });
   }
-  const finiteMonitors: FiniteMonitorDraft[] =
-    decision.followUp?.operation === "schedule"
-      ? [
-          {
-            id: deterministicUuid(`follow-up\0${turn.message.sourceId}`),
-            objective: decision.followUp.objective,
-            currentConclusion: decision.followUp.currentConclusion,
-            endCondition: decision.followUp.endCondition,
-            nextCheck: decision.followUp.nextCheck,
-            why: decision.followUp.why,
-            visibility: turn.authority.audience === "group" ? "household" : "private",
-            ownerAdultId: turn.authority.audience === "group" ? null : turn.authority.senderAdultId,
-            sourceIds: decision.followUp.sourceIds,
-          },
-        ]
-      : [];
+  const finiteMonitors: readonly [] = [];
   const finiteMonitorUpdates: FiniteMonitorUpdate[] =
     decision.followUp?.operation === "update"
       ? [
@@ -8495,6 +8480,7 @@ function decisionCommit(
           operation: "create",
           workId: deterministicUuid(`family-work\0${turn.message.sourceId}`),
           objective: decision.familyWork.objective,
+          completionCondition: decision.familyWork.completionCondition,
           ...(familyWorkAcknowledgementText ? { acknowledgementText: familyWorkAcknowledgementText } : {}),
           schedule: decision.familyWork.schedule,
           visibility: turn.authority.audience === "group" ? "household" : "private",
@@ -8506,6 +8492,7 @@ function decisionCommit(
             operation: "update",
             workId: decision.familyWork.workId,
             objective: decision.familyWork.objective,
+            completionCondition: decision.familyWork.completionCondition,
             schedule: decision.familyWork.schedule,
           }
         : decision.familyWork?.operation === "steer"
@@ -8513,6 +8500,7 @@ function decisionCommit(
               operation: "steer",
               workId: decision.familyWork.workId,
               instruction: decision.familyWork.instruction,
+              completionCondition: decision.familyWork.completionCondition,
               ...(familyWorkAcknowledgementText
                 ? { acknowledgementText: familyWorkAcknowledgementText }
                 : {}),

@@ -43,8 +43,6 @@ import {
   FlorenceReasoner,
   FlorenceReasonerError,
   type FlorenceReasonerInput,
-  florenceGoogleChangesAssessmentInputSchema,
-  florenceReasonerInputSchema,
 } from "./reasoner.js";
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
@@ -1262,66 +1260,88 @@ release("Florence parent journeys", () => {
     );
   }, 20_000);
 
-  test("keeps every active finite monitor available to Google review and parent control", async () => {
-    const objectives = Array.from({ length: 21 }, (_, index) => `Complete monitor ${index + 1}`);
-    let foregroundObjectives: readonly string[] = [];
+  test("keeps every seeded legacy monitor visible for Google review and parent control", async () => {
+    const objectives = Array.from({ length: 21 }, (_, index) => `Legacy monitor ${index + 1}`);
+    const monitorIds = objectives.map((objective) => deterministicUuid(`legacy-monitor\0${objective}`));
+    const evidenceSourceId = deterministicUuid("legacy-monitor\0google-evidence");
+    const nextCheck = "2026-12-01T18:00:00.000Z";
+    let listedObjectives: readonly string[] = [];
+    let cancelVisibleObjectives: readonly string[] = [];
     const harness = await createHarness(async (input) => {
-      const requestedObjective = objectives.find(
-        (objective) => input.currentMessage.text === `Watch ${objective.toLocaleLowerCase()}`,
-      );
-      if (requestedObjective) {
-        return decision({
-          bubbles: [{ text: `I’ll watch ${requestedObjective.toLocaleLowerCase()}.`, delayMs: 0 }],
-          followUp: {
-            operation: "schedule",
-            followUpId: null,
-            objective: requestedObjective,
-            currentConclusion: `${requestedObjective} is still unresolved.`,
-            endCondition: `${requestedObjective} is resolved.`,
-            nextCheck: "2026-12-01T18:00:00.000Z",
-            why: "The parent asked Florence to keep watching.",
-            sourceIds: [input.currentMessage.sourceId],
-          },
-        });
+      if (input.currentMessage.text === "What legacy monitors are still active?") {
+        listedObjectives = input.pendingFollowUps.map((followUp) => followUp.objective);
+        return {
+          ...decision({
+            bubbles: [{ text: "I found all of the active legacy monitors.", delayMs: 0 }],
+            followUp: {
+              operation: "list",
+              followUpId: null,
+              objective: null,
+              currentConclusion: null,
+              endCondition: null,
+              nextCheck: null,
+              why: null,
+              sourceIds: [],
+            },
+          }),
+          policy: { retain: true, schedule: false, stopMessaging: false },
+        };
       }
-      if (input.currentMessage.text === "Stop watching complete monitor 21") {
-        const parsed = florenceReasonerInputSchema.parse(input);
-        foregroundObjectives = parsed.pendingFollowUps.map((followUp) => followUp.objective);
-        const target = parsed.pendingFollowUps.find((followUp) => followUp.objective === objectives.at(-1));
-        if (!target) throw new Error("The last active monitor was unavailable to the parent turn");
-        return decision({
-          bubbles: [{ text: "Okay—I stopped watching that.", delayMs: 0 }],
-          followUp: {
-            operation: "cancel",
-            followUpId: target.followUpId,
-            objective: null,
-            currentConclusion: null,
-            endCondition: null,
-            nextCheck: null,
-            why: null,
-            sourceIds: [input.currentMessage.sourceId],
-          },
-        });
+      if (input.currentMessage.text === "Stop legacy monitor 21.") {
+        cancelVisibleObjectives = input.pendingFollowUps.map((followUp) => followUp.objective);
+        const target = input.pendingFollowUps.find((followUp) => followUp.objective === objectives.at(-1));
+        if (!target) throw new Error("Legacy monitor 21 was unavailable to cancel");
+        return {
+          ...decision({
+            bubbles: [{ text: "Okay—I stopped legacy monitor 21.", delayMs: 0 }],
+            followUp: {
+              operation: "cancel",
+              followUpId: target.followUpId,
+              objective: null,
+              currentConclusion: null,
+              endCondition: null,
+              nextCheck: null,
+              why: null,
+              sourceIds: [input.currentMessage.sourceId],
+            },
+          }),
+          policy: { retain: true, schedule: false, stopMessaging: false },
+        };
       }
       return decision();
     });
     await harness.readyHousehold();
 
-    for (const [index, objective] of objectives.entries()) {
-      await harness.accept(
-        "private",
-        `complete-monitor-${index + 1}`,
-        `Watch ${objective.toLocaleLowerCase()}`,
-      );
-      await harness.drain();
-    }
-    await harness.assertDatabase(
-      "The household did not retain all active finite monitors",
-      `(select count(*)=21 from proactive_work
-        where kind='finite_monitor' and status='active'
-          and owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid
-          and objective like 'Complete monitor %')`,
+    await writeFile(
+      harness.assertionFile,
+      `insert into sources (
+          id,household_id,kind,visibility,owner_adult_id,external_key,label,metadata,occurred_at
+        ) values (
+          ${sqlLiteral(evidenceSourceId)},
+          (select household_id from people where id=${sqlLiteral(harness.founderAdultId)}::uuid),
+          'gmail','private',${sqlLiteral(harness.founderAdultId)}::uuid,
+          'legacy-monitor-google-evidence','Legacy monitor Google evidence','{}'::jsonb,
+          ${sqlLiteral(harness.iso())}::timestamptz
+        );
+        insert into proactive_work (
+          id,household_id,kind,visibility,owner_adult_id,objective,current_conclusion,
+          end_condition,why,status,next_check_at,created_at
+        ) values ${objectives
+          .map(
+            (objective, index) =>
+              `(${sqlLiteral(monitorIds[index] ?? "")},
+                (select household_id from people where id=${sqlLiteral(harness.founderAdultId)}::uuid),
+                'finite_monitor','private',${sqlLiteral(harness.founderAdultId)}::uuid,
+                ${sqlLiteral(objective)},${sqlLiteral(`${objective} remains unresolved.`)},
+                ${sqlLiteral(`${objective} is resolved.`)},'Seeded legacy compatibility state',
+                'active',${sqlLiteral(nextCheck)}::timestamptz,${sqlLiteral(harness.iso())}::timestamptz)`,
+          )
+          .join(",")};
+        insert into proactive_work_sources (work_id,source_id) values ${monitorIds
+          .map((monitorId) => `(${sqlLiteral(monitorId)},${sqlLiteral(evidenceSourceId)})`)
+          .join(",")};`,
     );
+    await migrateDatabase(harness.databaseUrl, harness.assertionFile);
 
     const assessmentsBeforeChange = harness.state.googleAssessments.length;
     harness.state.privateFactUpdatePending = true;
@@ -1331,30 +1351,35 @@ release("Florence parent journeys", () => {
       .slice(assessmentsBeforeChange)
       .findLast((candidate) => candidate.adult.adultId === harness.founderAdultId);
     if (!assessment) throw new Error("The incremental Google review did not run");
-    const parsedAssessment = florenceGoogleChangesAssessmentInputSchema.parse(assessment);
-    const reviewedObjectives = parsedAssessment.activeMonitors
-      .map((monitor) => monitor.objective)
-      .filter((objective) => objective.startsWith("Complete monitor "));
-    expect(new Set(reviewedObjectives)).toEqual(new Set(objectives));
+    expect(
+      new Set(
+        assessment.activeMonitors
+          .map((monitor) => monitor.objective)
+          .filter((objective) => objective.startsWith("Legacy monitor ")),
+      ),
+    ).toEqual(new Set(objectives));
 
-    await harness.accept("private", "cancel-complete-monitor-21", "Stop watching complete monitor 21");
+    await harness.accept("private", "list-legacy-monitors", "What legacy monitors are still active?");
+    await harness.drain();
+    expect(new Set(listedObjectives.filter((objective) => objective.startsWith("Legacy monitor ")))).toEqual(
+      new Set(objectives),
+    );
+
+    await harness.accept("private", "cancel-legacy-monitor-21", "Stop legacy monitor 21.");
     await harness.drain();
     expect(
-      new Set(foregroundObjectives.filter((objective) => objective.startsWith("Complete monitor "))),
+      new Set(cancelVisibleObjectives.filter((objective) => objective.startsWith("Legacy monitor "))),
     ).toEqual(new Set(objectives));
     await harness.assertDatabase(
-      "The parent could not cancel the active monitor beyond the former presentation boundary",
+      "The parent could not cancel legacy monitor 21 with scheduling disabled",
       `not exists (
-          select 1 from proactive_work
-          where kind='finite_monitor' and status='active'
-            and owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid
-            and objective=${sqlLiteral(objectives.at(-1) ?? "")}
+          select 1 from proactive_work where id=${sqlLiteral(monitorIds.at(-1) ?? "")}::uuid
+            and kind='finite_monitor' and status='active'
         ) and (select count(*)=20 from proactive_work
-          where kind='finite_monitor' and status='active'
-            and owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid
-            and objective like 'Complete monitor %')`,
+          where id in (${monitorIds.map((monitorId) => `${sqlLiteral(monitorId)}::uuid`).join(",")})
+            and kind='finite_monitor' and status='active')`,
     );
-  }, 30_000);
+  }, 20_000);
 
   test("keeps every parent's and family-calendar conflict in proactive availability", async () => {
     const researchReasoner = new FlorenceReasoner({ apiKey: "test-openai-key", model: "test-model" }, {
@@ -1630,16 +1655,6 @@ release("Florence parent journeys", () => {
                 input.audience === "group" ? "household" : "private",
               ),
             ],
-            followUp: {
-              operation: "schedule",
-              followUpId: null,
-              objective: "Watch for use of the temporary code.",
-              currentConclusion: "The temporary code has not been used.",
-              endCondition: "The temporary code is used.",
-              nextCheck: "2026-08-20T19:00:00.000Z",
-              why: "The temporary code may need follow-through.",
-              sourceIds: [input.currentMessage.sourceId],
-            },
           }),
           policy: { retain: false, schedule: false, stopMessaging: false },
         };
@@ -3142,6 +3157,8 @@ release("Florence parent journeys", () => {
               operation: "create",
               workId: null,
               objective,
+              completionCondition:
+                "Alex has answered whether Maya can stay for the whole field-trip day, and the resulting plan is confirmed in the family thread.",
               instruction: null,
               schedule: null,
               candidateIds: [],
@@ -3335,6 +3352,8 @@ release("Florence parent journeys", () => {
               operation: "create",
               workId: null,
               objective,
+              completionCondition:
+                "The parent has chosen June 8 or June 15, and Florence has confirmed which camp date will be used.",
               instruction: null,
               schedule: null,
               candidateIds: [],
@@ -3434,6 +3453,9 @@ release("Florence parent journeys", () => {
               operation: "create",
               workId: null,
               objective: first ? firstObjective : secondObjective,
+              completionCondition: first
+                ? "The parent has chosen Monday or Tuesday for the morning camp plan, and that choice is confirmed."
+                : "The parent has chosen Thursday or Friday for the afternoon camp plan, and that choice is confirmed.",
               instruction: null,
               schedule: null,
               candidateIds: [],
@@ -3592,6 +3614,8 @@ release("Florence parent journeys", () => {
               operation: "create",
               workId: null,
               objective,
+              completionCondition:
+                "Google Tasks contains the camp follow-up, and the finished plan reflects the parent's latest day correction.",
               instruction: null,
               schedule: null,
               candidateIds: [],
@@ -3607,6 +3631,7 @@ release("Florence parent journeys", () => {
               operation: "steer",
               workId: work.workId,
               objective: null,
+              completionCondition: null,
               instruction: correction,
               schedule: null,
             },
@@ -3815,6 +3840,8 @@ release("Florence parent journeys", () => {
               operation: "create",
               workId: null,
               objective,
+              completionCondition:
+                "Next week’s dinner plan and grocery list are ready using the family’s current calendar and saved recipes.",
               instruction: null,
               schedule,
               candidateIds: [],
@@ -4131,6 +4158,8 @@ release("Florence parent journeys", () => {
                 operation: "create",
                 workId: null,
                 objective,
+                completionCondition:
+                  "The Family Calendar contains the requested Tuesday block for signing Maya’s form.",
                 schedule: null,
                 instruction: null,
                 candidateIds: [],
@@ -4326,6 +4355,7 @@ release("Florence parent journeys", () => {
                 operation: "create",
                 workId: null,
                 objective,
+                completionCondition: "Alex’s Google Tasks contains “Pack Maya’s camp permission slip”.",
                 schedule: null,
                 instruction: null,
                 candidateIds: [],
@@ -4477,6 +4507,8 @@ release("Florence parent journeys", () => {
                 operation: "create",
                 workId: null,
                 objective: "Upload Maya's field-trip form from Gmail.",
+                completionCondition:
+                  "Maya’s exact field-trip form from Gmail has been uploaded to the camp registration site.",
                 schedule: null,
                 instruction: null,
                 candidateIds: [],
@@ -4675,6 +4707,8 @@ release("Florence parent journeys", () => {
                 operation: "create",
                 workId: null,
                 objective,
+                completionCondition:
+                  "The exact camp receipt has been downloaded and returned to the family thread.",
                 schedule: null,
                 instruction: null,
                 candidateIds: [],
@@ -4959,6 +4993,7 @@ release("Florence parent journeys", () => {
             operation: "create",
             workId: null,
             objective: docketWorkObjective,
+            completionCondition: FOUNDER_FORM_COMPLETION_CONDITION,
             schedule: null,
             instruction: null,
             candidateIds: [candidate.candidateId],
@@ -5032,6 +5067,7 @@ release("Florence parent journeys", () => {
             operation: "create",
             workId: null,
             objective: NATIVE_DOCKET_WORK_OBJECTIVE,
+            completionCondition: NATIVE_DOCKET_COMPLETION_CONDITION,
             schedule: null,
             instruction: null,
             candidateIds: [candidate.candidateId],

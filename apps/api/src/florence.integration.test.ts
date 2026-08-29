@@ -4505,6 +4505,193 @@ release("Florence parent journeys", () => {
     });
   }, 20_000);
 
+  test("carries an exact browser download into the family result once", async () => {
+    const request = "Download the camp receipt and send the exact file back here.";
+    const objective = "Download the exact camp receipt and return it to the family thread.";
+    const terminalText = "I downloaded the camp receipt.";
+    const operation = {
+      kind: "download" as const,
+      selector: "a[data-testid='receipt-download']",
+    };
+    const receiptSha256 = createHash("sha256").update(PDF_BYTES).digest("hex");
+    const browserRuns: Parameters<FlorenceBrowserClient["run"]>[0][] = [];
+    const closedSessions: Parameters<FlorenceBrowserClient["close"]>[0][] = [];
+    const browser: FlorenceBrowserClient = {
+      run: async (input) => {
+        browserRuns.push(input);
+        return {
+          session: {
+            sessionId: "browserbase-receipt-session",
+            expiresAt: "2026-08-27T21:00:00.000Z",
+          },
+          observation: {
+            kind: "page",
+            reason: null,
+            url: "https://camp.example/receipts",
+            title: "Camp receipt",
+            snapshot: "Receipt ready",
+            refCount: 0,
+            truncated: false,
+            downloadedFile: {
+              filename: "receipt.pdf",
+              mimeType: "application/pdf",
+              bytes: PDF_BYTES,
+            },
+          },
+        };
+      },
+      close: async (session) => {
+        closedSessions.push(session);
+      },
+      closeAll: async () => undefined,
+    };
+    const harness = await createHarness(
+      async (input) =>
+        input.currentMessage.text === request
+          ? decision({
+              familyWork: {
+                operation: "create",
+                workId: null,
+                objective,
+                schedule: null,
+                instruction: null,
+                candidateIds: [],
+              },
+            })
+          : decision(),
+      {
+        browser,
+        continueFamilyWork: async (input, reads) => {
+          if (input.state.phase === "ready") {
+            return {
+              kind: "continue",
+              state: {
+                ...input.state,
+                phase: "tool_pending",
+                claim: null,
+                pendingCall: {
+                  callId: "download-camp-receipt",
+                  name: "browser_work",
+                  argumentsJson: JSON.stringify(operation),
+                  attempt: 0,
+                },
+              },
+              progressText: null,
+              nextCheckDelayMs: 0,
+            };
+          }
+          if (!reads.runBrowser) {
+            throw new Error("The family task did not receive authenticated browser work");
+          }
+          const pendingCall = input.state.pendingCall;
+          if (pendingCall?.name !== "browser_work") {
+            throw new Error("The browser download lost its pending call");
+          }
+          if (pendingCall.attempt === 1) {
+            const observation = await reads.runBrowser(operation);
+            const selectedFile = observation.selectedFile;
+            if (!selectedFile) throw new Error("The browser download was not stored as a selected file");
+            expect(selectedFile).toMatchObject({
+              signalId: input.workId,
+              workId: input.workId,
+              filename: "receipt.pdf",
+              mimeType: "application/pdf",
+              byteLength: PDF_BYTES.byteLength,
+              sha256: receiptSha256,
+            });
+            return {
+              kind: "continue",
+              state: {
+                ...input.state,
+                phase: "tool_pending",
+                claim: null,
+                browserFiles: [selectedFile],
+                pendingCall: { ...pendingCall, attempt: 1 },
+              },
+              progressText: null,
+              nextCheckDelayMs: 0,
+            };
+          }
+          if (pendingCall.attempt !== 2) {
+            throw new Error(`The browser download resumed on unexpected attempt ${pendingCall.attempt}`);
+          }
+          const retainedFile = input.state.browserFiles?.[0];
+          if (!retainedFile) throw new Error("The browser download was not retained for replay");
+          const observation = await reads.runBrowser(operation);
+          expect(observation.downloadedFile).toBeUndefined();
+          expect(observation.selectedFile).toEqual(retainedFile);
+          const selectedFile = observation.selectedFile;
+          if (!selectedFile) throw new Error("The stored browser download could not be reopened");
+          return {
+            kind: "terminal",
+            state: {
+              ...input.state,
+              phase: "terminal",
+              claim: null,
+              pendingCall: null,
+              progressRevision: input.state.progressRevision + 1,
+              terminal: { outcome: "succeeded", text: terminalText, selectedFiles: [selectedFile] },
+            },
+            outcome: "succeeded",
+            text: terminalText,
+            selectedFiles: [selectedFile],
+          };
+        },
+      },
+    );
+    await harness.readyHousehold();
+
+    await harness.accept("group", "group-browser-download", request, "partner");
+    await harness.drain();
+    harness.state.now += 1_001;
+    await harness.drain();
+
+    expect(browserRuns).toHaveLength(1);
+    expect(browserRuns[0]).toMatchObject({
+      ownerAdultId: harness.partnerAdultId,
+      callId: "download-camp-receipt",
+      attempt: 1,
+      session: null,
+      operation,
+    });
+    expect(closedSessions).toEqual([expect.objectContaining({ sessionId: "browserbase-receipt-session" })]);
+    expect(harness.linq.uploads).toHaveLength(1);
+    expect(harness.linq.uploads[0]).toMatchObject({
+      filename: "receipt.pdf",
+      mimeType: "application/pdf",
+    });
+    expect(Uint8Array.from(harness.linq.uploads[0]?.bytes ?? [])).toEqual(PDF_BYTES);
+    const terminalMoves = harness.linq.moves.filter(
+      ({ move }) =>
+        move.type === "message" &&
+        move.parts.some((part) => part.type === "text" && part.text === terminalText),
+    );
+    expect(terminalMoves).toHaveLength(1);
+    expect(terminalMoves[0]?.move).toEqual({
+      type: "message",
+      replyTo: { providerMessageId: "message-group-browser-download" },
+      parts: [
+        { type: "text", text: terminalText },
+        {
+          type: "media",
+          source: { type: "attachment", providerAttachmentId: "uploaded-attachment-1" },
+        },
+      ],
+    });
+    await harness.assertDatabase(
+      "The completed browser-download task did not retain its exact selected file",
+      `(select count(*)=1 from proactive_work
+          where kind='family_task' and objective=${sqlLiteral(objective)} and status='completed'
+            and jsonb_array_length(task_state->'browserFiles')=1
+            and jsonb_array_length(task_state->'terminal'->'selectedFiles')=1
+            and task_state->'browserFiles'->0=task_state->'terminal'->'selectedFiles'->0
+            and task_state->'browserFiles'->0->>'filename'='receipt.pdf'
+            and task_state->'browserFiles'->0->>'mimeType'='application/pdf'
+            and (task_state->'browserFiles'->0->>'byteLength')::integer=${PDF_BYTES.byteLength}
+            and task_state->'browserFiles'->0->>'sha256'=${sqlLiteral(receiptSha256)})`,
+    );
+  }, 20_000);
+
   test("gets ahead from both parents’ context, native inputs, a monitor, and the read-only calendar", async () => {
     const retainedSourceRecallRequest = "What did that archived account notice with code 123456 say?";
     const retainedSourceRecallReply =

@@ -48,6 +48,7 @@ import type {
   FamilyCalendarReviewProposal,
   FamilyGroupCreationWork,
   FamilyMemberRecord,
+  FamilyWorkSelectedFile,
   FamilyWorkSelectedImage,
   FamilyWorkStateV1,
   FiniteMonitorDraft,
@@ -2821,24 +2822,44 @@ export class Florence {
       if (!providerAttachmentId) {
         try {
           if (!this.#imageVault) {
-            throw new Error("Florence image delivery is not configured");
+            throw new Error("Florence attachment delivery is not configured");
           }
-          if (part.source.mimeType === "image/webp") {
-            throw new Error("Messages does not accept the captured image format");
+          if (part.source.type === "florence_file_artifact") {
+            const bytes = await this.#imageVault.readFileArtifact({
+              householdId,
+              workId: part.source.workId,
+              artifact: {
+                artifactId: part.source.assetId,
+                workId: part.source.workId,
+                filename: part.source.filename,
+                mimeType: part.source.mimeType,
+                byteLength: part.source.byteLength,
+                sha256: part.source.sha256,
+              },
+            });
+            providerAttachmentId = await this.#linq.uploadAttachment({
+              filename: part.source.filename,
+              mimeType: part.source.mimeType,
+              bytes,
+            });
+          } else {
+            if (part.source.mimeType === "image/webp") {
+              throw new Error("Messages does not accept the captured image format");
+            }
+            const image = await this.#imageVault.read({
+              householdId,
+              signalId: part.source.signalId,
+              image: { assetId: part.source.assetId, mimeType: part.source.mimeType },
+            });
+            if (image.mimeType !== part.source.mimeType) {
+              throw new Error("The selected browser image changed before delivery");
+            }
+            providerAttachmentId = await this.#linq.uploadAttachment({
+              filename: part.source.filename,
+              mimeType: image.mimeType,
+              bytes: image.bytes,
+            });
           }
-          const image = await this.#imageVault.read({
-            householdId,
-            signalId: part.source.signalId,
-            image: { assetId: part.source.assetId, mimeType: part.source.mimeType },
-          });
-          if (image.mimeType !== part.source.mimeType) {
-            throw new Error("The selected browser image changed before delivery");
-          }
-          providerAttachmentId = await this.#linq.uploadAttachment({
-            filename: part.source.filename,
-            mimeType: image.mimeType,
-            bytes: image.bytes,
-          });
         } catch {
           failedArtifactCount += 1;
           continue;
@@ -2857,8 +2878,8 @@ export class Florence {
     if (failedArtifactCount > 0) {
       const note =
         failedArtifactCount === 1
-          ? "I found a visual too, but it wouldn’t attach just now."
-          : "I found a few visuals too, but they wouldn’t attach just now.";
+          ? "I found an attachment too, but it wouldn’t send just now."
+          : "I found a few attachments too, but they wouldn’t send just now.";
       const textIndex = parts.findIndex((part) => part.type === "text");
       const textPart = textIndex >= 0 ? parts[textIndex] : undefined;
       if (textPart?.type === "text") {
@@ -5188,6 +5209,27 @@ export class Florence {
                           if (!this.#imageVault) {
                             throw new Error("Florence attachment upload is not configured");
                           }
+                          const storedFile = (work.state.browserFiles ?? []).find(
+                            (candidate) =>
+                              candidate.assetId === operation.attachmentRef &&
+                              candidate.workId === work.workId &&
+                              candidate.signalId === work.workId,
+                          );
+                          if (storedFile) {
+                            const bytes = await this.#imageVault.readFileArtifact({
+                              householdId: work.household.householdId,
+                              workId: work.workId,
+                              artifact: {
+                                artifactId: storedFile.assetId,
+                                workId: storedFile.workId,
+                                filename: storedFile.filename,
+                                mimeType: storedFile.mimeType,
+                                byteLength: storedFile.byteLength,
+                                sha256: storedFile.sha256,
+                              },
+                            });
+                            return { filename: storedFile.filename, bytes };
+                          }
                           const image = familyWorkOriginImages.find(
                             (candidate) => candidate.assetId === operation.attachmentRef,
                           );
@@ -5207,7 +5249,7 @@ export class Florence {
                           );
                           if (!document) {
                             throw new Error(
-                              "Browser upload requires an image or PDF from the initiating Messages context",
+                              "Browser upload requires a downloaded file or an image or PDF from the initiating Messages context",
                             );
                           }
                           const read = this.#imageVault.openPdf({
@@ -5230,6 +5272,10 @@ export class Florence {
                   const selectedAssetId =
                     operation.kind === "capture"
                       ? deterministicUuid(`family-work-browser-image\0${work.workId}\0${pendingCall.callId}`)
+                      : null;
+                  const selectedFileAssetId =
+                    operation.kind === "download"
+                      ? deterministicUuid(`family-work-browser-file\0${work.workId}\0${pendingCall.callId}`)
                       : null;
                   if (
                     operation.kind === "capture" &&
@@ -5272,6 +5318,41 @@ export class Florence {
                       }
                     }
                   }
+                  if (
+                    operation.kind === "download" &&
+                    selectedFileAssetId &&
+                    pendingCall.attempt > 1 &&
+                    this.#imageVault
+                  ) {
+                    try {
+                      const read = await this.#imageVault.readFileArtifactById({
+                        householdId: work.household.householdId,
+                        workId: work.workId,
+                        artifactId: selectedFileAssetId,
+                      });
+                      const selectedFile: FamilyWorkSelectedFile = {
+                        assetId: read.artifact.artifactId,
+                        signalId: work.workId,
+                        workId: read.artifact.workId,
+                        mimeType: read.artifact.mimeType,
+                        filename: read.artifact.filename,
+                        byteLength: read.artifact.byteLength,
+                        sha256: read.artifact.sha256,
+                      };
+                      return {
+                        kind: "page" as const,
+                        reason: "This exact browser file was already saved for the family result.",
+                        url: "",
+                        title: selectedFile.filename,
+                        snapshot: "",
+                        refCount: 0,
+                        truncated: false,
+                        selectedFile,
+                      };
+                    } catch {
+                      // The exact file may not have reached durable storage before interruption.
+                    }
+                  }
                   const result = await browser.run(
                     {
                       householdId: work.household.householdId,
@@ -5286,39 +5367,68 @@ export class Florence {
                     taskSignal,
                   );
                   browserSession = result.session;
-                  if (operation.kind !== "capture") return result.observation;
-                  if (!selectedAssetId || !result.observation.screenshot) {
-                    throw new Error("Kernel did not return the selected browser image");
+                  if (operation.kind === "capture") {
+                    if (!selectedAssetId || !result.observation.screenshot) {
+                      throw new Error("Kernel did not return the selected browser image");
+                    }
+                    if (!this.#imageVault) {
+                      throw new Error("Florence image persistence is not configured");
+                    }
+                    const stored = await this.#imageVault.store({
+                      assetId: selectedAssetId,
+                      householdId: work.household.householdId,
+                      signalId: work.workId,
+                      declaredMimeType: result.observation.screenshot.mimeType,
+                      bytes: result.observation.screenshot.bytes,
+                    });
+                    await this.#imageVault.retain({
+                      householdId: work.household.householdId,
+                      signalId: work.workId,
+                      image: stored.image,
+                      claimId: work.workId,
+                      now: this.#now(),
+                    });
+                    const selectedImage: FamilyWorkSelectedImage = {
+                      assetId: stored.image.assetId,
+                      signalId: work.workId,
+                      workId: work.workId,
+                      mimeType: stored.image.mimeType,
+                      filename: browserSelectedImageFilename(
+                        operation.label,
+                        stored.image.assetId,
+                        stored.image.mimeType,
+                      ),
+                    };
+                    return { ...result.observation, selectedImage };
                   }
-                  if (!this.#imageVault) {
-                    throw new Error("Florence image persistence is not configured");
+                  if (operation.kind === "download") {
+                    if (!selectedFileAssetId || !result.observation.downloadedFile) {
+                      throw new Error("Kernel did not return the selected browser file");
+                    }
+                    if (!this.#imageVault) {
+                      throw new Error("Florence file persistence is not configured");
+                    }
+                    const stored = await this.#imageVault.storeFileArtifact({
+                      artifactId: selectedFileAssetId,
+                      householdId: work.household.householdId,
+                      workId: work.workId,
+                      callId: pendingCall.callId,
+                      filename: result.observation.downloadedFile.filename,
+                      declaredMimeType: result.observation.downloadedFile.mimeType,
+                      bytes: result.observation.downloadedFile.bytes,
+                    });
+                    const selectedFile: FamilyWorkSelectedFile = {
+                      assetId: stored.artifactId,
+                      signalId: work.workId,
+                      workId: stored.workId,
+                      mimeType: stored.mimeType,
+                      filename: stored.filename,
+                      byteLength: stored.byteLength,
+                      sha256: stored.sha256,
+                    };
+                    return { ...result.observation, selectedFile };
                   }
-                  const stored = await this.#imageVault.store({
-                    assetId: selectedAssetId,
-                    householdId: work.household.householdId,
-                    signalId: work.workId,
-                    declaredMimeType: result.observation.screenshot.mimeType,
-                    bytes: result.observation.screenshot.bytes,
-                  });
-                  await this.#imageVault.retain({
-                    householdId: work.household.householdId,
-                    signalId: work.workId,
-                    image: stored.image,
-                    claimId: work.workId,
-                    now: this.#now(),
-                  });
-                  const selectedImage: FamilyWorkSelectedImage = {
-                    assetId: stored.image.assetId,
-                    signalId: work.workId,
-                    workId: work.workId,
-                    mimeType: stored.image.mimeType,
-                    filename: browserSelectedImageFilename(
-                      operation.label,
-                      stored.image.assetId,
-                      stored.image.mimeType,
-                    ),
-                  };
-                  return { ...result.observation, selectedImage };
+                  return result.observation;
                 },
               }
             : {}),

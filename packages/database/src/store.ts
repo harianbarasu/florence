@@ -22,6 +22,7 @@ const LINQ_RECEIPT_CLOCK_SKEW_MS = 5 * 60_000;
 const FAMILY_WORK_INITIAL_DELAY_MS = 1_000;
 const FAMILY_WORK_CLAIM_LEASE_MS = 2 * 60_000;
 const MAX_FAMILY_WORK_STATE_BYTES = 256 * 1024;
+const MAX_FAMILY_WORK_FILE_BYTES = 100 * 1024 * 1024;
 const MAX_FAMILY_WORK_COUNTER = 999_999_999;
 const CONVERSATION_HISTORY_PAGE_BYTE_BUDGET = 80_000;
 const CONVERSATION_HISTORY_FETCH_BATCH = 64;
@@ -691,6 +692,16 @@ export type FamilyWorkSelectedImage = {
   readonly filename: string;
 };
 
+export type FamilyWorkSelectedFile = {
+  readonly assetId: string;
+  readonly signalId: string;
+  readonly workId: string;
+  readonly mimeType: string;
+  readonly filename: string;
+  readonly byteLength: number;
+  readonly sha256: string;
+};
+
 export type FamilyWorkStateV1 = {
   readonly kind: "family_work_v1";
   readonly version: 1;
@@ -706,6 +717,7 @@ export type FamilyWorkStateV1 = {
     readonly expiresAt: string;
   } | null;
   readonly browserImages?: readonly FamilyWorkSelectedImage[];
+  readonly browserFiles?: readonly FamilyWorkSelectedFile[];
   readonly activePhoneCall: {
     readonly provider: "bland" | "twilio";
     readonly kind: "agent" | "announcement";
@@ -753,6 +765,7 @@ export type FamilyWorkStateV1 = {
     readonly text: string;
     readonly docket?: PrivateDocketCoordination | null;
     readonly selectedImages?: readonly FamilyWorkSelectedImage[];
+    readonly selectedFiles?: readonly FamilyWorkSelectedFile[];
   } | null;
 };
 
@@ -1370,7 +1383,8 @@ export type OutboundNativeMove =
             type: "media";
             source:
               | { type: "url"; url: string }
-              | ({ type: "florence_artifact"; providerAttachmentId?: string } & FamilyWorkSelectedImage);
+              | ({ type: "florence_artifact"; providerAttachmentId?: string } & FamilyWorkSelectedImage)
+              | ({ type: "florence_file_artifact"; providerAttachmentId?: string } & FamilyWorkSelectedFile);
           }
       )[];
     }
@@ -4141,7 +4155,14 @@ export class PostgresFlorenceStore {
       ) {
         return "stale";
       }
-      const nextState = familyWorkState(input.result.state);
+      const proposedNextState = familyWorkState(input.result.state);
+      const nextState = familyWorkState({
+        ...proposedNextState,
+        browserFiles: mergeFamilyWorkSelectedFiles(
+          currentState.browserFiles ?? [],
+          proposedNextState.browserFiles ?? [],
+        ),
+      });
       const queuedSteering = strictFamilyWorkSteeringSuffix(nextState.steering, currentState.steering);
       const sameDocketLinkage = sameStrings(
         [...(currentState.docketCandidateIds ?? [])].sort(),
@@ -4158,6 +4179,13 @@ export class PostgresFlorenceStore {
         throw new FlorenceStoreConflict(
           "A family work settlement changed its claim generation, steering, or docket linkage",
         );
+      }
+      if (
+        nextState.browserFiles?.some(
+          (file) => file.workId !== input.workId || file.signalId !== input.workId,
+        )
+      ) {
+        throw new FlorenceStoreConflict("A selected browser file belongs to another family task");
       }
       if (queuedSteering) {
         if (
@@ -4362,6 +4390,13 @@ export class PostgresFlorenceStore {
         }
         if (nextState.terminal.selectedImages?.some((image) => image.workId !== input.workId)) {
           throw new FlorenceStoreConflict("A selected family-work image belongs to another task");
+        }
+        if (
+          nextState.terminal.selectedFiles?.some(
+            (file) => file.workId !== input.workId || file.signalId !== input.workId,
+          )
+        ) {
+          throw new FlorenceStoreConflict("A selected family-work file belongs to another task");
         }
         const updated = await sql`
           update proactive_work set task_state=${sql.json(nextState)},status='delivering',
@@ -10343,7 +10378,8 @@ export class PostgresFlorenceStore {
       const parts = move.parts.map((part) => {
         if (
           part.type !== "media" ||
-          part.source.type !== "florence_artifact" ||
+          (part.source.type !== "florence_artifact" &&
+            part.source.type !== "florence_file_artifact") ||
           part.source.assetId !== input.assetId
         ) {
           return part;
@@ -19318,6 +19354,7 @@ const FAMILY_WORK_STATE_KEYS = [
   "acknowledgementText",
   "activePhoneCall",
   "activeTextMessage",
+  "browserFiles",
   "browserImages",
   "browserSession",
   "claim",
@@ -19354,6 +19391,7 @@ function initialFamilyWorkState(
     activePhoneCall: null,
     activeTextMessage: null,
     pendingParticipantRequest: null,
+    browserFiles: [],
     browserImages: [],
     browserSession: null,
     continuationItems: [],
@@ -19414,6 +19452,106 @@ function familyWorkSelectedImages(value: JsonValue, name: string): readonly Fami
   return images;
 }
 
+function familyWorkSelectedFile(value: JsonValue, name: string): FamilyWorkSelectedFile {
+  const file = strictJsonRecord(value, name);
+  assertExactJsonKeys(
+    file,
+    ["assetId", "signalId", "workId", "mimeType", "filename", "byteLength", "sha256"],
+    name,
+  );
+  const assetId = requiredStringField(file, "assetId", `${name} asset ID`);
+  const signalId = requiredStringField(file, "signalId", `${name} signal ID`);
+  const workId = requiredStringField(file, "workId", `${name} work ID`);
+  assertUuid(assetId, `${name} asset ID`);
+  assertUuid(signalId, `${name} signal ID`);
+  assertUuid(workId, `${name} work ID`);
+  const storedMimeType = requiredStringField(file, "mimeType", `${name} MIME type`);
+  const mimeType = limitedRequiredString(storedMimeType, 255, `${name} MIME type`);
+  const mimeParts = mimeType.split("/");
+  const mimeToken = /^[a-z0-9][a-z0-9!#$%&'*+\-.^_`|~]*$/u;
+  if (
+    mimeType !== storedMimeType ||
+    mimeType !== mimeType.toLowerCase() ||
+    mimeParts.length !== 2 ||
+    !mimeParts.every((part) => mimeToken.test(part))
+  ) {
+    throw new FlorenceStoreConflict(`${name} MIME type is invalid`);
+  }
+  const storedFilename = requiredStringField(file, "filename", `${name} filename`);
+  const filename = limitedRequiredString(storedFilename, 255, `${name} filename`);
+  const hasForbiddenFilenameCharacter =
+    filename.includes("/") ||
+    filename.includes("\\") ||
+    [...filename].some((character) => {
+      const codePoint = character.codePointAt(0) ?? 0;
+      return codePoint <= 31 || codePoint === 127;
+    });
+  if (
+    filename !== storedFilename ||
+    filename !== filename.normalize("NFC") ||
+    filename === "." ||
+    filename === ".." ||
+    hasForbiddenFilenameCharacter
+  ) {
+    throw new FlorenceStoreConflict(`${name} filename is invalid`);
+  }
+  const byteLength = file.byteLength;
+  if (
+    !Number.isSafeInteger(byteLength) ||
+    (byteLength as number) < 1 ||
+    (byteLength as number) > MAX_FAMILY_WORK_FILE_BYTES
+  ) {
+    throw new FlorenceStoreConflict(`${name} byte length is invalid`);
+  }
+  const sha = requiredStringField(file, "sha256", `${name} SHA-256`);
+  assertDigest(sha, `${name} SHA-256`);
+  return {
+    assetId,
+    signalId,
+    workId,
+    mimeType,
+    filename,
+    byteLength: byteLength as number,
+    sha256: sha,
+  };
+}
+
+function familyWorkSelectedFiles(value: JsonValue, name: string): readonly FamilyWorkSelectedFile[] {
+  if (!Array.isArray(value)) throw new FlorenceStoreConflict(`${name} are invalid`);
+  const files = value.map((file, index) => familyWorkSelectedFile(file, `${name} ${index + 1}`));
+  if (unique(files.map((file) => file.assetId)).length !== files.length) {
+    throw new FlorenceStoreConflict(`${name} contain a duplicate asset`);
+  }
+  return files;
+}
+
+function mergeFamilyWorkSelectedFiles(
+  current: readonly FamilyWorkSelectedFile[],
+  next: readonly FamilyWorkSelectedFile[],
+): readonly FamilyWorkSelectedFile[] {
+  const merged = [...current];
+  const byAssetId = new Map(current.map((file) => [file.assetId, file]));
+  for (const file of next) {
+    const existing = byAssetId.get(file.assetId);
+    if (!existing) {
+      merged.push(file);
+      byAssetId.set(file.assetId, file);
+      continue;
+    }
+    if (
+      existing.signalId !== file.signalId ||
+      existing.workId !== file.workId ||
+      existing.mimeType !== file.mimeType ||
+      existing.filename !== file.filename ||
+      existing.byteLength !== file.byteLength ||
+      existing.sha256 !== file.sha256
+    ) {
+      throw new FlorenceStoreConflict("A selected family-work file changed after it was checkpointed");
+    }
+  }
+  return merged;
+}
+
 function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWorkStateV1 {
   let serialized: string | undefined;
   try {
@@ -19432,6 +19570,7 @@ function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWor
   if (state.activePhoneCall === undefined) state.activePhoneCall = null;
   if (state.activeTextMessage === undefined) state.activeTextMessage = null;
   if (state.acknowledgementText === undefined) state.acknowledgementText = null;
+  if (state.browserFiles === undefined) state.browserFiles = [];
   if (state.browserImages === undefined) state.browserImages = [];
   if (state.browserSession === undefined) state.browserSession = null;
   if (state.docketCandidateIds === undefined) state.docketCandidateIds = [];
@@ -19650,6 +19789,10 @@ function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWor
   }
 
   const continuationItems = jsonArrayField(state, "continuationItems", "Family work continuation");
+  const browserFiles = familyWorkSelectedFiles(
+    state.browserFiles as JsonValue,
+    "Family work browser files",
+  );
   const browserImages = familyWorkSelectedImages(
     state.browserImages as JsonValue,
     "Family work browser images",
@@ -19744,12 +19887,19 @@ function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWor
   }
   if (state.terminal !== null) {
     const storedTerminal = strictJsonRecord(state.terminal, "Family work terminal result");
+    const hasSelectedFiles = storedTerminal.selectedFiles !== undefined;
     const hasSelectedImages = storedTerminal.selectedImages !== undefined;
     const storedTerminalDocket = storedTerminal.docket;
     const hasDocket = storedTerminalDocket !== undefined;
     assertExactJsonKeys(
       storedTerminal,
-      ["outcome", "text", ...(hasSelectedImages ? ["selectedImages"] : []), ...(hasDocket ? ["docket"] : [])],
+      [
+        "outcome",
+        "text",
+        ...(hasSelectedFiles ? ["selectedFiles"] : []),
+        ...(hasSelectedImages ? ["selectedImages"] : []),
+        ...(hasDocket ? ["docket"] : []),
+      ],
       "Family work terminal result",
     );
     const outcome = storedTerminal.outcome;
@@ -19800,6 +19950,14 @@ function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWor
         "Family work terminal text",
       ),
       docket,
+      ...(hasSelectedFiles
+        ? {
+            selectedFiles: familyWorkSelectedFiles(
+              storedTerminal.selectedFiles as JsonValue,
+              "Family work terminal selected files",
+            ),
+          }
+        : {}),
       ...(hasSelectedImages
         ? {
             selectedImages: familyWorkSelectedImages(
@@ -19837,6 +19995,7 @@ function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWor
     activePhoneCall,
     activeTextMessage,
     pendingParticipantRequest,
+    browserFiles,
     browserImages,
     browserSession,
     continuationItems: [...continuationItems],
@@ -20639,6 +20798,7 @@ async function insertFamilyWorkOutbound(
     deliveryKind === "terminal"
       ? await proactiveFamilyWorkResolutionMetadata(sql, work.id, state.terminal?.outcome === "succeeded")
       : null;
+  const selectedFiles = deliveryKind === "terminal" ? (state.terminal?.selectedFiles ?? []) : [];
   const selectedImages = deliveryKind === "terminal" ? (state.terminal?.selectedImages ?? []) : [];
   await insertProactiveOutbound(sql, {
     workId: work.id,
@@ -20649,7 +20809,7 @@ async function insertFamilyWorkOutbound(
     ownerAdultId: work.owner_adult_id,
     text,
     ...(replyToSourceId ? { replyToSourceId } : {}),
-    ...(selectedImages.length > 0
+    ...(selectedFiles.length > 0 || selectedImages.length > 0
       ? {
           nativeMove: {
             type: "message" as const,
@@ -20658,6 +20818,10 @@ async function insertFamilyWorkOutbound(
               ...selectedImages.map((image) => ({
                 type: "media" as const,
                 source: { type: "florence_artifact" as const, ...image },
+              })),
+              ...selectedFiles.map((file) => ({
+                type: "media" as const,
+                source: { type: "florence_file_artifact" as const, ...file },
               })),
             ],
           },
@@ -24655,6 +24819,52 @@ function outboundNativeMessagePart(
         source: {
           type: "florence_artifact",
           ...familyWorkSelectedImage(artifact, "Stored Florence artifact source"),
+          ...(hasProviderAttachmentId
+            ? {
+                providerAttachmentId: limitedRequiredString(
+                  requiredStringField(source, "providerAttachmentId", "Stored provider attachment ID"),
+                  500,
+                  "Stored provider attachment ID",
+                ),
+              }
+            : {}),
+        },
+      };
+    }
+    if (source.type === "florence_file_artifact") {
+      const hasProviderAttachmentId = source.providerAttachmentId !== undefined;
+      assertExactJsonKeys(
+        source,
+        hasProviderAttachmentId
+          ? [
+              "type",
+              "assetId",
+              "signalId",
+              "workId",
+              "mimeType",
+              "filename",
+              "byteLength",
+              "sha256",
+              "providerAttachmentId",
+            ]
+          : [
+              "type",
+              "assetId",
+              "signalId",
+              "workId",
+              "mimeType",
+              "filename",
+              "byteLength",
+              "sha256",
+            ],
+        "Stored Florence file artifact source",
+      );
+      const { type: _type, providerAttachmentId: _providerAttachmentId, ...artifact } = source;
+      return {
+        type: "media",
+        source: {
+          type: "florence_file_artifact",
+          ...familyWorkSelectedFile(artifact, "Stored Florence file artifact source"),
           ...(hasProviderAttachmentId
             ? {
                 providerAttachmentId: limitedRequiredString(

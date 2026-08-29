@@ -20,6 +20,8 @@ import type { ComputerBatchParams } from "@onkernel/sdk/resources/browsers/compu
  * provider. Browserbase remains only as a rollout fallback when Kernel is not
  * configured. Florence intentionally omits both upstreams' provider registries,
  * second agent runtimes, and arbitrary total-task or tool-call ceilings.
+ * Kernel file acquisition combines Kernel's File I/O flow with OpenInstinct's
+ * controlled remote-path, read-before-close, and finally-delete capture pattern.
  */
 
 const DEFAULT_BASE_URL = "https://api.browserbase.com";
@@ -37,13 +39,17 @@ const MAX_PROVIDER_RESPONSE_BYTES = 1 * 1_024 * 1_024;
 const MAX_COMMAND_STDOUT_BYTES = 256 * 1_024;
 const MAX_COMMAND_STDERR_BYTES = 64 * 1_024;
 const MAX_INPUT_CHARS = 20_000;
-const MAX_UPLOAD_BYTES = 20 * 1_024 * 1_024;
+const MAX_BROWSER_IMAGE_BYTES = 20 * 1_024 * 1_024;
+const MAX_FILE_TRANSFER_BYTES = 100 * 1_024 * 1_024;
+const MAX_UPLOAD_BYTES = MAX_FILE_TRANSFER_BYTES;
 const MAX_UPLOAD_FILENAME_BYTES = 255;
+const MAX_DOWNLOAD_BYTES = MAX_FILE_TRANSFER_BYTES;
+const KERNEL_DOWNLOAD_READ_ATTEMPTS = 20;
+const KERNEL_DOWNLOAD_READ_DELAY_MS = 250;
 const DEFAULT_KERNEL_SESSION_TIMEOUT_SECONDS = 259_200;
 const DEFAULT_KERNEL_PLAYWRIGHT_TIMEOUT_SECONDS = 60;
 const MAX_KERNEL_PLAYWRIGHT_TIMEOUT_SECONDS = 300;
 const MAX_PLAYWRIGHT_CODE_CHARS = 50_000;
-const MAX_BROWSER_IMAGE_BYTES = MAX_UPLOAD_BYTES;
 
 export interface FlorenceBrowserSession {
   readonly sessionId: string;
@@ -69,6 +75,7 @@ export type FlorenceBrowserOperation =
   | { readonly kind: "wait"; readonly milliseconds: number }
   | { readonly kind: "back" }
   | { readonly kind: "screenshot" }
+  | { readonly kind: "download"; readonly selector: string }
   | {
       readonly kind: "capture";
       readonly source: "viewport" | "full_page" | "element" | "image_resource";
@@ -172,6 +179,16 @@ export interface FlorenceBrowserSelectedImage {
   readonly filename: string;
 }
 
+export interface FlorenceBrowserSelectedFile {
+  readonly assetId: string;
+  readonly signalId: string;
+  readonly workId: string;
+  readonly mimeType: string;
+  readonly filename: string;
+  readonly byteLength: number;
+  readonly sha256: string;
+}
+
 export interface FlorenceBrowserObservation {
   readonly kind: FlorenceBrowserObservationKind;
   readonly reason: string | null;
@@ -183,7 +200,14 @@ export interface FlorenceBrowserObservation {
   readonly liveViewUrl?: string;
   readonly screenshot?: FlorenceBrowserScreenshot;
   readonly selectedImage?: FlorenceBrowserSelectedImage;
+  readonly selectedFile?: FlorenceBrowserSelectedFile;
   readonly computerReads?: readonly FlorenceBrowserComputerReadResult[];
+  /** Internal binary handoff for durable artifact promotion; never expose this payload to the model. */
+  readonly downloadedFile?: {
+    readonly filename: string;
+    readonly mimeType: string;
+    readonly bytes: Uint8Array;
+  };
 }
 
 export interface FlorenceBrowserRunInput {
@@ -422,6 +446,7 @@ export class KernelBrowserClient implements FlorenceBrowserClient {
 
     let actionMayHaveHappened = false;
     let computerReads: readonly FlorenceBrowserComputerReadResult[] | undefined;
+    let downloadedFile: FlorenceBrowserObservation["downloadedFile"];
     try {
       if (input.attempt > 1 && operationMayHaveUncertainEffect(input.operation)) {
         try {
@@ -455,6 +480,9 @@ export class KernelBrowserClient implements FlorenceBrowserClient {
         case "capture":
           screenshot = await this.#captureUserVisibleImage(sessionDetails, input.operation, localSignal);
           break;
+        case "download":
+          downloadedFile = await this.#acquireDownload(sessionDetails, input.operation, localSignal);
+          break;
         case "playwright":
           actionMayHaveHappened = true;
           operationResult = await this.#executePlaywright(sessionDetails, input.operation, localSignal);
@@ -484,10 +512,17 @@ export class KernelBrowserClient implements FlorenceBrowserClient {
         screenshot,
         operationResult,
         computerReads,
+        downloadedFile,
       );
       return { session, observation };
     } catch (error) {
       const browserError = asKernelBrowserError(error, localSignal);
+      if (downloadedFile && !localSignal.aborted) {
+        return {
+          session,
+          observation: unreadableDownloadedFileObservation(downloadedFile),
+        };
+      }
       if (browserError.code === "invalid_input") {
         if (createdThisRun) await this.#bestEffortClose(session);
         throw browserError;
@@ -814,7 +849,7 @@ export class KernelBrowserClient implements FlorenceBrowserClient {
     session: KernelSessionDetails,
     operation: Exclude<
       FlorenceBrowserOperation,
-      | { readonly kind: "snapshot" | "screenshot" | "capture" | "owner_handoff" }
+      | { readonly kind: "snapshot" | "screenshot" | "capture" | "download" | "owner_handoff" }
       | { readonly kind: "playwright" | "computer" }
     >,
     uploadFile: FlorenceBrowserRunInput["uploadFile"],
@@ -924,6 +959,7 @@ export class KernelBrowserClient implements FlorenceBrowserClient {
     screenshot?: FlorenceBrowserScreenshot,
     operationResult?: string,
     computerReads?: readonly FlorenceBrowserComputerReadResult[],
+    downloadedFile?: FlorenceBrowserObservation["downloadedFile"],
   ): Promise<FlorenceBrowserObservation> {
     const snapshotArgs = operation.kind === "snapshot" && operation.compact === false ? [] : ["-c"];
     const snapshotEnvelope = await this.#agentBrowser(
@@ -949,6 +985,7 @@ export class KernelBrowserClient implements FlorenceBrowserClient {
       ...(kind === "owner_handoff" && session.liveViewUrl ? { liveViewUrl: session.liveViewUrl } : {}),
       ...(screenshot ? { screenshot } : {}),
       ...(computerReads && computerReads.length > 0 ? { computerReads } : {}),
+      ...(downloadedFile ? { downloadedFile } : {}),
     };
   }
 
@@ -1093,6 +1130,75 @@ await target.screenshot({ animations: "disabled", caret: "hide", path: ${JSON.st
         .deleteFile(session.session.sessionId, { path: remotePath }, { signal })
         .catch(() => undefined);
     }
+  }
+
+  async #acquireDownload(
+    session: KernelSessionDetails,
+    operation: Extract<FlorenceBrowserOperation, { readonly kind: "download" }>,
+    signal: AbortSignal,
+  ): Promise<NonNullable<FlorenceBrowserObservation["downloadedFile"]>> {
+    const selector = requireDownloadSelector(operation.selector);
+    const remotePath = `/tmp/florence-browser-download-${randomUUID()}`;
+    try {
+      const result = await this.#kernel.browsers.playwright.execute(
+        session.session.sessionId,
+        {
+          code: `
+const downloadPromise = page.waitForEvent("download");
+await page.locator(${JSON.stringify(selector)}).first().click();
+const download = await downloadPromise;
+await download.saveAs(${JSON.stringify(remotePath)});
+return { filename: download.suggestedFilename() };`,
+          timeout_sec: MAX_KERNEL_PLAYWRIGHT_TIMEOUT_SECONDS,
+        },
+        { signal },
+      );
+      if (!result.success || !isRecord(result.result)) {
+        throw new FlorenceBrowserError(
+          "transient",
+          "The selected page element did not produce a downloadable file. Read the current page and try again.",
+          { retryable: true },
+        );
+      }
+      const filename = validatedDownloadFilename(result.result.filename);
+      const response = await this.#readDownloadedFile(session, remotePath, signal);
+      const bytes = await readBoundedResponseBytes(response, MAX_DOWNLOAD_BYTES, "download");
+      return {
+        filename,
+        mimeType: downloadMimeType(filename),
+        bytes,
+      };
+    } finally {
+      await this.#kernel.browsers.fs
+        .deleteFile(
+          session.session.sessionId,
+          { path: remotePath },
+          { signal: signal.aborted ? new AbortController().signal : signal },
+        )
+        .catch(() => undefined);
+    }
+  }
+
+  async #readDownloadedFile(
+    session: KernelSessionDetails,
+    remotePath: string,
+    signal: AbortSignal,
+  ): Promise<Response> {
+    for (let attempt = 1; attempt <= KERNEL_DOWNLOAD_READ_ATTEMPTS; attempt += 1) {
+      throwIfAborted(signal);
+      try {
+        const response = await this.#kernel.browsers.fs.readFile(
+          session.session.sessionId,
+          { path: remotePath },
+          { signal },
+        );
+        if (response.status !== 404 || attempt === KERNEL_DOWNLOAD_READ_ATTEMPTS) return response;
+      } catch (error) {
+        if (kernelErrorStatus(error) !== 404 || attempt === KERNEL_DOWNLOAD_READ_ATTEMPTS) throw error;
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, KERNEL_DOWNLOAD_READ_DELAY_MS));
+    }
+    throw invalidProviderResponse("Kernel could not read the downloaded file.");
   }
 
   async #agentBrowser(
@@ -1300,6 +1406,13 @@ export class BrowserbaseBrowserClient implements FlorenceBrowserClient {
   async run(input: FlorenceBrowserRunInput, signal?: AbortSignal): Promise<FlorenceBrowserRunResult> {
     const localSignal = signal ?? new AbortController().signal;
     throwIfAborted(localSignal);
+    if (input.operation.kind === "download") {
+      throw new FlorenceBrowserError(
+        "unavailable",
+        "Browser downloads require Florence's Kernel browser. Configure Kernel to acquire this file.",
+        { retryable: false },
+      );
+    }
     validateRunInput(input);
 
     let sessionDetails: BrowserbaseSessionDetails;
@@ -1625,6 +1738,12 @@ export class BrowserbaseBrowserClient implements FlorenceBrowserClient {
         command = "back";
         args = [];
         break;
+      case "download":
+        throw new FlorenceBrowserError(
+          "unavailable",
+          "Browser downloads require Florence's Kernel browser. Configure Kernel to acquire this file.",
+          { retryable: false },
+        );
       case "playwright":
       case "computer":
         throw new FlorenceBrowserError(
@@ -2124,6 +2243,98 @@ function requireCaptureSelector(value: string | undefined): string {
   return selector;
 }
 
+function requireDownloadSelector(value: string): string {
+  const selector = typeof value === "string" ? value.trim() : "";
+  if (!selector || selector.length > 2_000) {
+    throw new FlorenceBrowserError(
+      "invalid_input",
+      "Choose the exact page element that starts the file download.",
+    );
+  }
+  return selector;
+}
+
+function validatedDownloadFilename(value: unknown): string {
+  if (typeof value !== "string") {
+    throw invalidProviderResponse("Kernel returned a download without a valid filename.");
+  }
+  const filename = value.normalize("NFKC");
+  const hasInvalidCharacter = [...filename].some((character) => {
+    const codePoint = character.codePointAt(0) ?? 0;
+    return codePoint < 32 || codePoint === 127 || '<>:"/\\|?*'.includes(character);
+  });
+  if (
+    !filename.trim() ||
+    filename !== filename.trim() ||
+    filename === "." ||
+    filename === ".." ||
+    Buffer.byteLength(filename, "utf8") > MAX_UPLOAD_FILENAME_BYTES ||
+    hasInvalidCharacter
+  ) {
+    throw invalidProviderResponse("Kernel returned a download without a valid filename.");
+  }
+  return filename;
+}
+
+const DOWNLOAD_MIME_TYPES: Readonly<Record<string, string>> = {
+  "7z": "application/x-7z-compressed",
+  avi: "video/x-msvideo",
+  bmp: "image/bmp",
+  csv: "text/csv",
+  doc: "application/msword",
+  docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  eml: "message/rfc822",
+  epub: "application/epub+zip",
+  gif: "image/gif",
+  gz: "application/gzip",
+  heic: "image/heic",
+  htm: "text/html",
+  html: "text/html",
+  ics: "text/calendar",
+  jpeg: "image/jpeg",
+  jpg: "image/jpeg",
+  json: "application/json",
+  m4a: "audio/mp4",
+  md: "text/markdown",
+  mov: "video/quicktime",
+  mp3: "audio/mpeg",
+  mp4: "video/mp4",
+  odp: "application/vnd.oasis.opendocument.presentation",
+  ods: "application/vnd.oasis.opendocument.spreadsheet",
+  odt: "application/vnd.oasis.opendocument.text",
+  ogg: "audio/ogg",
+  pdf: "application/pdf",
+  png: "image/png",
+  ppt: "application/vnd.ms-powerpoint",
+  pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  rar: "application/vnd.rar",
+  rtf: "application/rtf",
+  svg: "image/svg+xml",
+  tar: "application/x-tar",
+  tif: "image/tiff",
+  tiff: "image/tiff",
+  tsv: "text/tab-separated-values",
+  txt: "text/plain",
+  vcf: "text/vcard",
+  wav: "audio/wav",
+  webm: "video/webm",
+  webp: "image/webp",
+  xls: "application/vnd.ms-excel",
+  xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  xml: "application/xml",
+  yaml: "application/yaml",
+  yml: "application/yaml",
+  zip: "application/zip",
+};
+
+function downloadMimeType(filename: string): string {
+  const extensionIndex = filename.lastIndexOf(".");
+  if (extensionIndex < 0 || extensionIndex === filename.length - 1) return "application/octet-stream";
+  const extension = filename.slice(extensionIndex + 1).toLowerCase();
+  if (!Object.hasOwn(DOWNLOAD_MIME_TYPES, extension)) return "application/octet-stream";
+  return DOWNLOAD_MIME_TYPES[extension] ?? "application/octet-stream";
+}
+
 function browserImageMimeType(bytes: Uint8Array): "image/jpeg" | "image/png" | "image/webp" | null {
   if (bytes.byteLength >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
     return "image/jpeg";
@@ -2154,18 +2365,33 @@ function browserImageMimeType(bytes: Uint8Array): "image/jpeg" | "image/png" | "
 async function readBoundedResponseBytes(
   response: Response,
   maximumBytes: number,
+  context: "screenshot" | "download" = "screenshot",
 ): Promise<Uint8Array<ArrayBuffer>> {
+  const unreadable = () =>
+    invalidProviderResponse(
+      context === "download"
+        ? "Kernel could not read the downloaded file."
+        : "Kernel could not capture the browser screenshot.",
+    );
+  const invalidSize = () =>
+    context === "download"
+      ? new FlorenceBrowserError(
+          "unavailable",
+          "The downloaded file is empty or exceeds Linq's 100MB attachment limit.",
+          { retryable: false },
+        )
+      : invalidProviderResponse("The browser screenshot was too large to keep with this task.");
   if (!response.ok) {
-    throw invalidProviderResponse("Kernel could not capture the browser screenshot.");
+    throw unreadable();
   }
   const contentLength = Number(response.headers.get("content-length"));
   if (Number.isFinite(contentLength) && contentLength > maximumBytes) {
-    throw invalidProviderResponse("The browser screenshot was too large to keep with this task.");
+    throw invalidSize();
   }
   if (!response.body) {
     const bytes = new Uint8Array(await response.arrayBuffer());
     if (bytes.byteLength < 1 || bytes.byteLength > maximumBytes) {
-      throw invalidProviderResponse("The browser screenshot was too large to keep with this task.");
+      throw invalidSize();
     }
     return bytes;
   }
@@ -2178,13 +2404,14 @@ async function readBoundedResponseBytes(
       if (result.done) break;
       total += result.value.byteLength;
       if (total > maximumBytes) {
-        throw invalidProviderResponse("The browser screenshot was too large to keep with this task.");
+        throw invalidSize();
       }
       chunks.push(result.value);
     }
   } finally {
     reader.releaseLock();
   }
+  if (total < 1 && context === "download") throw invalidSize();
   const bytes = new Uint8Array(total);
   let offset = 0;
   for (const chunk of chunks) {
@@ -2382,6 +2609,21 @@ function unreadableComputerReadObservation(
   };
 }
 
+function unreadableDownloadedFileObservation(
+  downloadedFile: NonNullable<FlorenceBrowserObservation["downloadedFile"]>,
+): FlorenceBrowserObservation {
+  return {
+    kind: "page",
+    reason: "The file downloaded successfully, but Florence could not read the resulting page afterward.",
+    url: "",
+    title: "",
+    snapshot: "",
+    refCount: 0,
+    truncated: false,
+    downloadedFile,
+  };
+}
+
 function validateRunInput(input: FlorenceBrowserRunInput): void {
   validateNonEmptyInput(input.householdId, "Browser household ID", 500);
   validateNonEmptyInput(input.workId, "Browser work ID", 500);
@@ -2412,6 +2654,9 @@ function validateRunInput(input: FlorenceBrowserRunInput): void {
         throw new FlorenceBrowserError("invalid_input", "The selected browser image region is invalid.");
       }
     }
+  }
+  if (input.operation.kind === "download") {
+    requireDownloadSelector(input.operation.selector);
   }
   if (input.operation.kind === "upload") {
     normalizeRef(input.operation.ref);

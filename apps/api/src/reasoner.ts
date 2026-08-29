@@ -5,6 +5,7 @@ import { memoryPresentationSchema } from "@florence/contracts";
 import type {
   FamilyWorkLinkedSource,
   FamilyWorkOriginContext,
+  FamilyWorkSelectedFile,
   FamilyWorkSelectedImage,
   FamilyWorkStateV1,
   SharedFamilyProfile,
@@ -1750,6 +1751,7 @@ const familyWorkTerminalDecisionSchema = z
     resumeAt: calendarInstant.nullable().default(null),
     progressText: z.string().trim().min(1).max(2_000).nullable().default(null),
     selectedImageAssetIds: z.array(z.string().uuid()).default([]),
+    selectedFileAssetIds: z.array(z.string().uuid()).default([]),
     docket: florencePrivateDocketCoordinationSchema.nullable().default(null),
   })
   .strict();
@@ -1761,6 +1763,7 @@ const familyWorkTerminalDecisionWithoutProgressSchema = z
     resumeAt: calendarInstant.nullable().default(null),
     progressText: z.string().trim().min(1).max(2_000).nullable().default(null),
     selectedImageAssetIds: z.array(z.string().uuid()).default([]),
+    selectedFileAssetIds: z.array(z.string().uuid()).default([]),
     docket: florencePrivateDocketCoordinationSchema.nullable().default(null),
   })
   .strict();
@@ -1878,6 +1881,7 @@ export type FlorenceFamilyWorkStep =
       text: string;
       docket?: FlorencePrivateDocketCoordination | null;
       selectedImages?: readonly FamilyWorkSelectedImage[];
+      selectedFiles?: readonly FamilyWorkSelectedFile[];
     }>;
 
 export type FlorenceSource = z.infer<typeof florenceSourceSchema>;
@@ -2330,7 +2334,7 @@ Keep choosing and chaining useful read or investigation tools in the current rea
 
 If useful work genuinely depends on outside state that cannot reasonably have changed yet, return outcome deferred with a proportionate absolute future resumeAt. Deferred work remains the same task and will wake automatically at that instant. It is not a substitute for using an available tool now, asking a genuinely blocking parent question, or returning a finished result. Use progressText only the first time Florence has something useful to say about the wait; use null on unchanged later checks so the family does not receive repeated status messages. A useful progress note tells the family what materially changed or what Florence is now waiting on in ordinary conversational language; it is not a provider-status translation.
 
-The result object always contains outcome, text, resumeAt, progressText, selectedImageAssetIds, and docket. For waiting, partial, or failed, docket must describe the linked unfinished item's current coordination: name who or what is naturally responsible for moving it next, give the smallest concrete next action, say whether a family answer is needed, and name the exact blocker or dependency in waitingOn when one exists. Keep docket to minimum family-safe coordination even when this task and its terminal chat text are private: never put private email or Calendar titles, source wording, or unrelated personal detail in it. A waiting result always needs a family answer, so set needsAnswer true and waitingOn to the exact choice or information requested by the one focused question in text. For partial or failed, needsAnswer is true only when a family answer is actually the next dependency; an outside blocker may instead have needsAnswer false while still being named in waitingOn. Use one supplied parent's exact name, Family, Florence, a plainly named outside person or organization, or null only when responsibility is genuinely unassigned. Derive all coordination from the task's actual current meaning, never from task category, origin or source ownership, private versus household visibility, the initiating parent, or which parent or worker claimed it. For succeeded, deferred, and progress, docket must be null. For outcome progress, text and resumeAt must be null, progressText must contain the useful update, and selectedImageAssetIds must be empty. For outcome deferred, text must be null, resumeAt must be the absolute future instant, progressText may be useful text or null, and selectedImageAssetIds must be empty. For every other outcome, text must contain the result or question and both resumeAt and progressText must be null. A browser capture marked user-visible returns an opaque selected image asset ID. Copy each exact ID into selectedImageAssetIds only when that image materially helps the finished result; routine browser screenshots are for your own inspection and must not be selected. Do not invent an asset ID. Selected images are currently delivered only with a succeeded or partial result, so waiting and failed results leave selectedImageAssetIds empty.
+The result object always contains outcome, text, resumeAt, progressText, selectedImageAssetIds, selectedFileAssetIds, and docket. For waiting, partial, or failed, docket must describe the linked unfinished item's current coordination: name who or what is naturally responsible for moving it next, give the smallest concrete next action, say whether a family answer is needed, and name the exact blocker or dependency in waitingOn when one exists. Keep docket to minimum family-safe coordination even when this task and its terminal chat text are private: never put private email or Calendar titles, source wording, or unrelated personal detail in it. A waiting result always needs a family answer, so set needsAnswer true and waitingOn to the exact choice or information requested by the one focused question in text. For partial or failed, needsAnswer is true only when a family answer is actually the next dependency; an outside blocker may instead have needsAnswer false while still being named in waitingOn. Use one supplied parent's exact name, Family, Florence, a plainly named outside person or organization, or null only when responsibility is genuinely unassigned. Derive all coordination from the task's actual current meaning, never from task category, origin or source ownership, private versus household visibility, the initiating parent, or which parent or worker claimed it. For succeeded, deferred, and progress, docket must be null. For outcome progress, text and resumeAt must be null, progressText must contain the useful update, and both selected asset-ID arrays must be empty. For outcome deferred, text must be null, resumeAt must be the absolute future instant, progressText may be useful text or null, and both selected asset-ID arrays must be empty. For every other outcome, text must contain the result or question and both resumeAt and progressText must be null. A browser capture marked user-visible returns an opaque selected image asset ID. A successful browser download returns an opaque selected file asset ID. Copy exact IDs into the matching array only when that image or original file materially helps the finished result. Routine browser screenshots are for your own inspection and must not be selected. Do not invent an asset ID. Selected images and files are currently delivered only with a succeeded or partial result, so waiting and failed results leave both arrays empty.
 
 If the accumulated evidence is enough, return a concise terminal result that leads with the useful answer and includes concrete options, times, tradeoffs, completed actions, and direct URLs already present in tool results when helpful. Write it as Florence rejoining the same family conversation: natural, specific, and warm enough for the moment, never like a ticket closing or a machine reporting state. Use outcome succeeded when the requested work is complete, partial when useful results exist but one named source or constraint could not be resolved, failed only when no useful result can be produced, and waiting only when one consequential parent choice remains genuinely blocking after the available tools. A waiting result must ask exactly one focused question in ordinary language. Never say you will keep working unless you actually call another tool in this checkpoint or return a deferred result with an exact resumeAt. Output only the strict result schema when you do not call a tool.`;
 
@@ -4217,6 +4221,7 @@ const browserWorkArguments = z
       "back",
       "screenshot",
       "capture",
+      "download",
       "playwright",
       "computer",
       "owner_handoff",
@@ -4284,6 +4289,7 @@ const browserWorkArguments = z
         });
       }
     }
+    if (args.operation === "download") requireValue(args.selector, "selector");
     if (args.operation === "computer" && args.actions.length === 0) {
       context.addIssue({
         code: "custom",
@@ -4404,6 +4410,7 @@ const BROWSER_WORK_PARAMETERS = {
         "back",
         "screenshot",
         "capture",
+        "download",
         "playwright",
         "computer",
         "owner_handoff",
@@ -4491,6 +4498,32 @@ const familyWorkSelectedImageSchema = z
   })
   .strict();
 
+const familyWorkSelectedFileSchema = z
+  .object({
+    assetId: z.string().uuid(),
+    signalId: z.string().uuid(),
+    workId: z.string().uuid(),
+    mimeType: z
+      .string()
+      .trim()
+      .min(3)
+      .max(255)
+      .regex(/^[A-Za-z0-9][A-Za-z0-9!#$&^_.+%'*`|~-]*\/[A-Za-z0-9][A-Za-z0-9!#$&^_.+%'*`|~-]*$/),
+    filename: z
+      .string()
+      .trim()
+      .min(1)
+      .max(255)
+      .refine((value) => value !== "." && value !== ".." && value.normalize("NFC") === value),
+    byteLength: z
+      .number()
+      .int()
+      .min(1)
+      .max(100 * 1024 * 1024),
+    sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  })
+  .strict();
+
 const browserComputerReadResultSchema = z.discriminatedUnion("type", [
   z
     .object({
@@ -4522,6 +4555,7 @@ const browserObservationOutputSchema = z
     liveViewUrl: z.string().url().max(4_096).nullable(),
     screenshotAttached: z.boolean(),
     selectedImage: familyWorkSelectedImageSchema.nullable(),
+    selectedFile: familyWorkSelectedFileSchema.nullable(),
     computerReads: z.array(browserComputerReadResultSchema).default([]),
   })
   .strict();
@@ -5536,6 +5570,11 @@ function browserOperation(args: z.infer<typeof browserWorkArguments>): FlorenceB
         ...(args.selector === null ? {} : { selector: args.selector }),
         ...(args.region === null ? {} : { region: args.region }),
       };
+    case "download":
+      return {
+        kind: "download",
+        selector: requiredWorkspaceValue(args.selector, "browser download selector"),
+      };
     case "playwright":
       return {
         kind: "playwright",
@@ -5602,6 +5641,7 @@ async function executeBrowserOperation(
       liveViewUrl: observation.liveViewUrl ?? null,
       screenshotAttached: observation.screenshot !== undefined,
       selectedImage: observation.selectedImage ?? null,
+      selectedFile: observation.selectedFile ?? null,
       computerReads: observation.computerReads ?? [],
     }),
   };
@@ -6058,7 +6098,7 @@ function foregroundCapabilityRegistry(): CapabilityRegistry<ForegroundCapability
     defineCapability({
       name: "browser_work",
       description:
-        "Use Florence's persistent real browser for any interactive website during durable family work. Prefer one bounded Playwright program to inspect the current DOM, perform related actions, and verify the resulting state. Use native computer actions when visual or coordinate-level control is more reliable: batches can click, move, type, press, scroll, drag, show or hide the cursor, and read or write the clipboard; clipboard and mouse-position reads are returned in action order. Set screenshot true on that same call when temporary visual inspection is useful. Routine screenshot is temporary visual context for you. Capture is different: it deliberately preserves one user-visible browser image for the final conversation, from the viewport or region, full page, rendered element, or original image resource; use it only when the parent asked for an image or the image materially improves the result. The compatibility operations can navigate, read an accessibility snapshot, click, type, upload one exact image or PDF from the initiating message, upload one exact Gmail attachment returned by gmail_work gmail_get by copying both its sourceId and attachmentRef, choose options, check boxes, press keys, scroll, wait, go back, or hand the live session to the parent for sign-in/MFA. For an initiating-message attachment set sourceId null. This is a general browser, not a task-specific workflow. Set fields unused by the chosen operation to null, false, or empty arrays.",
+        "Use Florence's persistent real browser for any interactive website during durable family work. Prefer one bounded Playwright program to inspect the current DOM, perform related actions, and verify the resulting state. Use native computer actions when visual or coordinate-level control is more reliable: batches can click, move, type, press, scroll, drag, show or hide the cursor, and read or write the clipboard; clipboard and mouse-position reads are returned in action order. Set screenshot true on that same call when temporary visual inspection is useful. Routine screenshot is temporary visual context for you. Capture deliberately preserves one user-visible browser image for the final conversation. Download clicks one exact CSS-selected control and promotes the resulting original file into Florence's durable task state before the browser can disappear; its returned asset ID may be selected for the final conversation or reused by upload in this same task. The compatibility operations can navigate, read an accessibility snapshot, click, type, upload one initiating-message image/PDF, upload one exact Gmail attachment returned by gmail_work gmail_get, or upload a previously downloaded file by copying its asset ID into attachmentRef with sourceId null; they can also choose options, check boxes, press keys, scroll, wait, go back, or hand the live session to the parent for sign-in/MFA. This is a general browser, not a task-specific workflow. Set fields unused by the chosen operation to null, false, or empty arrays.",
       modelSchema: BROWSER_WORK_PARAMETERS,
       inputSchema: browserWorkArguments,
       outputSchema: browserObservationOutputSchema,
@@ -6834,6 +6874,13 @@ function familyWorkModelContext(input: FlorenceFamilyWorkInput): JsonValue {
       assetId: image.assetId,
       filename: image.filename,
     })),
+    selectedBrowserFiles: (input.state.browserFiles ?? []).map((file) => ({
+      assetId: file.assetId,
+      filename: file.filename,
+      mimeType: file.mimeType,
+      byteLength: file.byteLength,
+      sha256: file.sha256,
+    })),
     steering: input.state.steering.map((item) => ({
       text: item.text,
       occurredAt: item.occurredAt,
@@ -6982,6 +7029,41 @@ function selectedBrowserImagesFromFamilyWork(
       const image = familyWorkSelectedImageSchema.safeParse(modelOutput.selectedImage);
       if (!image.success || image.data.workId !== workId || image.data.signalId !== workId) continue;
       selected.set(image.data.assetId, image.data);
+    }
+  }
+  return selected;
+}
+
+function selectedBrowserFilesFromFamilyWork(
+  items: readonly unknown[],
+  workId: string,
+): ReadonlyMap<string, FamilyWorkSelectedFile> {
+  const selected = new Map<string, FamilyWorkSelectedFile>();
+  for (const item of items) {
+    if (!isJsonRecord(item) || item.type !== "function_call_output") continue;
+    const output = item.output;
+    const texts =
+      typeof output === "string"
+        ? [output]
+        : Array.isArray(output)
+          ? output.flatMap((part) =>
+              isJsonRecord(part) && part.type === "input_text" && typeof part.text === "string"
+                ? [part.text]
+                : [],
+            )
+          : [];
+    for (const text of texts) {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        continue;
+      }
+      if (!isJsonRecord(parsed)) continue;
+      const modelOutput = isJsonRecord(parsed.output) ? parsed.output : parsed;
+      const file = familyWorkSelectedFileSchema.safeParse(modelOutput.selectedFile);
+      if (!file.success || file.data.workId !== workId || file.data.signalId !== workId) continue;
+      selected.set(file.data.assetId, file.data);
     }
   }
   return selected;
@@ -8605,6 +8687,16 @@ export class FlorenceReasoner {
         browserImageIndex.set(image.assetId, image);
       }
       const browserImages = [...browserImageIndex.values()];
+      const browserFileIndex = new Map(
+        (checkpointInput.state.browserFiles ?? []).map((file) => [file.assetId, file] as const),
+      );
+      for (const file of selectedBrowserFilesFromFamilyWork(
+        continuationItems,
+        checkpointInput.workId,
+      ).values()) {
+        browserFileIndex.set(file.assetId, file);
+      }
+      const browserFiles = [...browserFileIndex.values()];
       const continuedProgressBlock = workAdvanced ? false : (checkpointInput.state.progressBlocked ?? false);
       if (result.kind === "yielded") {
         const participantRequest = pendingParticipantRequest.current;
@@ -8626,6 +8718,7 @@ export class FlorenceReasoner {
               activeTextMessage,
               pendingParticipantRequest: participantRequest,
               browserImages,
+              browserFiles,
               continuationItems,
               pendingCall: null,
               progressBlocked: continuedProgressBlock,
@@ -8645,6 +8738,7 @@ export class FlorenceReasoner {
             activeTextMessage,
             pendingParticipantRequest: participantRequest,
             browserImages,
+            browserFiles,
             continuationItems,
             pendingCall: null,
             progressBlocked: continuedProgressBlock,
@@ -8667,6 +8761,7 @@ export class FlorenceReasoner {
             activeTextMessage,
             pendingParticipantRequest: pendingParticipantRequest.current,
             browserImages,
+            browserFiles,
             continuationItems,
             progressBlocked: continuedProgressBlock,
             pendingCall: {
@@ -8698,6 +8793,7 @@ export class FlorenceReasoner {
             activeTextMessage,
             pendingParticipantRequest: pendingParticipantRequest.current,
             browserImages,
+            browserFiles,
             continuationItems,
             pendingCall: null,
             progressBlocked: continuedProgressBlock,
@@ -8742,12 +8838,30 @@ export class FlorenceReasoner {
         if (!image) throw invalidOutput("Durable family work selected an unknown browser image");
         return image;
       });
+      const selectedFileAssetIds = terminal.selectedFileAssetIds;
+      if (new Set(selectedFileAssetIds).size !== selectedFileAssetIds.length) {
+        throw invalidOutput("Durable family work selected the same browser file more than once");
+      }
+      if (
+        selectedFileAssetIds.length > 0 &&
+        terminal.outcome !== "succeeded" &&
+        terminal.outcome !== "partial"
+      ) {
+        throw invalidOutput("Only a useful completed family-work result may include selected browser files");
+      }
+      const availableSelectedFiles = new Map(browserFiles.map((file) => [file.assetId, file] as const));
+      const selectedFiles = selectedFileAssetIds.map((assetId) => {
+        const file = availableSelectedFiles.get(assetId);
+        if (!file) throw invalidOutput("Durable family work selected an unknown browser file");
+        return file;
+      });
       if (terminal.outcome === "progress") {
         if (
           terminal.text !== null ||
           terminal.resumeAt !== null ||
           terminal.progressText === null ||
-          selectedImageAssetIds.length > 0
+          selectedImageAssetIds.length > 0 ||
+          selectedFileAssetIds.length > 0
         ) {
           throw invalidOutput("A family-work progress checkpoint needs only useful progress text");
         }
@@ -8771,6 +8885,7 @@ export class FlorenceReasoner {
             activeTextMessage,
             pendingParticipantRequest: pendingParticipantRequest.current,
             browserImages,
+            browserFiles,
             continuationItems,
             pendingCall: null,
             progressBlocked: true,
@@ -8821,6 +8936,7 @@ export class FlorenceReasoner {
             activeTextMessage,
             pendingParticipantRequest: pendingParticipantRequest.current,
             browserImages,
+            browserFiles,
             continuationItems,
             pendingCall: null,
             progressBlocked: terminal.progressText ? true : continuedProgressBlock,
@@ -8851,6 +8967,7 @@ export class FlorenceReasoner {
             activeTextMessage,
             pendingParticipantRequest: pendingParticipantRequest.current,
             browserImages,
+            browserFiles,
             continuationItems,
             pendingCall: null,
             progressRevision: checkpointInput.state.progressRevision + 1,
@@ -8874,6 +8991,7 @@ export class FlorenceReasoner {
           activeTextMessage,
           pendingParticipantRequest: pendingParticipantRequest.current,
           browserImages,
+          browserFiles,
           continuationItems: [],
           pendingCall: null,
           progressRevision: checkpointInput.state.progressRevision + 1,
@@ -8882,12 +9000,14 @@ export class FlorenceReasoner {
             text: terminalText,
             docket: terminal.docket,
             ...(selectedImages.length > 0 ? { selectedImages } : {}),
+            ...(selectedFiles.length > 0 ? { selectedFiles } : {}),
           },
         },
         outcome: terminal.outcome,
         text: terminalText,
         docket: terminal.docket,
         selectedImages,
+        selectedFiles,
       };
     } catch (error) {
       if (error instanceof APIUserAbortError || isAbortError(error)) throw error;

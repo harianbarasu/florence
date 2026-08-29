@@ -83,6 +83,7 @@ async function resetProduction(): Promise<void> {
         ambiguousCalendarCreates,
         activeGoogleCredentials: snapshot.activeGoogleCredentials.length,
         encryptedImageArtifacts: imageVaultSnapshot.encryptedImageArtifacts,
+        encryptedFileArtifacts: imageVaultSnapshot.encryptedFileArtifacts,
         encryptedImageTemporaryArtifacts: imageVaultSnapshot.encryptedImageTemporaryArtifacts,
         missingCreatorCredentials,
       });
@@ -130,6 +131,7 @@ async function resetProduction(): Promise<void> {
         calendarsAlreadyAbsent: absentCalendars,
         activeGoogleCredentials: snapshot.activeGoogleCredentials.length,
         encryptedImageArtifacts: imageVaultSnapshot.encryptedImageArtifacts,
+        encryptedFileArtifacts: imageVaultSnapshot.encryptedFileArtifacts,
         encryptedImageTemporaryArtifacts: imageVaultSnapshot.encryptedImageTemporaryArtifacts,
       });
       return;
@@ -176,6 +178,7 @@ async function resetProduction(): Promise<void> {
       calendarsConfirmedAbsent: deleted.deletedCalendars,
       activeGoogleCredentialsDeleted: deleted.deletedActiveGoogleCredentials,
       encryptedImageArtifactsDeleted: deletedImageArtifacts.encryptedImageArtifactsDeleted,
+      encryptedFileArtifactsDeleted: deletedImageArtifacts.encryptedFileArtifactsDeleted,
       encryptedImageTemporaryArtifactsDeleted: deletedImageArtifacts.encryptedImageTemporaryArtifactsDeleted,
       unconfirmedProviderRevocations: revocations.unconfirmed,
       migrationHistoryRetained: true,

@@ -6,14 +6,18 @@ import type { ImageReference } from "@florence/contracts";
 
 export const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
 export const MAX_PDF_BYTES = 20 * 1024 * 1024;
+export const MAX_FILE_ARTIFACT_BYTES = 100 * 1024 * 1024;
 const imageRetentionMs = 24 * 60 * 60 * 1_000;
 const envelopeOverheadLimit = 16 * 1024;
 const imageEnvelopeMagic = Buffer.from("FIV1");
 const pdfEnvelopeMagic = Buffer.from("FPD1");
+const fileArtifactEnvelopeMagic = Buffer.from("FAF1");
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const storedImageFilenamePattern =
   /^([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.fiv$/;
-const storedImageTemporaryFilenamePattern =
+const storedFileArtifactFilenamePattern =
+  /^([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.faf$/;
+const storedArtifactTemporaryFilenamePattern =
   /^\.([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.tmp$/;
 
 type StoredMimeType = Exclude<ImageReference["mimeType"], "image/heic">;
@@ -34,6 +38,23 @@ export type SealedPdf = {
   discardAfter: string;
   byteLength: number;
 };
+
+/**
+ * Browser-file persistence adapts OpenInstinct's scoped, hash-verified browser-image
+ * store (480045dbc63008e7f99313d1683858cd8657b35a), Hermes's explicit artifact
+ * receipt/attachment handoff (6dcebea7fc5d0cc4f621eeaddf52b7d877a5f882), and Pi's
+ * compact tool-result/reference boundary (4e494929998d6bc4fccf75e0a233f727db4b70ee).
+ * Florence generalizes those patterns to original files and keeps its encrypted volume
+ * plus durable family-work state instead of importing an image-only or process-local store.
+ */
+export type FileArtifactReference = Readonly<{
+  artifactId: string;
+  workId: string;
+  filename: string;
+  mimeType: string;
+  byteLength: number;
+  sha256: string;
+}>;
 
 export type HeicNormalizer = (bytes: Uint8Array) => Promise<Uint8Array>;
 
@@ -56,11 +77,13 @@ export type EncryptedImageVaultOptions = {
 export type ImageVaultProductionResetSnapshot = Readonly<{
   guard: string;
   encryptedImageArtifacts: number;
+  encryptedFileArtifacts: number;
   encryptedImageTemporaryArtifacts: number;
 }>;
 
 export type ImageVaultProductionResetResult = Readonly<{
   encryptedImageArtifactsDeleted: number;
+  encryptedFileArtifactsDeleted: number;
   encryptedImageTemporaryArtifactsDeleted: number;
 }>;
 
@@ -71,6 +94,8 @@ export type ImageVaultErrorCode =
   | "unsupported_image"
   | "invalid_document"
   | "document_too_large"
+  | "invalid_artifact"
+  | "artifact_too_large"
   | "asset_conflict"
   | "unauthorized_or_missing"
   | "expired"
@@ -120,6 +145,19 @@ type PdfMetadata = {
   retained?: boolean;
 };
 
+type FileArtifactMetadata = {
+  version: 1;
+  kind: "file_artifact";
+  artifactId: string;
+  householdId: string;
+  workId: string;
+  sourceCallId: string;
+  filename: string;
+  mimeType: string;
+  byteLength: number;
+  sha256: string;
+};
+
 export function decodeImageVaultKey(value: string): Uint8Array {
   const canonical = value.trim();
   const decoded = Buffer.from(canonical, "base64");
@@ -148,6 +186,97 @@ export class EncryptedImageVault {
     this.#rootDirectory = options.rootDirectory;
     this.#key = Buffer.from(options.encryptionKey);
     this.#normalizeHeic = options.normalizeHeic;
+  }
+
+  async storeFileArtifact(input: {
+    artifactId: string;
+    householdId: string;
+    workId: string;
+    callId: string;
+    filename: string;
+    declaredMimeType: string;
+    bytes: Uint8Array;
+  }): Promise<FileArtifactReference> {
+    requireFileArtifactUuid(input.artifactId, "File artifact");
+    requireFileArtifactUuid(input.householdId, "File artifact household");
+    requireFileArtifactUuid(input.workId, "File artifact work");
+    const sourceCallId = requireFileArtifactCallId(input.callId);
+    const filename = requireFileArtifactFilename(input.filename);
+    const mimeType = requireFileArtifactMimeType(input.declaredMimeType);
+    if (!(input.bytes instanceof Uint8Array) || input.bytes.byteLength < 1) {
+      throw new ImageVaultError("invalid_artifact", "File artifact is empty");
+    }
+    if (input.bytes.byteLength > MAX_FILE_ARTIFACT_BYTES) {
+      throw new ImageVaultError("artifact_too_large", "File artifact exceeds Florence's 100 MB limit");
+    }
+    const bytes = Buffer.from(input.bytes);
+    const metadata: FileArtifactMetadata = {
+      version: 1,
+      kind: "file_artifact",
+      artifactId: input.artifactId,
+      householdId: input.householdId,
+      workId: input.workId,
+      sourceCallId,
+      filename,
+      mimeType,
+      byteLength: bytes.length,
+      sha256: createHash("sha256").update(bytes).digest("hex"),
+    };
+    const existing = await this.#loadFileArtifact(input.artifactId);
+    if (existing) return existingFileArtifactResult(existing, metadata, bytes);
+
+    const encrypted = encryptAuthenticatedEnvelope(this.#key, fileArtifactEnvelopeMagic, metadata, bytes);
+    if (!(await this.#writeFileArtifactAtomically(input.artifactId, encrypted))) {
+      const raced = await this.#loadFileArtifact(input.artifactId);
+      if (!raced) throw new ImageVaultError("corrupt", "Concurrent file artifact write disappeared");
+      return existingFileArtifactResult(raced, metadata, bytes);
+    }
+    return fileArtifactReference(metadata);
+  }
+
+  async readFileArtifact(input: {
+    householdId: string;
+    workId: string;
+    artifact: FileArtifactReference;
+  }): Promise<Uint8Array> {
+    requireFileArtifactUuid(input.householdId, "File artifact household");
+    requireFileArtifactUuid(input.workId, "File artifact work");
+    requireFileArtifactReference(input.artifact);
+    const loaded = await this.#loadFileArtifact(input.artifact.artifactId);
+    if (!loaded) throw new ImageVaultError("unauthorized_or_missing", "File artifact is unavailable");
+    const authorized =
+      loaded.metadata.householdId === input.householdId &&
+      loaded.metadata.workId === input.workId &&
+      loaded.metadata.artifactId === input.artifact.artifactId &&
+      loaded.metadata.workId === input.artifact.workId &&
+      loaded.metadata.filename === input.artifact.filename &&
+      loaded.metadata.mimeType === input.artifact.mimeType &&
+      loaded.metadata.byteLength === input.artifact.byteLength &&
+      loaded.metadata.sha256 === input.artifact.sha256;
+    if (!authorized) {
+      throw new ImageVaultError("unauthorized_or_missing", "File artifact is unavailable");
+    }
+    return loaded.bytes;
+  }
+
+  async readFileArtifactById(input: {
+    householdId: string;
+    workId: string;
+    artifactId: string;
+  }): Promise<{ artifact: FileArtifactReference; bytes: Uint8Array }> {
+    requireFileArtifactUuid(input.householdId, "File artifact household");
+    requireFileArtifactUuid(input.workId, "File artifact work");
+    requireFileArtifactUuid(input.artifactId, "File artifact");
+    const loaded = await this.#loadFileArtifact(input.artifactId);
+    if (
+      !loaded ||
+      loaded.metadata.householdId !== input.householdId ||
+      loaded.metadata.workId !== input.workId ||
+      loaded.metadata.artifactId !== input.artifactId
+    ) {
+      throw new ImageVaultError("unauthorized_or_missing", "File artifact is unavailable");
+    }
+    return { artifact: fileArtifactReference(loaded.metadata), bytes: loaded.bytes };
   }
 
   async store(input: {
@@ -442,33 +571,38 @@ export class EncryptedImageVault {
   }
 
   /**
-   * Inventories only canonical Florence image envelopes and exact atomic-write temporary files. It
-   * never follows arbitrary directories, accepts non-canonical filenames, or exposes artifact
-   * identities to the reset operator.
+   * Inventories only canonical Florence image/file envelopes and exact atomic-write temporary
+   * files. It never follows arbitrary directories, accepts non-canonical filenames, or exposes
+   * artifact identities to the reset operator.
    */
   async inspectForProductionReset(): Promise<ImageVaultProductionResetSnapshot> {
     const inventory = await this.#productionResetInventory();
     return Object.freeze({
       guard: inventory.guard,
-      encryptedImageArtifacts: inventory.artifacts.filter(({ kind }) => kind === "envelope").length,
+      encryptedImageArtifacts: inventory.artifacts.filter(({ kind }) => kind === "image_envelope").length,
+      encryptedFileArtifacts: inventory.artifacts.filter(({ kind }) => kind === "file_envelope").length,
       encryptedImageTemporaryArtifacts: inventory.artifacts.filter(({ kind }) => kind === "temporary").length,
     });
   }
 
   /**
-   * Deletes exactly the canonical `.fiv` files and Florence atomic-write temporary files represented
-   * by a previously inspected inventory. Shard directories, arbitrary `.tmp` files, and unrelated
-   * volume contents are deliberately retained.
+   * Deletes exactly the canonical `.fiv`/`.faf` files and Florence atomic-write temporary files
+   * represented by a previously inspected inventory. Shard directories, arbitrary `.tmp` files,
+   * and unrelated volume contents are deliberately retained.
    */
   async purgeForProductionReset(
     expected: ImageVaultProductionResetSnapshot,
   ): Promise<ImageVaultProductionResetResult> {
     const current = await this.#productionResetInventory();
-    const encryptedImageArtifacts = current.artifacts.filter(({ kind }) => kind === "envelope").length;
-    const encryptedImageTemporaryArtifacts = current.artifacts.length - encryptedImageArtifacts;
+    const encryptedImageArtifacts = current.artifacts.filter(({ kind }) => kind === "image_envelope").length;
+    const encryptedFileArtifacts = current.artifacts.filter(({ kind }) => kind === "file_envelope").length;
+    const encryptedImageTemporaryArtifacts = current.artifacts.filter(
+      ({ kind }) => kind === "temporary",
+    ).length;
     if (
       current.guard !== expected.guard ||
       encryptedImageArtifacts !== expected.encryptedImageArtifacts ||
+      encryptedFileArtifacts !== expected.encryptedFileArtifacts ||
       encryptedImageTemporaryArtifacts !== expected.encryptedImageTemporaryArtifacts
     ) {
       throw new ImageVaultError(
@@ -477,11 +611,13 @@ export class EncryptedImageVault {
       );
     }
     let encryptedImageArtifactsDeleted = 0;
+    let encryptedFileArtifactsDeleted = 0;
     let encryptedImageTemporaryArtifactsDeleted = 0;
     for (const artifact of current.artifacts) {
       try {
         await unlink(path.join(this.#rootDirectory, artifact.relativePath));
-        if (artifact.kind === "envelope") encryptedImageArtifactsDeleted += 1;
+        if (artifact.kind === "image_envelope") encryptedImageArtifactsDeleted += 1;
+        else if (artifact.kind === "file_envelope") encryptedFileArtifactsDeleted += 1;
         else encryptedImageTemporaryArtifactsDeleted += 1;
       } catch (error) {
         if (isMissing(error)) {
@@ -499,6 +635,7 @@ export class EncryptedImageVault {
     }
     return Object.freeze({
       encryptedImageArtifactsDeleted,
+      encryptedFileArtifactsDeleted,
       encryptedImageTemporaryArtifactsDeleted,
     });
   }
@@ -527,7 +664,7 @@ export class EncryptedImageVault {
   async #productionResetInventory(): Promise<{
     guard: string;
     artifacts: readonly Readonly<{
-      kind: "envelope" | "temporary";
+      kind: "image_envelope" | "file_envelope" | "temporary";
       relativePath: string;
     }>[];
   }> {
@@ -535,7 +672,10 @@ export class EncryptedImageVault {
       if (isMissing(error)) return [];
       throw error;
     });
-    const artifacts: { kind: "envelope" | "temporary"; relativePath: string }[] = [];
+    const artifacts: {
+      kind: "image_envelope" | "file_envelope" | "temporary";
+      relativePath: string;
+    }[] = [];
     for (const shard of shards) {
       if (!shard.isDirectory() || !/^[0-9a-f]{2}$/.test(shard.name)) continue;
       const entries = await readdir(path.join(this.#rootDirectory, shard.name), {
@@ -548,11 +688,16 @@ export class EncryptedImageVault {
         if (!entry.isFile()) continue;
         const storedImageMatch = storedImageFilenamePattern.exec(entry.name);
         if (storedImageMatch?.[1]?.slice(0, 2) === shard.name) {
-          artifacts.push({ kind: "envelope", relativePath: path.join(shard.name, entry.name) });
+          artifacts.push({ kind: "image_envelope", relativePath: path.join(shard.name, entry.name) });
           continue;
         }
-        const temporaryImageMatch = storedImageTemporaryFilenamePattern.exec(entry.name);
-        if (temporaryImageMatch?.[1]?.slice(0, 2) === shard.name) {
+        const storedFileArtifactMatch = storedFileArtifactFilenamePattern.exec(entry.name);
+        if (storedFileArtifactMatch?.[1]?.slice(0, 2) === shard.name) {
+          artifacts.push({ kind: "file_envelope", relativePath: path.join(shard.name, entry.name) });
+          continue;
+        }
+        const temporaryArtifactMatch = storedArtifactTemporaryFilenamePattern.exec(entry.name);
+        if (temporaryArtifactMatch?.[1]?.slice(0, 2) === shard.name) {
           artifacts.push({ kind: "temporary", relativePath: path.join(shard.name, entry.name) });
         }
       }
@@ -561,7 +706,7 @@ export class EncryptedImageVault {
       left.relativePath < right.relativePath ? -1 : left.relativePath > right.relativePath ? 1 : 0,
     );
     const guard = createHash("sha256")
-      .update("florence-image-vault-production-reset-v2\0")
+      .update("florence-image-vault-production-reset-v3\0")
       .update(artifacts.map(({ kind, relativePath }) => `${kind}\0${relativePath}`).join("\0"))
       .digest("hex");
     return { guard, artifacts: Object.freeze(artifacts) };
@@ -569,6 +714,10 @@ export class EncryptedImageVault {
 
   #assetPath(assetId: string): string {
     return path.join(this.#rootDirectory, assetId.slice(0, 2), `${assetId}.fiv`);
+  }
+
+  #fileArtifactPath(artifactId: string): string {
+    return path.join(this.#rootDirectory, artifactId.slice(0, 2), `${artifactId}.faf`);
   }
 
   async #load(assetId: string): Promise<{ metadata: ImageMetadata; bytes: Uint8Array } | null> {
@@ -581,16 +730,47 @@ export class EncryptedImageVault {
     }
   }
 
+  async #loadFileArtifact(
+    artifactId: string,
+  ): Promise<{ metadata: FileArtifactMetadata; bytes: Uint8Array } | null> {
+    try {
+      const envelope = await readBounded(
+        this.#fileArtifactPath(artifactId),
+        MAX_FILE_ARTIFACT_BYTES,
+        "File artifact",
+      );
+      return decryptFileArtifactEnvelope(this.#key, envelope);
+    } catch (error) {
+      if (isMissing(error)) return null;
+      if (error instanceof ImageVaultError) throw error;
+      throw new ImageVaultError("corrupt", "File artifact envelope cannot be authenticated", {
+        cause: error,
+      });
+    }
+  }
+
   async #writeAtomically(assetId: string, envelope: Uint8Array): Promise<boolean> {
-    const directory = path.dirname(this.#assetPath(assetId));
+    return this.#writeEnvelopeAtomically(assetId, this.#assetPath(assetId), envelope);
+  }
+
+  async #writeFileArtifactAtomically(artifactId: string, envelope: Uint8Array): Promise<boolean> {
+    return this.#writeEnvelopeAtomically(artifactId, this.#fileArtifactPath(artifactId), envelope);
+  }
+
+  async #writeEnvelopeAtomically(
+    artifactId: string,
+    artifactPath: string,
+    envelope: Uint8Array,
+  ): Promise<boolean> {
+    const directory = path.dirname(artifactPath);
     await mkdir(this.#rootDirectory, { recursive: true, mode: 0o700 });
     await chmod(this.#rootDirectory, 0o700);
     await mkdir(directory, { recursive: true, mode: 0o700 });
     await chmod(directory, 0o700);
-    const temporary = path.join(directory, `.${assetId}.${randomUUID()}.tmp`);
+    const temporary = path.join(directory, `.${artifactId}.${randomUUID()}.tmp`);
     try {
       await writeFile(temporary, envelope, { flag: "wx", mode: 0o600 });
-      await link(temporary, this.#assetPath(assetId));
+      await link(temporary, artifactPath);
       await unlink(temporary);
       return true;
     } catch (error) {
@@ -631,6 +811,38 @@ export class EncryptedImageVault {
       if (this.#retentionQueues.get(assetId) === queued) this.#retentionQueues.delete(assetId);
     }
   }
+}
+
+function existingFileArtifactResult(
+  loaded: { metadata: FileArtifactMetadata; bytes: Uint8Array },
+  expected: FileArtifactMetadata,
+  expectedBytes: Uint8Array,
+): FileArtifactReference {
+  const identical =
+    loaded.metadata.artifactId === expected.artifactId &&
+    loaded.metadata.householdId === expected.householdId &&
+    loaded.metadata.workId === expected.workId &&
+    loaded.metadata.sourceCallId === expected.sourceCallId &&
+    loaded.metadata.filename === expected.filename &&
+    loaded.metadata.mimeType === expected.mimeType &&
+    loaded.metadata.byteLength === expected.byteLength &&
+    loaded.metadata.sha256 === expected.sha256 &&
+    Buffer.compare(loaded.bytes, expectedBytes) === 0;
+  if (!identical) {
+    throw new ImageVaultError("asset_conflict", "Artifact ID is already bound to a different file artifact");
+  }
+  return fileArtifactReference(loaded.metadata);
+}
+
+function fileArtifactReference(metadata: FileArtifactMetadata): FileArtifactReference {
+  return Object.freeze({
+    artifactId: metadata.artifactId,
+    workId: metadata.workId,
+    filename: metadata.filename,
+    mimeType: metadata.mimeType,
+    byteLength: metadata.byteLength,
+    sha256: metadata.sha256,
+  });
 }
 
 function existingStoreResult(
@@ -703,6 +915,27 @@ function decryptPdfEnvelope(key: Buffer, envelope: Uint8Array): { metadata: PdfM
   return { metadata: loaded.metadata, bytes: loaded.bytes };
 }
 
+function decryptFileArtifactEnvelope(
+  key: Buffer,
+  envelope: Uint8Array,
+): { metadata: FileArtifactMetadata; bytes: Uint8Array } {
+  const loaded = decryptAuthenticatedEnvelope(
+    key,
+    fileArtifactEnvelopeMagic,
+    envelope,
+    MAX_FILE_ARTIFACT_BYTES,
+    "File artifact",
+  );
+  requireFileArtifactMetadata(loaded.metadata);
+  if (
+    loaded.bytes.length !== loaded.metadata.byteLength ||
+    createHash("sha256").update(loaded.bytes).digest("hex") !== loaded.metadata.sha256
+  ) {
+    throw new ImageVaultError("corrupt", "File artifact payload is invalid");
+  }
+  return { metadata: loaded.metadata, bytes: loaded.bytes };
+}
+
 function decryptAuthenticatedEnvelope(
   key: Buffer,
   magic: Buffer,
@@ -747,10 +980,14 @@ function decryptAuthenticatedEnvelope(
   return { metadata, bytes };
 }
 
-async function readBounded(assetPath: string): Promise<Buffer> {
+async function readBounded(
+  assetPath: string,
+  maximumPayloadBytes = MAX_IMAGE_BYTES,
+  label = "Image",
+): Promise<Buffer> {
   const file = await stat(assetPath);
-  if (file.size > MAX_IMAGE_BYTES + envelopeOverheadLimit) {
-    throw new ImageVaultError("corrupt", "Image envelope exceeds its storage limit");
+  if (file.size > maximumPayloadBytes + envelopeOverheadLimit) {
+    throw new ImageVaultError("corrupt", `${label} envelope exceeds its storage limit`);
   }
   return readFile(assetPath);
 }
@@ -785,6 +1022,103 @@ function detectMimeType(bytes: Uint8Array): AcceptedMimeType | null {
 
 function requireUuid(value: string): void {
   if (!uuidPattern.test(value)) throw new ImageVaultError("invalid_image", "Image identity is invalid");
+}
+
+function requireFileArtifactUuid(value: string, label: string): void {
+  if (!isCanonicalUuid(value)) {
+    throw new ImageVaultError("invalid_artifact", `${label} identity is invalid`);
+  }
+}
+
+function isCanonicalUuid(value: unknown): value is string {
+  return typeof value === "string" && value === value.toLowerCase() && uuidPattern.test(value);
+}
+
+function requireFileArtifactCallId(value: string): string {
+  const callId = canonicalFileArtifactCallId(value);
+  if (callId === null) {
+    throw new ImageVaultError(
+      "invalid_artifact",
+      "File artifact source call ID must be nonempty and at most 500 characters",
+    );
+  }
+  return callId;
+}
+
+function canonicalFileArtifactCallId(value: unknown): string | null {
+  if (typeof value !== "string" || !value.isWellFormed()) return null;
+  const callId = value.trim();
+  return callId.length >= 1 && callId.length <= 500 ? callId : null;
+}
+
+function requireFileArtifactFilename(value: string): string {
+  const filename = canonicalFileArtifactFilename(value);
+  if (filename === null) {
+    throw new ImageVaultError("invalid_artifact", "File artifact filename is invalid");
+  }
+  return filename;
+}
+
+function canonicalFileArtifactFilename(value: unknown): string | null {
+  if (typeof value !== "string" || !value.isWellFormed()) return null;
+  const filename = value.normalize("NFC").trim();
+  const hasControlCharacter = [...filename].some((character) => {
+    const code = character.charCodeAt(0);
+    return code < 32 || code === 127;
+  });
+  if (
+    filename.length < 1 ||
+    filename.length > 255 ||
+    filename === "." ||
+    filename === ".." ||
+    filename.includes("/") ||
+    filename.includes("\\") ||
+    hasControlCharacter
+  ) {
+    return null;
+  }
+  return filename;
+}
+
+function requireFileArtifactMimeType(value: string): string {
+  const mimeType = canonicalFileArtifactMimeType(value);
+  if (mimeType === null) {
+    throw new ImageVaultError("invalid_artifact", "File artifact MIME type is invalid");
+  }
+  return mimeType;
+}
+
+function canonicalFileArtifactMimeType(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const mimeType = value.trim().toLowerCase();
+  if (mimeType.length < 3 || mimeType.length > 255) return null;
+  const parts = mimeType.split("/");
+  if (parts.length !== 2) return null;
+  const mimeToken = /^[a-z0-9][a-z0-9!#$%&'*+\-.^_`|~]*$/u;
+  return parts.every((part) => mimeToken.test(part)) ? mimeType : null;
+}
+
+function requireFileArtifactReference(value: FileArtifactReference): void {
+  if (!value || typeof value !== "object") {
+    throw new ImageVaultError("invalid_artifact", "File artifact reference is invalid");
+  }
+  const filename = canonicalFileArtifactFilename(value.filename);
+  const mimeType = canonicalFileArtifactMimeType(value.mimeType);
+  if (
+    !isCanonicalUuid(value.artifactId) ||
+    !isCanonicalUuid(value.workId) ||
+    filename === null ||
+    filename !== value.filename ||
+    mimeType === null ||
+    mimeType !== value.mimeType ||
+    !Number.isSafeInteger(value.byteLength) ||
+    value.byteLength < 1 ||
+    value.byteLength > MAX_FILE_ARTIFACT_BYTES ||
+    typeof value.sha256 !== "string" ||
+    !/^[0-9a-f]{64}$/u.test(value.sha256)
+  ) {
+    throw new ImageVaultError("invalid_artifact", "File artifact reference is invalid");
+  }
 }
 
 function requireImageMetadata(value: unknown): asserts value is ImageMetadata {
@@ -850,6 +1184,36 @@ function requirePdfMetadata(value: unknown): asserts value is PdfMetadata {
       : typeof metadata.discardAfter !== "string" || !Number.isFinite(Date.parse(metadata.discardAfter)))
   ) {
     throw new ImageVaultError("corrupt", "PDF metadata is invalid");
+  }
+}
+
+function requireFileArtifactMetadata(value: unknown): asserts value is FileArtifactMetadata {
+  if (!value || typeof value !== "object") {
+    throw new ImageVaultError("corrupt", "File artifact metadata is invalid");
+  }
+  const metadata = value as Partial<FileArtifactMetadata>;
+  const sourceCallId = canonicalFileArtifactCallId(metadata.sourceCallId);
+  const filename = canonicalFileArtifactFilename(metadata.filename);
+  const mimeType = canonicalFileArtifactMimeType(metadata.mimeType);
+  if (
+    metadata.version !== 1 ||
+    metadata.kind !== "file_artifact" ||
+    !isCanonicalUuid(metadata.artifactId) ||
+    !isCanonicalUuid(metadata.householdId) ||
+    !isCanonicalUuid(metadata.workId) ||
+    sourceCallId === null ||
+    sourceCallId !== metadata.sourceCallId ||
+    filename === null ||
+    filename !== metadata.filename ||
+    mimeType === null ||
+    mimeType !== metadata.mimeType ||
+    !Number.isSafeInteger(metadata.byteLength) ||
+    (metadata.byteLength ?? 0) < 1 ||
+    (metadata.byteLength ?? 0) > MAX_FILE_ARTIFACT_BYTES ||
+    typeof metadata.sha256 !== "string" ||
+    !/^[0-9a-f]{64}$/u.test(metadata.sha256)
+  ) {
+    throw new ImageVaultError("corrupt", "File artifact metadata is invalid");
   }
 }
 

@@ -154,6 +154,129 @@ describe("Florence reasoner capability cutover", () => {
     });
   });
 
+  test("an unbacked future commitment is reviewed and repaired once in the same tool transcript", async () => {
+    const input = foregroundInput();
+    input.currentMessage.text = "Can you compare the options and tell me which one is best?";
+    input.currentMessage.authoredText = input.currentMessage.text;
+    const promised = ordinaryDecision({
+      bubbleText: "I’ll compare them and get back to you with the best one.",
+    });
+    const repaired = ordinaryDecision({
+      bubbleText: "I’m on it—I’ll compare them and bring the best option back here.",
+    });
+    repaired.familyWork = {
+      operation: "create",
+      workId: null,
+      objective: "Compare the supplied options and report the best one with the reasons.",
+      schedule: null,
+      instruction: null,
+      candidateIds: [],
+    };
+    const modelRequests: Record<string, unknown>[] = [];
+    const reviewRequests: Record<string, unknown>[] = [];
+    let modelTurn = 0;
+    let reviewTurn = 0;
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        stream: (request: Record<string, unknown>) => {
+          modelRequests.push(request);
+          modelTurn += 1;
+          if (modelTurn === 1) {
+            return fakeStream({
+              status: "completed",
+              output_parsed: null,
+              output: [
+                functionCall("commitment-context-read", "search_gmail", {
+                  query: "supplied options",
+                  limit: 3,
+                }),
+              ],
+            });
+          }
+          const decision = modelTurn === 2 ? promised : repaired;
+          return fakeStream({
+            status: "completed",
+            output_parsed: decision,
+            output: [decisionMessage(`commitment-${modelTurn}`, decision)],
+          });
+        },
+        parse: async (request: Record<string, unknown>) => {
+          reviewRequests.push(request);
+          reviewTurn += 1;
+          return {
+            status: "completed",
+            output_parsed:
+              reviewTurn === 1
+                ? {
+                    verdict: "repair",
+                    reason: "Florence promises a later comparison without starting matching work.",
+                  }
+                : { verdict: "accept", reason: null },
+            output: [],
+          };
+        },
+      },
+    } as never);
+
+    const result = await reasoner.decide(input, inertReads());
+
+    expect(result.familyWork).toEqual(repaired.familyWork);
+    expect(modelRequests).toHaveLength(3);
+    expect(reviewRequests).toHaveLength(2);
+    expect(modelRequests.every((request) => !("max_tool_calls" in request))).toBe(true);
+    const repairedTranscript = JSON.stringify(modelRequests[2]?.input);
+    expect(repairedTranscript).toContain("commitment-context-read");
+    expect(repairedTranscript).toContain("function_call_output");
+    expect(repairedTranscript).toContain(promised.conversation.bubbles[0]?.text);
+    expect(repairedTranscript).toContain("foreground_commitment_repair");
+    const firstReview = JSON.stringify(reviewRequests[0]?.input);
+    const secondReview = JSON.stringify(reviewRequests[1]?.input);
+    expect(firstReview).toContain(input.currentMessage.text);
+    expect(firstReview).toContain(promised.conversation.bubbles[0]?.text);
+    expect(firstReview).toContain('\\"familyWork\\":null');
+    expect(secondReview).toContain(repaired.familyWork.objective);
+    expect(String(reviewRequests[0]?.instructions)).toContain("An unrelated mutation never backs");
+    expect(String(reviewRequests[0]?.instructions)).toContain("conditional offer or capability statement");
+  });
+
+  test("a still-unbacked commitment is rejected after the one semantic repair", async () => {
+    const promised = ordinaryDecision({
+      bubbleText: "I’ll keep checking and let you know what I find.",
+    });
+    let modelTurns = 0;
+    let reviewTurns = 0;
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        stream: () => {
+          modelTurns += 1;
+          return fakeStream({
+            status: "completed",
+            output_parsed: promised,
+            output: [decisionMessage(`still-unbacked-${modelTurns}`, promised)],
+          });
+        },
+        parse: async () => {
+          reviewTurns += 1;
+          return {
+            status: "completed",
+            output_parsed: {
+              verdict: "repair",
+              reason: "Florence still promises later monitoring without matching durable work.",
+            },
+            output: [],
+          };
+        },
+      },
+    } as never);
+
+    await expect(reasoner.decide(foregroundInput(), inertReads())).rejects.toMatchObject({
+      code: "invalid_output",
+      message: expect.stringContaining("without matching durable work"),
+    });
+    expect(modelTurns).toBe(2);
+    expect(reviewTurns).toBe(2);
+  });
+
   test("a reaction cannot replace the spoken acknowledgement for work Florence starts", async () => {
     const decision = ordinaryDecision();
     decision.conversation.bubbles = [];
@@ -4935,6 +5058,104 @@ Compare the family options.
     expect(JSON.stringify(requests)).not.toContain("connectionId");
   });
 
+  test("a Vault item discovered and read this turn can be corrected in place", async () => {
+    const factId = "22222222-2222-4222-8222-222222222222";
+    const uri = `vault://fact/${factId}`;
+    const corrected = ordinaryDecision({ bubbleText: "Got it—I updated the noodle recipe to use tamari." });
+    corrected.facts = [
+      {
+        operation: "correct",
+        factId,
+        statement: "The family noodle recipe uses tamari instead of soy sauce.",
+        visibility: "household",
+        memory: {
+          memoryKind: "artifact",
+          artifactKind: "recipe",
+          title: "Weeknight noodles",
+          details: "Toss noodles with sesame oil, tamari, and rice vinegar. Use tamari instead of soy sauce.",
+          tags: ["dinner", "noodles", "tamari"],
+        },
+        sourceIds: ["turn-1"],
+      },
+    ];
+    const responses = [
+      {
+        status: "completed",
+        output_parsed: null,
+        output: [
+          functionCall("vault-search-correction", "search_vault", { query: "noodle recipe", cursor: null }),
+        ],
+      },
+      {
+        status: "completed",
+        output_parsed: null,
+        output: [functionCall("vault-read-correction", "read_vault", { uri, level: "overview" })],
+      },
+      {
+        status: "completed",
+        output_parsed: corrected,
+        output: [decisionMessage("vault-correction", corrected)],
+      },
+    ];
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        stream: () => {
+          const response = responses.shift();
+          if (!response) throw new Error("Unexpected Vault-correction model turn");
+          return fakeStream(response);
+        },
+      },
+    } as never);
+    const input = foregroundInput();
+    input.currentMessage.text = "Actually, use tamari instead of soy sauce in that noodle recipe.";
+    input.currentMessage.authoredText = input.currentMessage.text;
+
+    const result = await reasoner.decide(input, {
+      ...inertReads(),
+      async searchVault() {
+        return {
+          query: "noodle recipe",
+          results: [
+            {
+              uri,
+              score: 1,
+              abstract: "The family weeknight noodle recipe.",
+              memoryKind: "artifact" as const,
+              artifactKind: "recipe" as const,
+              title: "Weeknight noodles",
+              tags: ["dinner", "noodles"],
+              updatedAt: NOW,
+            },
+          ],
+          total: 1,
+          complete: true,
+          nextCursor: null,
+        };
+      },
+      async readVault() {
+        return {
+          uri,
+          level: "overview" as const,
+          memory: {
+            factId,
+            statement: "The family noodle recipe uses soy sauce.",
+            memoryKind: "artifact" as const,
+            artifactKind: "recipe" as const,
+            title: "Weeknight noodles",
+            details: "Toss noodles with sesame oil, soy sauce, and rice vinegar.",
+            tags: ["dinner", "noodles"],
+            visibility: "household" as const,
+            updatedAt: NOW,
+          },
+          supports: [],
+        };
+      },
+    });
+
+    expect(result.facts).toEqual(corrected.facts);
+    expect(responses).toHaveLength(0);
+  });
+
   test("a complete Family Calendar cursor chain retains an earlier-page target for update", async () => {
     const requests: Record<string, unknown>[] = [];
     const calendarRef = "calendar-family";
@@ -5287,24 +5508,36 @@ Compare the family options.
     });
   });
 
-  test("both private Gmail attachment loops use the registry without exposing connection IDs", async () => {
-    const gmail = privateGmailSource();
+  test("both private Gmail attachment loops continue past the former four-read ceiling", async () => {
+    const gmail = {
+      ...privateGmailSource(),
+      attachments: Array.from({ length: 5 }, (_, index) => ({
+        attachmentRef: `attachment-${index + 1}`,
+        filename: `form-${index + 1}.pdf`,
+        mimeType: "application/pdf" as const,
+        sizeBytes: 5,
+      })),
+    };
     const requests: Record<string, unknown>[] = [];
     let workStarts = 0;
-    const responses = [
-      { status: "completed", output_parsed: null, output: [attachmentCall("batch-attachment")] },
-      {
+    const attachmentSequence = (prefix: string) => [
+      ...Array.from({ length: 5 }, (_, index) => ({
         status: "completed",
-        output_parsed: { findings: [], facts: [], dismissedSourceIds: [gmail.sourceId] },
-        output: [],
-      },
-      { status: "completed", output_parsed: null, output: [attachmentCall("change-attachment")] },
+        output_parsed: null,
+        output: [
+          functionCall(`${prefix}-attachment-${index + 1}`, "read_private_gmail_attachment", {
+            sourceId: gmail.sourceId,
+            attachmentRef: gmail.attachments[index]?.attachmentRef,
+          }),
+        ],
+      })),
       {
         status: "completed",
         output_parsed: { findings: [], facts: [], dismissedSourceIds: [gmail.sourceId] },
         output: [],
       },
     ];
+    const responses = [...attachmentSequence("batch"), ...attachmentSequence("change")];
     const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
       responses: {
         parse: (request: Record<string, unknown>) => {
@@ -5317,12 +5550,12 @@ Compare the family options.
     } as never);
     let attachmentReads = 0;
     const reads = {
-      async readGmailAttachment() {
+      async readGmailAttachment(input: { attachment: { attachmentRef: string; filename: string } }) {
         attachmentReads += 1;
         return {
           sourceId: gmail.sourceId,
-          attachmentRef: gmail.attachments[0]?.attachmentRef ?? "missing",
-          filename: gmail.attachments[0]?.filename ?? "missing.pdf",
+          attachmentRef: input.attachment.attachmentRef,
+          filename: input.attachment.filename,
           mimeType: "application/pdf" as const,
           bytes: new Uint8Array(Buffer.from("%PDF-")),
         };
@@ -5337,9 +5570,9 @@ Compare the family options.
     await reasoner.classifyPrivateGoogleBatch(privateBatchInput(gmail), reads, undefined, presentation);
     await reasoner.assessGoogleChanges(privateAssessmentInput(gmail), reads, undefined, presentation);
 
-    expect(attachmentReads).toBe(2);
+    expect(attachmentReads).toBe(10);
     expect(workStarts).toBe(2);
-    for (const firstRequest of [requests[0], requests[2]]) {
+    for (const firstRequest of [requests[0], requests[6]]) {
       expect(JSON.stringify(firstRequest)).not.toContain("private-google-connection");
       expect(JSON.stringify(firstRequest)).not.toContain("connectionId");
       expect(String(firstRequest?.instructions)).toContain("privateDocket");
@@ -5349,11 +5582,14 @@ Compare the family options.
         "read_private_gmail_attachment",
       ]);
     }
-    expect(JSON.stringify(requests[2])).toContain("artifact:recipe:weeknight-noodles");
-    expect(JSON.stringify(requests[2])).toContain(
+    expect(JSON.stringify(requests[6])).toContain("artifact:recipe:weeknight-noodles");
+    expect(JSON.stringify(requests[6])).toContain(
       "A reusable family recipe with noodles, sesame oil, soy sauce, and rice vinegar.",
     );
-    for (const continuation of [requests[1], requests[3]]) {
+    for (const request of requests) {
+      expect(request).not.toHaveProperty("max_tool_calls");
+    }
+    for (const continuation of [...requests.slice(1, 6), ...requests.slice(7, 12)]) {
       const output = functionOutputs(continuation)[0]?.output;
       expect(Array.isArray(output)).toBe(true);
       const serialized = JSON.stringify(output);
@@ -5612,6 +5848,22 @@ function functionCall(callId: string, name: string, args: object) {
   };
 }
 
+function decisionMessage(id: string, decision: FlorenceDecision) {
+  return {
+    id: `message-${id}`,
+    type: "message" as const,
+    role: "assistant" as const,
+    status: "completed" as const,
+    content: [
+      {
+        type: "output_text" as const,
+        text: JSON.stringify(decision),
+        annotations: [],
+      },
+    ],
+  };
+}
+
 function familyWorkResultMessage(id: string, result: object) {
   return {
     id: `message-${id}`,
@@ -5626,13 +5878,6 @@ function familyWorkResultMessage(id: string, result: object) {
       },
     ],
   };
-}
-
-function attachmentCall(callId: string) {
-  return functionCall(callId, "read_private_gmail_attachment", {
-    sourceId: "gmail-private-1",
-    attachmentRef: "attachment-1",
-  });
 }
 
 function completedWebSearch(url: string, query = "current result", id = "web-search-1") {

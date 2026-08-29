@@ -1401,8 +1401,13 @@ export type OutboundDraft = {
   notBefore: string;
 };
 
-export type ParticipantReplyCandidate = {
-  requestId: string;
+export type FamilyWorkReplyCandidate = {
+  kind: "participant_request" | "waiting";
+  workId: string;
+  generation: number;
+  progressRevision: number;
+  questionSourceId: string;
+  requestId: string | null;
   targetAdultName: string;
   question: string;
   askedAt: string;
@@ -1410,7 +1415,7 @@ export type ParticipantReplyCandidate = {
   explicitlyRepliesToQuestion: boolean;
 };
 
-export type ParticipantReplyAcknowledgement =
+export type FamilyWorkReplyAcknowledgement =
   | {
       kind: "reaction";
       reaction: "love" | "like" | "dislike" | "laugh" | "emphasize" | "question";
@@ -4109,10 +4114,11 @@ export class PostgresFlorenceStore {
         return "stale";
       }
       const nextState = familyWorkState(input.result.state);
+      const queuedSteering = strictFamilyWorkSteeringSuffix(nextState.steering, currentState.steering);
       if (
         nextState.generation !== input.generation ||
         nextState.claim !== null ||
-        !sameFamilyWorkSteering(currentState.steering, nextState.steering) ||
+        (!sameFamilyWorkSteering(currentState.steering, nextState.steering) && !queuedSteering) ||
         !sameStrings(
           [...(currentState.docketCandidateIds ?? [])].sort(),
           [...(nextState.docketCandidateIds ?? [])].sort(),
@@ -4121,6 +4127,40 @@ export class PostgresFlorenceStore {
         throw new FlorenceStoreConflict(
           "A family work settlement changed its claim generation, steering, or docket linkage",
         );
+      }
+      if (queuedSteering) {
+        if (
+          currentState.phase !== "tool_pending" ||
+          currentState.pendingCall === null ||
+          currentState.claim === null
+        ) {
+          throw new FlorenceStoreConflict(
+            "Only an in-flight family-work effect can settle across queued steering",
+          );
+        }
+        // The provider result is already represented by nextState's transcript.
+        // Discard any additional capability the stale model proposed from the
+        // pre-correction context, apply every queued parent correction after
+        // that exact effect boundary, and wake the same task to replan. Calling
+        // steerFamilyWorkState on a tool_pending nextState removes that newly
+        // proposed call while preserving the provider receipt that preceded it.
+        let steeredAfterEffect = familyWorkState({
+          ...nextState,
+          acknowledgementText: currentState.acknowledgementText ?? null,
+        });
+        for (const steering of queuedSteering) {
+          steeredAfterEffect = steerFamilyWorkState(steeredAfterEffect, steering);
+        }
+        await terminalizeUnsentFamilyWorkOutbounds(sql, work.id, "steering");
+        const updated = await sql`
+          update proactive_work set task_state=${sql.json(steeredAfterEffect)},status='active',
+            next_check_at=${settledAt},last_error=null
+          where id=${work.id} and kind='family_task' and status='active'
+            and task_state->>'generation'=${String(input.generation)}
+            and task_state->'claim'->>'claimId'=${input.claimId}
+          returning id
+        `;
+        return updated.length === 1 ? "settled" : "stale";
       }
       if (
         nextState.browserImages?.some(
@@ -4142,7 +4182,7 @@ export class PostgresFlorenceStore {
           throw new FlorenceStoreConflict("A family work continuation cannot be due in the past");
         }
         const progressText =
-          input.result.progressText == null
+          input.result.progressText == null || queuedSteering
             ? null
             : bounded(required(input.result.progressText, "Family work progress"), 10_000);
         if (progressText && nextState.progressRevision <= currentState.progressRevision) {
@@ -8544,20 +8584,23 @@ export class PostgresFlorenceStore {
   }
 
   /**
-   * Returns the one exact pending household question that this private Message
-   * could answer. This is intentionally only structural candidate selection;
-   * Florence still decides whether the Message actually belongs to it.
+   * Returns the one exact paused family-work question that this Message could
+   * answer. Exact iMessage replies bind to their stored question; an unthreaded
+   * Message is eligible only when this conversation has one waiting question.
+   * This is intentionally structural selection: Florence still decides whether
+   * the parent's words actually belong to the question.
    */
-  async readParticipantReplyCandidate(input: {
+  async readFamilyWorkReplyCandidate(input: {
     sourceId: string;
     readAt: string;
-  }): Promise<ParticipantReplyCandidate | null> {
-    assertUuid(input.sourceId, "Participant reply source ID");
+  }): Promise<FamilyWorkReplyCandidate | null> {
+    assertUuid(input.sourceId, "Family-work reply source ID");
     const readAt = instant(input.readAt);
     const [turn] = await this.#sql<
       (ChannelRow & {
         source_id: string;
         sender_adult_id: string;
+        sender_name: string;
         move_kind: "message" | "reply" | "reaction";
         text: string | null;
         reply_to_source_id: string | null;
@@ -8566,34 +8609,42 @@ export class PostgresFlorenceStore {
         occurred_at: Date;
       })[]
     >`
-      select channel.*,message.source_id,message.sender_adult_id,message.move_kind,
-        message.text,message.reply_to_source_id,message.status,source.visibility,
-        source.occurred_at
+      select channel.*,message.source_id,message.sender_adult_id,adult.display_name as sender_name,
+        message.move_kind,message.text,message.reply_to_source_id,message.status,
+        source.visibility,source.occurred_at
       from messages message
       join sources source on source.id=message.source_id
       join linq_channels channel on channel.id=message.channel_id
+      join people adult on adult.id=message.sender_adult_id and adult.household_id=channel.household_id
       where message.source_id=${input.sourceId} and message.direction='inbound'
         and coalesce(message.retry_at,message.not_before)<=${readAt}
     `;
     if (
       turn?.status !== "received" ||
-      turn.audience !== "private" ||
-      turn.visibility !== "private" ||
       turn.move_kind === "reaction" ||
       !turn.text?.trim() ||
       turn.revoked_at !== null ||
-      turn.stopped_at !== null
+      turn.stopped_at !== null ||
+      (turn.audience === "private" && turn.visibility !== "private") ||
+      (turn.audience === "group" && turn.visibility !== "household")
     ) {
       return null;
     }
 
-    const participantWorks = await this.#sql<ProactiveWorkRow[]>`
-      select work.*
+    type ReplyWorkRow = ProactiveWorkRow & {
+      question_source_id: string;
+      question_text: string;
+      question_asked_at: Date;
+    };
+    const participantWorks = await this.#sql<ReplyWorkRow[]>`
+      select work.*,question.source_id as question_source_id,
+        question.text as question_text,question_source.occurred_at as question_asked_at
       from proactive_work work
       join messages question
         on question.source_id=(work.task_state->'pendingParticipantRequest'->>'questionSourceId')::uuid
       join sources question_source on question_source.id=question.source_id
       where work.household_id=${turn.household_id} and work.kind='family_task'
+        and ${turn.audience}='private' and ${turn.visibility}='private'
         and work.visibility='household' and work.owner_adult_id is null
         and work.status='paused' and work.task_state->>'phase'='waiting'
         and work.task_state->'pendingParticipantRequest'->>'targetAdultId'=${turn.sender_adult_id}
@@ -8601,6 +8652,11 @@ export class PostgresFlorenceStore {
         and question.channel_id=${turn.id} and question.direction='outbound'
         and question.move_kind in ('message','reply') and question.status='sent'
         and question.provider_message_id is not null
+        and question_source.metadata->>'familyWorkGeneration'=work.task_state->>'generation'
+        and question_source.metadata->>'familyWorkProgressRevision'=
+          work.task_state->>'progressRevision'
+        and question_source.metadata->>'participantRequestId'=
+          work.task_state->'pendingParticipantRequest'->>'requestId'
         and (question_source.occurred_at,question_source.id)
           < (${turn.occurred_at},${turn.source_id}::uuid)
         and (${turn.reply_to_source_id}::uuid is null
@@ -8610,53 +8666,121 @@ export class PostgresFlorenceStore {
         work.created_at,work.id
       limit ${turn.reply_to_source_id === null ? 2 : 1}
     `;
-    const participantWork =
-      turn.reply_to_source_id === null
-        ? participantWorks.length === 1
-          ? participantWorks[0]
-          : null
-        : (participantWorks[0] ?? null);
-    if (!participantWork) return null;
-    const request = familyWorkState(participantWork.task_state).pendingParticipantRequest;
-    if (
-      !request ||
-      request.targetAdultId !== turn.sender_adult_id ||
-      request.channelId !== turn.id ||
-      (turn.reply_to_source_id !== null && request.questionSourceId !== turn.reply_to_source_id)
-    ) {
-      return null;
+
+    const waitingWorks = await this.#sql<ReplyWorkRow[]>`
+      select work.*,question.source_id as question_source_id,
+        question.text as question_text,question_source.occurred_at as question_asked_at
+      from proactive_work work
+      join sources question_source
+        on question_source.metadata->>'familyWorkId'=work.id::text
+        and question_source.metadata->>'familyWorkDeliveryKind'='waiting'
+      join messages question on question.source_id=question_source.id
+      where work.household_id=${turn.household_id} and work.kind='family_task'
+        and work.status='paused' and work.task_state->>'phase'='waiting'
+        and work.task_state->'pendingParticipantRequest'='null'::jsonb
+        and question.channel_id=${turn.id} and question.direction='outbound'
+        and question.move_kind in ('message','reply') and question.status='sent'
+        and question.provider_message_id is not null
+        and question_source.visibility=work.visibility
+        and ${turn.visibility}=work.visibility
+        and question_source.owner_adult_id is not distinct from work.owner_adult_id
+        and question_source.metadata->>'familyWorkGeneration'=work.task_state->>'generation'
+        and question_source.metadata->>'familyWorkProgressRevision'=
+          work.task_state->>'progressRevision'
+        and (question_source.occurred_at,question_source.id)
+          < (${turn.occurred_at},${turn.source_id}::uuid)
+        and (${turn.reply_to_source_id}::uuid is null
+          or question.source_id=${turn.reply_to_source_id}::uuid)
+        and ((work.visibility='private' and work.owner_adult_id=${turn.sender_adult_id}
+            and ${turn.audience}='private')
+          or (work.visibility='household' and work.owner_adult_id is null
+            and ${turn.audience}='group'
+            and (${turn.sender_adult_id}=turn.adult_one_id or ${turn.sender_adult_id}=turn.adult_two_id)))
+      order by question_source.occurred_at,work.created_at,work.id
+      limit ${turn.reply_to_source_id === null ? 2 : 1}
+    `;
+
+    const candidates = [
+      ...participantWorks.map((work) => ({ kind: "participant_request" as const, work })),
+      ...waitingWorks.map((work) => ({ kind: "waiting" as const, work })),
+    ];
+    const selected = candidates.length === 1 ? candidates[0] : null;
+    if (!selected) return null;
+    const state = familyWorkState(selected.work.task_state);
+    if (selected.kind === "participant_request") {
+      const request = state.pendingParticipantRequest;
+      if (
+        !request ||
+        request.targetAdultId !== turn.sender_adult_id ||
+        request.channelId !== turn.id ||
+        request.questionSourceId !== selected.work.question_source_id ||
+        (turn.reply_to_source_id !== null && request.questionSourceId !== turn.reply_to_source_id)
+      ) {
+        return null;
+      }
+      return {
+        kind: selected.kind,
+        workId: selected.work.id,
+        generation: state.generation,
+        progressRevision: state.progressRevision,
+        questionSourceId: request.questionSourceId,
+        requestId: request.requestId,
+        targetAdultName: request.targetAdultName,
+        question: request.question,
+        askedAt: request.askedAt,
+        taskObjective: required(selected.work.objective ?? "", "Participant task objective"),
+        explicitlyRepliesToQuestion: turn.reply_to_source_id !== null,
+      };
     }
     return {
-      requestId: request.requestId,
-      targetAdultName: request.targetAdultName,
-      question: request.question,
-      askedAt: request.askedAt,
-      taskObjective: required(participantWork.objective ?? "", "Participant task objective"),
+      kind: selected.kind,
+      workId: selected.work.id,
+      generation: state.generation,
+      progressRevision: state.progressRevision,
+      questionSourceId: selected.work.question_source_id,
+      requestId: null,
+      targetAdultName: turn.sender_name,
+      question: limitedRequiredString(selected.work.question_text, 10_000, "Family-work question"),
+      askedAt: selected.work.question_asked_at.toISOString(),
+      taskObjective: required(selected.work.objective ?? "", "Family-work task objective"),
       explicitlyRepliesToQuestion: turn.reply_to_source_id !== null,
     };
   }
 
   /**
-   * Atomically revalidates and consumes the exact request Florence classified.
-   * An unrelated private turn never reaches this commit.
+   * Atomically revalidates and consumes the exact waiting question Florence
+   * classified. An unrelated turn never reaches this commit.
    */
-  async commitParticipantReply(input: {
+  async commitFamilyWorkReply(input: {
     sourceId: string;
-    requestId: string;
-    acknowledgement: ParticipantReplyAcknowledgement;
+    kind: "participant_request" | "waiting";
+    workId: string;
+    generation: number;
+    progressRevision: number;
+    questionSourceId: string;
+    requestId: string | null;
+    acknowledgement: FamilyWorkReplyAcknowledgement;
     handledAt: string;
-  }): Promise<"committed" | "not_participant" | "superseded"> {
-    assertUuid(input.sourceId, "Participant reply source ID");
-    assertUuid(input.requestId, "Participant request ID");
+  }): Promise<"committed" | "not_family_work" | "superseded"> {
+    assertUuid(input.sourceId, "Family-work reply source ID");
+    assertUuid(input.workId, "Family-work reply task ID");
+    assertUuid(input.questionSourceId, "Family-work question source ID");
+    familyWorkCounter(input.generation, "Family-work reply generation");
+    familyWorkCounter(input.progressRevision, "Family-work reply progress revision");
+    if (input.kind === "participant_request") {
+      assertUuid(input.requestId ?? "", "Participant request ID");
+    } else if (input.requestId !== null) {
+      throw new FlorenceStoreConflict("A same-thread family-work reply cannot name a participant request");
+    }
     const handledAt = instant(input.handledAt);
     const acknowledgement =
       input.acknowledgement.kind === "text"
         ? {
             kind: "text" as const,
-            text: bounded(required(input.acknowledgement.text, "Participant acknowledgement"), 2_000),
+            text: bounded(required(input.acknowledgement.text, "Family-work acknowledgement"), 2_000),
           }
         : input.acknowledgement;
-    return this.#sql.begin(async (sql) => {
+    return this.#sql.begin("isolation level serializable", async (sql) => {
       const [turn] = await sql<
         (ChannelRow & {
           source_id: string;
@@ -8681,91 +8805,155 @@ export class PostgresFlorenceStore {
       `;
       if (turn?.status !== "received") return "superseded";
       if (
-        turn.audience !== "private" ||
-        turn.visibility !== "private" ||
         turn.move_kind === "reaction" ||
         !turn.text?.trim() ||
         turn.revoked_at !== null ||
         turn.stopped_at !== null
       ) {
-        return "not_participant";
+        return "not_family_work";
       }
 
-      const participantWorks = await sql<ProactiveWorkRow[]>`
-        select work.*
-        from proactive_work work
-        join messages question
-          on question.source_id=(work.task_state->'pendingParticipantRequest'->>'questionSourceId')::uuid
-        join sources question_source on question_source.id=question.source_id
-        where work.household_id=${turn.household_id} and work.kind='family_task'
-          and work.visibility='household' and work.owner_adult_id is null
-          and work.status='paused' and work.task_state->>'phase'='waiting'
-          and work.task_state->'pendingParticipantRequest'->>'targetAdultId'=${turn.sender_adult_id}
-          and work.task_state->'pendingParticipantRequest'->>'channelId'=${turn.id}
-          and question.channel_id=${turn.id} and question.direction='outbound'
-          and question.move_kind in ('message','reply') and question.status='sent'
-          and question.provider_message_id is not null
-          and (question_source.occurred_at,question_source.id)
-            < (${turn.occurred_at},${turn.source_id}::uuid)
-          and (${turn.reply_to_source_id}::uuid is null
-            or question.source_id=${turn.reply_to_source_id}::uuid)
-        order by
-          (work.task_state->'pendingParticipantRequest'->>'askedAt')::timestamptz,
-          work.created_at,work.id
-        limit ${turn.reply_to_source_id === null ? 2 : 1} for update of work
+      const structurallyEligible = await sql<
+        { work_id: string; question_source_id: string; kind: "participant_request" | "waiting" }[]
+      >`
+        with candidates as (
+          select work.id as work_id,question.source_id as question_source_id,
+            'participant_request'::text as kind,question_source.occurred_at,work.created_at
+          from proactive_work work
+          join messages question
+            on question.source_id=(work.task_state->'pendingParticipantRequest'->>'questionSourceId')::uuid
+          join sources question_source on question_source.id=question.source_id
+          where work.household_id=${turn.household_id} and work.kind='family_task'
+            and ${turn.audience}='private' and ${turn.visibility}='private'
+            and work.visibility='household' and work.owner_adult_id is null
+            and work.status='paused' and work.task_state->>'phase'='waiting'
+            and work.task_state->'pendingParticipantRequest'->>'targetAdultId'=${turn.sender_adult_id}
+            and work.task_state->'pendingParticipantRequest'->>'channelId'=${turn.id}
+            and question.channel_id=${turn.id} and question.direction='outbound'
+            and question.move_kind in ('message','reply') and question.status='sent'
+            and question.provider_message_id is not null
+            and question_source.metadata->>'familyWorkGeneration'=work.task_state->>'generation'
+            and question_source.metadata->>'familyWorkProgressRevision'=
+              work.task_state->>'progressRevision'
+            and question_source.metadata->>'participantRequestId'=
+              work.task_state->'pendingParticipantRequest'->>'requestId'
+            and (question_source.occurred_at,question_source.id)
+              < (${turn.occurred_at},${turn.source_id}::uuid)
+            and (${turn.reply_to_source_id}::uuid is null
+              or question.source_id=${turn.reply_to_source_id}::uuid)
+          union all
+          select work.id as work_id,question.source_id as question_source_id,
+            'waiting'::text as kind,question_source.occurred_at,work.created_at
+          from proactive_work work
+          join sources question_source
+            on question_source.metadata->>'familyWorkId'=work.id::text
+            and question_source.metadata->>'familyWorkDeliveryKind'='waiting'
+          join messages question on question.source_id=question_source.id
+          where work.household_id=${turn.household_id} and work.kind='family_task'
+            and work.status='paused' and work.task_state->>'phase'='waiting'
+            and work.task_state->'pendingParticipantRequest'='null'::jsonb
+            and question.channel_id=${turn.id} and question.direction='outbound'
+            and question.move_kind in ('message','reply') and question.status='sent'
+            and question.provider_message_id is not null
+            and question_source.visibility=work.visibility
+            and ${turn.visibility}=work.visibility
+            and question_source.owner_adult_id is not distinct from work.owner_adult_id
+            and question_source.metadata->>'familyWorkGeneration'=work.task_state->>'generation'
+            and question_source.metadata->>'familyWorkProgressRevision'=
+              work.task_state->>'progressRevision'
+            and (question_source.occurred_at,question_source.id)
+              < (${turn.occurred_at},${turn.source_id}::uuid)
+            and (${turn.reply_to_source_id}::uuid is null
+              or question.source_id=${turn.reply_to_source_id}::uuid)
+            and ((work.visibility='private' and work.owner_adult_id=${turn.sender_adult_id}
+                and ${turn.audience}='private')
+              or (work.visibility='household' and work.owner_adult_id is null
+                and ${turn.audience}='group'
+                and (${turn.sender_adult_id}=turn.adult_one_id
+                  or ${turn.sender_adult_id}=turn.adult_two_id)))
+        )
+        select work_id,question_source_id,kind from candidates
+        order by occurred_at,created_at,work_id limit 2
       `;
-      const participantWork =
-        turn.reply_to_source_id === null
-          ? participantWorks.length === 1
-            ? participantWorks[0]
-            : null
-          : (participantWorks[0] ?? null);
-      if (!participantWork) return "not_participant";
-
-      const state = familyWorkState(participantWork.task_state);
-      const request = state.pendingParticipantRequest;
+      const eligible = structurallyEligible.length === 1 ? structurallyEligible[0] : null;
       if (
-        !request ||
-        request.requestId !== input.requestId ||
-        request.targetAdultId !== turn.sender_adult_id ||
-        request.channelId !== turn.id ||
-        (turn.reply_to_source_id !== null && request.questionSourceId !== turn.reply_to_source_id)
+        !eligible ||
+        eligible.kind !== input.kind ||
+        eligible.work_id !== input.workId ||
+        eligible.question_source_id !== input.questionSourceId
       ) {
-        return "not_participant";
+        return "not_family_work";
+      }
+      const [work] = await sql<ProactiveWorkRow[]>`
+        select * from proactive_work where id=${input.workId} and household_id=${turn.household_id}
+          and kind='family_task' and status='paused' and task_state->>'phase'='waiting'
+        for update
+      `;
+      if (!work) return "not_family_work";
+      const state = familyWorkState(work.task_state);
+      if (state.generation !== input.generation || state.progressRevision !== input.progressRevision) {
+        return "not_family_work";
+      }
+      const request = state.pendingParticipantRequest;
+      if (input.kind === "participant_request") {
+        if (
+          turn.audience !== "private" ||
+          turn.visibility !== "private" ||
+          !request ||
+          request.requestId !== input.requestId ||
+          request.targetAdultId !== turn.sender_adult_id ||
+          request.channelId !== turn.id ||
+          request.questionSourceId !== input.questionSourceId ||
+          (turn.reply_to_source_id !== null && request.questionSourceId !== turn.reply_to_source_id)
+        ) {
+          return "not_family_work";
+        }
+      } else if (
+        request !== null ||
+        (work.visibility === "private" &&
+          (turn.audience !== "private" || work.owner_adult_id !== turn.sender_adult_id)) ||
+        (work.visibility === "household" &&
+          (turn.audience !== "group" ||
+            work.owner_adult_id !== null ||
+            (turn.sender_adult_id !== turn.adult_one_id && turn.sender_adult_id !== turn.adult_two_id)))
+      ) {
+        return "not_family_work";
       }
       const nextState = steerFamilyWorkState(state, {
         sourceId: turn.source_id,
-        text: bounded(required(turn.text, "Participant reply"), 4_000),
+        text: bounded(required(turn.text, "Family-work reply"), 4_000),
         occurredAt: turn.occurred_at.toISOString(),
       });
-      await terminalizeUnsentFamilyWorkOutbounds(sql, participantWork.id, "steering");
+      await terminalizeUnsentFamilyWorkOutbounds(sql, work.id, "steering");
       await sql`
         insert into proactive_work_sources (work_id,source_id)
-        values (${participantWork.id},${turn.source_id}) on conflict do nothing
+        values (${work.id},${turn.source_id}) on conflict do nothing
       `;
       await sql`
         update sources set metadata=metadata||${sql.json({
-          participantRequestId: request.requestId,
-          familyWorkSteeringForId: participantWork.id,
+          ...(request ? { participantRequestId: request.requestId } : {}),
+          familyWorkReplyKind: input.kind,
+          familyWorkSteeringForId: work.id,
         })}
         where id=${turn.source_id} and household_id=${turn.household_id}
       `;
       const [resumed] = await sql`
         update proactive_work set task_state=${sql.json(nextState)},status='active',
-          next_check_at=${handledAt},current_conclusion=${`Resuming after ${request.targetAdultName}'s reply.`},
+          next_check_at=${handledAt},current_conclusion='Resuming with the family’s answer.',
           last_error=null
-        where id=${participantWork.id} and status='paused'
-          and task_state->'pendingParticipantRequest'->>'requestId'=${request.requestId}
+        where id=${work.id} and status='paused'
+          and task_state->>'generation'=${String(input.generation)}
+          and task_state->>'progressRevision'=${String(input.progressRevision)}
         returning id
       `;
       if (!resumed) {
-        throw new FlorenceStoreConflict("The participant request changed before its reply was committed");
+        throw new FlorenceStoreConflict("The family-work question changed before its reply was committed");
       }
 
-      const acknowledgementTurnId = deterministicUuid(`participant-reply-ack-turn\0${turn.source_id}`);
+      const acknowledgementTurnId = deterministicUuid(`family-work-reply-ack-turn\0${turn.source_id}`);
       await insertOutbound(sql, {
-        sourceId: deterministicUuid(`participant-reply-ack\0${turn.source_id}`),
-        idempotencyKey: `participant-reply-ack:${turn.source_id}`,
+        sourceId: deterministicUuid(`family-work-reply-ack\0${turn.source_id}`),
+        idempotencyKey: `family-work-reply-ack:${turn.source_id}`,
         moveKind: acknowledgement.kind === "reaction" ? "reaction" : "reply",
         text: acknowledgement.kind === "text" ? acknowledgement.text : null,
         reaction: acknowledgement.kind === "reaction" ? acknowledgement.reaction : null,
@@ -8775,11 +8963,12 @@ export class PostgresFlorenceStore {
         notBefore: handledAt.toISOString(),
         householdId: turn.household_id,
         channelId: turn.id,
-        visibility: "private",
-        ownerAdultId: turn.sender_adult_id,
+        visibility: request ? "private" : work.visibility,
+        ownerAdultId: request ? turn.sender_adult_id : work.owner_adult_id,
         metadata: {
-          participantRequestId: request.requestId,
-          familyWorkSteeringForId: participantWork.id,
+          ...(request ? { participantRequestId: request.requestId } : {}),
+          familyWorkReplyKind: input.kind,
+          familyWorkSteeringForId: work.id,
         },
         occurredAt: handledAt,
       });
@@ -8788,7 +8977,7 @@ export class PostgresFlorenceStore {
         where source_id=${turn.source_id} and status='received' returning source_id
       `;
       if (handled.length !== 1) {
-        throw new FlorenceStoreConflict("The participant reply changed before commit");
+        throw new FlorenceStoreConflict("The family-work reply changed before commit");
       }
       return "committed";
     });
@@ -9565,11 +9754,16 @@ export class PostgresFlorenceStore {
               required(mutation.instruction, "Family work steering instruction"),
               4_000,
             );
-            const nextState = steerFamilyWorkState(state, {
+            const steering = {
               sourceId: turn.source_id,
               text: instruction,
               occurredAt: turn.occurred_at.toISOString(),
-            });
+            };
+            const pendingEffect =
+              state.phase === "tool_pending" && state.pendingCall !== null && state.claim !== null;
+            const nextState = pendingEffect
+              ? queueFamilyWorkSteeringDuringPendingEffect(state, steering)
+              : steerFamilyWorkState(state, steering);
             const acknowledgedState = mutation.acknowledgementText
               ? familyWorkState({
                   ...nextState,
@@ -9579,12 +9773,23 @@ export class PostgresFlorenceStore {
                   ),
                 })
               : nextState;
-            await terminalizeUnsentFamilyWorkOutbounds(sql, work.id, "steering");
-            await sql`
-              update proactive_work set task_state=${sql.json(acknowledgedState)},
-                status='active',next_check_at=${handledAt},
-                last_error=null where id=${work.id}
-            `;
+            if (pendingEffect) {
+              await terminalizeUnsentFamilyWorkOutbounds(sql, work.id, "steering");
+              await sql`
+                update proactive_work set task_state=${sql.json(acknowledgedState)},last_error=null
+                where id=${work.id} and status='active'
+                  and task_state->>'generation'=${String(state.generation)}
+                  and task_state->'claim'->>'claimId'=${state.claim?.claimId ?? ""}
+                  and task_state->'pendingCall'->>'callId'=${state.pendingCall?.callId ?? ""}
+              `;
+            } else {
+              await terminalizeUnsentFamilyWorkOutbounds(sql, work.id, "steering");
+              await sql`
+                update proactive_work set task_state=${sql.json(acknowledgedState)},
+                  status='active',next_check_at=${handledAt},
+                  last_error=null where id=${work.id}
+              `;
+            }
           } else if (mutation.operation === "pause") {
             if (!scheduled) throw new FlorenceStoreConflict("Only scheduled family work can be paused");
             if (work.status === "completed" || work.status === "cancelled") {
@@ -9921,10 +10126,22 @@ export class PostgresFlorenceStore {
         )
     `;
     await this.#sql`
-      update messages set status='pending',sending_at=null,retry_at=${current},
+      update messages message set status='failed',sending_at=null,retry_at=null,
+        last_error='Superseded family-work delivery was suppressed after interruption'
+      from sources source
+      where source.id=message.source_id and message.direction='outbound'
+        and message.move_kind in ('message','reply') and message.status='sending'
+        and message.sending_at<=${stale}
+        and source.metadata->>'familyWorkDeliverySupersededBy' is not null
+    `;
+    await this.#sql`
+      update messages message set status='pending',sending_at=null,retry_at=${current},
         last_error='Recovering an idempotent Linq send after interruption'
-      where direction='outbound' and move_kind in ('message','reply')
-        and status='sending' and sending_at<=${stale} and idempotency_key not like 'cue:%'
+      from sources source
+      where source.id=message.source_id and message.direction='outbound'
+        and message.move_kind in ('message','reply') and message.status='sending'
+        and message.sending_at<=${stale} and message.idempotency_key not like 'cue:%'
+        and source.metadata->>'familyWorkDeliverySupersededBy' is null
     `;
     await this.#sql`
       update messages m set status='failed',last_error='Messages authority is no longer active'
@@ -9962,6 +10179,8 @@ export class PostgresFlorenceStore {
     const [row] = await this.#sql<{ source_id: string }[]>`
       select m.source_id from messages m join sources s on s.id=m.source_id
       where m.direction='outbound' and m.status='pending'
+        and (s.metadata->>'familyWorkId' is null
+          or s.metadata->>'familyWorkDeliverySupersededBy' is null)
         and coalesce(m.retry_at,m.not_before)<=${current}
         and m.idempotency_key not like 'cue:%'
         and (
@@ -9983,6 +10202,8 @@ export class PostgresFlorenceStore {
       from linq_channels c,sources s where m.source_id=${input.sourceId} and m.channel_id=c.id
         and s.id=m.source_id
         and m.direction='outbound' and m.status='pending'
+        and (s.metadata->>'familyWorkId' is null
+          or s.metadata->>'familyWorkDeliverySupersededBy' is null)
         and c.revoked_at is null and c.stopped_at is null
         and (
           m.idempotency_key not like 'founder-handoff:%'
@@ -10027,21 +10248,24 @@ export class PostgresFlorenceStore {
         )
         and (
           source.metadata->>'familyWorkId' is null
-          or exists (
-            select 1 from proactive_work work
-            where work.id::text=source.metadata->>'familyWorkId' and work.kind='family_task'
-              and work.task_state->>'generation'=source.metadata->>'familyWorkGeneration'
-              and work.task_state->>'progressRevision'=
-                source.metadata->>'familyWorkProgressRevision'
-              and (
-                (source.metadata->>'familyWorkDeliveryKind'='progress' and work.status='active')
-                or (source.metadata->>'familyWorkDeliveryKind'='waiting' and work.status='paused')
-                or (source.metadata->>'familyWorkDeliveryKind'='participant_request'
-                  and work.status='paused'
-                  and work.task_state->'pendingParticipantRequest'->>'questionSourceId'=
-                    source.id::text)
-                or (source.metadata->>'familyWorkDeliveryKind'='terminal'
-                  and work.status='delivering')
+          or (
+            source.metadata->>'familyWorkDeliverySupersededBy' is null
+            and exists (
+              select 1 from proactive_work work
+              where work.id::text=source.metadata->>'familyWorkId' and work.kind='family_task'
+                and work.task_state->>'generation'=source.metadata->>'familyWorkGeneration'
+                and work.task_state->>'progressRevision'=
+                  source.metadata->>'familyWorkProgressRevision'
+                and (
+                  (source.metadata->>'familyWorkDeliveryKind'='progress' and work.status='active')
+                  or (source.metadata->>'familyWorkDeliveryKind'='waiting' and work.status='paused')
+                  or (source.metadata->>'familyWorkDeliveryKind'='participant_request'
+                    and work.status='paused'
+                    and work.task_state->'pendingParticipantRequest'->>'questionSourceId'=
+                      source.id::text)
+                  or (source.metadata->>'familyWorkDeliveryKind'='terminal'
+                    and work.status='delivering')
+                )
               )
           )
         )
@@ -10224,7 +10448,7 @@ export class PostgresFlorenceStore {
         for update of message,source
       `;
       if (!current) throw new FlorenceStoreConflict("The outbound message is no longer retryable");
-      const retryAt = input.retryAt;
+      const retryAt = jsonString(current.metadata, "familyWorkDeliverySupersededBy") ? null : input.retryAt;
       const updated = await sql`
         update messages set status=${retryAt ? "pending" : "failed"},sending_at=null,
           retry_at=${retryAt ? instant(retryAt) : null},last_error=${error}
@@ -19358,6 +19582,25 @@ export function steerFamilyWorkState(
   });
 }
 
+/**
+ * Pi injects messages only after the current tool batch has produced its results
+ * (4e494929, packages/agent/src/agent-loop.ts:173-242). Hermes likewise closes
+ * and reopens at a serialized interaction boundary instead of tearing through
+ * the in-flight segment (6dcebea7, gateway/stream_consumer.py:690-758,889-1022).
+ * Florence's durable equivalent is append-only while a claimed effect is in
+ * flight: the pending call and claim remain the one provider idempotency seam.
+ */
+function queueFamilyWorkSteeringDuringPendingEffect(
+  stateInput: FamilyWorkStateV1,
+  steering: FamilyWorkStateV1["steering"][number],
+): FamilyWorkStateV1 {
+  const state = familyWorkState(stateInput);
+  if (state.phase !== "tool_pending" || !state.pendingCall || !state.claim) {
+    throw new FlorenceStoreConflict("Only a claimed pending family-work effect can queue steering");
+  }
+  return familyWorkState({ ...state, steering: [...state.steering, steering] });
+}
+
 function incrementFamilyWorkCounter(value: number, name: string): number {
   familyWorkCounter(value, name);
   if (value >= MAX_FAMILY_WORK_COUNTER) throw new FlorenceStoreConflict(`${name} is exhausted`);
@@ -19400,6 +19643,15 @@ function sameFamilyWorkSteering(
         entry.occurredAt === right[index]?.occurredAt,
     )
   );
+}
+
+function strictFamilyWorkSteeringSuffix(
+  settled: FamilyWorkStateV1["steering"],
+  current: FamilyWorkStateV1["steering"],
+): FamilyWorkStateV1["steering"] | null {
+  if (current.length <= settled.length) return null;
+  if (!sameFamilyWorkSteering(settled, current.slice(0, settled.length))) return null;
+  return current.slice(settled.length);
 }
 
 async function activeReminderChannel(
@@ -19573,6 +19825,13 @@ async function terminalizeUnsentFamilyWorkOutbounds(
   workId: string,
   change: "steering" | "cancellation",
 ): Promise<void> {
+  await sql`
+    update sources source
+    set metadata=source.metadata||${sql.json({ familyWorkDeliverySupersededBy: change })}
+    from messages message
+    where message.source_id=source.id and source.metadata->>'familyWorkId'=${workId}
+      and message.direction='outbound' and message.status in ('pending','failed','sending')
+  `;
   await sql`
     update messages message set status='failed',sending_at=null,retry_at=null,
       last_error=${`Superseded by family work ${change} before delivery`}

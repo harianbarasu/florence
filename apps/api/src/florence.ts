@@ -1364,53 +1364,59 @@ export class Florence {
       });
       return null;
     }
-    const participantCandidate = await this.#store.readParticipantReplyCandidate({
+    const familyWorkReplyCandidate = await this.#store.readFamilyWorkReplyCandidate({
       sourceId: turn.message.sourceId,
       readAt: this.#now().toISOString(),
     });
-    if (participantCandidate) {
+    if (familyWorkReplyCandidate) {
       if (!this.#reasoner) {
         await this.#retryInbound(
           turn.message.sourceId,
-          "Florence participant-reply reasoning is not configured",
+          "Florence family-work reply reasoning is not configured",
         );
         return null;
       }
-      let participantDecision: Awaited<ReturnType<FlorenceReasoner["interpretParticipantReply"]>>;
+      let familyWorkReplyDecision: Awaited<ReturnType<FlorenceReasoner["interpretParticipantReply"]>>;
       try {
-        participantDecision = await this.#reasoner.interpretParticipantReply({
+        familyWorkReplyDecision = await this.#reasoner.interpretParticipantReply({
           pendingRequest: {
-            targetAdultName: participantCandidate.targetAdultName,
-            question: participantCandidate.question,
-            askedAt: participantCandidate.askedAt,
-            taskObjective: participantCandidate.taskObjective,
+            replyContext: familyWorkReplyCandidate.kind,
+            targetAdultName: familyWorkReplyCandidate.targetAdultName,
+            question: familyWorkReplyCandidate.question,
+            askedAt: familyWorkReplyCandidate.askedAt,
+            taskObjective: familyWorkReplyCandidate.taskObjective,
           },
           currentMessage: {
             text: turnText(turn.message),
             occurredAt: turn.message.occurredAt,
-            explicitlyRepliesToQuestion: participantCandidate.explicitlyRepliesToQuestion,
+            explicitlyRepliesToQuestion: familyWorkReplyCandidate.explicitlyRepliesToQuestion,
           },
         });
       } catch (error) {
         await this.#retryInbound(turn.message.sourceId, errorText(error));
         return null;
       }
-      if (participantDecision.belongsToRequest) {
-        if (!participantDecision.acknowledgement) {
+      if (familyWorkReplyDecision.belongsToRequest) {
+        if (!familyWorkReplyDecision.acknowledgement) {
           await this.#retryInbound(
             turn.message.sourceId,
-            "Florence returned no participant-reply acknowledgement",
+            "Florence returned no family-work reply acknowledgement",
           );
           return null;
         }
-        const participantReply = await this.#store.commitParticipantReply({
+        const familyWorkReply = await this.#store.commitFamilyWorkReply({
           sourceId: turn.message.sourceId,
-          requestId: participantCandidate.requestId,
-          acknowledgement: participantDecision.acknowledgement,
+          kind: familyWorkReplyCandidate.kind,
+          workId: familyWorkReplyCandidate.workId,
+          generation: familyWorkReplyCandidate.generation,
+          progressRevision: familyWorkReplyCandidate.progressRevision,
+          questionSourceId: familyWorkReplyCandidate.questionSourceId,
+          requestId: familyWorkReplyCandidate.requestId,
+          acknowledgement: familyWorkReplyDecision.acknowledgement,
           handledAt: this.#now().toISOString(),
         });
-        if (participantReply !== "not_participant") {
-          if (participantReply === "committed") this.#wake();
+        if (familyWorkReply !== "not_family_work") {
+          if (familyWorkReply === "committed") this.#wake();
           return null;
         }
       }

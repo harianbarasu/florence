@@ -3050,6 +3050,8 @@ release("Florence parent journeys", () => {
 
     await harness.accept("group", "participant-request-start", request);
     await harness.drain();
+    harness.state.now += 1_000;
+    await harness.drain();
     expect(
       harness.linq.messages.filter(
         (message) => message.providerConversationId === PRIVATE_PARTNER && message.text === question,
@@ -3112,6 +3114,441 @@ release("Florence parent journeys", () => {
       `(select count(*)=1 from proactive_work
         where kind='family_task' and visibility='household' and objective=${sqlLiteral(objective)}
           and status='completed' and task_state->'pendingParticipantRequest'='null'::jsonb)`,
+    );
+  }, 20_000);
+
+  test("leaves ordinary waiting work paused when the parent's Message does not answer its question", async () => {
+    const request = "Please compare the two camp dates and ask me which one to use.";
+    const objective = "Compare the two camp dates, then use the parent's choice.";
+    const question = "Which camp date should I use: June 8 or June 15?";
+    const unrelated = "Please also add strawberries to the grocery list.";
+    const unrelatedReply = "Got it—what would you like me to do with the strawberries?";
+    let durableRuns = 0;
+    const harness = await createHarness(
+      async (input) => {
+        if (input.currentMessage.text === request) {
+          return decision({
+            bubbles: [{ text: "I’ll compare them and ask you for the final choice.", delayMs: 0 }],
+            familyWork: {
+              operation: "create",
+              workId: null,
+              objective,
+              instruction: null,
+              schedule: null,
+              candidateIds: [],
+            },
+          });
+        }
+        if (input.currentMessage.text === unrelated) {
+          return decision({ bubbles: [{ text: unrelatedReply, delayMs: 0 }] });
+        }
+        return decision();
+      },
+      {
+        interpretParticipantReply: async (input) => {
+          expect(input.pendingRequest).toMatchObject({
+            replyContext: "waiting",
+            question,
+            taskObjective: objective,
+          });
+          expect(input.currentMessage).toMatchObject({
+            text: unrelated,
+            explicitlyRepliesToQuestion: false,
+          });
+          return { belongsToRequest: false, acknowledgement: null };
+        },
+        continueFamilyWork: async (input) => {
+          durableRuns += 1;
+          return {
+            kind: "waiting",
+            state: {
+              ...input.state,
+              phase: "waiting",
+              claim: null,
+              pendingCall: null,
+              pendingParticipantRequest: null,
+              progressRevision: input.state.progressRevision + 1,
+              waitingDocket: {
+                owner: "Hari Anbarasu",
+                nextAction: "Choose one camp date.",
+                waitingOn: question,
+                needsAnswer: true,
+              },
+            },
+            question,
+          };
+        },
+      },
+    );
+    await harness.readyHousehold();
+
+    await harness.accept("group", "same-thread-wait-start", request);
+    await harness.drain();
+    harness.state.now += 1_000;
+    await harness.drain();
+    expect(harness.linq.messages.filter((message) => message.text === question)).toHaveLength(1);
+
+    await harness.accept("group", "same-thread-wait-unrelated", unrelated);
+    await harness.drain();
+    expect(durableRuns).toBe(1);
+    expect(
+      harness.linq.messages.filter(
+        (message) => message.providerConversationId === FAMILY_GROUP && message.text === unrelatedReply,
+      ),
+    ).toHaveLength(1);
+    await harness.assertDatabase(
+      "An unrelated same-thread Message resumed waiting family work",
+      `(select count(*)=1 from proactive_work
+        where kind='family_task' and objective=${sqlLiteral(objective)} and status='paused'
+          and task_state->>'phase'='waiting' and task_state->'steering'='[]'::jsonb)`,
+    );
+  }, 20_000);
+
+  test("an exact inline reply selects one of two waiting tasks in the same conversation", async () => {
+    const firstRequest = "Compare the morning camp options and ask me which one to use.";
+    const secondRequest = "Compare the afternoon camp options and ask me which one to use.";
+    const firstObjective = "Use the parent's choice for the morning camp options.";
+    const secondObjective = "Use the parent's choice for the afternoon camp options.";
+    const firstQuestion = "For the morning camp, should I use Monday or Tuesday?";
+    const secondQuestion = "For the afternoon camp, should I use Thursday or Friday?";
+    const secondAnswer = "Friday works better.";
+    const acknowledgement = "Perfect—I’ll use Friday.";
+    const terminalText = "I used Friday for the afternoon camp plan.";
+    let answerReachedOrdinaryReasoner = false;
+    const harness = await createHarness(
+      async (input) => {
+        if (input.currentMessage.text === firstRequest || input.currentMessage.text === secondRequest) {
+          const first = input.currentMessage.text === firstRequest;
+          return decision({
+            bubbles: [
+              {
+                text: first ? "I’ll compare the morning options." : "I’ll compare the afternoon options.",
+                delayMs: 0,
+              },
+            ],
+            familyWork: {
+              operation: "create",
+              workId: null,
+              objective: first ? firstObjective : secondObjective,
+              instruction: null,
+              schedule: null,
+              candidateIds: [],
+            },
+          });
+        }
+        if (input.currentMessage.text === secondAnswer) answerReachedOrdinaryReasoner = true;
+        return decision();
+      },
+      {
+        interpretParticipantReply: async (input) => {
+          if (input.currentMessage.text === secondRequest) {
+            expect(input.pendingRequest.question).toBe(firstQuestion);
+            return { belongsToRequest: false, acknowledgement: null };
+          }
+          expect(input.pendingRequest).toMatchObject({
+            replyContext: "waiting",
+            question: secondQuestion,
+            taskObjective: secondObjective,
+          });
+          expect(input.currentMessage).toMatchObject({
+            text: secondAnswer,
+            explicitlyRepliesToQuestion: true,
+          });
+          return {
+            belongsToRequest: true,
+            acknowledgement: { kind: "text", text: acknowledgement },
+          };
+        },
+        continueFamilyWork: async (input) => {
+          if (input.state.steering.some((steering) => steering.text === secondAnswer)) {
+            expect(input.objective).toBe(secondObjective);
+            return {
+              kind: "terminal",
+              state: {
+                ...input.state,
+                phase: "terminal",
+                claim: null,
+                pendingCall: null,
+                waitingDocket: null,
+                progressRevision: input.state.progressRevision + 1,
+                terminal: { outcome: "succeeded", text: terminalText },
+              },
+              outcome: "succeeded",
+              text: terminalText,
+            };
+          }
+          const first = input.objective === firstObjective;
+          const question = first ? firstQuestion : secondQuestion;
+          return {
+            kind: "waiting",
+            state: {
+              ...input.state,
+              phase: "waiting",
+              claim: null,
+              pendingCall: null,
+              pendingParticipantRequest: null,
+              progressRevision: input.state.progressRevision + 1,
+              waitingDocket: {
+                owner: "Hari Anbarasu",
+                nextAction: "Choose one option.",
+                waitingOn: question,
+                needsAnswer: true,
+              },
+            },
+            question,
+          };
+        },
+      },
+    );
+    await harness.readyHousehold();
+
+    await harness.accept("private", "two-waits-first", firstRequest);
+    await harness.drain();
+    harness.state.now += 1_000;
+    await harness.drain();
+    await harness.accept("private", "two-waits-second", secondRequest);
+    await harness.drain();
+    harness.state.now += 1_000;
+    await harness.drain();
+    expect(harness.linq.messages.filter((message) => message.text === firstQuestion)).toHaveLength(1);
+    const secondQuestionDelivery = harness.linq.messages.find(
+      (message) => message.providerConversationId === PRIVATE_FOUNDER && message.text === secondQuestion,
+    );
+    if (!secondQuestionDelivery) throw new Error("The second waiting question was not delivered");
+    const secondQuestionReceipt = harness.linq.ledger.sent.get(secondQuestionDelivery.idempotencyKey);
+    if (secondQuestionReceipt?.status !== "committed" || !secondQuestionReceipt.providerReceiptId) {
+      throw new Error("The second waiting question lost its Linq receipt");
+    }
+
+    await harness.accept(
+      "private",
+      "two-waits-answer-second",
+      secondAnswer,
+      "founder",
+      secondQuestionReceipt.providerReceiptId,
+    );
+    await harness.drain();
+    expect(answerReachedOrdinaryReasoner).toBe(false);
+    expect(
+      harness.linq.messages.filter(
+        (message) => message.providerConversationId === PRIVATE_FOUNDER && message.text === acknowledgement,
+      ),
+    ).toHaveLength(1);
+    expect(harness.linq.messages.filter((message) => message.text === terminalText)).toHaveLength(1);
+    await harness.assertDatabase(
+      "The inline reply did not select only the exact waiting task",
+      `(select count(*)=1 from proactive_work
+          where kind='family_task' and objective=${sqlLiteral(firstObjective)} and status='paused'
+            and task_state->>'phase'='waiting')
+        and (select count(*)=1 from proactive_work
+          where kind='family_task' and objective=${sqlLiteral(secondObjective)} and status='completed')`,
+    );
+  }, 20_000);
+
+  test("queues a parent correction behind one provider effect and resumes from its receipt", async () => {
+    const request = "Add the camp follow-up to my Google Tasks and finish the plan.";
+    const objective = "Add the camp follow-up to Google Tasks and finish the plan.";
+    const correction = "Make the rest of the plan for Friday instead of Thursday.";
+    const acknowledgement = "Got it—I’ll use Friday for the rest of the plan.";
+    const obsoleteProgress = "I added the task and I’m finishing Thursday’s plan.";
+    const terminalText = "I added the camp follow-up once and finished the plan for Friday.";
+    const operation = {
+      operation: "tasks_create",
+      title: "Camp follow-up",
+      notes: "Finish the family camp plan.",
+    } satisfies GoogleWorkspaceOperation;
+    const staleSecondOperation = {
+      operation: "tasks_create",
+      title: "Thursday camp plan",
+      notes: "This stale second effect must be replanned after the parent's correction.",
+    } satisfies GoogleWorkspaceOperation;
+    let effectStartedResolve: () => void = () => undefined;
+    const effectStarted = new Promise<void>((resolve) => {
+      effectStartedResolve = resolve;
+    });
+    let releaseEffectResolve: () => void = () => undefined;
+    const releaseEffect = new Promise<void>((resolve) => {
+      releaseEffectResolve = resolve;
+    });
+    let resumedSawCorrection = false;
+    let staleSecondEffectRan = false;
+    const harness = await createHarness(
+      async (input) => {
+        if (input.currentMessage.text === request) {
+          return decision({
+            bubbles: [{ text: "I’m on it—I’ll add the follow-up and finish the plan.", delayMs: 0 }],
+            familyWork: {
+              operation: "create",
+              workId: null,
+              objective,
+              instruction: null,
+              schedule: null,
+              candidateIds: [],
+            },
+          });
+        }
+        if (input.currentMessage.text === correction) {
+          const work = input.visibleFamilyWork.find((candidate) => candidate.objective === objective);
+          if (!work) throw new Error("The correction could not resolve its active family task");
+          return decision({
+            bubbles: [{ text: acknowledgement, delayMs: 0 }],
+            familyWork: {
+              operation: "steer",
+              workId: work.workId,
+              objective: null,
+              instruction: correction,
+              schedule: null,
+            },
+          });
+        }
+        return decision();
+      },
+      {
+        continueFamilyWork: async (input, reads) => {
+          if (input.state.phase === "tool_pending") {
+            if (!reads.runGoogleWorkspace) {
+              throw new Error(
+                "The provider effect did not receive the initiating parent's Workspace adapter",
+              );
+            }
+            if (input.state.pendingCall?.callId === "stale-thursday-plan") {
+              staleSecondEffectRan = true;
+              await reads.runGoogleWorkspace(staleSecondOperation);
+              throw new Error("The stale second provider effect ran before Florence applied the correction");
+            }
+            const receipt = await reads.runGoogleWorkspace(operation);
+            effectStartedResolve();
+            await releaseEffect;
+            return {
+              kind: "continue",
+              state: {
+                ...input.state,
+                phase: "tool_pending",
+                claim: null,
+                continuationItems: [
+                  ...input.state.continuationItems,
+                  {
+                    type: "function_call_output",
+                    call_id: "camp-follow-up-create",
+                    output: JSON.stringify(receipt),
+                  },
+                  {
+                    type: "function_call",
+                    call_id: "stale-thursday-plan",
+                    name: "tasks_work",
+                    arguments: JSON.stringify(staleSecondOperation),
+                    status: "completed",
+                  },
+                ],
+                pendingCall: {
+                  callId: "stale-thursday-plan",
+                  name: "tasks_work",
+                  argumentsJson: JSON.stringify(staleSecondOperation),
+                  attempt: 0,
+                },
+                progressRevision: input.state.progressRevision + 1,
+              },
+              progressText: obsoleteProgress,
+              nextCheckDelayMs: 0,
+            };
+          }
+          if (input.state.steering.some((steering) => steering.text === correction)) {
+            resumedSawCorrection = true;
+            expect(JSON.stringify(input.state.continuationItems)).toContain("google-task-1");
+            expect(JSON.stringify(input.state.continuationItems)).not.toContain("stale-thursday-plan");
+            return {
+              kind: "terminal",
+              state: {
+                ...input.state,
+                phase: "terminal",
+                claim: null,
+                pendingCall: null,
+                progressRevision: input.state.progressRevision + 1,
+                terminal: { outcome: "succeeded", text: terminalText },
+              },
+              outcome: "succeeded",
+              text: terminalText,
+            };
+          }
+          if (input.state.phase === "ready" && input.state.progressRevision === 0) {
+            return {
+              kind: "continue",
+              state: {
+                ...input.state,
+                claim: null,
+                progressRevision: input.state.progressRevision + 1,
+              },
+              progressText: obsoleteProgress,
+              nextCheckDelayMs: 0,
+            };
+          }
+          if (input.state.phase === "ready") {
+            return {
+              kind: "continue",
+              state: {
+                ...input.state,
+                phase: "tool_pending",
+                claim: null,
+                pendingCall: {
+                  callId: "camp-follow-up-create",
+                  name: "tasks_work",
+                  argumentsJson: JSON.stringify(operation),
+                  attempt: 0,
+                },
+              },
+              progressText: null,
+              nextCheckDelayMs: 0,
+            };
+          }
+          throw new Error("Family work reached an unexpected phase");
+        },
+      },
+    );
+    await harness.readyHousehold();
+
+    await harness.accept("private", "effect-steering-start", request);
+    await harness.drain();
+    harness.state.now += 1_000;
+    await harness.florence.runOnce();
+    let staleProgress = null;
+    for (let index = 0; index < 50 && staleProgress === null; index += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const outbound = await harness.store.readNextOutbound(harness.iso());
+      if (outbound?.text === obsoleteProgress) staleProgress = outbound;
+    }
+    if (!staleProgress) throw new Error("The pre-effect progress outbound was not staged");
+    const begunProgress = await harness.store.beginOutbound({
+      sourceId: staleProgress.sourceId,
+      now: harness.iso(),
+    });
+    if (!begunProgress) throw new Error("The pre-effect progress outbound could not enter sending");
+    await harness.florence.runOnce();
+    await effectStarted;
+    expect(harness.state.workspaceExecutions).toHaveLength(1);
+
+    await harness.accept("private", "effect-steering-correction", correction);
+    await harness.drain();
+    expect(harness.state.workspaceExecutions).toHaveLength(1);
+    expect(harness.linq.messages.filter((message) => message.text === acknowledgement)).toHaveLength(1);
+    expect(await harness.store.outboundSendIsCurrent(staleProgress.sourceId)).toBe(false);
+    await harness.store.failSendingOutbound(
+      staleProgress.sourceId,
+      "The corrected family-work progress was suppressed before provider delivery",
+    );
+
+    releaseEffectResolve();
+    await harness.drain();
+    expect(resumedSawCorrection).toBe(true);
+    expect(staleSecondEffectRan).toBe(false);
+    expect(harness.state.workspaceExecutions).toHaveLength(1);
+    expect(harness.linq.messages.filter((message) => message.text === obsoleteProgress)).toHaveLength(0);
+    expect(harness.linq.messages.filter((message) => message.text === terminalText)).toHaveLength(1);
+    await harness.assertDatabase(
+      "Queued steering duplicated the provider effect or lost the resumed final",
+      `(select count(*)=1 from proactive_work
+        where kind='family_task' and objective=${sqlLiteral(objective)} and status='completed'
+          and jsonb_array_length(task_state->'steering')=1
+          and task_state->'pendingCall'='null'::jsonb)`,
     );
   }, 20_000);
 
@@ -7586,8 +8023,12 @@ class Harness {
     key: string,
     text: string,
     sender: "founder" | "partner" = "founder",
+    replyToProviderMessageId: string | null = null,
   ) {
-    const result = await this.florence.acceptInbound(this.inbound(audience, key, text, sender));
+    const result = await this.florence.acceptInbound({
+      ...this.inbound(audience, key, text, sender),
+      ...(replyToProviderMessageId ? { replyToProviderMessageId } : {}),
+    });
     if (!result) throw new Error(`Inbound ${key} was rejected`);
     return result;
   }

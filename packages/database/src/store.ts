@@ -21,6 +21,13 @@ const INTEREST_CHECK_INTERVAL_MS = 7 * 24 * 60 * 60_000;
 const LINQ_RECEIPT_CLOCK_SKEW_MS = 5 * 60_000;
 const FAMILY_WORK_INITIAL_DELAY_MS = 1_000;
 const FAMILY_WORK_CLAIM_LEASE_MS = 2 * 60_000;
+const FAMILY_WORK_DELIVERY_RECOVERY_DELAY_MS = 5_000;
+const FAMILY_WORK_TERMINAL_UNDELIVERED_ERROR_PREFIX =
+  "The final result is available in Florence, but Messages could not deliver it";
+
+function familyWorkTerminalUndeliveredError(sourceId: string): string {
+  return `${FAMILY_WORK_TERMINAL_UNDELIVERED_ERROR_PREFIX} [delivery ${sourceId}]`;
+}
 const HOUSEHOLD_NEXT_ACTION_CLAIM_LEASE_MS = 2 * 60_000;
 const MAX_FAMILY_WORK_STATE_BYTES = 256 * 1024;
 const MAX_FAMILY_WORK_FILE_BYTES = 100 * 1024 * 1024;
@@ -10894,11 +10901,20 @@ export class PostgresFlorenceStore {
         and message.sending_at<=${stale} and message.idempotency_key not like 'cue:%'
         and source.metadata->>'familyWorkDeliverySupersededBy' is null
     `;
-    await this.#sql`
-      update messages m set status='failed',last_error='Messages authority is no longer active'
-      from linq_channels c where c.id=m.channel_id and m.direction='outbound' and m.status='pending'
-        and (c.revoked_at is not null or c.stopped_at is not null)
-    `;
+    await this.#sql.begin(async (sql) => {
+      const failed = await sql<{ source_id: string }[]>`
+        update messages m set status='failed',last_error='Messages authority is no longer active'
+        from linq_channels c where c.id=m.channel_id and m.direction='outbound'
+          and m.status='pending' and (c.revoked_at is not null or c.stopped_at is not null)
+        returning m.source_id
+      `;
+      for (const row of failed) {
+        await recoverAuthoritativeFamilyWorkDeliveryFailure(sql, {
+          sourceId: row.source_id,
+          occurredAt: current,
+        });
+      }
+    });
     await this.#sql`
       update messages m set status='failed',sending_at=null,retry_at=null,
         last_error='Private conflict sharing was turned off before delivery'
@@ -11141,11 +11157,12 @@ export class PostgresFlorenceStore {
           move_kind: "message" | "reply" | "reaction";
           provider_message_id: string | null;
           receipt_detail: JsonValue | null;
+          source_metadata: JsonValue;
           not_before: Date;
           source_occurred_at: Date;
         }[]
       >`
-        select m.status,m.move_kind,m.provider_message_id,m.receipt_detail,m.not_before,
+        select m.status,m.move_kind,m.provider_message_id,m.receipt_detail,m.not_before,s.metadata as source_metadata,
           s.occurred_at as source_occurred_at
         from messages m join sources s on s.id=m.source_id
         where m.source_id=${input.sourceId} and m.direction='outbound' for update of m
@@ -11173,17 +11190,23 @@ export class PostgresFlorenceStore {
           update messages set receipt_detail=${sql.json(receiptDetail)} where source_id=${input.sourceId}
         `;
         await completeDeliveredOneShotReminder(sql, input.sourceId);
-        await completeDeliveredFamilyWorkTerminal(sql, input.sourceId);
+        await reconcileDeliveredAuthoritativeFamilyWork(sql, input.sourceId);
         return;
       }
       const reactionConfirmed =
         current.move_kind === "reaction" && receiptDetail.providerState === "reaction_added";
       if (current.status === "failed") {
         if (!reactionConfirmed) {
-          await sql`
-            update messages set receipt_detail=${sql.json(receiptDetail)} where source_id=${input.sourceId}
-          `;
-          return;
+          const deliveryKind = jsonString(current.source_metadata, "familyWorkDeliveryKind");
+          if (
+            current.move_kind === "reaction" ||
+            (deliveryKind !== "waiting" && deliveryKind !== "terminal")
+          ) {
+            await sql`
+              update messages set receipt_detail=${sql.json(receiptDetail)} where source_id=${input.sourceId}
+            `;
+            return;
+          }
         }
       } else if (current.status !== "sending") {
         throw new FlorenceStoreConflict("The outbound message was not begun");
@@ -11195,7 +11218,7 @@ export class PostgresFlorenceStore {
         where source_id=${input.sourceId}
       `;
       await completeDeliveredOneShotReminder(sql, input.sourceId);
-      await completeDeliveredFamilyWorkTerminal(sql, input.sourceId);
+      await reconcileDeliveredAuthoritativeFamilyWork(sql, input.sourceId);
     });
   }
 
@@ -11233,6 +11256,10 @@ export class PostgresFlorenceStore {
         throw new FlorenceStoreConflict("The outbound message is no longer retryable");
       }
       if (retryAt === null) {
+        await recoverAuthoritativeFamilyWorkDeliveryFailure(sql, {
+          sourceId: input.sourceId,
+          occurredAt,
+        });
         await wakeFamilyWorkAfterParticipantDeliveryFailure(sql, {
           sourceId: input.sourceId,
           householdId: current.household_id,
@@ -11319,6 +11346,10 @@ export class PostgresFlorenceStore {
         where source_id=${current.source_id}
       `;
       if (failed) {
+        await recoverAuthoritativeFamilyWorkDeliveryFailure(sql, {
+          sourceId: current.source_id,
+          occurredAt,
+        });
         await wakeFamilyWorkAfterParticipantDeliveryFailure(sql, {
           sourceId: current.source_id,
           householdId: current.source_household_id,
@@ -11326,6 +11357,10 @@ export class PostgresFlorenceStore {
           occurredAt,
           error: merged.lastError ?? "Messages could not deliver the private question.",
         });
+      }
+      if (succeeded) {
+        await completeDeliveredOneShotReminder(sql, current.source_id);
+        await reconcileDeliveredAuthoritativeFamilyWork(sql, current.source_id);
       }
       return "applied";
     });
@@ -21896,6 +21931,252 @@ async function completeDeliveredOneShotReminder(
 
 type FamilyWorkDeliveryKind = "progress" | "waiting" | "terminal" | "participant_request";
 
+async function recoverAuthoritativeFamilyWorkDeliveryFailure(
+  sql: postgres.TransactionSql,
+  input: { sourceId: string; occurredAt: Date },
+): Promise<void> {
+  const [failed] = await sql<
+    {
+      move_kind: "message" | "reply" | "reaction";
+      text: string | null;
+      household_id: string;
+      visibility: Visibility;
+      owner_adult_id: string | null;
+      metadata: JsonValue;
+    }[]
+  >`
+    select message.move_kind,message.text,
+      source.household_id,source.visibility,source.owner_adult_id,source.metadata
+    from messages message join sources source on source.id=message.source_id
+    where message.source_id=${input.sourceId} and message.direction='outbound'
+      and message.status='failed'
+    for update of message,source
+  `;
+  if (!failed || failed.move_kind === "reaction" || !failed.text) return;
+  const metadata = jsonRecord(failed.metadata);
+  const deliveryKind = jsonString(metadata, "familyWorkDeliveryKind");
+  if (deliveryKind !== "waiting" && deliveryKind !== "terminal") return;
+  if (metadata.familyWorkDeliverySupersededBy !== undefined) return;
+  const workId = jsonString(metadata, "familyWorkId");
+  const generation = metadata.familyWorkGeneration;
+  const progressRevision = metadata.familyWorkProgressRevision;
+  if (
+    !workId ||
+    typeof generation !== "number" ||
+    !Number.isSafeInteger(generation) ||
+    typeof progressRevision !== "number" ||
+    !Number.isSafeInteger(progressRevision)
+  ) {
+    return;
+  }
+  const [work] = await sql<ProactiveWorkRow[]>`
+    select * from proactive_work where id=${workId} and household_id=${failed.household_id}
+      and kind='family_task' for update
+  `;
+  if (!work || work.visibility !== failed.visibility || work.owner_adult_id !== failed.owner_adult_id) {
+    return;
+  }
+  const state = familyWorkState(work.task_state);
+  const current =
+    state.generation === generation &&
+    state.progressRevision === progressRevision &&
+    ((deliveryKind === "waiting" && work.status === "paused" && state.phase === "waiting") ||
+      (deliveryKind === "terminal" && work.status === "delivering" && state.phase === "terminal"));
+  if (!current) return;
+  await sql`
+    update messages message set status='failed',sending_at=null,retry_at=null,
+      last_error='Optional presentation was skipped after authoritative delivery failed'
+    from sources source where source.id=message.source_id and source.id<>${input.sourceId}
+      and source.metadata->>'familyWorkId'=${workId}
+      and source.metadata->>'familyWorkGeneration'=${String(generation)}
+      and source.metadata->>'familyWorkProgressRevision'=${String(progressRevision)}
+      and source.metadata->>'familyWorkDeliveryKind'='presentation'
+      and message.direction='outbound' and message.status in ('pending','sending')
+  `;
+  const recoveryOf = jsonString(metadata, "familyWorkDeliveryRecoveryOf");
+  if (recoveryOf) {
+    await blockAuthoritativeFamilyWorkDelivery(sql, {
+      work,
+      state,
+      deliveryKind,
+      deliveryRootSourceId: recoveryOf,
+      error: "Messages permanently rejected the plain-text delivery fallback",
+      occurredAt: input.occurredAt,
+    });
+    return;
+  }
+  if (metadata.familyWorkDeliveryRecoverySourceId !== undefined) return;
+  const channel = await activeReminderChannel(sql, work);
+  if (!channel) {
+    await blockAuthoritativeFamilyWorkDelivery(sql, {
+      work,
+      state,
+      deliveryKind,
+      deliveryRootSourceId: input.sourceId,
+      error: "No active Messages channel could deliver the result",
+      occurredAt: input.occurredAt,
+    });
+    return;
+  }
+
+  // Preserve the authoritative text, but degrade failed native/thread presentation to
+  // Hermes/OpenInstinct's one fresh reliable plain-text send on the current authority.
+  const suffix = `family-work-delivery-recovery:${input.sourceId}`;
+  const recoverySourceId = proactiveOutboundSourceId(workId, suffix);
+  const recoveryMetadata: Record<string, JsonValue> = {
+    ...metadata,
+    familyWorkDeliveryRecoveryOf: input.sourceId,
+    familyWorkDeliveryRecoveryAttempt: 1,
+  };
+  delete recoveryMetadata.nativeMove;
+  delete recoveryMetadata.familyWorkPresentationFor;
+  delete recoveryMetadata.familyWorkPresentationPart;
+  delete recoveryMetadata.familyWorkDeliveryRecoverySourceId;
+  await insertProactiveOutbound(sql, {
+    workId,
+    suffix,
+    householdId: failed.household_id,
+    channel,
+    visibility: failed.visibility,
+    ownerAdultId: failed.owner_adult_id,
+    text: failed.text,
+    metadata: recoveryMetadata,
+    notBefore: new Date(input.occurredAt.getTime() + FAMILY_WORK_DELIVERY_RECOVERY_DELAY_MS),
+    occurredAt: input.occurredAt,
+  });
+  await sql`
+    update sources set metadata=metadata||${sql.json({
+      familyWorkDeliveryRecoverySourceId: recoverySourceId,
+    })}
+    where id=${input.sourceId}
+  `;
+}
+
+async function blockAuthoritativeFamilyWorkDelivery(
+  sql: postgres.TransactionSql,
+  input: {
+    work: ProactiveWorkRow;
+    state: FamilyWorkStateV1;
+    deliveryKind: "waiting" | "terminal";
+    deliveryRootSourceId: string;
+    error: string;
+    occurredAt: Date;
+  },
+): Promise<void> {
+  if (input.deliveryKind === "waiting") {
+    await sql`
+      update proactive_work set status='paused',next_check_at=null,
+        current_conclusion='Waiting for an answer, but Messages could not deliver the question.',
+        last_error=${bounded(input.error, 2_000)}
+      where id=${input.work.id} and status='paused' and task_state->>'phase'='waiting'
+        and task_state->>'generation'=${String(input.state.generation)}
+        and task_state->>'progressRevision'=${String(input.state.progressRevision)}
+    `;
+    return;
+  }
+  if (!input.state.terminal) return;
+  const scheduled = scheduledFamilyWork(input.work.reminder_schedule);
+  const completedSchedule = scheduled
+    ? { ...scheduled, occurrenceActive: false, previousResult: input.state.terminal.text }
+    : null;
+  if (
+    input.state.terminal.outcome !== "cancelled" &&
+    completedSchedule &&
+    completedSchedule.schedule.kind !== "once"
+  ) {
+    const recurringCandidateIds =
+      input.state.terminal.outcome === "succeeded" ? [] : (input.state.docketCandidateIds ?? []);
+    const nextState = familyWorkState({
+      ...initialFamilyWorkState(
+        input.state.acknowledgementText ?? null,
+        recurringCandidateIds,
+        completedSchedule.completionCondition !== undefined
+          ? completedSchedule.completionCondition
+          : (input.state.completionCondition ?? null),
+      ),
+      generation: incrementFamilyWorkCounter(input.state.generation, "Family work generation"),
+    });
+    const [household] = await sql<{ time_zone: string }[]>`
+      select time_zone from households where id=${input.work.household_id}
+    `;
+    if (!household) throw new FlorenceStoreConflict("Undelivered family work lost its household");
+    const nextAt = completedSchedule.paused
+      ? null
+      : nextReminderOccurrence(completedSchedule.schedule, input.occurredAt, household.time_zone);
+    if (!completedSchedule.paused && !nextAt) {
+      throw new FlorenceStoreConflict("Recurring family work lost its next occurrence");
+    }
+    await sql`
+      update proactive_work set task_state=${sql.json(nextState)},
+        reminder_schedule=${sql.json(completedSchedule)},last_run_at=${input.occurredAt},
+        status=${completedSchedule.paused ? "paused" : "active"},next_check_at=${nextAt},
+        current_conclusion=${input.state.terminal.text},
+        last_error=${familyWorkTerminalUndeliveredError(input.deliveryRootSourceId)}
+      where id=${input.work.id} and status='delivering'
+        and task_state->>'generation'=${String(input.state.generation)}
+    `;
+    return;
+  }
+  await sql`
+    update proactive_work set
+      status=${input.state.terminal.outcome === "cancelled" ? "cancelled" : "completed"},
+      next_check_at=null,current_conclusion=${input.state.terminal.text},
+      reminder_schedule=${completedSchedule ? sql.json(completedSchedule) : null},
+      last_run_at=${input.occurredAt},
+      last_error=${familyWorkTerminalUndeliveredError(input.deliveryRootSourceId)}
+    where id=${input.work.id} and status='delivering' and task_state->>'phase'='terminal'
+      and task_state->>'generation'=${String(input.state.generation)}
+      and task_state->>'progressRevision'=${String(input.state.progressRevision)}
+  `;
+}
+
+async function reconcileDeliveredAuthoritativeFamilyWork(
+  sql: postgres.TransactionSql,
+  sourceId: string,
+): Promise<void> {
+  const [source] = await sql<{ metadata: JsonValue }[]>`
+    select metadata from sources where id=${sourceId} for update
+  `;
+  if (!source) return;
+  const metadata = jsonRecord(source.metadata);
+  const kind = jsonString(metadata, "familyWorkDeliveryKind");
+  if (kind !== "waiting" && kind !== "terminal") return;
+  const rootSourceId = jsonString(metadata, "familyWorkDeliveryRecoveryOf") ?? sourceId;
+  await sql`
+    update messages message set status='failed',sending_at=null,retry_at=null,
+      last_error='Superseded after the authoritative family-work result was delivered'
+    from sources candidate
+    where candidate.id=message.source_id and candidate.id<>${sourceId}
+      and (candidate.id=${rootSourceId}
+        or candidate.metadata->>'familyWorkDeliveryRecoveryOf'=${rootSourceId})
+      and message.direction='outbound' and message.status in ('pending','sending')
+  `;
+  await sql`
+    update sources candidate set metadata=candidate.metadata||${sql.json({
+      familyWorkDeliverySupersededBy: "delivered_predecessor",
+    })}
+    from messages message where message.source_id=candidate.id and candidate.id<>${sourceId}
+      and (candidate.id=${rootSourceId}
+        or candidate.metadata->>'familyWorkDeliveryRecoveryOf'=${rootSourceId})
+      and message.direction='outbound' and message.status='failed'
+  `;
+  if (kind === "waiting") {
+    await sql`
+      update proactive_work work set current_conclusion=message.text,last_error=null
+      from sources delivered join messages message on message.source_id=delivered.id
+      where delivered.id=${sourceId} and delivered.metadata->>'familyWorkId'=work.id::text
+        and message.status='sent' and work.kind='family_task' and work.status='paused'
+        and work.task_state->>'phase'='waiting'
+        and work.task_state->>'generation'=delivered.metadata->>'familyWorkGeneration'
+        and work.task_state->>'progressRevision'=
+          delivered.metadata->>'familyWorkProgressRevision'
+    `;
+    return;
+  }
+  await completeDeliveredFamilyWorkTerminal(sql, sourceId);
+  await completeDeliveredPriorRecurringFamilyWorkTerminal(sql, sourceId);
+}
+
 async function wakeFamilyWorkAfterParticipantDeliveryFailure(
   sql: postgres.TransactionSql,
   input: {
@@ -21972,7 +22253,10 @@ async function completeDeliveredFamilyWorkTerminal(
     join households household on household.id=work.household_id
     where source.id=${sourceId} and source.metadata->>'familyWorkDeliveryKind'='terminal'
       and message.status='sent' and message.sent_at is not null
-      and work.kind='family_task' and work.status='delivering'
+      and work.kind='family_task'
+      and (work.status='delivering'
+        or (work.status in ('completed','cancelled')
+          and work.last_error like ${`${FAMILY_WORK_TERMINAL_UNDELIVERED_ERROR_PREFIX}%`}))
       and work.task_state->>'generation'=source.metadata->>'familyWorkGeneration'
       and work.task_state->>'progressRevision'=
         source.metadata->>'familyWorkProgressRevision'
@@ -21983,23 +22267,6 @@ async function completeDeliveredFamilyWorkTerminal(
   if (!state.terminal) {
     throw new FlorenceStoreConflict("Delivered family work lost its terminal result");
   }
-  const completionMemoryMutations = storedFamilyWorkCompletionMemoryMutations(
-    delivery.source_metadata,
-  );
-  if (state.terminal.outcome !== "succeeded" && completionMemoryMutations.length > 0) {
-    throw new FlorenceStoreConflict(
-      "Only a delivered successful family-work result may retain completion memory",
-    );
-  }
-  if (state.terminal.outcome === "succeeded") {
-    await applyDeliveredFamilyWorkCompletionMemories(sql, {
-      work: delivery,
-      terminalSourceId: sourceId,
-      mutations: completionMemoryMutations,
-      handledAt: delivery.sent_at,
-    });
-  }
-  const evidenceBasisAt = state.evidenceRevisionAt ? instant(state.evidenceRevisionAt) : delivery.created_at;
   const scheduled = scheduledFamilyWork(delivery.reminder_schedule);
   const completedSchedule = scheduled
     ? { ...scheduled, occurrenceActive: false, previousResult: state.terminal.text }
@@ -22009,7 +22276,9 @@ async function completeDeliveredFamilyWorkTerminal(
       update proactive_work set status='cancelled',next_check_at=null,
         reminder_schedule=${completedSchedule ? sql.json(completedSchedule) : null},
         last_run_at=${delivery.sent_at},last_error=null
-      where id=${delivery.id} and status='delivering'
+      where id=${delivery.id}
+        and (status='delivering'
+          or last_error like ${`${FAMILY_WORK_TERMINAL_UNDELIVERED_ERROR_PREFIX}%`})
         and task_state->>'generation'=${String(state.generation)}
     `;
   } else if (!completedSchedule || completedSchedule.schedule.kind === "once") {
@@ -22017,7 +22286,9 @@ async function completeDeliveredFamilyWorkTerminal(
       update proactive_work set status='completed',next_check_at=null,
         reminder_schedule=${completedSchedule ? sql.json(completedSchedule) : null},
         last_run_at=${delivery.sent_at},last_error=null
-      where id=${delivery.id} and status='delivering'
+      where id=${delivery.id}
+        and (status='delivering'
+          or last_error like ${`${FAMILY_WORK_TERMINAL_UNDELIVERED_ERROR_PREFIX}%`})
         and task_state->>'generation'=${String(state.generation)}
     `;
   } else {
@@ -22044,55 +22315,172 @@ async function completeDeliveredFamilyWorkTerminal(
         reminder_schedule=${sql.json(completedSchedule)},last_run_at=${delivery.sent_at},
         status=${completedSchedule.paused ? "paused" : "active"},next_check_at=${nextAt},
         current_conclusion=${state.terminal.text},last_error=null
-      where id=${delivery.id} and status='delivering'
+      where id=${delivery.id}
+        and (status='delivering'
+          or last_error like ${`${FAMILY_WORK_TERMINAL_UNDELIVERED_ERROR_PREFIX}%`})
         and task_state->>'generation'=${String(state.generation)}
       returning id
     `;
     if (updated.length !== 1) return;
   }
-  const candidateIds = state.docketCandidateIds ?? [];
+  await applyDeliveredFamilyWorkCompletionEffectsOnce(sql, {
+    work: delivery,
+    state,
+    sourceMetadata: delivery.source_metadata,
+    sourceId,
+    deliveredAt: delivery.sent_at,
+  });
+}
+
+async function completeDeliveredPriorRecurringFamilyWorkTerminal(
+  sql: postgres.TransactionSql,
+  sourceId: string,
+): Promise<void> {
+  const [delivered] = await sql<
+    (ProactiveWorkRow & { source_metadata: JsonValue; sent_at: Date })[]
+  >`
+    select work.*,source.metadata as source_metadata,message.sent_at
+    from sources source join messages message on message.source_id=source.id
+    join proactive_work work on source.metadata->>'familyWorkId'=work.id::text
+    where source.id=${sourceId} and source.metadata->>'familyWorkDeliveryKind'='terminal'
+      and message.status='sent' and message.sent_at is not null and work.kind='family_task'
+      and work.task_state->>'generation'<>source.metadata->>'familyWorkGeneration'
+    for update of work,source
+  `;
+  if (!delivered) return;
+  const metadata = jsonRecord(delivered.source_metadata);
+  const rootSourceId = jsonString(metadata, "familyWorkDeliveryRecoveryOf") ?? sourceId;
+  const settlementValue = metadata.familyWorkTerminalSettlementState;
+  if (settlementValue === undefined) return;
+  const settlementState = familyWorkState(settlementValue);
+  if (!settlementState.terminal) return;
+  const generation = metadata.familyWorkGeneration;
+  const progressRevision = metadata.familyWorkProgressRevision;
   if (
-    (state.terminal.outcome === "partial" || state.terminal.outcome === "failed") &&
-    state.terminal.docket &&
+    settlementState.generation !== generation ||
+    settlementState.progressRevision !== progressRevision
+  ) {
+    throw new FlorenceStoreConflict("Prior family-work delivery lost its terminal settlement");
+  }
+  await applyDeliveredFamilyWorkCompletionEffectsOnce(sql, {
+    work: delivered,
+    state: settlementState,
+    sourceMetadata: delivered.source_metadata,
+    sourceId,
+    deliveredAt: delivered.sent_at,
+  });
+  await sql`
+    update proactive_work set last_error=null where id=${delivered.id}
+      and last_error=${familyWorkTerminalUndeliveredError(rootSourceId)}
+  `;
+}
+
+async function applyDeliveredFamilyWorkCompletionEffectsOnce(
+  sql: postgres.TransactionSql,
+  input: {
+    work: ProactiveWorkRow;
+    state: FamilyWorkStateV1;
+    sourceMetadata: JsonValue;
+    sourceId: string;
+    deliveredAt: Date;
+  },
+): Promise<void> {
+  const metadata = jsonRecord(input.sourceMetadata);
+  const rootSourceId = jsonString(metadata, "familyWorkDeliveryRecoveryOf") ?? input.sourceId;
+  const lineage = await sql<{ id: string; metadata: JsonValue }[]>`
+    select id,metadata from sources where id=${rootSourceId}
+      or metadata->>'familyWorkDeliveryRecoveryOf'=${rootSourceId}
+    order by id for update
+  `;
+  if (
+    lineage.some(
+      (candidate) => jsonRecord(candidate.metadata).familyWorkDeliveryEffectsAppliedAt !== undefined,
+    )
+  ) {
+    return;
+  }
+  await applyDeliveredFamilyWorkCompletionEffects(sql, input);
+  await sql`
+    update sources set metadata=metadata||${sql.json({
+      familyWorkDeliveryEffectsAppliedAt: input.deliveredAt.toISOString(),
+    })}
+    where id=${rootSourceId} or metadata->>'familyWorkDeliveryRecoveryOf'=${rootSourceId}
+  `;
+}
+
+async function applyDeliveredFamilyWorkCompletionEffects(
+  sql: postgres.TransactionSql,
+  input: {
+    work: ProactiveWorkRow;
+    state: FamilyWorkStateV1;
+    sourceMetadata: JsonValue;
+    sourceId: string;
+    deliveredAt: Date;
+  },
+): Promise<void> {
+  if (!input.state.terminal) {
+    throw new FlorenceStoreConflict("Delivered family work lost its terminal result");
+  }
+  const completionMemoryMutations = storedFamilyWorkCompletionMemoryMutations(input.sourceMetadata);
+  if (input.state.terminal.outcome !== "succeeded" && completionMemoryMutations.length > 0) {
+    throw new FlorenceStoreConflict(
+      "Only a delivered successful family-work result may retain completion memory",
+    );
+  }
+  if (input.state.terminal.outcome === "succeeded") {
+    await applyDeliveredFamilyWorkCompletionMemories(sql, {
+      work: input.work,
+      terminalSourceId: input.sourceId,
+      mutations: completionMemoryMutations,
+      handledAt: input.deliveredAt,
+    });
+  }
+  const evidenceBasisAt = input.state.evidenceRevisionAt
+    ? instant(input.state.evidenceRevisionAt)
+    : input.work.created_at;
+  const candidateIds = input.state.docketCandidateIds ?? [];
+  if (
+    (input.state.terminal.outcome === "partial" || input.state.terminal.outcome === "failed") &&
+    input.state.terminal.docket &&
     candidateIds.length > 0
   ) {
     await persistFamilyWorkTerminalDocketCoordination(sql, {
-      householdId: delivery.household_id,
-      visibility: delivery.visibility,
-      ownerAdultId: delivery.owner_adult_id,
+      householdId: input.work.household_id,
+      visibility: input.work.visibility,
+      ownerAdultId: input.work.owner_adult_id,
       candidateIds,
-      coordination: state.terminal.docket,
+      coordination: input.state.terminal.docket,
       workStartedAt: evidenceBasisAt,
-      updatedAt: delivery.sent_at,
+      updatedAt: input.deliveredAt,
     });
   }
-  if (state.terminal.outcome === "succeeded") {
+  if (input.state.terminal.outcome === "succeeded") {
     if (candidateIds.length > 0) {
       await resolveConversationDocketItemsCompletedByFamilyWork(sql, {
-        householdId: delivery.household_id,
-        visibility: delivery.visibility,
-        ownerAdultId: delivery.owner_adult_id,
+        householdId: input.work.household_id,
+        visibility: input.work.visibility,
+        ownerAdultId: input.work.owner_adult_id,
         candidateIds,
-        resolutionSourceId: sourceId,
+        resolutionSourceId: input.sourceId,
         workStartedAt: evidenceBasisAt,
-        resolvedAt: delivery.sent_at,
+        resolvedAt: input.deliveredAt,
       });
       await removeInitialReviewDocketCandidatesCompletedByFamilyWork(sql, {
-        householdId: delivery.household_id,
+        householdId: input.work.household_id,
         candidateIds,
         workStartedAt: evidenceBasisAt,
       });
     }
-    for (const { key, ownerAdultId } of proactiveFamilyWorkActionOwners(delivery.source_metadata)) {
+    for (const { key, ownerAdultId } of proactiveFamilyWorkActionOwners(input.sourceMetadata)) {
       await removeHouseholdDocketCandidateForGoogleAction(sql, {
-        householdId: delivery.household_id,
+        householdId: input.work.household_id,
         ownerAdultId,
         actionKey: key,
         notUpdatedAfter: evidenceBasisAt,
       });
     }
   }
-  await requestHouseholdNextAction(sql, delivery.household_id, delivery.sent_at);
+  await requestHouseholdNextAction(sql, input.work.household_id, input.deliveredAt);
 }
 
 async function resolveConversationDocketItemsCompletedByFamilyWork(
@@ -22548,6 +22936,9 @@ async function insertFamilyWorkOutbound(
         familyWorkGeneration: state.generation,
         familyWorkProgressRevision: state.progressRevision,
         familyWorkDeliveryKind: authoritative ? deliveryKind : "presentation",
+        ...(authoritative && deliveryKind === "terminal"
+          ? { familyWorkTerminalSettlementState: state }
+          : {}),
         familyWorkPresentationFor: deliveryKind,
         familyWorkPresentationPart: index,
         ...(authoritative && deliveryKind === "terminal" && completionMemoryMutations.length > 0

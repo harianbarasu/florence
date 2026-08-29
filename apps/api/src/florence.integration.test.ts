@@ -1221,10 +1221,89 @@ release("Durable family work store", () => {
       moveKind: "reply",
       replyToProviderMessageId: "family-work-steering-message",
     });
+    await store.retryOutbound({
+      sourceId: terminal.sourceId,
+      retryAt: null,
+      error: "Linq rejected the terminal message",
+      occurredAt: at(120_301),
+    });
+    expect(
+      await store.recordLinqObservation({
+        kind: "message_status",
+        providerEventId: "late-terminal-failure-event",
+        providerConversationId: "test-chat",
+        providerMessageId: "late-terminal-failure-message",
+        idempotencyKey: terminal.idempotencyKey,
+        status: "failed",
+        occurredAt: at(120_302),
+        traceId: "late-terminal-failure-trace",
+        failure: { code: 422, reason: "Linq rejected the terminal message" },
+      }),
+    ).toBe("applied");
+    expect(await store.readNextOutbound(at(125_300))).toBeNull();
+    await assertDatabase(
+      "A non-recovery family-work delivery remained pending",
+      `not exists (select 1 from messages message join sources source on source.id=message.source_id
+        where source.metadata->>'familyWorkId'='10000000-0000-4000-8000-000000000003'
+          and message.status='pending'
+          and source.metadata->>'familyWorkDeliveryRecoveryOf' is null)`,
+    );
+    const recoveredTerminalDue = await store.readNextOutbound(at(125_301));
+    if (!recoveredTerminalDue) throw new Error("Failed terminal family work was not recovered");
+    expect(recoveredTerminalDue.sourceId).not.toBe(terminal.sourceId);
+    expect(recoveredTerminalDue).toMatchObject({
+      text: terminalText,
+      moveKind: "message",
+      replyToProviderMessageId: null,
+      nativeMove: null,
+    });
+    expect(recoveredTerminalDue.idempotencyKey).not.toBe(terminal.idempotencyKey);
+    await assertDatabase(
+      "A failed authoritative family-work result did not stage exactly one plain-text recovery",
+      `(select count(*)=1 from messages recovered
+        join sources source on source.id=recovered.source_id
+        where source.metadata->>'familyWorkDeliveryRecoveryOf'='${terminal.sourceId}'
+          and source.metadata->>'familyWorkDeliveryRecoveryAttempt'='1'
+          and source.metadata->>'nativeMove' is null and recovered.status='pending'
+          and recovered.text=${sqlLiteral(terminalText)})
+       and exists (select 1 from proactive_work
+        where id='10000000-0000-4000-8000-000000000003'::uuid and status='delivering')`,
+    );
+    const recoveredTerminal = await store.beginOutbound({
+      sourceId: recoveredTerminalDue.sourceId,
+      now: at(125_301),
+    });
+    if (!recoveredTerminal || !(await store.outboundSendIsCurrent(recoveredTerminal.sourceId))) {
+      throw new Error("Recovered terminal outbound was not current");
+    }
+    await store.retryOutbound({
+      sourceId: recoveredTerminal.sourceId,
+      retryAt: null,
+      error: "Linq also rejected the plain-text recovery",
+      occurredAt: at(125_302),
+    });
+    expect(await store.readNextOutbound(at(135_302))).toBeNull();
+    await assertDatabase(
+      "A permanently rejected fallback did not settle terminal work as undelivered",
+      `exists (select 1 from proactive_work
+        where id='10000000-0000-4000-8000-000000000003'::uuid and status='completed'
+          and last_error like '%Messages could not deliver it%')
+       and not exists (select 1 from facts
+        where id='10000000-0000-4000-8000-000000000019')
+       and (select count(*)=1 from sources source
+        where source.metadata->>'familyWorkDeliveryRecoveryOf'='${terminal.sourceId}')`,
+    );
+    // A delayed provider success remains authoritative: it suppresses the failed fallback,
+    // settles the terminal result, and applies delivery-dependent memory exactly once.
     await store.completeOutbound({
       sourceId: terminal.sourceId,
-      providerMessageId: "provider-terminal",
-      sentAt: at(120_301),
+      providerMessageId: "late-terminal-failure-message",
+      sentAt: at(135_303),
+    });
+    await store.completeOutbound({
+      sourceId: recoveredTerminal.sourceId,
+      providerMessageId: "provider-terminal-recovery-late-success",
+      sentAt: at(135_304),
     });
     await assertDatabase(
       "Delivered terminal work did not retain its sourced completion memory exactly once",
@@ -1245,9 +1324,13 @@ release("Durable family work store", () => {
         where source.metadata->>'familyWorkId'='10000000-0000-4000-8000-000000000003'
           and message.status='sent'
           and message.reply_to_source_id='10000000-0000-4000-8000-000000000017'::uuid
-          and source.parent_source_id='10000000-0000-4000-8000-000000000017'::uuid)`,
+          and source.parent_source_id='10000000-0000-4000-8000-000000000017'::uuid)
+       and (select count(*)=2 from sources source
+        where (source.id='${terminal.sourceId}'
+          or source.metadata->>'familyWorkDeliveryRecoveryOf'='${terminal.sourceId}')
+          and source.metadata->>'familyWorkDeliveryEffectsAppliedAt' is not null)`,
     );
-    expect(await store.readNextOutbound(at(120_400))).toBeNull();
+    expect(await store.readNextOutbound(at(135_400))).toBeNull();
   });
 });
 

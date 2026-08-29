@@ -220,11 +220,11 @@ const GOOGLE_RECIPE_QUESTION = "What was that mild noodle dinner we saved for he
 const GOOGLE_RECIPE_REPLY =
   "The weeknight sesame noodles use spaghetti, soy sauce, sesame oil, and rice vinegar—tossed warm and kept mild.";
 const PROACTIVE_FAMILY_WORK_OBJECTIVE =
-  "Use the current household docket and saved weeknight recipe to prepare a practical family plan that removes the loose ends.";
+  "Use the shared Family Calendar and saved weeknight recipe to prepare a practical plan for the week.";
 const PROACTIVE_FAMILY_WORK_KICKOFF =
-  "I’m turning those current loose ends and what I already know about your family into a practical plan now.";
+  "I noticed Maya’s field-trip deadline on the family calendar and remembered your mild sesame-noodle recipe, so I’m putting together a practical plan for the week now.";
 const PROACTIVE_FAMILY_WORK_RESULT =
-  "I put together a practical family plan from the current docket and the useful details already in the Vault.";
+  "I put together a practical family plan from the Family Calendar and the useful details already in the Vault.";
 const GOOGLE_DELETION_PRIVATE_ALERT = "Muir says Maya’s emergency card still needs a signature.";
 const UNRELATED_ACCOUNT_EMAIL_SUBJECT = "Your retail account password has changed";
 const UNRELATED_ACCOUNT_EMAIL_ALERT =
@@ -3453,31 +3453,35 @@ release("Florence parent journeys", () => {
       "handoff",
       "family_date",
     ]);
-    const incompleteCandidate = incompleteWork.candidates[0];
-    if (!incompleteCandidate) throw new Error("The incomplete briefing regression needs one candidate");
+    const unknownCandidateId = "99999999-9999-4999-8999-999999999999";
     await expect(
       harness.store.completeHouseholdInitialBriefing({
         workId: incompleteWork.workId,
-        selectedCandidateIds: [incompleteCandidate.candidateId],
+        selectedCandidateIds: [unknownCandidateId],
         familyCalendarCursor: "{}",
         bubbles: [
           {
-            text: `Here’s what’s on the docket:\n• ${incompleteCandidate.summary}\n\nDid I get that right? If I missed something, tell me here.`,
+            text: "I found one thing that seems worth sorting out together.",
             delayMs: 0,
           },
         ],
         occurredAt: harness.iso(),
       }),
-    ).rejects.toThrow(/ranked current docket/i);
-    const wrongRankedCandidates = incompleteWork.candidates.slice(-3);
+    ).rejects.toThrow(/outside the current docket/i);
+    const firstRankedCandidate = incompleteWork.candidates[0];
+    const secondRankedCandidate = incompleteWork.candidates[1];
+    if (!firstRankedCandidate || !secondRankedCandidate) {
+      throw new Error("The household briefing order regression needs two candidates");
+    }
+    const outOfOrderCandidates = [secondRankedCandidate, firstRankedCandidate];
     await expect(
       harness.store.completeHouseholdInitialBriefing({
         workId: incompleteWork.workId,
-        selectedCandidateIds: wrongRankedCandidates.map((candidate) => candidate.candidateId),
+        selectedCandidateIds: outOfOrderCandidates.map((candidate) => candidate.candidateId),
         familyCalendarCursor: "{}",
         bubbles: [
           {
-            text: `Here’s what’s on the docket:\n${wrongRankedCandidates
+            text: `Here’s what’s on the docket:\n${outOfOrderCandidates
               .map((candidate) => `• ${candidate.summary}`)
               .join("\n")}\n\nDid I get that right? If I missed something, tell me here.`,
             delayMs: 0,
@@ -3485,7 +3489,7 @@ release("Florence parent journeys", () => {
         ],
         occurredAt: harness.iso(),
       }),
-    ).rejects.toThrow(/ranked current docket/i);
+    ).rejects.toThrow(/ranked order of the current docket/i);
     await harness.assertDatabase(
       "An incomplete household docket advanced work, sent an all-clear, or started polling",
       `not exists (
@@ -7285,25 +7289,27 @@ function createReasoner(
       input: Parameters<FlorenceReasoner["synthesizeHouseholdBriefing"]>[0],
     ) => {
       state.briefings.push(input);
-      const selected = input.candidates.slice(0, 3);
+      const selected = state.proactiveFamilyWorkExercise ? [] : input.candidates.slice(0, 3);
       const remaining = input.candidates.length - selected.length;
       if (state.proactiveFamilyWorkExercise) {
-        expect(selected.length).toBeGreaterThan(0);
         expect(
           input.memory.some(
             (item) => item.label === GOOGLE_RECIPE_TITLE && item.text.includes("keep it mild"),
           ),
         ).toBe(true);
+        expect(input.familyCalendar.some((event) => event.title === AUTOMATIC_FAMILY_DATE.title)).toBe(true);
       }
       return {
         selectedCandidateIds: selected.map((candidate) => candidate.candidateId),
         bubbles: [
           {
-            text: `Here’s what I found:\n${selected.map((candidate) => `– ${candidate.summary}`).join("\n")}${
-              remaining > 0
-                ? `\n\nI kept ${remaining} lower-priority items on the docket too. Ask me anytime.`
-                : ""
-            }${state.proactiveFamilyWorkExercise ? `\n\n${PROACTIVE_FAMILY_WORK_KICKOFF}` : ""}\n\nDid I get that right? If I missed something, tell me here.`,
+            text: state.proactiveFamilyWorkExercise
+              ? PROACTIVE_FAMILY_WORK_KICKOFF
+              : `Here’s what I found:\n${selected.map((candidate) => `– ${candidate.summary}`).join("\n")}${
+                  remaining > 0
+                    ? `\n\nI kept ${remaining} lower-priority items on the docket too. Ask me anytime.`
+                    : ""
+                }\n\nDid I get that right? If I missed something, tell me here.`,
             delayMs: 0,
           },
         ],
@@ -7311,7 +7317,7 @@ function createReasoner(
           ? {
               objective: PROACTIVE_FAMILY_WORK_OBJECTIVE,
               kickoffBubbleIndex: 0,
-              candidateIds: selected.slice(0, 1).map((candidate) => candidate.candidateId),
+              candidateIds: [],
             }
           : null,
       };

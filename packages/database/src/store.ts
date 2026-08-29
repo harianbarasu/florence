@@ -2902,13 +2902,29 @@ export class PostgresFlorenceStore {
         candidates.map(({ candidate, ownerAdultId }) => [candidate.candidateId, ownerAdultId] as const),
       );
       const candidateGroups = rankedBriefingCandidateGroups(candidates);
-      const selectedCandidateGroups = candidateGroups.slice(0, 3);
-      const representativeCandidateIds = selectedCandidateGroups.map(
-        ({ candidate }) => candidate.candidateId,
+      const representativeCandidates = new Map(
+        candidateGroups.map((group, index) => [group.candidate.candidateId, { group, index }] as const),
       );
-      if (!sameStringSet(input.selectedCandidateIds, representativeCandidateIds)) {
-        throw new FlorenceStoreConflict("The household briefing did not select the ranked current docket");
+      const selectedCandidateEntries = input.selectedCandidateIds.map((candidateId) => {
+        const entry = representativeCandidates.get(candidateId);
+        if (!entry) {
+          throw new FlorenceStoreConflict(
+            "The household briefing selected an item outside the current docket",
+          );
+        }
+        return entry;
+      });
+      if (
+        selectedCandidateEntries.some(
+          ({ index }, selectionIndex) =>
+            selectionIndex > 0 && index <= (selectedCandidateEntries[selectionIndex - 1]?.index ?? -1),
+        )
+      ) {
+        throw new FlorenceStoreConflict(
+          "The household briefing changed the ranked order of the current docket",
+        );
       }
+      const selectedCandidateGroups = selectedCandidateEntries.map(({ group }) => group);
       const bubbleCandidateGroups = householdInitialBriefingCandidateGroups(
         candidateGroups,
         selectedCandidateGroups,
@@ -18257,16 +18273,6 @@ function householdInitialBriefingCandidateGroups(
   selectedCandidateGroups: readonly StoredBriefingCandidateGroup[],
   bubbles: readonly InitialBriefingBubble[],
 ): StoredBriefingCandidateGroup[][] {
-  if (selectedCandidateGroups.length === 0) {
-    if (
-      bubbles.length !== 1 ||
-      bubbles[0]?.text !== "I don’t have a household item to flag right now. I’ll keep watching."
-    ) {
-      throw new FlorenceStoreConflict("A household all-clear must use the complete deterministic output");
-    }
-    return [[]];
-  }
-
   const selectedBySummary = new Map<string, StoredBriefingCandidateGroup[]>();
   for (const group of selectedCandidateGroups) {
     const summary = group.candidate.summary;

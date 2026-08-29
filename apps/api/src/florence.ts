@@ -4546,6 +4546,7 @@ export class Florence {
           household: work.household,
           visibleSources: familyWorkVisibleSources,
           googleConnections: familyWorkGoogleModelConnections,
+          lastDeliveredProgress: work.lastDeliveredProgress,
           state: work.state,
           scheduledOccurrence: work.scheduledOccurrence
             ? {
@@ -7501,12 +7502,19 @@ function decisionCommit(
               reminderId: decision.reminder.reminderId as string,
             }
           : null;
+  const familyWorkAcknowledgementText = [
+    ...bubbles.map((bubble) => bubble.text),
+    ...(decision.conversation.nativeMoves ?? []).flatMap((move) =>
+      move.type === "mention" ? [move.text] : [],
+    ),
+  ].join("\n");
   const familyWorkMutation: CommitTurnInput["familyWorkMutation"] =
     decision.familyWork?.operation === "create"
       ? {
           operation: "create",
           workId: deterministicUuid(`family-work\0${turn.message.sourceId}`),
           objective: decision.familyWork.objective,
+          ...(familyWorkAcknowledgementText ? { acknowledgementText: familyWorkAcknowledgementText } : {}),
           schedule: decision.familyWork.schedule,
           visibility: turn.authority.audience === "group" ? "household" : "private",
           ownerAdultId: turn.authority.audience === "group" ? null : turn.authority.senderAdultId,
@@ -7523,14 +7531,24 @@ function decisionCommit(
               operation: "steer",
               workId: decision.familyWork.workId,
               instruction: decision.familyWork.instruction,
+              ...(familyWorkAcknowledgementText
+                ? { acknowledgementText: familyWorkAcknowledgementText }
+                : {}),
             }
-          : decision.familyWork &&
-              ["pause", "resume", "run", "cancel"].includes(decision.familyWork.operation)
+          : decision.familyWork?.operation === "run"
             ? {
-                operation: decision.familyWork.operation as "pause" | "resume" | "run" | "cancel",
-                workId: decision.familyWork.workId as string,
+                operation: "run",
+                workId: decision.familyWork.workId,
+                ...(familyWorkAcknowledgementText
+                  ? { acknowledgementText: familyWorkAcknowledgementText }
+                  : {}),
               }
-            : null;
+            : decision.familyWork && ["pause", "resume", "cancel"].includes(decision.familyWork.operation)
+              ? {
+                  operation: decision.familyWork.operation as "pause" | "resume" | "cancel",
+                  workId: decision.familyWork.workId as string,
+                }
+              : null;
   const calendar = calendarCommit(turn, decision, options.resolveCalendarEventTarget);
   const approval = options.approveCalendarOffer ? [calendarApproval(options.approveCalendarOffer)] : [];
   const householdUpdate = decision.householdUpdate;

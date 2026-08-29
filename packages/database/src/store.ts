@@ -664,6 +664,7 @@ export type FamilyWorkStateV1 = {
   readonly kind: "family_work_v1";
   readonly version: 1;
   readonly generation: number;
+  readonly acknowledgementText?: string | null;
   readonly phase: "ready" | "tool_pending" | "waiting" | "terminal";
   readonly claim: { readonly claimId: string; readonly leaseUntil: string } | null;
   readonly browserSession: {
@@ -693,6 +694,7 @@ export type FamilyWorkStateV1 = {
     readonly text: string;
     readonly occurredAt: string;
   }[];
+  readonly progressBlocked?: boolean;
   readonly progressRevision: number;
   readonly terminal: {
     readonly outcome: "succeeded" | "partial" | "failed" | "cancelled";
@@ -755,6 +757,7 @@ export type DueProactiveWork =
       initiatingAdultId: string;
       origin: FamilyWorkOriginContext;
       objective: string;
+      lastDeliveredProgress: string | null;
       state: FamilyWorkStateV1;
       claimId: string;
       generation: number;
@@ -1440,6 +1443,7 @@ export type FamilyWorkMutation =
       operation: "create";
       workId: string;
       objective: string;
+      acknowledgementText?: string;
       visibility: Visibility;
       ownerAdultId: string | null;
       schedule: ReminderSchedule | null;
@@ -1450,8 +1454,9 @@ export type FamilyWorkMutation =
       objective: string | null;
       schedule: ReminderSchedule | null;
     }
-  | { operation: "steer"; workId: string; instruction: string }
-  | { operation: "pause" | "resume" | "run" | "cancel"; workId: string };
+  | { operation: "steer"; workId: string; instruction: string; acknowledgementText?: string }
+  | { operation: "run"; workId: string; acknowledgementText?: string }
+  | { operation: "pause" | "resume" | "cancel"; workId: string };
 
 export type ApprovedPartnerInvitation = {
   householdId: string;
@@ -3450,6 +3455,7 @@ export class PostgresFlorenceStore {
             initiatingAdultId: resolvedOrigin.initiatingAdultId,
             origin: resolvedOrigin.origin,
             objective: required(familyTask.objective ?? "", "Family work objective"),
+            lastDeliveredProgress: claimedState.progressRevision > 0 ? familyTask.current_conclusion : null,
             state: claimedState,
             claimId,
             generation: claimedState.generation,
@@ -8374,7 +8380,7 @@ export class PostgresFlorenceStore {
             select * from proactive_work where id=${mutation.workId} for update
           `;
           if (sameId) throw new FlorenceStoreConflict("A family work ID was already used");
-          const state = initialFamilyWorkState();
+          const state = initialFamilyWorkState(mutation.acknowledgementText ?? null);
           const scheduled = mutation.schedule ? newScheduledFamilyWork(mutation.schedule) : null;
           let nextCheckAt = new Date(handledAt.getTime() + FAMILY_WORK_INITIAL_DELAY_MS);
           if (scheduled) {
@@ -8508,9 +8514,18 @@ export class PostgresFlorenceStore {
               text: instruction,
               occurredAt: turn.occurred_at.toISOString(),
             });
+            const acknowledgedState = mutation.acknowledgementText
+              ? familyWorkState({
+                  ...nextState,
+                  acknowledgementText: mergeFamilyWorkAcknowledgements(
+                    state.acknowledgementText,
+                    mutation.acknowledgementText,
+                  ),
+                })
+              : nextState;
             await terminalizeUnsentFamilyWorkOutbounds(sql, work.id, "steering");
             await sql`
-              update proactive_work set task_state=${sql.json(nextState)},
+              update proactive_work set task_state=${sql.json(acknowledgedState)},
                 status='active',next_check_at=${handledAt},
                 last_error=null where id=${work.id}
             `;
@@ -8568,10 +8583,20 @@ export class PostgresFlorenceStore {
             if (!isIdleScheduledFamilyWork(work, state)) {
               throw new FlorenceStoreConflict("That family-work occurrence is already in progress");
             }
+            const nextState = mutation.acknowledgementText
+              ? familyWorkState({
+                  ...state,
+                  acknowledgementText: mergeFamilyWorkAcknowledgements(
+                    state.acknowledgementText,
+                    mutation.acknowledgementText,
+                  ),
+                })
+              : state;
             await sql`
               update proactive_work set status='active',next_check_at=${handledAt},
                 reminder_schedule=${sql.json({ ...scheduled, occurrenceActive: true })},
-                current_conclusion='Starting now.',last_error=null where id=${work.id}
+                task_state=${sql.json(nextState)},current_conclusion='Starting now.',last_error=null
+              where id=${work.id}
             `;
           } else if (work.status !== "cancelled") {
             if (work.status === "completed") {
@@ -17201,6 +17226,7 @@ async function checkpointFamilyWorkCapabilityReceipt(
 }
 
 const FAMILY_WORK_STATE_KEYS = [
+  "acknowledgementText",
   "activePhoneCall",
   "activeTextMessage",
   "browserImages",
@@ -17211,17 +17237,19 @@ const FAMILY_WORK_STATE_KEYS = [
   "kind",
   "pendingCall",
   "phase",
+  "progressBlocked",
   "progressRevision",
   "steering",
   "terminal",
   "version",
 ] as const;
 
-function initialFamilyWorkState(): FamilyWorkStateV1 {
+function initialFamilyWorkState(acknowledgementText: string | null = null): FamilyWorkStateV1 {
   return {
     kind: "family_work_v1",
     version: 1,
     generation: 0,
+    acknowledgementText,
     phase: "ready",
     claim: null,
     activePhoneCall: null,
@@ -17231,9 +17259,17 @@ function initialFamilyWorkState(): FamilyWorkStateV1 {
     continuationItems: [],
     pendingCall: null,
     steering: [],
+    progressBlocked: false,
     progressRevision: 0,
     terminal: null,
   };
+}
+
+function mergeFamilyWorkAcknowledgements(current: string | null | undefined, next: string): string {
+  const normalizedNext = required(next, "Family work acknowledgement");
+  if (!current) return normalizedNext;
+  const normalizedCurrent = required(current, "Family work acknowledgement");
+  return normalizedCurrent === normalizedNext ? normalizedCurrent : `${normalizedCurrent}\n${normalizedNext}`;
 }
 
 function familyWorkSelectedImage(value: JsonValue, name: string): FamilyWorkSelectedImage {
@@ -17293,14 +17329,23 @@ function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWor
   const state = canonical;
   if (state.activePhoneCall === undefined) state.activePhoneCall = null;
   if (state.activeTextMessage === undefined) state.activeTextMessage = null;
+  if (state.acknowledgementText === undefined) state.acknowledgementText = null;
   if (state.browserImages === undefined) state.browserImages = [];
   if (state.browserSession === undefined) state.browserSession = null;
+  if (state.progressBlocked === undefined) state.progressBlocked = false;
   assertExactJsonKeys(state, FAMILY_WORK_STATE_KEYS, "Family work state");
   if (state.kind !== "family_work_v1" || state.version !== 1) {
     throw new FlorenceStoreConflict("Family work state has an unsupported version");
   }
   const generation = familyWorkCounter(state.generation, "Family work generation");
+  const acknowledgementText =
+    state.acknowledgementText === null
+      ? null
+      : requiredStringField(state, "acknowledgementText", "Family work acknowledgement");
   const progressRevision = familyWorkCounter(state.progressRevision, "Family work progress revision");
+  if (typeof state.progressBlocked !== "boolean") {
+    throw new FlorenceStoreConflict("Family work progress gate is invalid");
+  }
   const phase = state.phase;
   if (phase !== "ready" && phase !== "tool_pending" && phase !== "waiting" && phase !== "terminal") {
     throw new FlorenceStoreConflict("Family work state has an invalid phase");
@@ -17526,6 +17571,7 @@ function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWor
     kind: "family_work_v1",
     version: 1,
     generation,
+    acknowledgementText,
     phase,
     claim,
     activePhoneCall,
@@ -17535,6 +17581,7 @@ function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWor
     continuationItems: [...continuationItems],
     pendingCall,
     steering,
+    progressBlocked: state.progressBlocked,
     progressRevision,
     terminal,
   };
@@ -17857,7 +17904,7 @@ async function completeDeliveredFamilyWorkTerminal(
     `;
   } else {
     const nextState = familyWorkState({
-      ...initialFamilyWorkState(),
+      ...initialFamilyWorkState(state.acknowledgementText ?? null),
       generation: incrementFamilyWorkCounter(state.generation, "Family work generation"),
     });
     const nextAt = completedSchedule.paused

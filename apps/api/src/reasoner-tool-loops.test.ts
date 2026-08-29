@@ -149,6 +149,71 @@ describe("Florence reasoner capability cutover", () => {
     });
   });
 
+  test("a reaction cannot replace the spoken acknowledgement for work Florence starts", async () => {
+    const decision = ordinaryDecision();
+    decision.conversation.bubbles = [];
+    decision.conversation.nativeMoves = [
+      {
+        type: "reaction",
+        operation: "add",
+        targetSourceId: "turn-1",
+        partIndex: 0,
+        reaction: { type: "tapback", reaction: "like" },
+      },
+    ];
+    decision.familyWork = {
+      operation: "create",
+      workId: null,
+      objective: "Find three good dinner options for Saturday and compare them.",
+      schedule: null,
+      instruction: null,
+    };
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        stream: () => fakeStream({ status: "completed", output_parsed: decision, output: [] }),
+      },
+    } as never);
+
+    await expect(reasoner.decide(foregroundInput(), inertReads())).rejects.toMatchObject({
+      code: "invalid_output",
+      message: expect.stringContaining("spoken acknowledgement"),
+    });
+  });
+
+  test("a natural text mention can acknowledge work Florence starts in the family group", async () => {
+    const decision = ordinaryDecision();
+    decision.conversation.bubbles = [];
+    decision.conversation.nativeMoves = [
+      {
+        type: "mention",
+        text: "Jackson, I’m comparing the Saturday dinner options now.",
+        adultDisplayName: "Jackson",
+      },
+    ];
+    decision.familyWork = {
+      operation: "create",
+      workId: null,
+      objective: "Find three good dinner options for Saturday and compare them.",
+      schedule: null,
+      instruction: null,
+    };
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        stream: () => fakeStream({ status: "completed", output_parsed: decision, output: [] }),
+      },
+    } as never);
+    const input = foregroundInput();
+    input.audience = "group";
+    input.googleConnections = [
+      { emailLabel: "Family", calendarAvailable: true, kind: "family", writesEnabled: false },
+    ];
+
+    await expect(reasoner.decide(input, inertReads())).resolves.toMatchObject({
+      conversation: { bubbles: [], nativeMoves: decision.conversation.nativeMoves },
+      familyWork: { operation: "create" },
+    });
+  });
+
   test("a verified voice note can relay a concise derived household conclusion with a large Vault", async () => {
     const requests: Record<string, unknown>[] = [];
     const decision = ordinaryDecision();
@@ -473,6 +538,19 @@ describe("Florence reasoner capability cutover", () => {
   });
 
   test("durable household work calls a business and reports the transcript-backed outcome", async () => {
+    const modelRequests: Record<string, unknown>[] = [];
+    const usefulProgress = {
+      outcome: "progress",
+      text: null,
+      resumeAt: null,
+      progressText:
+        "The dentist has a Wednesday 3:30 PM opening and is checking whether they can hold it for Violet.",
+      selectedImageAssetIds: [],
+    } as const;
+    const unchangedProgress = {
+      ...usefulProgress,
+      progressText: "The office still has the request, and I’m still waiting for a time.",
+    } as const;
     const modelResponses = [
       {
         status: "completed",
@@ -491,6 +569,44 @@ describe("Florence reasoner capability cutover", () => {
             dispositions: ["booked", "availability_found", "no_availability"],
           }),
         ],
+      },
+      {
+        status: "completed",
+        output_parsed: null,
+        output: [
+          functionCall("check-dentist-call-progress", "phone_agent_call", {
+            operation: "status",
+            to: null,
+            task: null,
+            providerCallId: "bland-call-1",
+            firstSentence: null,
+            voice: null,
+            maxDurationMinutes: null,
+            record: false,
+            summaryPrompt: null,
+            dispositions: [],
+          }),
+        ],
+      },
+      {
+        status: "completed",
+        output_parsed: usefulProgress,
+        output: [familyWorkResultMessage("dentist-progress", usefulProgress)],
+      },
+      {
+        status: "completed",
+        output_parsed: { deliver: true },
+        output: [],
+      },
+      {
+        status: "completed",
+        output_parsed: usefulProgress,
+        output: [familyWorkResultMessage("dentist-progress-repeat", usefulProgress)],
+      },
+      {
+        status: "completed",
+        output_parsed: unchangedProgress,
+        output: [familyWorkResultMessage("dentist-progress-paraphrase", unchangedProgress)],
       },
       {
         status: "completed",
@@ -521,7 +637,8 @@ describe("Florence reasoner capability cutover", () => {
     ];
     const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
       responses: {
-        parse() {
+        parse(request: Record<string, unknown>) {
+          modelRequests.push(request);
           const response = modelResponses.shift();
           if (!response) throw new Error("Unexpected dentist-call model turn");
           return response;
@@ -564,6 +681,7 @@ describe("Florence reasoner capability cutover", () => {
         kind: "family_work_v1" as const,
         version: 1 as const,
         generation: 0,
+        acknowledgementText: "I’ll call the dentist and work within those times.",
         phase: "ready" as const,
         claim: null,
         activePhoneCall: null,
@@ -589,6 +707,16 @@ describe("Florence reasoner capability cutover", () => {
             operation: operation.kind,
             providerId: "bland-call-1",
             providerStatus: "queued",
+          });
+        }
+        if (operation.kind === "ai_call_status" && operations.length === 2) {
+          return telephonyResult({
+            kind: "progress",
+            provider: "bland",
+            operation: operation.kind,
+            providerId: "bland-call-1",
+            providerStatus: "in-progress",
+            summary: "The office has a Wednesday 3:30 PM opening and is checking whether it can be held.",
           });
         }
         if (operation.kind === "ai_call_status") {
@@ -619,7 +747,47 @@ describe("Florence reasoner capability cutover", () => {
       providerCallId: "bland-call-1",
     });
 
-    const plannedStatus = await reasoner.continueFamilyWork({ ...input, state: started.state }, reads);
+    const plannedProgressCheck = await reasoner.continueFamilyWork({ ...input, state: started.state }, reads);
+    if (plannedProgressCheck.kind !== "continue") {
+      throw new Error("Dentist interim call status was not planned");
+    }
+    const checkedProgress = await reasoner.continueFamilyWork(
+      { ...input, state: plannedProgressCheck.state },
+      reads,
+    );
+    if (checkedProgress.kind !== "continue") {
+      throw new Error("Dentist interim call status did not settle");
+    }
+
+    const progress = await reasoner.continueFamilyWork({ ...input, state: checkedProgress.state }, reads);
+    if (progress.kind !== "continue") throw new Error("Dentist progress was not checkpointed");
+    expect(progress.progressText).toBe(usefulProgress.progressText);
+    expect(progress.state.progressRevision).toBe(1);
+    expect(progress.state.activePhoneCall).toEqual({
+      provider: "bland",
+      kind: "agent",
+      providerCallId: "bland-call-1",
+    });
+
+    const repeatedProgress = await reasoner.continueFamilyWork({ ...input, state: progress.state }, reads);
+    if (repeatedProgress.kind !== "continue") throw new Error("Repeated progress did not continue");
+    expect(repeatedProgress.progressText).toBeNull();
+    expect(repeatedProgress.state.progressRevision).toBe(1);
+
+    const paraphrasedProgress = await reasoner.continueFamilyWork(
+      { ...input, state: repeatedProgress.state },
+      reads,
+    );
+    if (paraphrasedProgress.kind !== "continue") {
+      throw new Error("Paraphrased progress did not continue");
+    }
+    expect(paraphrasedProgress.progressText).toBeNull();
+    expect(paraphrasedProgress.state.progressRevision).toBe(1);
+
+    const plannedStatus = await reasoner.continueFamilyWork(
+      { ...input, state: paraphrasedProgress.state },
+      reads,
+    );
     if (plannedStatus.kind !== "continue") throw new Error("Dentist call status was not planned");
     const completed = await reasoner.continueFamilyWork({ ...input, state: plannedStatus.state }, reads);
     if (completed.kind !== "continue") throw new Error("Dentist call status did not settle");
@@ -636,7 +804,18 @@ describe("Florence reasoner capability cutover", () => {
     expect(operations).toEqual([
       expect.objectContaining({ kind: "ai_call_start", to: "+13105550144" }),
       { kind: "ai_call_status", provider: "bland", providerCallId: "bland-call-1" },
+      { kind: "ai_call_status", provider: "bland", providerCallId: "bland-call-1" },
     ]);
+    expect(JSON.stringify(modelRequests[3]?.input)).toContain(
+      "I’ll call the dentist and work within those times.",
+    );
+    const reviewInput = modelRequests[3]?.input as Array<{
+      content: Array<{ text: string }>;
+    }>;
+    const reviewContext = JSON.parse(reviewInput[0]?.content[0]?.text ?? "{}") as {
+      taskTranscript?: unknown;
+    };
+    expect(JSON.stringify(reviewContext.taskTranscript)).not.toContain(usefulProgress.progressText);
   });
 
   test("waits for a Bland start confirmation after cancellation so the provider call stays tracked", async () => {
@@ -833,7 +1012,7 @@ describe("Florence reasoner capability cutover", () => {
       outcome: "deferred",
       text: null,
       resumeAt: "2026-08-27T22:00:00.000Z",
-      progressText: null,
+      progressText: "There’s no reply yet, so I’m still keeping an eye on it.",
     } as const;
     const modelResponses = [
       {
@@ -873,6 +1052,11 @@ describe("Florence reasoner capability cutover", () => {
       },
       {
         status: "completed",
+        output_parsed: { deliver: true },
+        output: [],
+      },
+      {
+        status: "completed",
         output_parsed: null,
         output: [
           functionCall("read-dentist-replies-1", "sms_work", {
@@ -890,6 +1074,11 @@ describe("Florence reasoner capability cutover", () => {
         status: "completed",
         output_parsed: secondDeferResult,
         output: [familyWorkResultMessage("dentist-defer-2", secondDeferResult)],
+      },
+      {
+        status: "completed",
+        output_parsed: { deliver: false },
+        output: [],
       },
       {
         status: "completed",

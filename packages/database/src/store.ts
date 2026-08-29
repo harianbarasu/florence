@@ -742,6 +742,10 @@ export type FamilyWorkStateV1 = {
     readonly text: string;
     readonly occurredAt: string;
   }[];
+  /** Latest provider-evidence revision this same task has incorporated. */
+  readonly evidenceRevisionAt?: string | null;
+  /** Stable identity for the exact provider revision, used to ignore replay. */
+  readonly evidenceRevisionKey?: string | null;
   readonly progressBlocked?: boolean;
   readonly progressRevision: number;
   readonly terminal: {
@@ -2625,11 +2629,13 @@ export class PostgresFlorenceStore {
         householdId: work.household_id,
         ownerAdultId: work.owner_adult_id,
         sourceIds: removedSourceIds,
+        occurredAt,
       });
       await persistGoogleEvidenceDrafts(sql, {
         householdId: work.household_id,
         drafts: input.googleEvidence,
         sourceIds: draftSourceIds,
+        occurredAt,
       });
       if (draftSourceIds.length > 0) {
         await assertProactiveSources(sql, work.household_id, "private", work.owner_adult_id, draftSourceIds);
@@ -2768,13 +2774,15 @@ export class PostgresFlorenceStore {
           ...facts.flatMap((fact) => [...fact.sourceIds]),
         ]),
       ];
-      if (input.googleEvidence.length > 0) {
-        await persistGoogleEvidenceDrafts(sql, {
-          householdId: work.household_id,
-          drafts: input.googleEvidence,
-          sourceIds: allSourceIds,
-        });
-      }
+      const continuedFamilyWorkBySourceId =
+        input.googleEvidence.length > 0
+          ? await persistGoogleEvidenceDrafts(sql, {
+              householdId: work.household_id,
+              drafts: input.googleEvidence,
+              sourceIds: allSourceIds,
+              occurredAt,
+            })
+          : new Map<string, ReadonlySet<string>>();
       if (allSourceIds.length > 0) {
         const sources = await sql<{ id: string }[]>`
           select id from sources where household_id=${work.household_id}
@@ -3082,6 +3090,7 @@ export class PostgresFlorenceStore {
         await applyGooglePollDeliveries(sql, {
           work,
           executionAdultId: work.owner_adult_id,
+          continuedFamilyWorkBySourceId,
           deliveries,
           deliverNotBefore: rescanDeliverNotBefore,
           occurredAt,
@@ -3246,11 +3255,17 @@ export class PostgresFlorenceStore {
       const visibleGoogleActions = selectedCandidateGroups.flatMap(({ members }, candidateGroupIndex) =>
         members.flatMap((member) => {
           const key = googleActionKeyForCandidate(member, stableGoogleSourceDigests);
+          const continuityKey = googleActionContinuityKey(
+            member.sourceIds,
+            stableGoogleSourceDigests,
+            member.actionAnchorDigest ?? null,
+          );
           const ownerAdultId = candidateOwnerAdultIds.get(member.candidateId);
-          return key
+          return key && continuityKey
             ? [
                 {
                   key,
+                  continuityKey,
                   candidateGroupIndex,
                   sourceIds: member.sourceIds,
                   urgency: member.urgency,
@@ -3403,6 +3418,19 @@ export class PostgresFlorenceStore {
           actionOwners: visibleGoogleActions.flatMap(({ key, candidateGroupIndex, ownerAdultId }) =>
             referencedGroups.has(candidateGroupIndex) && ownerAdultId ? [{ key, ownerAdultId }] : [],
           ),
+          continuityKeys: unique(
+            visibleGoogleActions.flatMap(({ continuityKey, candidateGroupIndex }) =>
+              referencedGroups.has(candidateGroupIndex) ? [continuityKey] : [],
+            ),
+          ).sort(),
+          continuedWorkIds: [],
+          evidenceSourceIds: unique(
+            selectedCandidateGroups.flatMap((group, index) =>
+              referencedGroups.has(index)
+                ? group.members.flatMap((candidate) => [...candidate.sourceIds])
+                : [],
+            ),
+          ).sort(),
           candidateIds: referencedCandidateIds,
           occurredAt,
         });
@@ -4115,14 +4143,17 @@ export class PostgresFlorenceStore {
       }
       const nextState = familyWorkState(input.result.state);
       const queuedSteering = strictFamilyWorkSteeringSuffix(nextState.steering, currentState.steering);
+      const sameDocketLinkage = sameStrings(
+        [...(currentState.docketCandidateIds ?? [])].sort(),
+        [...(nextState.docketCandidateIds ?? [])].sort(),
+      );
       if (
         nextState.generation !== input.generation ||
         nextState.claim !== null ||
         (!sameFamilyWorkSteering(currentState.steering, nextState.steering) && !queuedSteering) ||
-        !sameStrings(
-          [...(currentState.docketCandidateIds ?? [])].sort(),
-          [...(nextState.docketCandidateIds ?? [])].sort(),
-        )
+        (!sameDocketLinkage && !queuedSteering) ||
+        (nextState.evidenceRevisionAt !== currentState.evidenceRevisionAt && !queuedSteering) ||
+        (nextState.evidenceRevisionKey !== currentState.evidenceRevisionKey && !queuedSteering)
       ) {
         throw new FlorenceStoreConflict(
           "A family work settlement changed its claim generation, steering, or docket linkage",
@@ -4147,6 +4178,9 @@ export class PostgresFlorenceStore {
         let steeredAfterEffect = familyWorkState({
           ...nextState,
           acknowledgementText: currentState.acknowledgementText ?? null,
+          docketCandidateIds: currentState.docketCandidateIds ?? [],
+          evidenceRevisionAt: currentState.evidenceRevisionAt ?? null,
+          evidenceRevisionKey: currentState.evidenceRevisionKey ?? null,
         });
         for (const steering of queuedSteering) {
           steeredAfterEffect = steerFamilyWorkState(steeredAfterEffect, steering);
@@ -4729,15 +4763,17 @@ export class PostgresFlorenceStore {
       const reconciledSourceIds = [...reviewedGoogleSources.keys()].filter(
         (sourceId) => !echoedSourceIds.has(sourceId),
       );
+      const continuedFamilyWorkBySourceId = await persistGoogleEvidenceDrafts(sql, {
+        householdId: work.household_id,
+        drafts: input.googleEvidence,
+        sourceIds: reconciledSourceIds,
+        occurredAt,
+      });
       await reconcileRemovedGoogleSources(sql, {
         householdId: work.household_id,
         ownerAdultId: work.owner_adult_id,
         sourceIds: removedSourceIds,
-      });
-      await persistGoogleEvidenceDrafts(sql, {
-        householdId: work.household_id,
-        drafts: input.googleEvidence,
-        sourceIds: reconciledSourceIds,
+        occurredAt,
       });
       if (work.kind === "personal_google_poll") {
         if (!work.owner_adult_id) {
@@ -4764,6 +4800,7 @@ export class PostgresFlorenceStore {
       const desiredState = await applyGooglePollDeliveries(sql, {
         work,
         executionAdultId: input.executionAdultId ?? null,
+        continuedFamilyWorkBySourceId,
         deliveries,
         deliverNotBefore,
         occurredAt,
@@ -4953,6 +4990,7 @@ export class PostgresFlorenceStore {
         drafts: input.googleEvidence,
         sourceIds:
           input.outcome !== "silent" && (input.privateDetail || householdConclusion) ? sourceIds : [],
+        occurredAt,
       });
       if (sourceIds.length > 0) {
         await assertProactiveSources(sql, work.household_id, work.visibility, work.owner_adult_id, sourceIds);
@@ -9249,6 +9287,7 @@ export class PostgresFlorenceStore {
           ...(input.finiteMonitorUpdates ?? []).flatMap((monitor) => [...monitor.sourceIds]),
           ...(input.docketMutation ? [...input.docketMutation.sourceIds] : []),
         ]),
+        occurredAt: handledAt,
       });
 
       if (input.partnerInvitationApproval) {
@@ -12928,10 +12967,11 @@ async function persistGoogleEvidenceDrafts(
     householdId: string;
     drafts: readonly GoogleEvidenceDraft[];
     sourceIds: readonly string[];
+    occurredAt: Date;
   },
-): Promise<void> {
+): Promise<ReadonlyMap<string, ReadonlySet<string>>> {
   const sourceIds = unique(input.sourceIds);
-  if (sourceIds.length === 0) return;
+  if (sourceIds.length === 0) return new Map();
   const selected = new Set(sourceIds);
   for (const sourceId of sourceIds) assertUuid(sourceId, "Cited Google source ID");
   const drafts = new Map<string, GoogleEvidenceDraft>();
@@ -12953,6 +12993,7 @@ async function persistGoogleEvidenceDrafts(
     }
     return left.id.localeCompare(right.id);
   });
+  const revisedSourceIds: string[] = [];
   for (const draft of ordered) {
     const [connection] = await sql<{ id: string }[]>`
       select id from google_connections where id=${draft.connectionId}
@@ -12981,6 +13022,15 @@ async function persistGoogleEvidenceDrafts(
       }
       const currentHistoryId = current ? jsonString(current.metadata, "historyId") : null;
       if (currentHistoryId === null || BigInt(draft.historyId) >= BigInt(currentHistoryId)) {
+        if (
+          !current ||
+          canonicalConversationHistoryJson(current.metadata) !==
+            canonicalConversationHistoryJson(draft.metadata) ||
+          current.label !== draft.label ||
+          current.occurred_at.toISOString() !== instant(draft.occurredAt).toISOString()
+        ) {
+          revisedSourceIds.push(draft.id);
+        }
         await sql`
           insert into sources (
             id,household_id,kind,visibility,owner_adult_id,external_key,label,metadata,occurred_at
@@ -13056,32 +13106,51 @@ async function persistGoogleEvidenceDrafts(
         .join("\n"),
       4_000,
     );
+    const metadata = {
+      connectionId: draft.connectionId,
+      calendarId: draft.calendarId,
+      providerEventId: draft.providerEventId,
+      providerRevision: draft.providerRevision,
+      providerUpdatedAt: draft.providerUpdatedAt,
+      status: draft.status,
+      busy: draft.busy,
+      title,
+      startsAt,
+      endsAt,
+      allDay,
+      content,
+      searchText,
+    };
+    if (
+      !current ||
+      canonicalConversationHistoryJson(current.metadata) !== canonicalConversationHistoryJson(metadata) ||
+      current.label !==
+        bounded(
+          title ?? (draft.status === "cancelled" ? "Cancelled calendar event" : "Private calendar event"),
+          500,
+        ) ||
+      current.occurred_at.toISOString() !== instant(occurredAt).toISOString()
+    ) {
+      revisedSourceIds.push(draft.id);
+    }
     await sql`
       insert into sources (
         id,household_id,kind,visibility,owner_adult_id,external_key,label,metadata,occurred_at
       ) values (${draft.id},${draft.householdId},'calendar',${draft.visibility},${draft.ownerAdultId},
         ${draft.externalKey},
         ${bounded(title ?? (draft.status === "cancelled" ? "Cancelled calendar event" : "Private calendar event"), 500)},
-        ${sql.json({
-          connectionId: draft.connectionId,
-          calendarId: draft.calendarId,
-          providerEventId: draft.providerEventId,
-          providerRevision: draft.providerRevision,
-          providerUpdatedAt: draft.providerUpdatedAt,
-          status: draft.status,
-          busy: draft.busy,
-          title,
-          startsAt,
-          endsAt,
-          allDay,
-          content,
-          searchText,
-        })},${instant(occurredAt)})
+        ${sql.json(metadata)},${instant(occurredAt)})
       on conflict (household_id,kind,external_key) do update set
         parent_source_id=null,label=excluded.label,metadata=excluded.metadata,occurred_at=excluded.occurred_at
     `;
     await assertStoredGoogleEvidence(sql, draft);
   }
+  return replanFamilyWorkForGoogleSourceChanges(sql, {
+    householdId: input.householdId,
+    revisedSourceIds,
+    removedSourceIds: [],
+    occurredAt: input.occurredAt,
+  });
 }
 
 function priorCalendarSourceLocation(metadata: JsonObject | undefined): string | null {
@@ -13432,17 +13501,201 @@ function isHouseholdFactRelevance(
   return value === "household";
 }
 
-async function reconcileRemovedGoogleSources(
+/**
+ * Provider revisions are steering for the durable household objective that is
+ * already under way. They must never become a second task, leave a stale
+ * waiting question in flight, or erase the task's evidence lineage.
+ */
+async function replanFamilyWorkForGoogleSourceChanges(
+  sql: postgres.TransactionSql,
+  input: {
+    householdId: string;
+    revisedSourceIds: readonly string[];
+    removedSourceIds: readonly string[];
+    occurredAt: Date;
+  },
+): Promise<ReadonlyMap<string, ReadonlySet<string>>> {
+  const revisedSourceIds = unique(input.revisedSourceIds);
+  const removedSourceIds = unique(input.removedSourceIds);
+  const sourceIds = unique([...revisedSourceIds, ...removedSourceIds]);
+  for (const sourceId of sourceIds) assertUuid(sourceId, "Changed Google source ID");
+  if (sourceIds.length === 0) return new Map();
+
+  const changedRows = await sql<StableGoogleSourceRow[]>`
+    select id,kind,owner_adult_id,metadata from sources
+    where household_id=${input.householdId} and id in ${sql(sourceIds)}
+      and kind in ('gmail','calendar','google_file')
+    order by id for share
+  `;
+  const workRows = await sql<ProactiveWorkRow[]>`
+    select * from proactive_work where household_id=${input.householdId}
+      and kind='family_task' and status in ('active','paused','delivering')
+    order by created_at,id for update
+  `;
+  if (workRows.length === 0) return new Map();
+
+  const linkedRows = await sql<
+    {
+      work_id: string;
+      source_id: string;
+      kind: SourceRow["kind"];
+      owner_adult_id: string | null;
+      metadata: JsonValue;
+    }[]
+  >`
+    select link.work_id,source.id as source_id,source.kind,source.owner_adult_id,source.metadata
+    from proactive_work_sources link join sources source on source.id=link.source_id
+    where link.work_id in ${sql(workRows.map(({ id }) => id))}
+    order by link.work_id,source.occurred_at,source.id for share of source
+  `;
+  const changedMetadataBySourceId = new Map(
+    changedRows.map((source) => [source.id, source.metadata] as const),
+  );
+  const changedProviderDigests = new Map(
+    changedRows.flatMap((source): [string, string][] => {
+      const digest = stableGoogleProviderDigest(source);
+      return digest ? [[source.id, digest]] : [];
+    }),
+  );
+  const workLinksById = new Map(
+    workRows.map((work) => [work.id, linkedRows.filter((linked) => linked.work_id === work.id)] as const),
+  );
+  const referencedSourceIdsByWorkId = new Map(
+    workRows.map((work) => {
+      const referenced = new Set(
+        (workLinksById.get(work.id) ?? []).flatMap((linked) => {
+          const metadata = jsonRecord(linked.metadata);
+          return Array.isArray(metadata.googleSourceIds)
+            ? metadata.googleSourceIds.filter((value): value is string => typeof value === "string")
+            : [];
+        }),
+      );
+      return [work.id, referenced] as const;
+    }),
+  );
+  const providerDigestsByWorkId = new Map(
+    workRows.map(
+      (work) =>
+        [
+          work.id,
+          new Set(
+            (workLinksById.get(work.id) ?? []).flatMap((linked) => {
+              if (linked.kind !== "gmail" && linked.kind !== "calendar") return [];
+              const digest = stableGoogleProviderDigest({
+                id: linked.source_id,
+                kind: linked.kind,
+                owner_adult_id: linked.owner_adult_id,
+                metadata: jsonRecord(linked.metadata),
+              });
+              return digest ? [digest] : [];
+            }),
+          ),
+        ] as const,
+    ),
+  );
+  const matchedWorkIdsBySourceId = new Map<string, Set<string>>();
+  for (const sourceId of sourceIds) {
+    const changedProviderDigest = changedProviderDigests.get(sourceId);
+    const exactWorkIds = workRows.flatMap((work) => {
+      const exact =
+        (workLinksById.get(work.id) ?? []).some((linked) => linked.source_id === sourceId) ||
+        (referencedSourceIdsByWorkId.get(work.id) ?? new Set()).has(sourceId) ||
+        (changedProviderDigest
+          ? providerDigestsByWorkId.get(work.id)?.has(changedProviderDigest) === true
+          : false);
+      return exact ? [work.id] : [];
+    });
+    if (exactWorkIds.length > 0) matchedWorkIdsBySourceId.set(sourceId, new Set(exactWorkIds));
+  }
+  const revisedSourceIdSet = new Set(revisedSourceIds);
+  const removedSourceIdSet = new Set(removedSourceIds);
+  const replannedWorkIdsBySourceId = new Map<string, Set<string>>();
+
+  const revisionAt = input.occurredAt.toISOString();
+  for (const work of workRows) {
+    const matchedSourceIds = unique(
+      sourceIds.filter((sourceId) => matchedWorkIdsBySourceId.get(sourceId)?.has(work.id)),
+    );
+    if (matchedSourceIds.length === 0) continue;
+    for (const sourceId of matchedSourceIds) {
+      const workIds = replannedWorkIdsBySourceId.get(sourceId) ?? new Set<string>();
+      workIds.add(work.id);
+      replannedWorkIdsBySourceId.set(sourceId, workIds);
+    }
+    const matchedRevisedSourceIds = matchedSourceIds.filter((sourceId) => revisedSourceIdSet.has(sourceId));
+    const matchedRemovedSourceIds = matchedSourceIds.filter((sourceId) => removedSourceIdSet.has(sourceId));
+    const availableSources = changedRows.filter((source) => matchedSourceIds.includes(source.id));
+    await linkProactiveWorkSources(
+      sql,
+      work.id,
+      availableSources.map(({ id }) => id),
+    );
+
+    const state = familyWorkState(work.task_state);
+    const evidenceRevisionKey = sha256(
+      canonicalConversationHistoryJson({
+        revised: matchedRevisedSourceIds.sort().map((sourceId) => ({
+          sourceId,
+          metadata: changedMetadataBySourceId.get(sourceId) ?? null,
+        })),
+        removed: matchedRemovedSourceIds.sort(),
+      }),
+    );
+    if (state.evidenceRevisionKey === evidenceRevisionKey) continue;
+    const steeringText = [
+      matchedRevisedSourceIds.length > 0
+        ? "Google information grounding this task changed. Re-read the current linked sources, discard any stale assumption or question, and continue the same household objective from the new evidence."
+        : null,
+      matchedRemovedSourceIds.length > 0
+        ? "Some Google information grounding this task was removed. Do not rely on it; re-check the plan and continue the same household objective using the evidence that remains."
+        : null,
+    ]
+      .filter((part): part is string => part !== null)
+      .join(" ");
+    const steering = {
+      sourceId: matchedSourceIds[0] as string,
+      text: steeringText,
+      occurredAt: revisionAt,
+    };
+    const pendingEffect =
+      state.phase === "tool_pending" && state.pendingCall !== null && state.claim !== null;
+    const steered = pendingEffect
+      ? queueFamilyWorkSteeringDuringPendingEffect(state, steering)
+      : steerFamilyWorkState(state, steering);
+    const nextState = familyWorkState({
+      ...steered,
+      evidenceRevisionAt: revisionAt,
+      evidenceRevisionKey,
+    });
+
+    if (!pendingEffect) await terminalizeUnsentFamilyWorkOutbounds(sql, work.id, "steering");
+    await sql`
+      update proactive_work set task_state=${sql.json(nextState)},status='active',
+        next_check_at=${pendingEffect ? work.next_check_at : input.occurredAt},
+        current_conclusion=${
+          pendingEffect
+            ? "New information arrived; finishing the current step before replanning."
+            : "New information arrived; replanning now."
+        },
+        last_error=null
+      where id=${work.id} and kind='family_task'
+        and status in ('active','paused','delivering')
+    `;
+  }
+  return replannedWorkIdsBySourceId;
+}
+
+async function expandedRemovedGoogleSourceIds(
   sql: postgres.TransactionSql,
   input: {
     householdId: string;
     ownerAdultId: string | null;
     sourceIds: readonly string[];
   },
-): Promise<void> {
+): Promise<string[]> {
   const requested = unique(input.sourceIds);
   for (const sourceId of requested) assertUuid(sourceId, "Removed Google source ID");
-  if (requested.length === 0) return;
+  if (requested.length === 0) return [];
   const requestedSet = new Set(requested);
   // Source IDs include the OAuth connection so provider items can be proven against the exact
   // credential that observed them. A reconnect creates a new connection ID for the same Google
@@ -13473,7 +13726,7 @@ async function reconcileRemovedGoogleSources(
       and (source.id in ${sql(requested)} or active.id is not null)
     order by source.id for update of source
   `;
-  const sourceIds = unique(
+  return unique(
     candidates.flatMap((candidate) => {
       if (requestedSet.has(candidate.id)) return [candidate.id];
       if (!candidate.active_connection_id) return [];
@@ -13506,7 +13759,25 @@ async function reconcileRemovedGoogleSources(
       return [];
     }),
   );
+}
+
+async function reconcileRemovedGoogleSources(
+  sql: postgres.TransactionSql,
+  input: {
+    householdId: string;
+    ownerAdultId: string | null;
+    sourceIds: readonly string[];
+    occurredAt: Date;
+  },
+): Promise<void> {
+  const sourceIds = await expandedRemovedGoogleSourceIds(sql, input);
   if (sourceIds.length === 0) return;
+  await replanFamilyWorkForGoogleSourceChanges(sql, {
+    householdId: input.householdId,
+    revisedSourceIds: [],
+    removedSourceIds: sourceIds,
+    occurredAt: input.occurredAt,
+  });
   const removed = new Set(sourceIds);
   const completedPrivateReviews = await sql<ProactiveWorkRow[]>`
     select * from proactive_work work where work.household_id=${input.householdId}
@@ -13570,7 +13841,11 @@ async function reconcileRemovedGoogleSources(
       and link.source_id in ${sql(sourceIds)}
     order by work.id for update of work
   `;
-  await sql`delete from proactive_work_sources where source_id in ${sql(sourceIds)}`;
+  await sql`
+    delete from proactive_work_sources link using proactive_work work
+    where link.work_id=work.id and link.source_id in ${sql(sourceIds)}
+      and work.kind<>'family_task'
+  `;
   if (impactedWork.length > 0) {
     const orphaned = await sql<{ id: string; last_error: string | null }[]>`
       select id,last_error from proactive_work work
@@ -14467,6 +14742,7 @@ type StableGoogleSourceRow = {
 
 type StableGoogleSourceIdentity = {
   providerDigest: string;
+  continuityProviderDigest: string;
   calendarStateDigest: string | null;
 };
 
@@ -14484,12 +14760,14 @@ async function readStableGoogleSourceDigestMap(
   return new Map(
     sources.flatMap((source): [string, StableGoogleSourceIdentity][] => {
       const providerDigest = stableGoogleProviderDigest(source);
-      if (!providerDigest) return [];
+      const continuityProviderDigest = stableGoogleContinuityProviderDigest(source, providerDigest);
+      if (!providerDigest || !continuityProviderDigest) return [];
       return [
         [
           source.id,
           {
             providerDigest,
+            continuityProviderDigest,
             calendarStateDigest:
               source.kind === "calendar" ? stableGoogleCalendarStateDigest(source, providerDigest) : null,
           },
@@ -14497,6 +14775,19 @@ async function readStableGoogleSourceDigestMap(
       ];
     }),
   );
+}
+
+function stableGoogleContinuityProviderDigest(
+  source: StableGoogleSourceRow,
+  providerDigest: string | null,
+): string | null {
+  if (!providerDigest) return null;
+  if (source.kind !== "gmail") return providerDigest;
+  if (!source.owner_adult_id) return null;
+  const threadId = source.metadata.threadId;
+  return typeof threadId === "string" && threadId
+    ? sha256(`gmail-thread\0${source.owner_adult_id}\0${threadId}`)
+    : null;
 }
 
 function stableGoogleProviderDigest(source: StableGoogleSourceRow): string | null {
@@ -14617,6 +14908,34 @@ function googleActionKey(
       category: semantics.category,
       dueAt: semantics.dueAt === null ? null : instant(semantics.dueAt).toISOString(),
       actionAnchorDigest: semantics.actionAnchorDigest,
+    }),
+  );
+}
+
+/**
+ * Stable identity for one unresolved objective across mutable provider state.
+ * Calendar state and due dates deliberately stay out of this key: a moved event
+ * is new evidence for the same objective, not a second household task.
+ */
+function googleActionContinuityKey(
+  sourceIds: readonly string[],
+  sourceDigests: ReadonlyMap<string, StableGoogleSourceIdentity>,
+  actionAnchorDigest: string | null,
+): string | null {
+  const uniqueSourceIds = unique(sourceIds);
+  const identities = uniqueSourceIds.flatMap((sourceId) => {
+    const identity = sourceDigests.get(sourceId);
+    return identity ? [identity] : [];
+  });
+  if (identities.length !== uniqueSourceIds.length || identities.length === 0) return null;
+  const providers = unique(identities.map((identity) => identity.continuityProviderDigest)).sort();
+  const calendarOnly = identities.every((identity) => identity.calendarStateDigest !== null);
+  if (!calendarOnly && actionAnchorDigest === null) return null;
+  return sha256(
+    JSON.stringify({
+      version: 1,
+      providers,
+      actionAnchorDigest: calendarOnly ? null : actionAnchorDigest,
     }),
   );
 }
@@ -14855,6 +15174,7 @@ async function applyGooglePollDeliveries(
   input: {
     work: ProactiveWorkRow;
     executionAdultId: string | null;
+    continuedFamilyWorkBySourceId: ReadonlyMap<string, ReadonlySet<string>>;
     deliveries: readonly ProactiveDelivery[];
     deliverNotBefore: Date;
     occurredAt: Date;
@@ -14964,6 +15284,13 @@ async function applyGooglePollDeliveries(
   );
   const deliveryActionKeys = input.deliveries.map((delivery) =>
     googleActionKeyForDelivery(delivery, stableGoogleSourceDigests),
+  );
+  const deliveryContinuityKeys = input.deliveries.map((delivery) =>
+    googleActionContinuityKey(
+      delivery.actionSourceIds ?? delivery.sourceIds,
+      stableGoogleSourceDigests,
+      delivery.actionAnchorDigest ?? null,
+    ),
   );
   if (deliveryActionKeys.some((actionKey) => actionKey === null)) {
     throw new FlorenceStoreConflict("A Google poll outcome requires an exact stable provider identity");
@@ -15242,6 +15569,10 @@ async function applyGooglePollDeliveries(
               householdDocketCandidate,
               input.occurredAt,
             );
+      const continuityKey = deliveryContinuityKeys[index];
+      if (!continuityKey) {
+        throw new FlorenceStoreConflict("A proactive next job lost its stable provider objective");
+      }
       await stageProactiveFamilyWork(sql, {
         basis: `google-action\0${googleActionKey}`,
         householdId: work.household_id,
@@ -15253,6 +15584,13 @@ async function applyGooglePollDeliveries(
         actionOwners: work.owner_adult_id
           ? [{ key: googleActionKey, ownerAdultId: work.owner_adult_id }]
           : [],
+        continuityKeys: [continuityKey],
+        continuedWorkIds: unique(
+          (delivery.actionSourceIds ?? sourceIds).flatMap((sourceId) => [
+            ...(input.continuedFamilyWorkBySourceId.get(sourceId) ?? []),
+          ]),
+        ).sort(),
+        evidenceSourceIds: sourceIds,
         candidateIds,
         occurredAt: input.occurredAt,
       });
@@ -18985,6 +19323,8 @@ const FAMILY_WORK_STATE_KEYS = [
   "claim",
   "continuationItems",
   "docketCandidateIds",
+  "evidenceRevisionAt",
+  "evidenceRevisionKey",
   "generation",
   "kind",
   "pendingCall",
@@ -19019,6 +19359,8 @@ function initialFamilyWorkState(
     continuationItems: [],
     pendingCall: null,
     steering: [],
+    evidenceRevisionAt: null,
+    evidenceRevisionKey: null,
     progressBlocked: false,
     progressRevision: 0,
     terminal: null,
@@ -19093,6 +19435,8 @@ function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWor
   if (state.browserImages === undefined) state.browserImages = [];
   if (state.browserSession === undefined) state.browserSession = null;
   if (state.docketCandidateIds === undefined) state.docketCandidateIds = [];
+  if (state.evidenceRevisionAt === undefined) state.evidenceRevisionAt = null;
+  if (state.evidenceRevisionKey === undefined) state.evidenceRevisionKey = null;
   if (state.pendingParticipantRequest === undefined) state.pendingParticipantRequest = null;
   if (state.progressBlocked === undefined) state.progressBlocked = false;
   if (state.waitingDocket === undefined) state.waitingDocket = null;
@@ -19118,6 +19462,19 @@ function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWor
     throw new FlorenceStoreConflict("Family work docket candidates contain a duplicate");
   }
   const progressRevision = familyWorkCounter(state.progressRevision, "Family work progress revision");
+  const evidenceRevisionAt =
+    state.evidenceRevisionAt === null
+      ? null
+      : instant(
+          requiredStringField(state, "evidenceRevisionAt", "Family work evidence revision"),
+        ).toISOString();
+  const evidenceRevisionKey =
+    state.evidenceRevisionKey === null
+      ? null
+      : requiredStringField(state, "evidenceRevisionKey", "Family work evidence revision key");
+  if (evidenceRevisionKey !== null) {
+    assertDigest(evidenceRevisionKey, "Family work evidence revision key");
+  }
   if (typeof state.progressBlocked !== "boolean") {
     throw new FlorenceStoreConflict("Family work progress gate is invalid");
   }
@@ -19485,6 +19842,8 @@ function familyWorkState(value: JsonValue | FamilyWorkStateV1 | null): FamilyWor
     continuationItems: [...continuationItems],
     pendingCall,
     steering,
+    evidenceRevisionAt,
+    evidenceRevisionKey,
     progressBlocked: state.progressBlocked,
     progressRevision,
     terminal,
@@ -19865,6 +20224,7 @@ async function completeDeliveredFamilyWorkTerminal(
   if (!state.terminal) {
     throw new FlorenceStoreConflict("Delivered family work lost its terminal result");
   }
+  const evidenceBasisAt = state.evidenceRevisionAt ? instant(state.evidenceRevisionAt) : delivery.created_at;
   const scheduled = scheduledFamilyWork(delivery.reminder_schedule);
   const completedSchedule = scheduled
     ? { ...scheduled, occurrenceActive: false, previousResult: state.terminal.text }
@@ -19921,7 +20281,7 @@ async function completeDeliveredFamilyWorkTerminal(
       ownerAdultId: delivery.owner_adult_id,
       candidateIds,
       coordination: state.terminal.docket,
-      workStartedAt: delivery.created_at,
+      workStartedAt: evidenceBasisAt,
       updatedAt: delivery.sent_at,
     });
   }
@@ -19933,13 +20293,13 @@ async function completeDeliveredFamilyWorkTerminal(
         ownerAdultId: delivery.owner_adult_id,
         candidateIds,
         resolutionSourceId: sourceId,
-        workStartedAt: delivery.created_at,
+        workStartedAt: evidenceBasisAt,
         resolvedAt: delivery.sent_at,
       });
       await removeInitialReviewDocketCandidatesCompletedByFamilyWork(sql, {
         householdId: delivery.household_id,
         candidateIds,
-        workStartedAt: delivery.created_at,
+        workStartedAt: evidenceBasisAt,
       });
     }
     for (const { key, ownerAdultId } of proactiveFamilyWorkActionOwners(delivery.source_metadata)) {
@@ -19947,7 +20307,7 @@ async function completeDeliveredFamilyWorkTerminal(
         householdId: delivery.household_id,
         ownerAdultId,
         actionKey: key,
-        notUpdatedAfter: delivery.created_at,
+        notUpdatedAfter: evidenceBasisAt,
       });
     }
   }
@@ -20345,16 +20705,17 @@ async function proactiveFamilyWorkResolutionMetadata(
   workId: string,
   resolved: boolean,
 ): Promise<JsonObject | null> {
-  const [kickoff] = await sql<{ metadata: JsonValue }[]>`
+  const kickoffs = await sql<{ metadata: JsonValue }[]>`
     select source.metadata from proactive_work_sources link
     join sources source on source.id=link.source_id
     where link.work_id=${workId}
       and (source.metadata->>'proactiveFamilyWorkId'=${workId}::text
         or source.metadata->>'familyWorkOriginId'=${workId}::text)
-    order by source.occurred_at,source.id limit 1
+    order by source.occurred_at,source.id
   `;
-  if (!kickoff) return null;
-  const owners = proactiveFamilyWorkActionOwners(kickoff.metadata);
+  const owners = uniqueProactiveFamilyWorkActionOwners(
+    kickoffs.flatMap((kickoff) => proactiveFamilyWorkActionOwners(kickoff.metadata)),
+  );
   if (owners.length === 0) return null;
   const actionOwners: Record<string, JsonValue> = {};
   for (const { key, ownerAdultId } of owners) {
@@ -20504,6 +20865,9 @@ async function stageProactiveFamilyWork(
     objective: string;
     kickoffSourceId: string;
     actionOwners: readonly ProactiveFamilyWorkActionOwner[];
+    continuityKeys: readonly string[];
+    continuedWorkIds: readonly string[];
+    evidenceSourceIds: readonly string[];
     candidateIds: readonly string[];
     occurredAt: Date;
   },
@@ -20518,8 +20882,31 @@ async function stageProactiveFamilyWork(
   for (const candidateId of candidateIds) {
     assertUuid(candidateId, "Proactive family-work docket candidate ID");
   }
+  const continuityKeys = unique(input.continuityKeys);
+  if (continuityKeys.length !== input.continuityKeys.length) {
+    throw new FlorenceStoreConflict("Proactive family work repeated a continuity key");
+  }
+  for (const continuityKey of continuityKeys) {
+    assertDigest(continuityKey, "Proactive family-work continuity key");
+  }
+  const continuedWorkIds = unique(input.continuedWorkIds);
+  if (continuedWorkIds.length !== input.continuedWorkIds.length) {
+    throw new FlorenceStoreConflict("Proactive family work repeated a continued task");
+  }
+  for (const workId of continuedWorkIds) {
+    assertUuid(workId, "Continued proactive family-work ID");
+  }
+  const evidenceSourceIds = unique(input.evidenceSourceIds);
+  if (evidenceSourceIds.length !== input.evidenceSourceIds.length) {
+    throw new FlorenceStoreConflict("Proactive family work repeated an evidence source");
+  }
+  for (const sourceId of evidenceSourceIds) {
+    assertUuid(sourceId, "Proactive family-work evidence source ID");
+  }
   const objective = bounded(required(input.objective, "Proactive family-work objective"), 4_000);
-  const workId = deterministicUuid(`proactive-family-work\0${required(input.basis, "Proactive work basis")}`);
+  const proposedWorkId = deterministicUuid(
+    `proactive-family-work\0${required(input.basis, "Proactive work basis")}`,
+  );
   const [kickoff] = await sql<
     {
       source_visibility: Visibility;
@@ -20584,55 +20971,232 @@ async function stageProactiveFamilyWork(
       : [];
     actionOwners[key] = unique([...owners, ownerAdultId]).sort();
   }
-  const [existing] = await sql<ProactiveWorkRow[]>`
-    select * from proactive_work where id=${workId} for update
-  `;
-  const existingCandidateIds = existing
-    ? [...(familyWorkState(existing.task_state).docketCandidateIds ?? [])]
-    : [];
-  if (
-    existing &&
-    (existing.household_id !== input.householdId ||
-      existing.kind !== "family_task" ||
-      existing.visibility !== input.visibility ||
-      existing.owner_adult_id !== input.ownerAdultId ||
-      existing.objective !== objective ||
-      (existingCandidateIds.length > 0 &&
-        !sameStrings([...existingCandidateIds].sort(), [...candidateIds].sort())))
-  ) {
-    throw new FlorenceStoreConflict("A proactive family-work basis changed after it was staged");
+  if (evidenceSourceIds.length > 0) {
+    const evidence = await sql<
+      {
+        id: string;
+        visibility: Visibility;
+        owner_adult_id: string | null;
+        kind: string;
+        metadata: JsonValue;
+      }[]
+    >`
+      select id,visibility,owner_adult_id,kind,metadata from sources
+      where household_id=${input.householdId} and id in ${sql(evidenceSourceIds)}
+      order by id for share
+    `;
+    if (
+      evidence.length !== evidenceSourceIds.length ||
+      evidence.some(
+        (source) =>
+          !["gmail", "calendar", "google_file"].includes(source.kind) ||
+          (input.visibility === "private"
+            ? source.visibility !== "private" || source.owner_adult_id !== input.ownerAdultId
+            : !(
+                (source.visibility === "private" && source.owner_adult_id !== null) ||
+                (source.visibility === "household" && source.owner_adult_id === null)
+              )),
+      )
+    ) {
+      throw new FlorenceStoreUnauthorized("Proactive family work cited Google evidence outside its scope");
+    }
   }
+
+  const evidenceRows =
+    evidenceSourceIds.length === 0
+      ? []
+      : await sql<{ id: string; metadata: JsonValue }[]>`
+          select id,metadata from sources where household_id=${input.householdId}
+            and id in ${sql(evidenceSourceIds)} order by id for share
+        `;
+  const evidenceRevisionKey =
+    evidenceRows.length === 0
+      ? null
+      : sha256(
+          canonicalConversationHistoryJson({
+            revised: evidenceRows.map((source) => ({
+              sourceId: source.id,
+              metadata: source.metadata,
+            })),
+            removed: [],
+          }),
+        );
+
+  const activeRows = await sql<ProactiveWorkRow[]>`
+    select * from proactive_work where household_id=${input.householdId}
+      and kind='family_task' and status in ('active','paused','delivering')
+      and visibility=${input.visibility} and owner_adult_id is not distinct from ${input.ownerAdultId}
+    order by created_at,id for update
+  `;
+  const linkedRows =
+    activeRows.length === 0
+      ? []
+      : await sql<{ work_id: string; source_id: string; metadata: JsonValue }[]>`
+          select link.work_id,source.id as source_id,source.metadata
+          from proactive_work_sources link join sources source on source.id=link.source_id
+          where link.work_id in ${sql(activeRows.map(({ id }) => id))}
+          order by link.work_id,source.occurred_at,source.id for share of source
+        `;
+  const candidateIdSet = new Set(candidateIds);
+  const continuityKeySet = new Set(continuityKeys);
+  const linkedForWork = (workId: string) => linkedRows.filter((linked) => linked.work_id === workId);
+  const exactMatches = activeRows.filter((work) => work.id === proposedWorkId);
+  const continuityMatches = activeRows.filter((work) =>
+    linkedForWork(work.id).some((linked) => {
+      const metadata = jsonRecord(linked.metadata);
+      const storedContinuityKeys = Array.isArray(metadata.proactiveFamilyWorkContinuityKeys)
+        ? metadata.proactiveFamilyWorkContinuityKeys.filter(
+            (value): value is string => typeof value === "string",
+          )
+        : [];
+      return storedContinuityKeys.some((key) => continuityKeySet.has(key));
+    }),
+  );
+  const candidateMatches = activeRows.filter((work) => {
+    const state = familyWorkState(work.task_state);
+    return (state.docketCandidateIds ?? []).some((candidateId) => candidateIdSet.has(candidateId));
+  });
+  const continuedWorkIdSet = new Set(continuedWorkIds);
+  const continuedMatches = activeRows.filter((work) => continuedWorkIdSet.has(work.id));
+  const strongMatchingIds = unique(
+    [...exactMatches, ...continuityMatches, ...candidateMatches].map(({ id }) => id),
+  );
+  const matchingIds =
+    strongMatchingIds.length > 0 ? strongMatchingIds : unique(continuedMatches.map(({ id }) => id));
+  if (matchingIds.length > 1) {
+    throw new FlorenceStoreConflict("One Google objective matched multiple active family tasks");
+  }
+  let existing =
+    matchingIds.length === 1 ? (activeRows.find(({ id }) => id === matchingIds[0]) ?? null) : null;
+  if (!existing) {
+    const [sameBasis] = await sql<ProactiveWorkRow[]>`
+      select * from proactive_work where id=${proposedWorkId} for update
+    `;
+    if (sameBasis) {
+      if (
+        sameBasis.household_id !== input.householdId ||
+        sameBasis.kind !== "family_task" ||
+        sameBasis.visibility !== input.visibility ||
+        sameBasis.owner_adult_id !== input.ownerAdultId ||
+        sameBasis.objective !== objective
+      ) {
+        throw new FlorenceStoreConflict("A proactive family-work basis changed after it was staged");
+      }
+      existing = sameBasis;
+    }
+  }
+  const workId = existing?.id ?? proposedWorkId;
+  const existingState = existing ? familyWorkState(existing.task_state) : null;
+  const existingCandidateIds = [...(existingState?.docketCandidateIds ?? [])];
+  const mergedCandidateIds = unique([...existingCandidateIds, ...candidateIds]).sort();
   await assertDocketCandidatesAvailableForFamilyWork(sql, {
     householdId: input.householdId,
-    candidateIds,
+    candidateIds: mergedCandidateIds,
     excludeWorkId: existing?.id ?? null,
   });
   if (!existing) {
+    const initialState = familyWorkState({
+      ...initialFamilyWorkState(null, mergedCandidateIds),
+      evidenceRevisionAt: input.occurredAt.toISOString(),
+      evidenceRevisionKey,
+    });
     await sql`
       insert into proactive_work (
         id,household_id,kind,visibility,owner_adult_id,objective,current_conclusion,
         task_state,status,next_check_at,created_at
       ) values (${workId},${input.householdId},'family_task',${input.visibility},
-        ${input.ownerAdultId},${objective},'Starting now.',${sql.json(
-          initialFamilyWorkState(null, candidateIds),
-        )},
+        ${input.ownerAdultId},${objective},'Starting now.',${sql.json(initialState)},
         'active',${new Date(
           Math.max(input.occurredAt.getTime(), kickoff.not_before.getTime()) + FAMILY_WORK_INITIAL_DELAY_MS,
         )},${input.occurredAt})
     `;
+  } else if (
+    existing.status === "active" ||
+    existing.status === "paused" ||
+    existing.status === "delivering"
+  ) {
+    const revisionAt = input.occurredAt.toISOString();
+    const sameRevisionKey =
+      evidenceRevisionKey !== null && existingState?.evidenceRevisionKey === evidenceRevisionKey;
+    const sameRevisionTimestamp = existingState?.evidenceRevisionAt === revisionAt;
+    const alreadyReplanned = sameRevisionKey || sameRevisionTimestamp;
+    const candidateLinkageChanged = !sameStrings(
+      [...existingCandidateIds].sort(),
+      [...mergedCandidateIds].sort(),
+    );
+    const needsReplan = !alreadyReplanned || candidateLinkageChanged;
+    const pendingEffect =
+      existingState?.phase === "tool_pending" &&
+      existingState.pendingCall !== null &&
+      existingState.claim !== null;
+    if (needsReplan) {
+      const nextEvidenceRevisionAt = alreadyReplanned ? existingState?.evidenceRevisionAt : revisionAt;
+      const nextEvidenceRevisionKey =
+        sameRevisionTimestamp && evidenceRevisionKey !== null
+          ? evidenceRevisionKey
+          : alreadyReplanned
+            ? existingState?.evidenceRevisionKey
+            : evidenceRevisionKey;
+      let nextState = familyWorkState({
+        ...(existingState as FamilyWorkStateV1),
+        docketCandidateIds: mergedCandidateIds,
+        evidenceRevisionAt: nextEvidenceRevisionAt,
+        evidenceRevisionKey: nextEvidenceRevisionKey,
+      });
+      const steering = {
+        sourceId: evidenceSourceIds[0] ?? input.kickoffSourceId,
+        text: alreadyReplanned
+          ? "The current docket linkage for this same household objective changed. Re-check the linked sources and continue this task instead of starting another one."
+          : "New provider evidence belongs to this same household objective. Re-read the linked sources, discard any stale assumption or question, and continue this task instead of starting another one.",
+        occurredAt: revisionAt,
+      };
+      nextState = familyWorkState({
+        ...(pendingEffect
+          ? queueFamilyWorkSteeringDuringPendingEffect(nextState, steering)
+          : steerFamilyWorkState(nextState, steering)),
+        evidenceRevisionAt: nextEvidenceRevisionAt,
+        evidenceRevisionKey: nextEvidenceRevisionKey,
+      });
+      if (!pendingEffect) await terminalizeUnsentFamilyWorkOutbounds(sql, workId, "steering");
+      await sql`
+        update proactive_work set task_state=${sql.json(nextState)},status='active',
+          next_check_at=${pendingEffect ? existing.next_check_at : input.occurredAt},
+          current_conclusion=${
+            pendingEffect
+              ? "New information arrived; finishing the current step before replanning."
+              : "New information arrived; continuing the same task."
+          },
+          last_error=null where id=${workId} and kind='family_task'
+      `;
+    } else if (
+      sameRevisionTimestamp &&
+      evidenceRevisionKey !== null &&
+      existingState?.evidenceRevisionKey !== evidenceRevisionKey
+    ) {
+      // The source-change reconciler hashes only the changed slice so it can wake the task before
+      // this delivery is applied. Once the same poll supplies the complete evidence set, retain its
+      // canonical key without steering or touching scheduling. This makes later identical polls a
+      // true no-op and preserves any steering already queued behind an in-flight provider effect.
+      const normalizedState = familyWorkState({
+        ...(existingState as FamilyWorkStateV1),
+        evidenceRevisionKey,
+      });
+      await sql`
+        update proactive_work set task_state=${sql.json(normalizedState)}
+        where id=${workId} and kind='family_task'
+      `;
+    }
   }
   await sql`
     update sources set metadata=metadata||${sql.json({
       proactiveFamilyWorkId: workId,
       proactiveFamilyWorkExecutionAdultId: input.executionAdultId,
       proactiveFamilyWorkActionOwners: actionOwners,
+      proactiveFamilyWorkContinuityKeys: continuityKeys,
     })}
     where id=${input.kickoffSourceId}
   `;
-  await sql`
-    insert into proactive_work_sources (work_id,source_id)
-    values (${workId},${input.kickoffSourceId}) on conflict do nothing
-  `;
+  await linkProactiveWorkSources(sql, workId, [input.kickoffSourceId, ...evidenceSourceIds]);
   return workId;
 }
 

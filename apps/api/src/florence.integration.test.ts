@@ -248,6 +248,17 @@ const PROACTIVE_FAMILY_WORK_KICKOFF =
   "I noticed Maya’s field-trip deadline on the family calendar and remembered your mild sesame-noodle recipe, so I’m putting together a practical plan for the week now.";
 const PROACTIVE_FAMILY_WORK_RESULT =
   "I put together a practical family plan from the Family Calendar and the useful details already in the Vault.";
+const SOURCE_CHANGE_FAMILY_WORK_OBJECTIVE =
+  "Resolve Maya’s field-trip form using the school’s current instructions.";
+const SOURCE_CHANGE_FAMILY_WORK_KICKOFF =
+  "Maya’s field-trip form still needs a parent response. I’m checking the current school instructions now.";
+const SOURCE_CHANGE_FAMILY_WORK_QUESTION = "Who should sign Maya’s field-trip form?";
+const SOURCE_CHANGE_GMAIL_MESSAGE_ID = "gmail-school-form-reply";
+const SOURCE_CHANGE_GMAIL_SUBJECT = "Revised field-trip form instructions";
+const SOURCE_CHANGE_GMAIL_TEXT =
+  "The school revised Maya’s field-trip form instructions: use the new attached form and return it Friday.";
+const SOURCE_CHANGE_FAMILY_WORK_RESULT =
+  "I updated the same field-trip task with the school’s revised instructions.";
 const GOOGLE_DELETION_PRIVATE_ALERT = "Muir says Maya’s emergency card still needs a signature.";
 const UNRELATED_ACCOUNT_EMAIL_SUBJECT = "Your retail account password has changed";
 const UNRELATED_ACCOUNT_EMAIL_ALERT =
@@ -487,6 +498,7 @@ type HarnessState = {
   founderProductRecenterReview: boolean;
   googleRecipeArtifactExercise: boolean;
   proactiveFamilyWorkExercise: boolean;
+  sourceChangeFamilyWorkExercise: boolean;
   familyCalendarProvisioningFailuresRemaining: number;
   invalidGrantAdultId: string | null;
   invalidGrantTriggered: boolean;
@@ -2923,6 +2935,109 @@ release("Florence parent journeys", () => {
     expect(
       harness.linq.messages.filter((message) => message.text === PROACTIVE_FAMILY_WORK_RESULT),
     ).toHaveLength(1);
+  }, 20_000);
+
+  test("keeps revised Google evidence in the same durable family task", async () => {
+    let familyWorkRuns = 0;
+    let revisedSourceRead = false;
+    const harness = await createHarness(async () => decision(), {
+      continueFamilyWork: async (input, reads) => {
+        familyWorkRuns += 1;
+        if (familyWorkRuns === 1) {
+          expect(input.objective).toBe(SOURCE_CHANGE_FAMILY_WORK_OBJECTIVE);
+          return {
+            kind: "waiting",
+            state: {
+              ...input.state,
+              phase: "waiting",
+              claim: null,
+              pendingCall: null,
+              pendingParticipantRequest: null,
+              progressRevision: input.state.progressRevision + 1,
+              waitingDocket: {
+                owner: "Parents",
+                nextAction: "Choose who will sign the field-trip form.",
+                waitingOn: SOURCE_CHANGE_FAMILY_WORK_QUESTION,
+                needsAnswer: true,
+              },
+            },
+            question: SOURCE_CHANGE_FAMILY_WORK_QUESTION,
+          };
+        }
+
+        expect(input.objective).toBe(SOURCE_CHANGE_FAMILY_WORK_OBJECTIVE);
+        expect(input.state.steering).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              text: expect.stringContaining("same household objective"),
+            }),
+          ]),
+        );
+        const gmailSource = input.linkedSources?.find((source) => source.kind === "gmail");
+        if (!gmailSource) throw new Error("The revised task lost its exact Gmail evidence link");
+        if (!reads.readSource) throw new Error("The revised task could not reopen its linked evidence");
+        const source = await reads.readSource({ sourceId: gmailSource.sourceId });
+        revisedSourceRead = source?.kind === "gmail" && source.text.includes(SOURCE_CHANGE_GMAIL_TEXT);
+        if (!revisedSourceRead) {
+          throw new Error("The same family task did not receive the revised Google evidence");
+        }
+        return {
+          kind: "terminal",
+          state: {
+            ...input.state,
+            phase: "terminal",
+            claim: null,
+            pendingCall: null,
+            waitingDocket: null,
+            progressRevision: input.state.progressRevision + 1,
+            terminal: { outcome: "succeeded", text: SOURCE_CHANGE_FAMILY_WORK_RESULT },
+          },
+          outcome: "succeeded",
+          text: SOURCE_CHANGE_FAMILY_WORK_RESULT,
+        };
+      },
+    });
+    harness.state.sourceChangeFamilyWorkExercise = true;
+    await harness.readyHousehold();
+
+    expect(
+      harness.linq.messages.filter((message) => message.text === SOURCE_CHANGE_FAMILY_WORK_KICKOFF),
+    ).toHaveLength(1);
+    harness.state.now += 1_001;
+    await harness.drain();
+    const waitingMessage = harness.linq.messages.find(
+      (message) => message.text === SOURCE_CHANGE_FAMILY_WORK_QUESTION,
+    );
+    const originalWorkId = /^proactive:([^:]+):/.exec(waitingMessage?.idempotencyKey ?? "")?.[1];
+    if (!originalWorkId) throw new Error("The initial family task did not expose its durable work ID");
+
+    harness.state.privateFactUpdatePending = true;
+    harness.state.now += 2 * 60_000;
+    await harness.drain();
+
+    expect(harness.state.privateFactUpdateDelivered).toBe(true);
+    expect(familyWorkRuns).toBe(2);
+    expect(revisedSourceRead).toBe(true);
+    const terminalMessage = harness.linq.messages.find(
+      (message) => message.text === SOURCE_CHANGE_FAMILY_WORK_RESULT,
+    );
+    const completedWorkId = /^proactive:([^:]+):/.exec(terminalMessage?.idempotencyKey ?? "")?.[1];
+    expect(completedWorkId).toBe(originalWorkId);
+    await harness.assertDatabase(
+      "Revised Google evidence duplicated its durable family task or lost its current source",
+      `(select count(*)=1 from proactive_work
+          where kind='family_task' and id=${sqlLiteral(originalWorkId)}::uuid
+            and objective=${sqlLiteral(SOURCE_CHANGE_FAMILY_WORK_OBJECTIVE)}
+            and status='completed'
+            and jsonb_array_length(task_state->'steering')>=1)
+        and (select count(*)=1 from proactive_work where kind='family_task')
+        and exists (
+          select 1 from proactive_work_sources link
+          join sources source on source.id=link.source_id
+          where link.work_id=${sqlLiteral(originalWorkId)}::uuid and source.kind='gmail'
+            and source.metadata->>'messageId'=${sqlLiteral(SOURCE_CHANGE_GMAIL_MESSAGE_ID)}
+        )`,
+    );
   }, 20_000);
 
   test("asks the other parent privately, consumes one reply, and finishes in the family thread", async () => {
@@ -8659,6 +8774,7 @@ async function createHarness(
     founderProductRecenterReview: false,
     googleRecipeArtifactExercise: false,
     proactiveFamilyWorkExercise: false,
+    sourceChangeFamilyWorkExercise: false,
     familyCalendarProvisioningFailuresRemaining: 0,
     invalidGrantAdultId: null,
     invalidGrantTriggered: false,
@@ -9235,6 +9351,21 @@ function createReasoner(
       input: Parameters<FlorenceReasoner["synthesizeHouseholdBriefing"]>[0],
     ) => {
       state.briefings.push(input);
+      if (state.sourceChangeFamilyWorkExercise) {
+        const candidate = input.candidates.find((item) => item.summary === FOUNDER_FORM_SUMMARY);
+        if (!candidate) {
+          throw new Error("The source-change regression lost its Google-backed docket candidate");
+        }
+        return {
+          selectedCandidateIds: [candidate.candidateId],
+          bubbles: [{ text: SOURCE_CHANGE_FAMILY_WORK_KICKOFF, delayMs: 0 }],
+          nextJob: {
+            objective: SOURCE_CHANGE_FAMILY_WORK_OBJECTIVE,
+            kickoffBubbleIndex: 0,
+            candidateIds: [candidate.candidateId],
+          },
+        };
+      }
       const selected = state.proactiveFamilyWorkExercise ? [] : input.candidates.slice(0, 3);
       const remaining = input.candidates.length - selected.length;
       if (state.proactiveFamilyWorkExercise) {
@@ -9273,6 +9404,9 @@ function createReasoner(
       const source = input.evidence.gmail.sources.find(
         (candidate) => candidate.subject === "Maya school enrollment update",
       );
+      const sourceChange = input.evidence.gmail.sources.find(
+        (candidate) => candidate.subject === SOURCE_CHANGE_GMAIL_SUBJECT,
+      );
       const overlap = input.evidence.gmail.sources.find(
         (candidate) => candidate.subject === OVERLAP_GMAIL_SUBJECT,
       );
@@ -9301,6 +9435,42 @@ function createReasoner(
       if (overlap) {
         state.overlapGmailAssessments += 1;
         state.overlapGmailSourceId = overlap.sourceId;
+      }
+      if (sourceChange) {
+        return {
+          findings: [
+            {
+              privateDetail: null,
+              privateDocket: null,
+              actionAnchor: "field-trip form",
+              familyRelevance: "household" as const,
+              householdConclusion: {
+                category: "loose_end" as const,
+                summary:
+                  "The school revised Maya’s field-trip form instructions, so I’m updating the current task now.",
+                urgency: "soon" as const,
+                dueAt: "2026-08-21T16:00:00.000Z",
+                needsAnswer: false,
+                owner: "Florence",
+                nextAction: "Use the revised instructions to finish the existing field-trip task.",
+                waitingOn: null,
+              },
+              sourceIds: [sourceChange.sourceId],
+              urgency: "soon" as const,
+              dueAt: "2026-08-21T16:00:00.000Z",
+              materialChange: true,
+              monitor: null,
+              familyCalendar: null,
+            },
+          ],
+          facts: [],
+          dismissedSourceIds: [],
+          nextJob: {
+            objective: SOURCE_CHANGE_FAMILY_WORK_OBJECTIVE,
+            findingIndex: 0,
+            visibility: "household" as const,
+          },
+        };
       }
       const decision = {
         findings: familyCalendarMixedChangeSource
@@ -10344,6 +10514,7 @@ function createGoogle(store: PostgresFlorenceStore, state: HarnessState): Google
         input.ownerAdultId === founderSetup().adultId &&
         state.overlapGmailReadsRemaining > 0;
       const overlapHistoryId = state.overlapGmailReadsRemaining === 2 ? "104" : "105";
+      const privateFactHistoryId = state.sourceChangeFamilyWorkExercise ? "107" : "103";
       if (hasOverlap) state.overlapGmailReadsRemaining -= 1;
       return {
         status: "complete" as const,
@@ -10367,13 +10538,21 @@ function createGoogle(store: PostgresFlorenceStore, state: HarnessState): Google
           : hasPrivateFactUpdate
             ? [
                 {
-                  messageId: "gmail-maya-school-enrollment-update",
-                  threadId: "gmail-maya-school-enrollment-thread",
-                  historyId: "103",
+                  messageId: state.sourceChangeFamilyWorkExercise
+                    ? SOURCE_CHANGE_GMAIL_MESSAGE_ID
+                    : "gmail-maya-school-enrollment-update",
+                  threadId: state.sourceChangeFamilyWorkExercise
+                    ? `thread-${SCHOOL_ATTACHMENT.messageId}`
+                    : "gmail-maya-school-enrollment-thread",
+                  historyId: privateFactHistoryId,
                   from: "registrar@muir.example",
-                  subject: "Maya school enrollment update",
+                  subject: state.sourceChangeFamilyWorkExercise
+                    ? SOURCE_CHANGE_GMAIL_SUBJECT
+                    : "Maya school enrollment update",
                   sentAt: new Date(state.now).toISOString(),
-                  text: UPDATED_PRIVATE_SCHOOL_FACT,
+                  text: state.sourceChangeFamilyWorkExercise
+                    ? SOURCE_CHANGE_GMAIL_TEXT
+                    : UPDATED_PRIVATE_SCHOOL_FACT,
                   textStatus: "complete" as const,
                   attachmentsStatus: "complete" as const,
                   attachments: [],
@@ -10413,7 +10592,11 @@ function createGoogle(store: PostgresFlorenceStore, state: HarnessState): Google
         cursor: hasUnrelatedAccountEmail
           ? { ...input.cursor, historyId: "102", capturedAt: new Date(state.now).toISOString() }
           : hasPrivateFactUpdate
-            ? { ...input.cursor, historyId: "103", capturedAt: new Date(state.now).toISOString() }
+            ? {
+                ...input.cursor,
+                historyId: privateFactHistoryId,
+                capturedAt: new Date(state.now).toISOString(),
+              }
             : hasGoogleDeletionEvidence
               ? { ...input.cursor, historyId: "106", capturedAt: new Date(state.now).toISOString() }
               : hasOverlap

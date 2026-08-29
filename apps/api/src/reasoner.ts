@@ -6827,6 +6827,7 @@ function familyWorkModelContext(input: FlorenceFamilyWorkInput): JsonValue {
     initialAcknowledgement: input.state.acknowledgementText ?? null,
     activePhoneCall: input.state.activePhoneCall,
     activeTextMessage: input.state.activeTextMessage,
+    evidenceRevisionAt: input.state.evidenceRevisionAt ?? null,
     progressAllowed: input.state.progressBlocked !== true,
     lastDeliveredProgress: input.state.progressRevision > 0 ? (input.lastDeliveredProgress ?? null) : null,
     selectedBrowserImages: (input.state.browserImages ?? []).map((image) => ({

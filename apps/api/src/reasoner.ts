@@ -3092,7 +3092,13 @@ const WEATHER_PARAMETERS = {
   properties: {
     coordinates: MAP_COORDINATES_PARAMETERS,
     kind: { type: "string", enum: ["daily", "hourly"] },
-    periodCount: { type: "integer", minimum: 1, maximum: 14 },
+    periodCount: {
+      type: "integer",
+      minimum: 1,
+      maximum: 48,
+      description:
+        "For daily forecasts, the number of distinct local calendar dates (1-14); for hourly forecasts, the number of hours (1-48).",
+    },
   },
   required: ["coordinates", "kind", "periodCount"],
 } as const;
@@ -6259,7 +6265,7 @@ function foregroundCapabilityRegistry(): CapabilityRegistry<ForegroundCapability
     defineCapability({
       name: "weather_forecast",
       description:
-        "Get the live U.S. National Weather Service forecast, latest nearby observation, and active warnings for exact coordinates.",
+        "Get the live U.S. National Weather Service forecast, latest nearby observation, and active warnings for exact coordinates. Daily counts mean distinct local dates and include both day and night periods; hourly counts may request up to 48 hours.",
       modelSchema: WEATHER_PARAMETERS,
       inputSchema: weatherForecastRequestSchema,
       outputSchema: weatherForecastResultSchema,

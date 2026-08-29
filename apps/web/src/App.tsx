@@ -69,6 +69,7 @@ type CalendarMonthCell = {
 };
 
 type VaultDocket = NonNullable<WorkspaceView["vault"]>["docket"];
+type VaultActiveWork = NonNullable<WorkspaceView["vault"]>["activeWork"][number];
 
 export function AppShell() {
   const directEntry = onboardingEntry.setupToken !== null || onboardingEntry.accessToken !== null;
@@ -1397,6 +1398,12 @@ export function VaultPage() {
         />
       )}
 
+      {vault.activeWork.length > 0 && (
+        <VaultSection label="Florence is working">
+          <ActiveWorkList work={vault.activeWork} timeZone={vault.timeZone} />
+        </VaultSection>
+      )}
+
       <VaultSection label="On the docket">
         <DocketList
           docket={vault.docket}
@@ -1503,6 +1510,79 @@ export function VaultPage() {
       </VaultSection>
     </Page>
   );
+}
+
+function ActiveWorkList({ work, timeZone }: { work: VaultActiveWork[]; timeZone: string }) {
+  return (
+    <div className="watch-list">
+      {work.map((item) => (
+        <article className="watch-card" key={item.workId}>
+          <div className="watch-card-heading">
+            <div className="watch-badges">
+              <span className={`watch-badge${item.status === "paused" ? " paused" : ""}`}>
+                {activeWorkStatusLabel(item.status)}
+              </span>
+              {item.needsAnswer && <span className="watch-badge">Answer needed</span>}
+              <span className="watch-badge">
+                {item.visibility === "private" ? "Private to you" : "Shared with the household"}
+              </span>
+            </div>
+          </div>
+          <strong className="watch-objective">{item.objective}</strong>
+          <p className="watch-conclusion">{activeWorkProgress(item)}</p>
+          <p className="watch-source">{activeWorkCoordination(item, timeZone)}</p>
+        </article>
+      ))}
+    </div>
+  );
+}
+
+function activeWorkStatusLabel(status: VaultActiveWork["status"]): string {
+  switch (status) {
+    case "working":
+      return "Working";
+    case "waiting":
+      return "Waiting";
+    case "paused":
+      return "Paused";
+    case "finishing":
+      return "Finishing";
+  }
+}
+
+function activeWorkProgress(item: VaultActiveWork): string {
+  if (item.currentProgress) return item.currentProgress;
+  switch (item.status) {
+    case "working":
+      return "Florence is working on this now.";
+    case "waiting":
+      if (item.needsAnswer) {
+        return item.waitingOn
+          ? `Waiting on ${item.waitingOn}.`
+          : "Florence needs an answer before continuing.";
+      }
+      return "Florence is waiting for the next useful check.";
+    case "paused":
+      return "This work is paused.";
+    case "finishing":
+      return "Florence has the result and is sending it now.";
+  }
+}
+
+function activeWorkCoordination(item: VaultActiveWork, timeZone: string): string {
+  if (item.needsAnswer) {
+    const owner = docketOwnerLabel(item.owner);
+    return item.nextAction ? `${owner} · ${item.nextAction}` : owner;
+  }
+  if (item.nextCheckAt) {
+    return `Picking this back up ${watchTime(item.nextCheckAt, timeZone)}`;
+  }
+  if (item.status === "waiting") {
+    return item.waitingOn ? `Waiting on ${item.waitingOn}` : "Florence will keep this moving.";
+  }
+  if (item.status === "finishing") return "The result is on its way to Messages.";
+  if (item.status === "paused") return "Resume or change this in Messages.";
+  return "Florence is handling this.";
 }
 
 function DocketList({

@@ -261,6 +261,22 @@ export const vaultDocketSchema = z
   });
 export type VaultDocket = z.infer<typeof vaultDocketSchema>;
 
+export const vaultActiveWorkSchema = z
+  .object({
+    workId: idSchema,
+    objective: nonempty(4_000),
+    currentProgress: nonempty(10_000).nullable(),
+    status: z.enum(["working", "waiting", "paused", "finishing"]),
+    visibility: vaultVisibilitySchema,
+    owner: nonempty(2_000).nullable(),
+    nextAction: nonempty(2_000).nullable(),
+    waitingOn: nonempty(2_000).nullable(),
+    needsAnswer: z.boolean(),
+    nextCheckAt: timestampSchema.nullable(),
+  })
+  .strict();
+export type VaultActiveWork = z.infer<typeof vaultActiveWorkSchema>;
+
 export const googleConnectionSummarySchema = z
   .object({
     connectionId: idSchema,
@@ -302,6 +318,7 @@ export const householdVaultSchema = z
     postalCode: postalCodeSchema.nullable(),
     members: z.array(familyMemberProfileSchema).max(100),
     docket: vaultDocketSchema,
+    activeWork: z.array(vaultActiveWorkSchema),
     facts: z.array(vaultFactSchema),
     watches: z.array(vaultWatchSchema).max(100),
   })

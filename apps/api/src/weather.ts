@@ -130,6 +130,7 @@ export const weatherForecastResultSchema = z
     forecastUpdatedAt: z.string().datetime({ offset: true }).nullable(),
     periods: z.array(weatherForecastPeriodSchema).min(1).max(48),
     observation: weatherObservationSchema.nullable(),
+    alertsAvailable: z.boolean(),
     activeAlertCount: z.number().int().nonnegative(),
     alertsTruncated: z.boolean(),
     alerts: z.array(weatherAlertSchema).max(MAX_ALERTS),
@@ -320,6 +321,11 @@ type ObservationResponse = z.infer<typeof observationResponseSchema>;
 type AlertFeature = z.infer<typeof alertFeatureSchema>;
 type Quantity = z.infer<typeof quantitySchema>;
 
+type AlertLoadResult = {
+  readonly available: boolean;
+  readonly features: readonly AlertFeature[];
+};
+
 type CacheEntry = { readonly expiresAt: number; readonly value: unknown };
 
 type RequestJsonOptions = {
@@ -389,18 +395,24 @@ export class NwsWeatherClient implements FlorenceWeatherClient {
     });
   }
 
-  async #loadAlerts(request: ParsedWeatherRequest, signal: AbortSignal): Promise<readonly AlertFeature[]> {
-    const url = new URL(`${this.#apiUrl}/alerts/active`);
-    url.searchParams.set(
-      "point",
-      `${formatCoordinate(request.coordinates.lat)},${formatCoordinate(request.coordinates.lon)}`,
-    );
-    const response = await this.#requestJson(url.toString(), alertCollectionSchema, signal, {
-      fallbackCacheMs: MIN_ALERT_CACHE_MS,
-      minimumCacheMs: MIN_ALERT_CACHE_MS,
-      attempts: 1,
-    });
-    return response.features;
+  async #loadAlerts(request: ParsedWeatherRequest, signal: AbortSignal): Promise<AlertLoadResult> {
+    try {
+      const url = new URL(`${this.#apiUrl}/alerts/active`);
+      url.searchParams.set(
+        "point",
+        `${formatCoordinate(request.coordinates.lat)},${formatCoordinate(request.coordinates.lon)}`,
+      );
+      const response = await this.#requestJson(url.toString(), alertCollectionSchema, signal, {
+        fallbackCacheMs: MIN_ALERT_CACHE_MS,
+        minimumCacheMs: MIN_ALERT_CACHE_MS,
+        attempts: 1,
+      });
+      return { available: true, features: response.features };
+    } catch (error) {
+      const providerError = asWeatherProviderError(error);
+      if (providerError.code === "cancelled") throw providerError;
+      return { available: false, features: [] };
+    }
   }
 
   async #loadObservation(
@@ -570,11 +582,16 @@ function normalizeResult(
   point: PointResponse,
   forecast: ForecastResponse,
   observation: { readonly station: StationFeature; readonly report: ObservationResponse } | null,
-  alerts: readonly AlertFeature[],
+  alerts: AlertLoadResult,
   now: number,
 ): FlorenceWeatherResult {
   const pointProperties = point.properties;
-  const periods = forecast.properties.periods.slice(0, request.periodCount).map((period) => ({
+  const selectedPeriods = selectForecastPeriods(
+    request,
+    forecast.properties.periods,
+    pointProperties.timeZone,
+  );
+  const periods = selectedPeriods.map((period) => ({
     number: period.number,
     name: boundedText(period.name ?? "", 120),
     startTime: period.startTime,
@@ -616,9 +633,10 @@ function normalizeResult(
     forecastUpdatedAt: validDateTimeOrNull(forecast.properties.updated),
     periods,
     observation: observation === null ? null : normalizeObservation(observation),
-    activeAlertCount: alerts.length,
-    alertsTruncated: alerts.length > MAX_ALERTS,
-    alerts: alerts.slice(0, MAX_ALERTS).map(normalizeAlert),
+    alertsAvailable: alerts.available,
+    activeAlertCount: alerts.features.length,
+    alertsTruncated: alerts.features.length > MAX_ALERTS,
+    alerts: alerts.features.slice(0, MAX_ALERTS).map(normalizeAlert),
     fetchedAt: new Date(now).toISOString(),
     attribution: {
       provider: "National Weather Service",
@@ -626,6 +644,62 @@ function normalizeResult(
       url: "https://www.weather.gov/documentation/services-web-api",
     },
   };
+}
+
+function selectForecastPeriods(
+  request: ParsedWeatherRequest,
+  periods: ForecastResponse["properties"]["periods"],
+  timeZone: string,
+): ForecastResponse["properties"]["periods"] {
+  if (request.kind === "hourly") return periods.slice(0, request.periodCount);
+
+  let formatter: Intl.DateTimeFormat;
+  try {
+    formatter = new Intl.DateTimeFormat("en-US", {
+      timeZone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    });
+  } catch (error) {
+    throw new WeatherProviderError(
+      "invalid_response",
+      "The National Weather Service returned a forecast with an invalid time zone.",
+      { provider: "National Weather Service", cause: error },
+    );
+  }
+
+  const localDates = periods.map((period) => localCalendarDate(period.startTime, formatter));
+  const requestedDates = new Set<string>();
+  for (const localDate of localDates) {
+    if (requestedDates.has(localDate)) continue;
+    if (requestedDates.size >= request.periodCount) break;
+    requestedDates.add(localDate);
+  }
+  return periods.filter((_period, index) => requestedDates.has(localDates[index] ?? ""));
+}
+
+function localCalendarDate(value: string, formatter: Intl.DateTimeFormat): string {
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) {
+    throw new WeatherProviderError(
+      "invalid_response",
+      "The National Weather Service returned a forecast with an invalid start time.",
+      { provider: "National Weather Service" },
+    );
+  }
+  const parts = new Map(formatter.formatToParts(date).map((part) => [part.type, part.value]));
+  const year = parts.get("year");
+  const month = parts.get("month");
+  const day = parts.get("day");
+  if (!(year && month && day)) {
+    throw new WeatherProviderError(
+      "invalid_response",
+      "The National Weather Service returned a forecast Florence could not place on a date.",
+      { provider: "National Weather Service" },
+    );
+  }
+  return `${year}-${month}-${day}`;
 }
 
 function normalizeObservation(input: {

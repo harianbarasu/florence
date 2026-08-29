@@ -140,6 +140,11 @@ describe("NwsWeatherClient", () => {
           precipitationChancePercent: 10,
           condition: "Mostly Sunny",
         },
+        {
+          name: "Tonight",
+          temperature: 64,
+          condition: "Partly Cloudy",
+        },
       ],
       observation: {
         stationId: "KLAX",
@@ -150,11 +155,12 @@ describe("NwsWeatherClient", () => {
         windSpeedKph: 14.4,
         windGustKph: 19.3,
       },
+      alertsAvailable: true,
       activeAlertCount: 1,
       alerts: [{ event: "Heat Advisory", instruction: "Drink plenty of fluids." }],
       attribution: { provider: "National Weather Service" },
     });
-    expect(result.periods).toHaveLength(1);
+    expect(result.periods.map((period) => period.name)).toEqual(["This Afternoon", "Tonight"]);
     expect(weatherForecastResultSchema.safeParse(result).success).toBe(true);
     expect(fetchMock).toHaveBeenCalledTimes(5);
     expect(requestUrl(fetchMock.mock.calls[0]?.[0] ?? "https://invalid.test").pathname).toBe(
@@ -197,6 +203,66 @@ describe("NwsWeatherClient", () => {
     expect(first.observation).toBeNull();
     expect(first.periods).toHaveLength(2);
     expect(alertCalls).toBe(2);
+  });
+
+  test("preserves a valid forecast when alerts are unavailable", async () => {
+    const fetchMock = vi.fn<typeof fetch>(async (input) => {
+      const url = requestUrl(input);
+      if (url.pathname.startsWith("/points/")) return jsonResponse(pointReply);
+      if (url.pathname.endsWith("/forecast/hourly")) return jsonResponse(forecastReply);
+      if (url.pathname.endsWith("/stations")) return jsonResponse({ features: [] });
+      if (url.pathname === "/alerts/active") return jsonResponse({}, 503);
+      return jsonResponse({}, 404);
+    });
+    const client = new NwsWeatherClient({ fetch: fetchMock });
+
+    const result = await client.run({
+      coordinates: { lat: 34.0522, lon: -118.2437 },
+      kind: "hourly",
+      periodCount: 2,
+    });
+
+    expect(result).toMatchObject({
+      alertsAvailable: false,
+      activeAlertCount: 0,
+      alerts: [],
+      periods: [{ name: "This Afternoon" }, { name: "Tonight" }],
+    });
+  });
+
+  test("propagates cancellation while alerts are loading", async () => {
+    const controller = new AbortController();
+    let markAlertsStarted: (() => void) | undefined;
+    const alertsStarted = new Promise<void>((resolve) => {
+      markAlertsStarted = resolve;
+    });
+    const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
+      const url = requestUrl(input);
+      if (url.pathname.startsWith("/points/")) return jsonResponse(pointReply);
+      if (url.pathname.endsWith("/forecast/hourly")) return jsonResponse(forecastReply);
+      if (url.pathname.endsWith("/stations")) return jsonResponse({ features: [] });
+      if (url.pathname === "/alerts/active") {
+        markAlertsStarted?.();
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+        });
+      }
+      return jsonResponse({}, 404);
+    });
+    const client = new NwsWeatherClient({ fetch: fetchMock });
+    const running = client.run(
+      {
+        coordinates: { lat: 34.0522, lon: -118.2437 },
+        kind: "hourly",
+        periodCount: 2,
+      },
+      controller.signal,
+    );
+
+    await alertsStarted;
+    controller.abort(new Error("parent cancelled"));
+
+    await expect(running).rejects.toMatchObject({ code: "cancelled" });
   });
 
   test("propagates cancellation and retries a transient provider failure once", async () => {

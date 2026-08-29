@@ -783,6 +783,20 @@ export type VisibleFamilyWork = {
   createdAt: string;
 };
 
+export type VisibleActiveFamilyWork = {
+  workId: string;
+  candidateIds: readonly string[];
+  objective: string;
+  currentProgress: string | null;
+  status: "working" | "waiting" | "paused" | "finishing";
+  visibility: Visibility;
+  owner: string | null;
+  nextAction: string | null;
+  waitingOn: string | null;
+  needsAnswer: boolean;
+  nextCheckAt: string | null;
+};
+
 export type ScheduledFamilyWork = Readonly<{
   version: 1;
   schedule: ReminderSchedule;
@@ -2308,6 +2322,50 @@ export class PostgresFlorenceStore {
         }) => item,
       ),
     };
+  }
+
+  async readVisibleActiveFamilyWork(input: {
+    householdId: string;
+    viewerAdultId: string;
+    now?: string;
+  }): Promise<readonly VisibleActiveFamilyWork[]> {
+    assertUuid(input.householdId, "Active family-work household ID");
+    assertUuid(input.viewerAdultId, "Active family-work viewer ID");
+    const now = instant(input.now ?? new Date().toISOString());
+    const rows = await this.#sql<ProactiveWorkRow[]>`
+      select work.* from proactive_work work
+      join people viewer on viewer.household_id=work.household_id
+        and viewer.id=${input.viewerAdultId}
+        and viewer.kind='adult' and viewer.status='verified'
+      where work.household_id=${input.householdId} and work.kind='family_task'
+        and work.status in ('active','paused','delivering')
+        and (
+          (work.visibility='household' and work.owner_adult_id is null)
+          or (work.visibility='private' and work.owner_adult_id=viewer.id)
+        )
+      order by work.created_at,work.id
+    `;
+    return rows.flatMap((row) => {
+      const state = familyWorkState(row.task_state);
+      if (isIdleScheduledFamilyWork(row, state)) return [];
+      const coordination =
+        activeFamilyWorkDocketCoordination(row, state) ?? familyWorkActiveCoordination(row, state);
+      return [
+        {
+          workId: row.id,
+          candidateIds: [...(state.docketCandidateIds ?? [])],
+          objective: required(row.objective ?? "", "Active family-work objective"),
+          currentProgress: row.current_conclusion,
+          status: visibleActiveFamilyWorkStatus(row, state, now),
+          visibility: row.visibility,
+          owner: coordination.owner,
+          nextAction: coordination.nextAction,
+          waitingOn: coordination.waitingOn,
+          needsAnswer: coordination.needsAnswer,
+          nextCheckAt: row.next_check_at?.toISOString() ?? null,
+        },
+      ];
+    });
   }
 
   async ensureInitialIntelligence(input: { householdId: string; now: string }): Promise<void> {
@@ -16701,16 +16759,27 @@ function activeFamilyWorkDocketCoordination(
   state: FamilyWorkStateV1,
 ): PrivateDocketCoordination | null {
   if ((state.docketCandidateIds?.length ?? 0) === 0) return null;
+  // Preserve paused scheduled work on the docket so the family can resume it; an idle active
+  // series is not current work and remains hidden until its next occurrence starts.
+  if (isIdleScheduledFamilyWork(row, state) && row.status !== "paused") return null;
+  return familyWorkActiveCoordination(row, state);
+}
+
+function familyWorkActiveCoordination(
+  row: ProactiveWorkRow,
+  state: FamilyWorkStateV1,
+): PrivateDocketCoordination {
   const visibleLine = (value: string | null, fallback: string): string => {
     const line = (value ?? "").replaceAll(/\s+/gu, " ").trim();
     return bounded(line || fallback, 2_000);
   };
   if (state.phase === "waiting") {
+    const participantRequest = state.pendingParticipantRequest;
     return (
       state.waitingDocket ?? {
-        owner: null,
+        owner: participantRequest?.targetAdultName ?? null,
         nextAction: "Reply to Florence.",
-        waitingOn: visibleLine(row.current_conclusion, "Florence’s question"),
+        waitingOn: participantRequest?.question ?? visibleLine(row.current_conclusion, "Florence’s question"),
         needsAnswer: true,
       }
     );
@@ -16723,7 +16792,6 @@ function activeFamilyWorkDocketCoordination(
       needsAnswer: false,
     };
   }
-  if (isIdleScheduledFamilyWork(row, state)) return null;
   if (row.status === "delivering") {
     return {
       owner: "Florence",
@@ -16738,6 +16806,25 @@ function activeFamilyWorkDocketCoordination(
     waitingOn: null,
     needsAnswer: false,
   };
+}
+
+function visibleActiveFamilyWorkStatus(
+  row: ProactiveWorkRow,
+  state: FamilyWorkStateV1,
+  now: Date,
+): VisibleActiveFamilyWork["status"] {
+  if (row.status === "delivering") return "finishing";
+  if (row.status === "paused" && state.phase === "waiting") {
+    return "waiting";
+  }
+  if (
+    row.status === "active" &&
+    (state.claim !== null || row.next_check_at === null || row.next_check_at <= now)
+  ) {
+    return "working";
+  }
+  if (row.status === "active") return "waiting";
+  return "paused";
 }
 
 function visibleFamilyWork(row: VisibleFamilyWorkRow): VisibleFamilyWork {

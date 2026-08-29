@@ -257,10 +257,29 @@ export class Florence {
 
   async workspaceForAdult(adultId: string): Promise<WorkspaceView> {
     const household = await this.#householdForAdultOrNull(adultId);
-    const docket = household
-      ? await workspaceDocket(this.#store, household.id, adultId, this.#now().toISOString())
-      : { totalItems: 0, items: [] };
-    return workspaceViewSchema.parse(workspace(adultId, household, docket, this.#messagesUrl));
+    const now = this.#now().toISOString();
+    const [docket, activeWork] = household
+      ? await Promise.all([
+          workspaceDocket(this.#store, household.id, adultId, now),
+          this.#store.readVisibleActiveFamilyWork({
+            householdId: household.id,
+            viewerAdultId: adultId,
+            now,
+          }),
+        ])
+      : [{ totalItems: 0, items: [] }, []];
+    const activeCandidateIds = new Set(activeWork.flatMap((item) => [...item.candidateIds]));
+    const docketItems = docket.items.filter((item) => !activeCandidateIds.has(item.candidateId));
+    const visibleActiveWork = activeWork.map(({ candidateIds: _candidateIds, ...item }) => item);
+    return workspaceViewSchema.parse(
+      workspace(
+        adultId,
+        household,
+        { totalItems: docketItems.length, items: docketItems },
+        visibleActiveWork,
+        this.#messagesUrl,
+      ),
+    );
   }
 
   async familyCalendarMonthForAdult(
@@ -7227,6 +7246,7 @@ function workspace(
   adultId: string,
   household: HouseholdRecord | null,
   docket: NonNullable<WorkspaceView["vault"]>["docket"],
+  activeWork: readonly NonNullable<WorkspaceView["vault"]>["activeWork"][number][],
   messagesUrl: string | null,
 ): WorkspaceView {
   const viewer = household?.members.find((member) => member.id === adultId) ?? null;
@@ -7294,6 +7314,7 @@ function workspace(
           postalCode: founder ? profileString(founder.profile, "postalCode") : null,
           members: household.members.map(memberView),
           docket,
+          activeWork: [...activeWork],
           facts: household.facts.flatMap((fact) => {
             const source = fact.sources[0];
             if (fact.kind === "address" || fact.kind === "phone") return [];

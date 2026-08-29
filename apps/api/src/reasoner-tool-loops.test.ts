@@ -2823,6 +2823,12 @@ describe("Florence reasoner capability cutover", () => {
     expect(((requests[0]?.tools as { name: string }[]) ?? []).map((tool) => tool.name)).toEqual(
       expect.arrayContaining(["maps_search", "weather_forecast"]),
     );
+    const weatherParameters = (
+      (requests[0]?.tools as Array<{ name: string; parameters?: unknown }>) ?? []
+    ).find((tool) => tool.name === "weather_forecast")?.parameters as
+      | { properties?: { periodCount?: { maximum?: number } } }
+      | undefined;
+    expect(weatherParameters?.properties?.periodCount?.maximum).toBe(48);
     expect(
       functionOutputEnvelopes(requests[2]).find((envelope) => envelope.callId === "weather-live"),
     ).toMatchObject({
@@ -6005,6 +6011,7 @@ function weatherResult() {
       },
     ],
     observation: null,
+    alertsAvailable: true,
     activeAlertCount: 0,
     alertsTruncated: false,
     alerts: [],

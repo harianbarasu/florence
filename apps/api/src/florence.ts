@@ -1926,6 +1926,22 @@ export class Florence {
     const publicPages = this.#publicPages;
     const weather = this.#weather;
     const flights = this.#flights;
+    const indexConversationalGmailMessage = (
+      message: GmailEvidence,
+      connectionId: string,
+    ): FlorenceConversationalGmailSource => {
+      const prepared = conversationalGmailEvidence({
+        householdId: turn.authority.householdId,
+        ownerAdultId: turn.authority.senderAdultId,
+        connectionId,
+        message,
+      });
+      pendingGoogleEvidence.set(prepared.draft.id, prepared.draft);
+      for (const [key, attachment] of prepared.attachments) {
+        gmailAttachmentIndex.set(key, attachment);
+      }
+      return prepared.source;
+    };
 
     const reads: FlorenceReadTools = {
       ...(publicPages
@@ -1966,6 +1982,16 @@ export class Florence {
               if (!result) throw new Error("Google Workspace is unavailable");
               googleConnectionIdsUsed.add(activeGoogleConnection.connectionId);
               return result;
+            },
+            readWorkspaceGmailSource: async (identity) => {
+              const message = await this.#google?.readGmailMessage({
+                householdId: turn.authority.householdId,
+                ownerAdultId: turn.authority.senderAdultId,
+                connectionId: activeGoogleConnection.connectionId,
+                ...identity,
+              });
+              if (!message) throw new Error("Google Workspace Gmail reading is unavailable");
+              return indexConversationalGmailMessage(message, activeGoogleConnection.connectionId);
             },
           }
         : {}),
@@ -2366,38 +2392,9 @@ export class Florence {
           ...(before === null ? {} : { before }),
           limit,
         });
-        const sources = evidence.messages.map((message): FlorenceConversationalGmailSource => {
-          const draft = draftGmailEvidence({
-            householdId: turn.authority.householdId,
-            ownerAdultId: turn.authority.senderAdultId,
-            connectionId: activeGoogleConnection.connectionId,
-            ...message,
-          });
-          pendingGoogleEvidence.set(draft.id, draft);
-          for (const attachment of message.attachments) {
-            gmailAttachmentIndex.set(
-              `${draft.id}\0${gmailAttachmentRefFor(draft.id, attachment)}`,
-              attachment,
-            );
-          }
-          return {
-            sourceId: draft.id,
-            kind: "gmail",
-            visibility: "adult_private",
-            sentAt: message.sentAt,
-            sender: modelSafeGmailText(message.from),
-            subject: message.subject === null ? null : modelSafeGmailText(message.subject),
-            text: modelSafeGmailText(message.text),
-            textStatus: message.textStatus,
-            attachments: message.attachments.map((attachment) => ({
-              attachmentRef: gmailAttachmentRefFor(draft.id, attachment),
-              filename: attachment.filename,
-              mimeType: attachment.mimeType,
-              sizeBytes: attachment.sizeBytes,
-            })),
-            attachmentsStatus: message.attachmentsStatus,
-          };
-        });
+        const sources = evidence.messages.map((message) =>
+          indexConversationalGmailMessage(message, activeGoogleConnection.connectionId),
+        );
         return { status: evidence.status, sources };
       },
     };
@@ -3802,7 +3799,28 @@ export class Florence {
                 },
               ]
             : [];
-      const familyWorkGmailAttachmentIndex = new Map<string, GmailAttachmentReference>();
+      const familyWorkGmailAttachmentIndex = new Map<
+        string,
+        Readonly<{ connectionId: string; attachment: GmailAttachmentReference }>
+      >();
+      const indexFamilyWorkGmailMessage = (
+        message: GmailEvidence,
+        connectionId: string,
+      ): FlorenceConversationalGmailSource => {
+        if (!familyWorkExecutionAdultId) {
+          throw new Error("Durable Gmail reading lost its initiating parent");
+        }
+        const prepared = conversationalGmailEvidence({
+          householdId: work.household.householdId,
+          ownerAdultId: familyWorkExecutionAdultId,
+          connectionId,
+          message,
+        });
+        for (const [key, attachment] of prepared.attachments) {
+          familyWorkGmailAttachmentIndex.set(key, { connectionId, attachment });
+        }
+        return prepared.source;
+      };
       const familyWorkCalendarTargets = new Map<string, CalendarEventTarget>();
       const familyWorkCalendarRef = (calendarId: string): string => {
         const connectionIdentity =
@@ -4598,56 +4616,28 @@ export class Florence {
                     ...(before === null ? {} : { before }),
                     limit,
                   });
-                  const sources = evidence.messages.map((message): FlorenceConversationalGmailSource => {
-                    const draft = draftGmailEvidence({
-                      householdId: work.household.householdId,
-                      ownerAdultId: familyWorkExecutionAdultId,
-                      connectionId: familyWorkCalendarConnection.connectionId,
-                      ...message,
-                    });
-                    for (const attachment of message.attachments) {
-                      familyWorkGmailAttachmentIndex.set(
-                        `${draft.id}\0${gmailAttachmentRefFor(draft.id, attachment)}`,
-                        attachment,
-                      );
-                    }
-                    return {
-                      sourceId: draft.id,
-                      kind: "gmail",
-                      visibility: "adult_private",
-                      sentAt: message.sentAt,
-                      sender: modelSafeGmailText(message.from),
-                      subject: message.subject === null ? null : modelSafeGmailText(message.subject),
-                      text: modelSafeGmailText(message.text),
-                      textStatus: message.textStatus,
-                      attachments: message.attachments.map((attachment) => ({
-                        attachmentRef: gmailAttachmentRefFor(draft.id, attachment),
-                        filename: attachment.filename,
-                        mimeType: attachment.mimeType,
-                        sizeBytes: attachment.sizeBytes,
-                      })),
-                      attachmentsStatus: message.attachmentsStatus,
-                    };
-                  });
+                  const sources = evidence.messages.map((message) =>
+                    indexFamilyWorkGmailMessage(message, familyWorkCalendarConnection.connectionId),
+                  );
                   return { status: evidence.status, sources };
                 },
                 readGmailAttachment: async ({ sourceId, attachment }) => {
-                  const providerReference = familyWorkGmailAttachmentIndex.get(
+                  const indexed = familyWorkGmailAttachmentIndex.get(
                     `${sourceId}\0${attachment.attachmentRef}`,
                   );
                   if (
-                    !providerReference ||
-                    providerReference.filename !== attachment.filename ||
-                    providerReference.mimeType !== attachment.mimeType ||
-                    providerReference.sizeBytes !== attachment.sizeBytes
+                    !indexed ||
+                    indexed.attachment.filename !== attachment.filename ||
+                    indexed.attachment.mimeType !== attachment.mimeType ||
+                    indexed.attachment.sizeBytes !== attachment.sizeBytes
                   ) {
                     throw new Error("The Gmail attachment reference changed before it could be read");
                   }
                   const read = await google.readGmailAttachment({
                     householdId: work.household.householdId,
                     ownerAdultId: familyWorkExecutionAdultId,
-                    connectionId: familyWorkCalendarConnection.connectionId,
-                    attachment: providerReference,
+                    connectionId: indexed.connectionId,
+                    attachment: indexed.attachment,
                   });
                   return {
                     sourceId,
@@ -4655,6 +4645,22 @@ export class Florence {
                     filename: read.filename,
                     mimeType: read.mimeType,
                     bytes: read.bytes,
+                  };
+                },
+                resolveWorkspaceGmailAttachment: async ({
+                  sourceId,
+                  attachmentRef,
+                }: {
+                  sourceId: string;
+                  attachmentRef: string;
+                }) => {
+                  const indexed = familyWorkGmailAttachmentIndex.get(`${sourceId}\0${attachmentRef}`);
+                  if (!indexed || indexed.connectionId !== familyWorkWorkspaceConnection?.connectionId) {
+                    throw new Error("The Gmail attachment is not in the active Workspace account");
+                  }
+                  return {
+                    messageId: indexed.attachment.messageId,
+                    attachmentId: indexed.attachment.attachmentId,
                   };
                 },
               }
@@ -4898,7 +4904,10 @@ export class Florence {
               now: this.#now(),
             });
           },
-          ...(google && familyWorkGoogleAdultId && familyWorkWorkspaceConnection
+          ...(google &&
+          familyWorkGoogleAdultId &&
+          familyWorkWorkspaceConnection &&
+          work.visibility === "private"
             ? {
                 runGoogleWorkspace: (operation: GoogleWorkspaceOperation, taskSignal?: AbortSignal) =>
                   google.runWorkspace(
@@ -4910,6 +4919,19 @@ export class Florence {
                     },
                     taskSignal,
                   ),
+                readWorkspaceGmailSource: async (identity: {
+                  messageId: string;
+                  threadId: string;
+                  historyId: string;
+                }) => {
+                  const message = await google.readGmailMessage({
+                    householdId: work.household.householdId,
+                    ownerAdultId: familyWorkGoogleAdultId,
+                    connectionId: familyWorkWorkspaceConnection.connectionId,
+                    ...identity,
+                  });
+                  return indexFamilyWorkGmailMessage(message, familyWorkWorkspaceConnection.connectionId);
+                },
               }
             : {}),
         },
@@ -9446,6 +9468,47 @@ function gmailAttachmentRefFor(sourceId: string, attachment: GmailAttachmentRefe
   return `attachment_${sha256(
     `${sourceId}\0${attachment.attachmentId}\0${attachment.filename}\0${attachment.mimeType}\0${attachment.sizeBytes}`,
   ).slice(0, 32)}`;
+}
+
+function conversationalGmailEvidence(input: {
+  householdId: string;
+  ownerAdultId: string;
+  connectionId: string;
+  message: GmailEvidence;
+}): Readonly<{
+  draft: ReturnType<typeof draftGmailEvidence>;
+  source: FlorenceConversationalGmailSource;
+  attachments: readonly (readonly [string, GmailAttachmentReference])[];
+}> {
+  const draft = draftGmailEvidence({
+    householdId: input.householdId,
+    ownerAdultId: input.ownerAdultId,
+    connectionId: input.connectionId,
+    ...input.message,
+  });
+  return {
+    draft,
+    source: {
+      sourceId: draft.id,
+      kind: "gmail",
+      visibility: "adult_private",
+      sentAt: input.message.sentAt,
+      sender: modelSafeGmailText(input.message.from),
+      subject: input.message.subject === null ? null : modelSafeGmailText(input.message.subject),
+      text: modelSafeGmailText(input.message.text),
+      textStatus: input.message.textStatus,
+      attachments: input.message.attachments.map((attachment) => ({
+        attachmentRef: gmailAttachmentRefFor(draft.id, attachment),
+        filename: attachment.filename,
+        mimeType: attachment.mimeType,
+        sizeBytes: attachment.sizeBytes,
+      })),
+      attachmentsStatus: input.message.attachmentsStatus,
+    },
+    attachments: input.message.attachments.map(
+      (attachment) => [`${draft.id}\0${gmailAttachmentRefFor(draft.id, attachment)}`, attachment] as const,
+    ),
+  };
 }
 
 function sha256(value: string): string {

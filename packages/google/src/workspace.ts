@@ -23,7 +23,6 @@ const TASKS_API = "https://tasks.googleapis.com/tasks/v1";
 const REQUEST_TIMEOUT_MS = 20_000;
 const MAX_PAGES = 20;
 const MAX_BODY_CHARACTERS = 500_000;
-const MAX_GMAIL_DRAFT_ATTACHMENTS = 20;
 const MAX_GMAIL_DRAFT_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 const MAX_GMAIL_DRAFT_TOTAL_ATTACHMENT_BYTES = 24 * 1024 * 1024;
 const MAX_GMAIL_DRAFT_MESSAGE_RESULT_BYTES = 140_000;
@@ -724,9 +723,7 @@ function gmailRecipients(
 function mailAttachmentSources(
   values: readonly GoogleWorkspaceMailAttachment[],
 ): readonly GoogleWorkspaceMailAttachment[] {
-  if (!Array.isArray(values) || values.length > MAX_GMAIL_DRAFT_ATTACHMENTS) {
-    invalid(`Gmail draft attachments must contain at most ${MAX_GMAIL_DRAFT_ATTACHMENTS} items`);
-  }
+  if (!Array.isArray(values)) invalid("Gmail draft attachments must be an array");
   const result: GoogleWorkspaceMailAttachment[] = [];
   const seen = new Set<string>();
   for (const value of values) {
@@ -749,9 +746,6 @@ function mailAttachmentSources(
       seen.add(key);
       result.push(normalized);
     }
-  }
-  if (result.length > MAX_GMAIL_DRAFT_ATTACHMENTS) {
-    invalid(`Gmail draft attachments must contain at most ${MAX_GMAIL_DRAFT_ATTACHMENTS} items`);
   }
   return result;
 }
@@ -1241,8 +1235,8 @@ type GmailDraftAttachmentReference = Readonly<{
 function gmailAttachmentReferences(payload: JsonRecord): readonly GmailDraftAttachmentReference[] {
   const result: GmailDraftAttachmentReference[] = [];
   const visit = (part: JsonRecord, depth: number): void => {
-    if (depth > 20 || result.length > MAX_GMAIL_DRAFT_ATTACHMENTS * 10) {
-      invalidResponse("Gmail message MIME structure is too deep or large", "Gmail");
+    if (depth > 20) {
+      invalidResponse("Gmail message MIME structure is too deep", "Gmail");
     }
     const filenameValue = optionalString(part.filename);
     const body = optionalRecord(part.body);

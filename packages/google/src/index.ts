@@ -16,7 +16,6 @@ export { GoogleWorkspaceError } from "./workspace.js";
 // Keep these aligned with @florence/artifacts. This package has no workspace dependencies.
 const MAX_GMAIL_IMAGE_BYTES = 20 * 1024 * 1024;
 const MAX_GMAIL_PDF_BYTES = 20 * 1024 * 1024;
-const MAX_GMAIL_ATTACHMENTS_PER_MESSAGE = 20;
 const MAX_GMAIL_READABLE_TEXT_CHARACTERS = 50_000;
 const CALENDAR_CURSOR_OVERLAP_MS = 5 * 60_000;
 const GOOGLE_CHANGE_PAGE_SIZE = 100;
@@ -4737,9 +4736,8 @@ function collectGmailAttachmentReferences(
   };
   visit(payload);
   return {
-    attachments: found.slice(0, MAX_GMAIL_ATTACHMENTS_PER_MESSAGE),
-    status:
-      omittedNamedAttachment || found.length > MAX_GMAIL_ATTACHMENTS_PER_MESSAGE ? "truncated" : "complete",
+    attachments: found,
+    status: omittedNamedAttachment ? "truncated" : "complete",
   };
 }
 

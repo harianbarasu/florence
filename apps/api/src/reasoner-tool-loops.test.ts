@@ -2958,7 +2958,8 @@ Compare the useful family options.
     });
   });
 
-  test("durable group work forwards a Gmail message with its attachment and sends the exact draft", async () => {
+  test("durable private work preserves a Gmail attachment reference across a draft checkpoint", async () => {
+    const gmail = conversationalGmailSource();
     const modelResponses = [
       {
         status: "completed",
@@ -2996,8 +2997,25 @@ Compare the useful family options.
             subject: null,
             body: "Here is the school form Florence found.",
             bodyFormat: "plain",
-            includeSourceAttachments: true,
-            attachments: [],
+            includeSourceAttachments: false,
+            attachments: [
+              {
+                source: "gmail",
+                sourceId: gmail.sourceId,
+                attachmentRef: gmail.attachments[0]?.attachmentRef ?? "missing-attachment",
+                messageId: null,
+                attachmentId: null,
+                fileId: null,
+              },
+              {
+                source: "gmail",
+                sourceId: null,
+                attachmentRef: null,
+                messageId: "gmail-school-message",
+                attachmentId: "gmail-docx-1",
+                fileId: null,
+              },
+            ],
           }),
         ],
       },
@@ -3043,8 +3061,8 @@ Compare the useful family options.
       workId: "family-work-forward-school-form",
       scheduledOccurrence: null,
       objective: "Forward the school email and its form attachment to Jackson.",
-      visibility: "household" as const,
-      ownerAdultId: null,
+      visibility: "private" as const,
+      ownerAdultId: "adult-hari",
       initiatingAdultId: "adult-hari",
       origin: familyWorkOrigin("Forward the school email and its form attachment to Jackson.", "adult-hari"),
       household: {
@@ -3058,6 +3076,14 @@ Compare the useful family options.
         ],
         children: [],
       },
+      googleConnections: [
+        {
+          emailLabel: "Personal Google",
+          calendarAvailable: true,
+          kind: "personal" as const,
+          writesEnabled: true,
+        },
+      ],
       state: {
         kind: "family_work_v1" as const,
         version: 1 as const,
@@ -3084,19 +3110,29 @@ Compare the useful family options.
         return {
           operation: operation.operation,
           result: {
-            messageId: "gmail-school-message",
-            threadId: "gmail-thread-1",
-            subject: "School form",
-            body: "Please return the attached form.",
-            attachments: [
-              {
-                attachmentId: "gmail-attachment-1",
-                partId: "1",
-                filename: "school-form.pdf",
-                mimeType: "application/pdf",
-                sizeBytes: 42_000,
-              },
-            ],
+            message: {
+              messageId: "gmail-school-message",
+              threadId: "gmail-thread-1",
+              historyId: "gmail-history-1",
+              subject: "School form",
+              body: "Please return the attached form.",
+              attachments: [
+                {
+                  attachmentId: "gmail-attachment-1",
+                  partId: "1",
+                  filename: "form.pdf",
+                  mimeType: "application/pdf",
+                  sizeBytes: 5,
+                },
+                {
+                  attachmentId: "gmail-docx-1",
+                  partId: "2",
+                  filename: "instructions.docx",
+                  mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                  sizeBytes: 12_000,
+                },
+              ],
+            },
           },
         };
       }
@@ -3126,8 +3162,23 @@ Compare the useful family options.
       }
       throw new Error(`Unexpected Google operation ${operation.operation}`);
     };
+    const workspaceReads: Array<{ messageId: string; threadId: string; historyId: string }> = [];
+    const reads = {
+      runGoogleWorkspace,
+      async readWorkspaceGmailSource(identity: { messageId: string; threadId: string; historyId: string }) {
+        workspaceReads.push(identity);
+        return gmail;
+      },
+      async resolveWorkspaceGmailAttachment(input: { sourceId: string; attachmentRef: string }) {
+        expect(input).toEqual({
+          sourceId: gmail.sourceId,
+          attachmentRef: gmail.attachments[0]?.attachmentRef,
+        });
+        return { messageId: "gmail-school-message", attachmentId: "gmail-attachment-1" };
+      },
+    };
 
-    const draftPlanned = await reasoner.continueFamilyWork(input, { runGoogleWorkspace });
+    const draftPlanned = await reasoner.continueFamilyWork(input, reads);
     expect(draftPlanned).toMatchObject({
       kind: "continue",
       state: {
@@ -3137,18 +3188,14 @@ Compare the useful family options.
     });
     if (draftPlanned.kind !== "continue") throw new Error("Gmail forward draft was not planned");
     expect(operations.map((operation) => operation.operation)).toEqual(["gmail_get"]);
+    expect(JSON.stringify(draftPlanned.state.continuationItems)).toContain("draftAttachmentAccess");
+    expect(JSON.stringify(draftPlanned.state.continuationItems)).toContain("gmail-docx-1");
 
-    const draftCreated = await reasoner.continueFamilyWork(
-      { ...input, state: draftPlanned.state },
-      { runGoogleWorkspace },
-    );
+    const draftCreated = await reasoner.continueFamilyWork({ ...input, state: draftPlanned.state }, reads);
     if (draftCreated.kind !== "continue") throw new Error("Gmail forward draft was not created");
     expect(operations.map((operation) => operation.operation)).toEqual(["gmail_get", "gmail_draft_create"]);
 
-    const sendPlanned = await reasoner.continueFamilyWork(
-      { ...input, state: draftCreated.state },
-      { runGoogleWorkspace },
-    );
+    const sendPlanned = await reasoner.continueFamilyWork({ ...input, state: draftCreated.state }, reads);
     expect(sendPlanned).toMatchObject({
       kind: "continue",
       state: {
@@ -3159,24 +3206,40 @@ Compare the useful family options.
     if (sendPlanned.kind !== "continue") throw new Error("Exact Gmail draft send was not planned");
     expect(operations).toHaveLength(2);
 
-    const sent = await reasoner.continueFamilyWork(
-      { ...input, state: sendPlanned.state },
-      { runGoogleWorkspace },
-    );
+    const sent = await reasoner.continueFamilyWork({ ...input, state: sendPlanned.state }, reads);
     if (sent.kind !== "continue") throw new Error("Exact Gmail draft was not sent");
-    const terminal = await reasoner.continueFamilyWork(
-      { ...input, state: sent.state },
-      { runGoogleWorkspace },
-    );
+    const terminal = await reasoner.continueFamilyWork({ ...input, state: sent.state }, reads);
 
     expect(operations[1]).toMatchObject({
       operation: "gmail_draft_create",
       mode: "forward",
       messageId: "gmail-school-message",
       to: ["jackson@example.com"],
-      includeSourceAttachments: true,
+      includeSourceAttachments: false,
+      attachments: [
+        {
+          source: "gmail",
+          messageId: "gmail-school-message",
+          attachmentId: "gmail-attachment-1",
+        },
+        {
+          source: "gmail",
+          messageId: "gmail-school-message",
+          attachmentId: "gmail-docx-1",
+        },
+      ],
       idempotencyKey: expect.stringMatching(/^[a-f0-9]{64}$/),
     });
+    expect(workspaceReads).toEqual(
+      expect.arrayContaining([
+        {
+          messageId: "gmail-school-message",
+          threadId: "gmail-thread-1",
+          historyId: "gmail-history-1",
+        },
+      ]),
+    );
+    expect(workspaceReads.length).toBeGreaterThan(1);
     expect(operations[2]).toEqual({
       operation: "gmail_draft_send",
       draftId: "gmail-draft-1",
@@ -3458,7 +3521,7 @@ Compare the useful family options.
     expect(workStarts).toBe(1);
   });
 
-  test("a foreground Gmail search can open only its verified attachment as an ephemeral artifact", async () => {
+  test("a foreground Workspace Gmail get can open its app-scoped verified attachment", async () => {
     const gmail = conversationalGmailSource();
     const requests: Record<string, unknown>[] = [];
     const responses = [
@@ -3466,9 +3529,20 @@ Compare the useful family options.
         status: "completed",
         output_parsed: null,
         output: [
-          functionCall("gmail-search", "search_gmail", {
-            query: "school form",
-            limit: 3,
+          functionCall("gmail-get", "gmail_work", {
+            operation: "gmail_get",
+            query: null,
+            limit: null,
+            messageId: "gmail-message-1",
+            to: [],
+            cc: [],
+            bcc: [],
+            subject: null,
+            body: null,
+            bodyFormat: null,
+            threadId: null,
+            addLabelIds: [],
+            removeLabelIds: [],
           }),
         ],
       },
@@ -3499,11 +3573,38 @@ Compare the useful family options.
       },
     } as never);
     let attachmentInput: { sourceId: string; attachmentRef: string } | null = null;
+    let workspaceIdentity: { messageId: string; threadId: string; historyId: string } | null = null;
 
     await reasoner.decide(foregroundInput(), {
       ...inertReads(),
-      async searchGmail() {
-        return { status: "complete", sources: [gmail] };
+      async runGoogleWorkspace(operation) {
+        expect(operation).toEqual({ operation: "gmail_get", messageId: "gmail-message-1" });
+        return {
+          operation: "gmail_get",
+          result: {
+            message: {
+              messageId: "gmail-message-1",
+              threadId: "gmail-thread-1",
+              historyId: "gmail-history-1",
+              from: "School",
+              subject: "School form",
+              body: "Please review the attached form.",
+              attachments: [
+                {
+                  attachmentId: "provider-attachment-1",
+                  partId: "1",
+                  filename: "form.pdf",
+                  mimeType: "application/pdf",
+                  sizeBytes: 5,
+                },
+              ],
+            },
+          },
+        };
+      },
+      async readWorkspaceGmailSource(identity) {
+        workspaceIdentity = identity;
+        return gmail;
       },
       async readGmailAttachment(input) {
         attachmentInput = {
@@ -3524,19 +3625,40 @@ Compare the useful family options.
       sourceId: gmail.sourceId,
       attachmentRef: gmail.attachments[0]?.attachmentRef,
     });
-    const searchEnvelope = functionOutputEnvelopes(requests[1]).find(
-      (envelope) => envelope.callId === "gmail-search",
+    expect((requests[0]?.tools as Array<{ name?: string }> | undefined)?.map((tool) => tool.name)).toContain(
+      "gmail_work",
     );
-    expect(searchEnvelope?.output).toMatchObject({
-      status: "complete",
-      sources: [
-        expect.objectContaining({
-          sourceId: gmail.sourceId,
-          textStatus: "complete",
-          attachmentsStatus: "complete",
-        }),
-      ],
+    expect(
+      (requests[0]?.tools as Array<{ name?: string }> | undefined)?.map((tool) => tool.name),
+    ).not.toContain("search_gmail");
+    expect(workspaceIdentity).toEqual({
+      messageId: "gmail-message-1",
+      threadId: "gmail-thread-1",
+      historyId: "gmail-history-1",
     });
+    const getEnvelope = functionOutputEnvelopes(requests[1]).find(
+      (envelope) => envelope.callId === "gmail-get",
+    );
+    expect(getEnvelope?.output).toMatchObject({
+      operation: "gmail_get",
+      result: {
+        message: {
+          sourceId: gmail.sourceId,
+          body: gmail.text,
+          bodyFormat: "plain",
+          textStatus: "complete",
+          attachments: gmail.attachments,
+        },
+        attachmentAccess: {
+          sourceId: gmail.sourceId,
+          attachments: gmail.attachments,
+          attachmentsStatus: "complete",
+        },
+      },
+    });
+    expect(JSON.stringify(getEnvelope?.output)).not.toContain("provider-attachment-1");
+    expect(JSON.stringify(getEnvelope?.output)).not.toContain("attachmentId");
+    expect(JSON.stringify(getEnvelope?.output)).not.toContain("partId");
     const attachmentOutput = functionOutputs(requests[2]).find(
       (item) => item.call_id === "gmail-attachment",
     )?.output;

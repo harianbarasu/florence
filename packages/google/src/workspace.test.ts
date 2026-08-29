@@ -229,6 +229,107 @@ describe("Gmail draft provider journey", () => {
   });
 });
 
+describe("Gmail inbound attachment reads", () => {
+  test("returns and reads every supported attachment when a message contains more than twenty", async () => {
+    const connectionId = "connection-attachments";
+    const householdId = "household-attachments";
+    const ownerAdultId = "adult-attachments";
+    const messageId = "message-attachments";
+    const threadId = "thread-attachments";
+    const historyId = "456";
+    const key = Buffer.alloc(32, 8);
+    const pngSignature = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+    const attachmentBytes = Array.from({ length: 25 }, (_, index) => Buffer.from([...pngSignature, index]));
+    const message = {
+      id: messageId,
+      threadId,
+      historyId,
+      internalDate: String(Date.UTC(2026, 7, 28, 19)),
+      labelIds: ["INBOX"],
+      snippet: "Twenty-five photos are attached.",
+      payload: {
+        mimeType: "multipart/mixed",
+        headers: [
+          { name: "From", value: "School <school@example.com>" },
+          { name: "Subject", value: "Class photos" },
+        ],
+        parts: attachmentBytes.map((bytes, index) => ({
+          partId: `part-${index}`,
+          filename: `photo-${index}.png`,
+          mimeType: "image/png",
+          body: {
+            attachmentId: `attachment-${index}`,
+            size: bytes.byteLength,
+          },
+        })),
+      },
+    };
+    const readAttachmentIds: string[] = [];
+    const fetchMock = vi.fn<typeof fetch>(async (input) => {
+      const url = new URL(String(input));
+      if (url.origin === "https://oauth2.googleapis.com") {
+        return jsonResponse({ access_token: "access-token", token_type: "Bearer" });
+      }
+      if (
+        url.origin === "https://gmail.googleapis.com" &&
+        url.pathname === `/gmail/v1/users/me/messages/${messageId}`
+      ) {
+        return jsonResponse(message);
+      }
+      const attachmentPrefix = `/gmail/v1/users/me/messages/${messageId}/attachments/attachment-`;
+      if (url.origin === "https://gmail.googleapis.com" && url.pathname.startsWith(attachmentPrefix)) {
+        const index = Number(url.pathname.slice(attachmentPrefix.length));
+        const bytes = attachmentBytes[index];
+        if (!bytes) throw new Error(`Unexpected attachment index: ${index}`);
+        readAttachmentIds.push(`attachment-${index}`);
+        return jsonResponse({ size: bytes.byteLength, data: bytes.toString("base64url") });
+      }
+      throw new Error(`Unexpected provider request: ${url}`);
+    });
+    const store = {
+      async readActiveGoogleCredential() {
+        return {
+          connectionId,
+          householdId,
+          ownerAdultId,
+          refreshTokenEnvelope: refreshTokenEnvelope({ key, connectionId, householdId, ownerAdultId }),
+        };
+      },
+    } as unknown as GoogleConnectionStore;
+    const google = new GoogleConnection({
+      store,
+      clientId: "client-id",
+      clientSecret: "client-secret",
+      redirectUri: "https://app.tryflorence.com/oauth/google/callback",
+      encryptionKey: key,
+      fetch: fetchMock,
+    });
+
+    const evidence = await google.readGmailMessage({
+      householdId,
+      ownerAdultId,
+      connectionId,
+      messageId,
+      threadId,
+      historyId,
+    });
+
+    expect(evidence.attachmentsStatus).toBe("complete");
+    expect(evidence.attachments.map((attachment) => attachment.attachmentId)).toEqual(
+      attachmentBytes.map((_, index) => `attachment-${index}`),
+    );
+    const reads = await Promise.all(
+      evidence.attachments.map((attachment) =>
+        google.readGmailAttachment({ householdId, ownerAdultId, connectionId, attachment }),
+      ),
+    );
+    expect(reads.map((read) => Buffer.from(read.bytes).toString("hex"))).toEqual(
+      attachmentBytes.map((bytes) => bytes.toString("hex")),
+    );
+    expect(readAttachmentIds.sort()).toEqual(attachmentBytes.map((_, index) => `attachment-${index}`).sort());
+  });
+});
+
 describe("initial Family Calendar review", () => {
   test("exhausts every provider page inside the fixed review window", async () => {
     const connectionId = "connection-1";

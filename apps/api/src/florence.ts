@@ -3769,6 +3769,7 @@ export class Florence {
       const familyWorkSourceIndex = new Map(
         familyWorkMemoryCorpus.map((source) => [source.sourceId, source] as const),
       );
+      const familyWorkLinkedSourceIds = new Set(work.linkedSources.map((source) => source.sourceId));
       const familyWorkConversationHistoryObservedAt = this.#now().toISOString();
       const familyWorkGoogleConnections =
         google && familyWorkGoogleAdultId
@@ -4556,6 +4557,7 @@ export class Florence {
           initiatingAdultId: work.initiatingAdultId,
           origin: work.origin,
           household: work.household,
+          linkedSources: work.linkedSources.map((source) => ({ ...source })),
           visibleSources: familyWorkVisibleSources,
           googleConnections: familyWorkGoogleModelConnections,
           lastDeliveredProgress: work.lastDeliveredProgress,
@@ -4641,16 +4643,31 @@ export class Florence {
           searchFamilyMemory: async ({ query, limit }) =>
             searchMemorySources(familyWorkSearchableMemory, query).slice(0, limit),
           readSource: async ({ sourceId }) => {
+            if (familyWorkLinkedSourceIds.has(sourceId)) {
+              const retained = await this.#store.readClaimedFamilyWorkLinkedGoogleSource({
+                workId: work.workId,
+                generation: work.generation,
+                claimId: work.claimId,
+                occurredAt: familyWorkConversationHistoryObservedAt,
+                sourceId,
+              });
+              const source = retainedPrivateGoogleSource(retained);
+              familyWorkSourceIndex.set(source.sourceId, source);
+              return source;
+            }
             const indexed = familyWorkSourceIndex.get(sourceId);
             if (indexed) return indexed;
-            if (work.visibility !== "private") return null;
-            const retained = await this.#store.readClaimedFamilyWorkPrivateGoogleSource({
-              workId: work.workId,
-              generation: work.generation,
-              claimId: work.claimId,
-              occurredAt: familyWorkConversationHistoryObservedAt,
-              sourceId,
-            });
+            const retained =
+              work.visibility === "private"
+                ? await this.#store.readClaimedFamilyWorkPrivateGoogleSource({
+                    workId: work.workId,
+                    generation: work.generation,
+                    claimId: work.claimId,
+                    occurredAt: familyWorkConversationHistoryObservedAt,
+                    sourceId,
+                  })
+                : null;
+            if (!retained) return null;
             const source = retainedPrivateGoogleSource(retained);
             familyWorkSourceIndex.set(source.sourceId, source);
             return source;
@@ -7570,6 +7587,7 @@ function decisionCommit(
           schedule: decision.familyWork.schedule,
           visibility: turn.authority.audience === "group" ? "household" : "private",
           ownerAdultId: turn.authority.audience === "group" ? null : turn.authority.senderAdultId,
+          candidateIds: [...decision.familyWork.candidateIds],
         }
       : decision.familyWork?.operation === "update"
         ? {

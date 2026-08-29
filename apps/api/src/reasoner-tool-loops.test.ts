@@ -167,6 +167,7 @@ describe("Florence reasoner capability cutover", () => {
       objective: "Find three good dinner options for Saturday and compare them.",
       schedule: null,
       instruction: null,
+      candidateIds: [],
     };
     const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
       responses: {
@@ -196,6 +197,7 @@ describe("Florence reasoner capability cutover", () => {
       objective: "Find three good dinner options for Saturday and compare them.",
       schedule: null,
       instruction: null,
+      candidateIds: [],
     };
     const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
       responses: {
@@ -3066,6 +3068,7 @@ Compare the useful family options.
                         "Email the school that Violet's enrollment paperwork is complete and ask them to confirm her status is current.",
                       schedule: null,
                       instruction: null,
+                      candidateIds: [],
                     },
                   },
                   output: [],

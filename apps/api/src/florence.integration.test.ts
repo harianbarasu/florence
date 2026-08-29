@@ -2917,6 +2917,7 @@ release("Florence parent journeys", () => {
               objective,
               instruction: null,
               schedule,
+              candidateIds: [],
             },
           });
         }
@@ -3227,6 +3228,7 @@ release("Florence parent journeys", () => {
                 objective,
                 schedule: null,
                 instruction: null,
+                candidateIds: [],
               },
             })
           : decision(),
@@ -3416,6 +3418,7 @@ release("Florence parent journeys", () => {
                 objective,
                 schedule: null,
                 instruction: null,
+                candidateIds: [],
               },
             })
           : decision(),
@@ -3561,6 +3564,7 @@ release("Florence parent journeys", () => {
                 objective: "Upload Maya's field-trip form from Gmail.",
                 schedule: null,
                 instruction: null,
+                candidateIds: [],
               },
             })
           : decision(),
@@ -3717,6 +3721,12 @@ release("Florence parent journeys", () => {
     let groupHouseholdFactWasVisible = false;
     let retainedPrivateSourceWasRead = false;
     let groupSourceSearchWasHidden = false;
+    const docketWorkRequest = "Please take care of Maya’s field-trip form from the docket.";
+    const docketWorkObjective =
+      "Use the retained source for Maya’s field-trip form to determine and complete the next useful family action.";
+    const docketWorkAcknowledgement = "I’m on it—I’ll work from the form already on the docket.";
+    const docketWorkResult = "I opened the exact school-form source and worked from that family deadline.";
+    let docketWorkReadExactLinkedSource = false;
     const observedHouseholdDocket: {
       value: FlorenceReasonerInput["householdDocket"] | null;
     } = { value: null };
@@ -3817,10 +3827,25 @@ release("Florence parent journeys", () => {
       imageBytes: null,
       pdfBytes: null,
     };
-    const harness = await createHarness(async (input, reads, signal, hooks) => {
+    const householdReasoner: Reason = async (input, reads, signal, hooks) => {
       if (input.currentMessage.text === HOUSEHOLD_DOCKET_REQUEST) {
         observedHouseholdDocket.value = input.householdDocket;
         return decision({ bubbles: [{ text: HOUSEHOLD_DOCKET_REPLY, delayMs: 0 }] });
+      }
+      if (input.currentMessage.text === docketWorkRequest) {
+        const candidate = input.householdDocket.items.find((item) => item.summary === FOUNDER_FORM_SUMMARY);
+        if (!candidate) throw new Error("The selected docket item was not supplied to the reasoner");
+        return decision({
+          bubbles: [{ text: docketWorkAcknowledgement, delayMs: 0 }],
+          familyWork: {
+            operation: "create",
+            workId: null,
+            objective: docketWorkObjective,
+            schedule: null,
+            instruction: null,
+            candidateIds: [candidate.candidateId],
+          },
+        });
       }
       if (input.currentMessage.text === HOUSEHOLD_DOCKET_HANDLED) {
         const candidate = input.householdDocket.items.find(
@@ -4007,6 +4032,46 @@ release("Florence parent journeys", () => {
           sourceIds: [input.currentMessage.sourceId],
         },
       });
+    };
+    const harness = await createHarness(householdReasoner, {
+      continueFamilyWork: async (input, reads) => {
+        if (input.objective !== docketWorkObjective) {
+          throw new Error(`Unexpected family work in docket narrative: ${input.objective}`);
+        }
+        expect(input.visibility).toBe("household");
+        expect(input.ownerAdultId).toBeNull();
+        expect(input.initiatingAdultId).toBe(harness.partnerAdultId);
+        expect(reads.searchSources).toBeUndefined();
+        expect(input.visibleSources?.some((source) => source.kind === "gmail")).toBe(false);
+        expect(input.linkedSources).toEqual([
+          expect.objectContaining({ kind: "gmail", sourceId: expect.any(String) }),
+        ]);
+        const linkedSource = input.linkedSources?.[0];
+        if (!linkedSource) throw new Error("The docket-grounded work lost its linked source ID");
+        if (!reads.readSource) throw new Error("The durable worker did not receive exact source reading");
+        const source = await reads.readSource({ sourceId: linkedSource.sourceId });
+        docketWorkReadExactLinkedSource =
+          source?.kind === "gmail" &&
+          source.visibility === "adult_private" &&
+          source.text.includes("Hari private email") &&
+          source.text.includes("form needs a signature");
+        if (!docketWorkReadExactLinkedSource) {
+          throw new Error("The household worker could not open the exact selected docket source");
+        }
+        return {
+          kind: "terminal",
+          state: {
+            ...input.state,
+            progressRevision: input.state.progressRevision + 1,
+            phase: "terminal",
+            claim: null,
+            pendingCall: null,
+            terminal: { outcome: "succeeded", text: docketWorkResult },
+          },
+          outcome: "succeeded",
+          text: docketWorkResult,
+        };
+      },
     });
     harness.state.initialGoogleFailuresRemaining = 2;
     harness.state.initialClassifierFailuresRemaining = 1;
@@ -4302,6 +4367,43 @@ release("Florence parent journeys", () => {
       "conflict",
     ]);
     expect(harness.linq.messages.some((message) => message.text === HOUSEHOLD_DOCKET_REPLY)).toBe(true);
+    await harness.accept("group", "docket-grounded-family-work", docketWorkRequest, "partner");
+    await harness.drain();
+    expect(harness.linq.messages.some((message) => message.text === docketWorkAcknowledgement)).toBe(true);
+    harness.state.now += 1_001;
+    await harness.drain();
+    expect(docketWorkReadExactLinkedSource).toBe(true);
+    expect(harness.linq.messages.some((message) => message.text === docketWorkResult)).toBe(true);
+    await harness.assertDatabase(
+      "Docket-grounded household work lost its exact Message/source lineage or attached unrelated evidence",
+      `exists (
+          select 1 from proactive_work work
+          where work.kind='family_task' and work.objective=${sqlLiteral(docketWorkObjective)}
+            and work.visibility='household' and work.owner_adult_id is null
+            and work.status='completed'
+        ) and exists (
+          select 1 from proactive_work work
+          join proactive_work_sources link on link.work_id=work.id
+          join messages message on message.source_id=link.source_id
+          where work.kind='family_task' and work.objective=${sqlLiteral(docketWorkObjective)}
+            and message.provider_message_id='message-docket-grounded-family-work'
+            and message.direction='inbound'
+        ) and (select count(*)=1 from proactive_work work
+          join proactive_work_sources link on link.work_id=work.id
+          join sources source on source.id=link.source_id
+          where work.kind='family_task' and work.objective=${sqlLiteral(docketWorkObjective)}
+            and source.kind in ('gmail','calendar')
+            and source.owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid
+            and source.metadata->>'messageId'=${sqlLiteral(SCHOOL_ATTACHMENT.messageId)})
+        and not exists (
+          select 1 from proactive_work work
+          join proactive_work_sources link on link.work_id=work.id
+          join sources source on source.id=link.source_id
+          where work.kind='family_task' and work.objective=${sqlLiteral(docketWorkObjective)}
+            and source.kind in ('gmail','calendar')
+            and source.owner_adult_id=${sqlLiteral(harness.partnerAdultId)}::uuid
+        )`,
+    );
     await harness.accept("group", "household-docket-handled", HOUSEHOLD_DOCKET_HANDLED, "partner");
     await harness.drain();
     expect(harness.linq.messages.some((message) => message.text === HOUSEHOLD_DOCKET_HANDLED_ACK)).toBe(true);

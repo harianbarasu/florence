@@ -549,10 +549,8 @@ export const florenceReasonerInputSchema = z
     ),
     householdDocket: z
       .object({
-        totalItems: z.number().int().min(0).max(10_000),
-        items: z
-          .array(florenceHouseholdSafeCandidateSchema.extend({ candidateId: opaqueId }).strict())
-          .max(20),
+        totalItems: z.number().int().min(0),
+        items: z.array(florenceHouseholdSafeCandidateSchema.extend({ candidateId: opaqueId }).strict()),
       })
       .strict(),
     visibleReminders: z.array(
@@ -739,6 +737,7 @@ const familyWorkDecisionSchema = z.discriminatedUnion("operation", [
       objective: shortText,
       schedule: reminderScheduleSchema.nullable(),
       instruction: z.null(),
+      candidateIds: z.array(opaqueId),
     })
     .strict(),
   z
@@ -987,7 +986,7 @@ export const florenceDecisionSchema = z
     followUp: followUpDecisionSchema.nullable(),
     reminder: reminderDecisionSchema.nullable(),
     familyWork: familyWorkDecisionSchema.nullable(),
-    docketCompletions: z.array(opaqueId).max(20).nullable(),
+    docketCompletions: z.array(opaqueId).nullable(),
     interest: florenceDurableInterestDecisionSchema.nullable().optional(),
     calendar: calendarDecisionSchema.nullable(),
     householdUpdate: z
@@ -1637,6 +1636,7 @@ export type FlorenceFamilyWorkInput = Readonly<{
   initiatingAdultId?: string | null;
   origin: FamilyWorkOriginContext;
   household: SharedFamilyProfile;
+  linkedSources?: readonly Readonly<{ sourceId: string; kind: "gmail" | "calendar" }>[];
   visibleSources?: readonly FlorenceSource[];
   googleConnections?: FlorenceReasonerInput["googleConnections"];
   lastDeliveredProgress?: string | null;
@@ -2006,9 +2006,11 @@ The reminder, followUp, and familyWork fields are different general capabilities
 
 currentTime is the authoritative current instant for resolving all new schedules; currentMessage.occurredAt is only when the parent sent the Message. Create familyWork with the parent's actual objective and either schedule null for work starting now or a resolved schedule for future or recurring work. Use the same once, interval, daily, weekly, monthly, and yearly schedule meanings as reminders. list answers from visibleFamilyWork, including the natural objective, schedule, paused state, last result, and next occurrence when useful; never expose work IDs. update changes a supplied scheduled series definition and is patch-only: objective null preserves the objective and schedule null preserves the schedule, and at least one field must change. Immediate one-off work is steered instead of updated. Prefer updating a supplied matching scheduled familyWork over creating a duplicate. pause and resume control only scheduled familyWork; use its paused boolean even while a current occurrence is active or waiting. run starts one occurrence now without changing its cadence, and a paused series stays paused after that one run. cancel ends the supplied work and future occurrences.
 
+For familyWork create, candidateIds is structured provenance beside the natural-language objective. Include each supplied householdDocket candidateId that directly grounds the work Florence is starting, with no duplicates, and include no merely similar or background item. Use an empty array when the objective is not grounded in a supplied docket item. Never copy candidate IDs into conversation text.
+
 steer changes only the current occurrence, never the recurring definition or a future occurrence. Use it only while an immediate task or one scheduled occurrence is actually active or waiting on the parent. If a scheduled occurrence is already in flight, steer it rather than updating its series definition; update can be used when no occurrence is in flight. Resolve every list, update, steer, pause, resume, run, or cancel against visibleFamilyWork, and ask one focused question instead of guessing when more than one item plausibly matches. Return one immediate natural acknowledgement bubble for every familyWork mutation that names the work Florence is actually starting or changing; a brief reaction may accompany it when that feels natural, but cannot replace the acknowledgement. Never say the work is complete at acceptance. Report a real result, useful partial findings plus one blocking question, or an exact honest failure.
 
-householdDocket is the ranked household-safe backlog retained from the complete Google review. Treat it as current structured context, not a reason to volunteer every item. When a parent asks what is on the docket, what needs attention, or what the family is waiting on, reconcile it with visible reminders, active or waiting family work, paused scheduled family work, pending follow-ups, pending Calendar offers, and a near-term family-Calendar read when timing could change the answer. Rank by consequence and time, not source or message count. Lead with at most three unfinished items. For each, say naturally what it is, why it matters now, and the next decision or action without inventing facts beyond the supplied summary, category, dueAt, and needsAnswer. If householdDocket.totalItems exceeds what you show, say how many lower-priority items remain instead of dumping them. Do not treat silence from another person as completion, and do not repeat an unchanged docket item unsolicited merely because it is still present. When the parent clearly says a supplied docket item is handled, finished, cancelled, or no longer relevant, put exactly that candidateId in docketCompletions and acknowledge it naturally. A reply or unambiguous recent referent may identify the item; if more than one supplied item plausibly matches, ask one focused question and return docketCompletions null. Return docketCompletions null when nothing was completed. Never infer completion from thanks, agreement, silence, or a reaction.
+householdDocket is the complete ranked household-safe backlog retained from the complete Google review. Treat it as current structured context, not a reason to volunteer every item. When a parent asks what is on the docket, what needs attention, or what the family is waiting on, reconcile it with visible reminders, active or waiting family work, paused scheduled family work, pending follow-ups, pending Calendar offers, and a near-term family-Calendar read when timing could change the answer. Rank by consequence and time, not source or message count. Lead with at most three unfinished items. For each, say naturally what it is, why it matters now, and the next decision or action without inventing facts beyond the supplied summary, category, dueAt, and needsAnswer. If householdDocket.totalItems exceeds what you show, say how many lower-priority items remain instead of dumping them. When a parent asks Florence to take care of one or more supplied items and the work needs the durable agent, create familyWork for the actual outcome and put only those exact candidate IDs in familyWork.candidateIds so the retained evidence follows the work. Do not treat silence from another person as completion, and do not repeat an unchanged docket item unsolicited merely because it is still present. When the parent clearly says a supplied docket item is handled, finished, cancelled, or no longer relevant, put exactly that candidateId in docketCompletions and acknowledge it naturally. A reply or unambiguous recent referent may identify the item; if more than one supplied item plausibly matches, ask one focused question and return docketCompletions null. Return docketCompletions null when nothing was completed. Never infer completion from thanks, agreement, silence, or a reaction.
 
 Use visibleFamilyWork to answer status questions and all family-work control naturally. When active work has a future nextAt, say naturally when Florence will run it rather than implying that work is happening continuously. schedule null means one immediate task; a non-null schedule means a scheduled series. The paused boolean is the real scheduled-series state even when status describes an occurrence that is currently active, waiting, or delivering. lastRunAt and lastResult describe the latest delivered occurrence and help distinguish a useful rerun from a duplicate. A reply or an unambiguous recent referent can resolve “that”; if two tasks plausibly match, ask one focused question and return no familyWork mutation. An unrelated family Message must leave every task untouched. Never expose work IDs, phases, generations, claims, or other machinery in conversation.
 
@@ -2133,6 +2135,8 @@ Reason from the objective and the accumulated evidence, then choose and compose 
 At the point when one concrete outside-effect call is fully formed, but before requesting that call, make one private semantic decision from the exact initiating parent message, every later steering message in order, the accumulated task transcript, and the proposed call itself. Proceed when the call only observes or prepares while leaving the family uncommitted, or when ordinary parent language has already explicitly requested or approved that exact outside commitment. An exact parent instruction that already requests the proposed outside commitment is authorization; perform it without asking twice. An origin whose requested endpoint leaves the family free to choose does not authorize the first act that commits the family outside Florence. In that case do not request that call yet: return waiting and ask one natural, focused question about the meaningful choice. A later ordinary reply may approve, modify, or decline it and is authoritative steering for this same task. Never turn this decision into a policy explanation, warning, refusal, named category, or command protocol. Ask only when that one consequential choice remains genuinely unknowable after using available sources.
 
 Vault knowledge, reminders, and the shared Family Calendar are ordinary composable capabilities in this same task loop. Use them whenever they are a useful part of the requested outcome, without turning them into a named workflow or assuming that every task needs one. For a household task whose answer depends on when the family is available, read the exact needed household-availability window; this exposes only opted-in title-free busy intervals, and any non-complete coverage is unknown rather than free. List reminders before changing an existing one unless its exact ID was already returned here. Read a complete shared-Calendar window before creating within it, and copy an exact returned event target before updating or deleting. A successful capability result is already the durable receipt for that effect; do not repeat it or send a separate mechanical confirmation.
+
+linkedSources contains only exact retained Gmail or Calendar source IDs that grounded this task when the parent selected a household-docket item. It is structured evidence context, not prose and not a second objective. Use read_source on an exact linked source when its evidence can advance the objective; the source body is intentionally absent until that read. Do not search broadly for another adult's private sources. For household-visible work, use linked private evidence only to produce or complete the requested household outcome, and share only the household-relevant conclusion or confirmed action rather than exposing unrelated private wording or details.
 
 Google Workspace tools use the account of the adult who initiated this task, including when they asked in the family thread. In household-visible work, use that account only as needed to fulfill the initiating parent's explicit group request. Return the requested shared conclusion or confirmed action, not an unsolicited recap of unrelated private mail, files, contacts, or tasks.
 
@@ -5517,7 +5521,7 @@ function foregroundCapabilityRegistry(): CapabilityRegistry<ForegroundCapability
     defineCapability({
       name: "read_source",
       description:
-        "Read one exact source already referenced in the supplied turn or discovered by search_sources. A lightweight search hit becomes citeable evidence only after this exact read succeeds.",
+        "Read one exact source already referenced in the supplied turn, linked to this durable task, or discovered by search_sources. A lightweight reference becomes usable evidence only after this exact read succeeds.",
       modelSchema: SOURCE_PARAMETERS,
       inputSchema: sourceArguments,
       outputSchema: sourceReadOutputSchema,
@@ -6458,6 +6462,7 @@ function familyWorkModelContext(input: FlorenceFamilyWorkInput): JsonValue {
     currentTime: input.currentTime,
     timeZone: input.household.timeZone,
     objective: input.objective,
+    linkedSources: (input.linkedSources ?? []).map((source) => ({ ...source })),
     scheduledOccurrence: input.scheduledOccurrence
       ? {
           schedule:
@@ -7806,6 +7811,7 @@ export class FlorenceReasoner {
       ...(reasonerInput.currentMessage.pdfs ?? []).map((document) => document.documentId),
       ...reasonerInput.recentMessages.map((message) => message.sourceId),
       ...reasonerInput.visibleSources.map((source) => source.sourceId),
+      ...(checkpointInput.linkedSources ?? []).map((source) => source.sourceId),
     ]);
     const readableSourceIds = new Set<string>();
     const knownFacts = new Set(
@@ -10187,6 +10193,14 @@ function validateDecision(
       validateFutureSchedule(familyWork.schedule, input.currentTime, "A family-work schedule");
     }
     if (familyWork.operation === "create") {
+      if (
+        new Set(familyWork.candidateIds).size !== familyWork.candidateIds.length ||
+        familyWork.candidateIds.some(
+          (candidateId) => !input.householdDocket.items.some((item) => item.candidateId === candidateId),
+        )
+      ) {
+        throw invalidOutput("OpenAI grounded family work in an unavailable or repeated docket item");
+      }
       if (
         input.visibleFamilyWork.some(
           (work) =>

@@ -757,6 +757,7 @@ export type DueProactiveWork =
       initiatingAdultId: string;
       origin: FamilyWorkOriginContext;
       objective: string;
+      linkedSources: readonly Readonly<{ sourceId: string; kind: "gmail" | "calendar" }>[];
       lastDeliveredProgress: string | null;
       state: FamilyWorkStateV1;
       claimId: string;
@@ -1447,6 +1448,7 @@ export type FamilyWorkMutation =
       visibility: Visibility;
       ownerAdultId: string | null;
       schedule: ReminderSchedule | null;
+      candidateIds: readonly string[];
     }
   | {
       operation: "update";
@@ -3453,6 +3455,7 @@ export class PostgresFlorenceStore {
             initiatingAdultId: resolvedOrigin.initiatingAdultId,
             origin: resolvedOrigin.origin,
             objective: required(familyTask.objective ?? "", "Family work objective"),
+            linkedSources: await familyWorkLinkedGoogleSources(sql, familyTask, now),
             lastDeliveredProgress: claimedState.progressRevision > 0 ? familyTask.current_conclusion : null,
             state: claimedState,
             claimId,
@@ -7293,6 +7296,16 @@ export class PostgresFlorenceStore {
     });
   }
 
+  async readClaimedFamilyWorkLinkedGoogleSource(
+    input: ClaimedFamilyWorkPrivateGoogleSourceReadInput,
+  ): Promise<PrivateGoogleSourceReadResult> {
+    const occurredAt = instant(input.occurredAt);
+    return this.#sql.begin(async (sql) => {
+      const context = await claimedFamilyWorkContext(sql, input, occurredAt);
+      return readClaimedFamilyWorkLinkedGoogleSourceOn(sql, context, occurredAt, input.sourceId);
+    });
+  }
+
   async stageRetryCue(input: { sourceId: string; occurredAt: string }): Promise<string | null> {
     assertUuid(input.sourceId, "Inbound source ID");
     const occurredAt = instant(input.occurredAt);
@@ -7867,7 +7880,7 @@ export class PostgresFlorenceStore {
       householdDocket: await this.readHouseholdDocket({
         householdId: row.household_id,
         viewerAdultId: privateViewer,
-        limit: 20,
+        limit: null,
         now: current.toISOString(),
       }),
       visibleFamilyWork: familyWorkRows.map((work) => ({
@@ -8374,6 +8387,49 @@ export class PostgresFlorenceStore {
               "Family work must stay inside the conversation where it was requested",
             );
           }
+          for (const candidateId of mutation.candidateIds) {
+            assertUuid(candidateId, "Family work docket candidate ID");
+          }
+          let selectedDocketSourceIds: readonly string[] = [];
+          if (mutation.candidateIds.length > 0) {
+            await lockHouseholdGooglePolls(sql, turn.household_id);
+            const docketState = await currentHouseholdDocketState(sql, {
+              householdId: turn.household_id,
+              audience: turn.audience,
+              requestingAdultId: turn.sender_adult_id,
+              handledAt,
+            });
+            const selection = selectCurrentHouseholdDocketCandidates(docketState, mutation.candidateIds);
+            const candidateSourceIds = unique(
+              selection.candidates.flatMap((candidate) => [...candidate.sourceIds]),
+            );
+            const selectedSources =
+              candidateSourceIds.length === 0
+                ? []
+                : await sql<
+                    {
+                      id: string;
+                      visibility: Visibility;
+                      owner_adult_id: string | null;
+                    }[]
+                  >`
+                    select id,visibility,owner_adult_id from sources
+                    where household_id=${turn.household_id} and id in ${sql(candidateSourceIds)}
+                    order by id for share
+                  `;
+            if (selectedSources.length !== candidateSourceIds.length) {
+              throw new FlorenceStoreConflict(
+                "A household docket source changed before Florence could start the work",
+              );
+            }
+            selectedDocketSourceIds = selectedSources.flatMap((source) =>
+              expectedVisibility === "household" ||
+              source.visibility === "household" ||
+              source.owner_adult_id === turn.sender_adult_id
+                ? [source.id]
+                : [],
+            );
+          }
           const objective = bounded(required(mutation.objective, "Family work objective"), 4_000);
           const [sameId] = await sql<ProactiveWorkRow[]>`
             select * from proactive_work where id=${mutation.workId} for update
@@ -8411,6 +8467,20 @@ export class PostgresFlorenceStore {
             insert into proactive_work_sources (work_id,source_id)
             values (${mutation.workId},${turn.source_id})
           `;
+          // Adapted port: Hermes 6dcebea7 cron/jobs.py:1959-2150 and
+          // cron/scheduler.py:4611-4677 persist context IDs separately and resolve them when work
+          // executes; Pi 4e494929 packages/agent/src/types.ts:360-369,
+          // packages/ai/src/types.ts:449-465, and packages/agent/src/agent-loop.ts:218-232,777-790
+          // keep structured tool provenance beside model content; OpenInstinct 480045db
+          // agent/instructions.md:66-79 passes complete relevant context plus exact targets.
+          // Florence keeps the objective natural-language while linking the selected docket's
+          // current provider lineage transactionally in the existing durable-work row.
+          for (const sourceId of selectedDocketSourceIds) {
+            await sql`
+              insert into proactive_work_sources (work_id,source_id)
+              values (${mutation.workId},${sourceId}) on conflict do nothing
+            `;
+          }
         } else {
           const [work] = await sql<ProactiveWorkRow[]>`
             select * from proactive_work
@@ -15412,6 +15482,29 @@ type FamilyWorkOriginMessageRow = {
   occurred_at: Date;
 };
 
+async function familyWorkLinkedGoogleSources(
+  sql: postgres.TransactionSql,
+  work: ProactiveWorkRow,
+  snapshotAt: Date,
+): Promise<readonly Readonly<{ sourceId: string; kind: "gmail" | "calendar" }>[]> {
+  const sources = await sql<{ id: string; kind: "gmail" | "calendar" }[]>`
+    select source.id,source.kind from proactive_work_sources work_source
+    join sources source on source.id=work_source.source_id
+    where work_source.work_id=${work.id} and source.household_id=${work.household_id}
+      and source.kind in ('gmail','calendar') and source.created_at<=${snapshotAt}
+      and coalesce(source.metadata->>'providerRemoved','false')<>'true'
+      and (
+        (${work.visibility}='household' and source.visibility='private'
+          and source.owner_adult_id is not null)
+        or (${work.visibility}='private' and source.visibility='private'
+          and source.owner_adult_id=${work.owner_adult_id})
+      )
+    order by source.occurred_at,source.id
+    for share of source
+  `;
+  return sources.map((source) => ({ sourceId: source.id, kind: source.kind }));
+}
+
 async function familyWorkOriginContext(
   sql: postgres.TransactionSql,
   work: ProactiveWorkRow,
@@ -15852,6 +15945,42 @@ async function claimedFamilyWorkPrivateGoogleSourceAccess(
     viewerAdultId: context.senderAdultId,
     snapshotAt: occurredAt,
   };
+}
+
+async function readClaimedFamilyWorkLinkedGoogleSourceOn(
+  sql: postgres.TransactionSql,
+  context: ClaimedFamilyWorkContext,
+  occurredAt: Date,
+  sourceId: string,
+): Promise<PrivateGoogleSourceReadResult> {
+  assertUuid(sourceId, "Linked family-work Google source ID");
+  const [source] = await sql<{ owner_adult_id: string }[]>`
+    select source.owner_adult_id from proactive_work_sources work_source
+    join sources source on source.id=work_source.source_id
+    where work_source.work_id=${context.work.id} and source.id=${sourceId}
+      and source.household_id=${context.work.household_id}
+      and source.kind in ('gmail','calendar') and source.visibility='private'
+      and source.owner_adult_id is not null and source.created_at<=${occurredAt}
+      and coalesce(source.metadata->>'providerRemoved','false')<>'true'
+      and (
+        (${context.work.visibility}='household')
+        or (${context.work.visibility}='private'
+          and source.owner_adult_id=${context.work.owner_adult_id})
+      )
+    limit 1 for share of source
+  `;
+  if (!source) {
+    throw new FlorenceStoreConflict("That linked family-work source is no longer available");
+  }
+  return readPrivateGoogleSourceOn(
+    sql,
+    {
+      householdId: context.work.household_id,
+      viewerAdultId: source.owner_adult_id,
+      snapshotAt: occurredAt,
+    },
+    sourceId,
+  );
 }
 
 async function searchPrivateGoogleSourcesOn(
@@ -18294,25 +18423,25 @@ async function lockHouseholdDocketMonitors(
   `;
 }
 
-async function completeHouseholdDocketCandidates(
+type CurrentHouseholdDocketState = {
+  reviews: readonly (ProactiveWorkRow & { private_conflict_busy_sharing_enabled: boolean })[];
+  groups: readonly StoredBriefingCandidateGroup[];
+  visiblePrivateFindings: readonly StoredPrivateReviewFinding[];
+};
+
+async function currentHouseholdDocketState(
   sql: postgres.TransactionSql,
   input: {
     householdId: string;
     audience: Audience;
     requestingAdultId: string;
-    candidateIds: readonly string[];
-    basisSourceId: string;
     handledAt: Date;
   },
-): Promise<void> {
-  assertUuid(input.basisSourceId, "Household docket completion source ID");
-  assertUuid(input.requestingAdultId, "Household docket completion adult ID");
+): Promise<CurrentHouseholdDocketState> {
   const [household] = await sql<{ time_zone: string }[]>`
     select time_zone from households where id=${input.householdId} for share
   `;
   if (!household) throw new FlorenceStoreConflict("The household docket no longer exists");
-  await lockHouseholdGooglePolls(sql, input.householdId);
-  const linkedMonitors = await lockHouseholdDocketMonitors(sql, input.householdId);
   const reviews = await sql<(ProactiveWorkRow & { private_conflict_busy_sharing_enabled: boolean })[]>`
     select work.*,
       coalesce(person.preferences->'privateConflictBusySharingEnabled'='true'::jsonb,false)
@@ -18338,29 +18467,75 @@ async function completeHouseholdDocketCandidates(
         .map((candidate) => ({ candidate, ownerAdultId: review.owner_adult_id as string }));
     }),
   );
+  const resolvedActionKeys =
+    input.audience === "private"
+      ? await readResolvedGoogleActionKeys(sql, input.householdId)
+      : new Set<string>();
   const visiblePrivateFindings =
     input.audience === "private"
       ? reviews
           .filter((review) => review.owner_adult_id === input.requestingAdultId)
           .flatMap((review) => storedPrivateReviewFindings(review.briefing_candidates))
+          .filter((finding) => !finding.actionKey || !resolvedActionKeys.has(finding.actionKey))
       : [];
-  const completedGroups = input.candidateIds.flatMap((candidateId) => {
-    const group = groups.find((candidateGroup) =>
+  return { reviews, groups, visiblePrivateFindings };
+}
+
+function selectCurrentHouseholdDocketCandidates(
+  state: CurrentHouseholdDocketState,
+  candidateIds: readonly string[],
+): {
+  groups: readonly StoredBriefingCandidateGroup[];
+  privateFindings: readonly StoredPrivateReviewFinding[];
+  candidates: readonly StoredBriefingCandidate[];
+} {
+  if (new Set(candidateIds).size !== candidateIds.length) {
+    throw new FlorenceStoreConflict("A household docket selection repeated an item");
+  }
+  const groups = candidateIds.flatMap((candidateId) => {
+    const group = state.groups.find((candidateGroup) =>
       candidateGroup.members.some((candidate) => candidate.candidateId === candidateId),
     );
     return group ? [group] : [];
   });
-  const completedPrivateFindings = input.candidateIds.flatMap((candidateId) => {
-    const finding = visiblePrivateFindings.find((candidate) => candidate.candidateId === candidateId);
+  const privateFindings = candidateIds.flatMap((candidateId) => {
+    const finding = state.visiblePrivateFindings.find((candidate) => candidate.candidateId === candidateId);
     return finding ? [finding] : [];
   });
-  if (completedGroups.length + completedPrivateFindings.length !== input.candidateIds.length) {
-    throw new FlorenceStoreConflict("A household docket item changed before it was completed");
+  if (groups.length + privateFindings.length !== candidateIds.length) {
+    throw new FlorenceStoreConflict("A household docket item changed before it was used");
   }
-  const completedCandidates = [
-    ...completedGroups.flatMap((group) => [...group.members]),
-    ...completedPrivateFindings.map(privateFindingAsDocketCandidate),
-  ];
+  return {
+    groups,
+    privateFindings,
+    candidates: [
+      ...groups.flatMap((group) => [...group.members]),
+      ...privateFindings.map(privateFindingAsDocketCandidate),
+    ],
+  };
+}
+
+async function completeHouseholdDocketCandidates(
+  sql: postgres.TransactionSql,
+  input: {
+    householdId: string;
+    audience: Audience;
+    requestingAdultId: string;
+    candidateIds: readonly string[];
+    basisSourceId: string;
+    handledAt: Date;
+  },
+): Promise<void> {
+  assertUuid(input.basisSourceId, "Household docket completion source ID");
+  assertUuid(input.requestingAdultId, "Household docket completion adult ID");
+  await lockHouseholdGooglePolls(sql, input.householdId);
+  const linkedMonitors = await lockHouseholdDocketMonitors(sql, input.householdId);
+  const state = await currentHouseholdDocketState(sql, input);
+  const selection = selectCurrentHouseholdDocketCandidates(state, input.candidateIds);
+  const reviews = state.reviews;
+  const completedGroups = selection.groups;
+  const completedPrivateFindings = selection.privateFindings;
+  const completedCandidates = selection.candidates;
   const completedCandidateSourceDigests = await readStableGoogleSourceDigestMap(
     sql,
     input.householdId,

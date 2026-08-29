@@ -407,6 +407,7 @@ describe("Florence reasoner capability cutover", () => {
     };
     const input = {
       workId: "family-work-pdf",
+      scheduledOccurrence: null,
       objective: `Read ${pdfUrl} and tell me the deadline and what I need to do.`,
       visibility: "private" as const,
       ownerAdultId: "adult-1",
@@ -529,6 +530,7 @@ describe("Florence reasoner capability cutover", () => {
     } as never);
     const input = {
       workId: "family-work-dentist-call",
+      scheduledOccurrence: null,
       objective: "Call the dentist and arrange Violet’s cleaning Tuesday or Wednesday after 3 PM.",
       visibility: "household" as const,
       ownerAdultId: null,
@@ -662,6 +664,7 @@ describe("Florence reasoner capability cutover", () => {
     };
     const input = {
       workId: "family-work-cancelled-call-start",
+      scheduledOccurrence: null,
       objective: "Call the dentist and ask for an appointment.",
       visibility: "private" as const,
       ownerAdultId: "adult-jackson",
@@ -753,6 +756,7 @@ describe("Florence reasoner capability cutover", () => {
     };
     const input = {
       workId: "family-work-pending-twilio-call",
+      scheduledOccurrence: null,
       objective: "Announce that pickup moved to 3 PM.",
       visibility: "private" as const,
       ownerAdultId: "adult-jackson",
@@ -924,6 +928,7 @@ describe("Florence reasoner capability cutover", () => {
     } as never);
     const input = {
       workId: "family-work-dentist-text",
+      scheduledOccurrence: null,
       objective: "Text the dentist and confirm Violet’s Wednesday cleaning.",
       visibility: "private" as const,
       ownerAdultId: "adult-jackson",
@@ -1219,6 +1224,7 @@ describe("Florence reasoner capability cutover", () => {
     };
     const input = {
       workId: "family-work-camp-registration",
+      scheduledOccurrence: null,
       objective: "Fill out Violet’s camp registration and get it ready for my final review.",
       visibility: "private" as const,
       ownerAdultId: "adult-1",
@@ -2134,6 +2140,7 @@ describe("Florence reasoner capability cutover", () => {
     };
     const input = {
       workId: "family-work-1",
+      scheduledOccurrence: null,
       objective: "DL 747 is delayed tonight. Find the two best nonstop alternatives; Delta if possible.",
       visibility: "household" as const,
       ownerAdultId: null,
@@ -2361,6 +2368,7 @@ describe("Florence reasoner capability cutover", () => {
     } as never);
     const input = {
       workId: "family-work-dinner",
+      scheduledOccurrence: null,
       objective: "Save Tuesday's recipe, remind us to start prep, and put dinner on our calendar.",
       visibility: "household" as const,
       ownerAdultId: null,
@@ -2619,6 +2627,7 @@ Compare the useful family options.
     const result = await reasoner.continueFamilyWork(
       {
         workId: "family-work-large",
+        scheduledOccurrence: null,
         objective: "Compare the useful options.",
         visibility: "household",
         ownerAdultId: null,
@@ -2722,6 +2731,7 @@ Compare the useful family options.
                       workId: null,
                       objective:
                         "Email the school that Violet's enrollment paperwork is complete and ask them to confirm her status is current.",
+                      schedule: null,
                       instruction: null,
                     },
                   },
@@ -2844,6 +2854,7 @@ Compare the useful family options.
     };
     const input = {
       workId: "family-work-workspace-email",
+      scheduledOccurrence: null,
       objective: "Email the school an enrollment status update and ask them to confirm it is current.",
       visibility: "private" as const,
       ownerAdultId: "adult-1",
@@ -3030,6 +3041,7 @@ Compare the useful family options.
     } as never);
     const input = {
       workId: "family-work-forward-school-form",
+      scheduledOccurrence: null,
       objective: "Forward the school email and its form attachment to Jackson.",
       visibility: "household" as const,
       ownerAdultId: null,
@@ -3240,6 +3252,7 @@ Compare the useful family options.
     };
     const input = {
       workId: "family-work-calendar",
+      scheduledOccurrence: null,
       objective: "Check the School Calendar for tomorrow's schedule.",
       visibility: "private" as const,
       ownerAdultId: "adult-1",
@@ -3596,6 +3609,7 @@ Compare the useful family options.
     const result = await reasoner.continueFamilyWork(
       {
         workId: "family-work-private-reads",
+        scheduledOccurrence: null,
         objective: "Check what we know about pickup and verify the latest school form in Gmail.",
         visibility: "private",
         ownerAdultId: "adult-1",
@@ -3982,6 +3996,7 @@ function foregroundInput(): FlorenceReasonerInput {
     },
     audience: "private",
     currentAdultId: "adult-1",
+    currentTime: NOW,
     currentMessage: {
       sourceId: "turn-1",
       senderName: "Hari",

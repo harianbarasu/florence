@@ -1743,6 +1743,7 @@ export class Florence {
       },
       audience: turn.authority.audience,
       currentAdultId: turn.authority.senderAdultId,
+      currentTime: this.#now().toISOString(),
       currentMessage: {
         sourceId: turn.message.sourceId,
         senderName: members.get(turn.message.speaker) ?? "Family member",
@@ -1810,8 +1811,15 @@ export class Florence {
         workId: work.workId,
         objective: work.objective,
         currentProgress: work.currentProgress,
+        schedule:
+          work.schedule?.kind === "weekly"
+            ? { ...work.schedule, weekdays: [...work.schedule.weekdays] }
+            : work.schedule,
+        paused: work.paused,
         status: work.status,
         nextAt: work.nextAt,
+        lastRunAt: work.lastRunAt,
+        lastResult: work.lastResult,
         createdAt: work.createdAt,
       })),
       visibleInterests: turn.visibleInterests.map((interest) => ({
@@ -4421,6 +4429,19 @@ export class Florence {
           visibleSources: familyWorkVisibleSources,
           googleConnections: familyWorkGoogleModelConnections,
           state: work.state,
+          scheduledOccurrence: work.scheduledOccurrence
+            ? {
+                schedule:
+                  work.scheduledOccurrence.schedule.kind === "weekly"
+                    ? {
+                        ...work.scheduledOccurrence.schedule,
+                        weekdays: [...work.scheduledOccurrence.schedule.weekdays],
+                      }
+                    : work.scheduledOccurrence.schedule,
+                previousResult: work.scheduledOccurrence.previousResult,
+                previousRunAt: work.scheduledOccurrence.previousRunAt,
+              }
+            : null,
           currentTime: this.#now().toISOString(),
         },
         {
@@ -7295,18 +7316,30 @@ function decisionCommit(
           operation: "create",
           workId: deterministicUuid(`family-work\0${turn.message.sourceId}`),
           objective: decision.familyWork.objective,
+          schedule: decision.familyWork.schedule,
           visibility: turn.authority.audience === "group" ? "household" : "private",
           ownerAdultId: turn.authority.audience === "group" ? null : turn.authority.senderAdultId,
         }
-      : decision.familyWork?.operation === "steer"
+      : decision.familyWork?.operation === "update"
         ? {
-            operation: "steer",
+            operation: "update",
             workId: decision.familyWork.workId,
-            instruction: decision.familyWork.instruction,
+            objective: decision.familyWork.objective,
+            schedule: decision.familyWork.schedule,
           }
-        : decision.familyWork?.operation === "cancel"
-          ? { operation: "cancel", workId: decision.familyWork.workId }
-          : null;
+        : decision.familyWork?.operation === "steer"
+          ? {
+              operation: "steer",
+              workId: decision.familyWork.workId,
+              instruction: decision.familyWork.instruction,
+            }
+          : decision.familyWork &&
+              ["pause", "resume", "run", "cancel"].includes(decision.familyWork.operation)
+            ? {
+                operation: decision.familyWork.operation as "pause" | "resume" | "run" | "cancel",
+                workId: decision.familyWork.workId as string,
+              }
+            : null;
   const calendar = calendarCommit(turn, decision, options.resolveCalendarEventTarget);
   const approval = options.approveCalendarOffer ? [calendarApproval(options.approveCalendarOffer)] : [];
   const householdUpdate = decision.householdUpdate;

@@ -2787,6 +2787,337 @@ release("Florence parent journeys", () => {
     ).toHaveLength(1);
   }, 20_000);
 
+  test("plans next week's dinners from fresh family context every Sunday until either parent stops it", async () => {
+    const request =
+      "Every Sunday at 4 PM, look at next week’s Family Calendar and our saved recipes and preferences, plan dinners, and send us the grocery list.";
+    const acknowledgement =
+      "Absolutely—I’ll plan next week’s dinners from the family calendar and what you’ve saved, then send the grocery list here every Sunday at 4 PM.";
+    const objective =
+      "Every Sunday, use the latest Family Calendar, saved recipes, and family preferences to plan next week's dinners and send the grocery list.";
+    const schedule = {
+      kind: "weekly" as const,
+      everyWeeks: 1,
+      weekdays: [7],
+      localTime: "16:00",
+      startsOn: "2026-08-16",
+    };
+    const firstDue = "2026-08-16T23:00:00.000Z";
+    const secondDue = "2026-08-23T23:00:00.000Z";
+    const thirdDue = "2026-08-30T23:00:00.000Z";
+    const firstResult =
+      "Next week’s dinners are planned around Maya’s Wednesday field-trip deadline. Grocery list: spaghetti, soy sauce, sesame oil, rice vinegar, and easy sides.";
+    const addedRecipeRequest =
+      "Please save sheet-pan fajitas as another easy family dinner: peppers, onions, tortillas, and black beans; keep the kids’ portion mild.";
+    const addedRecipeTitle = "Sheet-pan fajitas";
+    const addedRecipeDetails =
+      "Ingredients: peppers, onions, tortillas, and black beans. Family note: keep the kids’ portion mild.";
+    const addedCalendarTitle = "Thursday school open house";
+    const secondResult =
+      "I updated next week’s plan for Thursday’s school open house and added the saved sheet-pan fajitas. Grocery list: peppers, onions, tortillas, black beans, and mild toppings.";
+    const cancelRequest = "Please stop the Sunday dinner planning.";
+    const cancelAcknowledgement = "Okay—I’ve stopped the Sunday dinner planning.";
+    const occurrences: Array<{
+      generation: number;
+      currentTime: string;
+      previousResult: string | null;
+      previousRunAt: string | null;
+      recipeTitle: string;
+      calendarTitles: string[];
+    }> = [];
+
+    const harness = await createHarness(
+      async (input) => {
+        if (input.currentMessage.text === request) {
+          return decision({
+            bubbles: [{ text: acknowledgement, delayMs: 0 }],
+            familyWork: {
+              operation: "create",
+              workId: null,
+              objective,
+              instruction: null,
+              schedule,
+            },
+          });
+        }
+        if (input.currentMessage.text === addedRecipeRequest) {
+          return decision({
+            bubbles: [{ text: "Saved—I’ll use the fajitas in future family meal plans.", delayMs: 0 }],
+            facts: [
+              {
+                operation: "remember",
+                factId: null,
+                statement: "The family has a reusable sheet-pan fajitas recipe.",
+                visibility: "household",
+                memory: {
+                  memoryKind: "artifact",
+                  artifactKind: "recipe",
+                  title: addedRecipeTitle,
+                  details: addedRecipeDetails,
+                  tags: ["recipe", "fajitas", "weeknight"],
+                },
+                sourceIds: [input.currentMessage.sourceId],
+              },
+            ],
+          });
+        }
+        if (input.currentMessage.text === cancelRequest) {
+          const scheduledWork = input.visibleFamilyWork.find((work) => work.objective === objective);
+          if (!scheduledWork) throw new Error("The partner could not see the shared Sunday dinner planning");
+          expect(scheduledWork).toMatchObject({
+            schedule,
+            paused: false,
+            status: "active",
+            nextAt: thirdDue,
+            lastRunAt: secondDue,
+            lastResult: secondResult,
+          });
+          return decision({
+            bubbles: [{ text: cancelAcknowledgement, delayMs: 0 }],
+            familyWork: {
+              operation: "cancel",
+              workId: scheduledWork.workId,
+              objective: null,
+              instruction: null,
+              schedule: null,
+            },
+          });
+        }
+        return decision();
+      },
+      {
+        continueFamilyWork: async (input, reads) => {
+          const occurrence = input.scheduledOccurrence;
+          if (!occurrence) throw new Error("Recurring family work lost its scheduled occurrence");
+          const runIndex = occurrences.length;
+          const expectedDue = runIndex === 0 ? firstDue : secondDue;
+          const expectedPreviousResult = runIndex === 0 ? null : firstResult;
+          const expectedPreviousRunAt = runIndex === 0 ? null : firstDue;
+          expect(input.state.generation).toBe(runIndex);
+          expect(occurrence).toEqual({
+            schedule,
+            previousResult: expectedPreviousResult,
+            previousRunAt: expectedPreviousRunAt,
+          });
+          expect(input.currentTime).toBe(expectedDue);
+
+          const vaultSearch = await reads.searchVault?.({
+            query: runIndex === 0 ? "mild weeknight noodle recipe" : "sheet-pan fajitas recipe",
+            cursor: null,
+          });
+          const recipeSearchResult = vaultSearch?.results.find((result) =>
+            runIndex === 0 ? result.title === GOOGLE_RECIPE_TITLE : result.title === addedRecipeTitle,
+          );
+          if (!recipeSearchResult || !reads.readVault) {
+            throw new Error("Scheduled dinner planning could not find the current saved recipe");
+          }
+          const recipe = await reads.readVault({ uri: recipeSearchResult.uri, level: "full" });
+          const expectedRecipeTitle = runIndex === 0 ? GOOGLE_RECIPE_TITLE : addedRecipeTitle;
+          expect(recipe?.memory).toMatchObject({
+            title: expectedRecipeTitle,
+            artifactKind: "recipe",
+            details: expect.stringContaining(runIndex === 0 ? "keep it mild" : "black beans"),
+          });
+
+          const catalog = await reads.listCalendars?.();
+          const familyCalendar = catalog?.calendars.find(
+            (calendar) => calendar.primary === null && calendar.accessRole === null,
+          );
+          if (!familyCalendar || !reads.readCalendarWindow) {
+            throw new Error("Scheduled dinner planning could not resolve the Family Calendar");
+          }
+          const calendar = await reads.readCalendarWindow({
+            timeMin: runIndex === 0 ? "2026-08-17T07:00:00.000Z" : "2026-08-24T07:00:00.000Z",
+            timeMax: runIndex === 0 ? "2026-08-24T07:00:00.000Z" : "2026-08-31T07:00:00.000Z",
+            pageSize: 50,
+            cursor: null,
+            scope: "selected",
+            calendarRefs: [familyCalendar.calendarRef],
+          });
+          const expectedCalendarTitle = runIndex === 0 ? AUTOMATIC_FAMILY_DATE.title : addedCalendarTitle;
+          expect(calendar.status).toBe("complete");
+          expect(calendar.events.some((event) => event.title === expectedCalendarTitle)).toBe(true);
+
+          occurrences.push({
+            generation: input.state.generation,
+            currentTime: input.currentTime,
+            previousResult: occurrence.previousResult,
+            previousRunAt: occurrence.previousRunAt,
+            recipeTitle: expectedRecipeTitle,
+            calendarTitles: calendar.events.flatMap((event) => (event.title ? [event.title] : [])),
+          });
+          const text = runIndex === 0 ? firstResult : secondResult;
+          return {
+            kind: "terminal",
+            state: {
+              ...input.state,
+              phase: "terminal",
+              claim: null,
+              pendingCall: null,
+              progressRevision: input.state.progressRevision + 1,
+              terminal: { outcome: "succeeded", text },
+            },
+            outcome: "succeeded",
+            text,
+          };
+        },
+      },
+    );
+    harness.state.googleRecipeArtifactExercise = true;
+    await harness.readyHousehold();
+
+    await harness.accept("group", "schedule-sunday-dinner-planning", request);
+    await harness.drain();
+    expect(
+      harness.linq.messages.filter(
+        (message) => message.providerConversationId === FAMILY_GROUP && message.text === acknowledgement,
+      ),
+    ).toHaveLength(1);
+    expect(occurrences).toHaveLength(0);
+    await harness.assertDatabase(
+      "The Sunday planning request did not become one future recurring family task",
+      `(select count(*)=1 from proactive_work
+        where kind='family_task' and visibility='household' and owner_adult_id is null
+          and objective=${sqlLiteral(objective)} and status='active'
+          and reminder_schedule->'schedule'=${sqlLiteral(JSON.stringify(schedule))}::jsonb
+          and reminder_schedule->'version'='1'::jsonb
+          and reminder_schedule->'paused'='false'::jsonb
+          and reminder_schedule->'occurrenceActive'='false'::jsonb
+          and reminder_schedule->'previousResult'='null'::jsonb
+          and next_check_at=${sqlLiteral(firstDue)}::timestamptz
+          and last_run_at is null and task_state->>'generation'='0')`,
+    );
+
+    harness.state.now = Date.parse(firstDue) - 1;
+    await harness.drain();
+    expect(occurrences).toHaveLength(0);
+
+    harness.state.now = Date.parse(firstDue);
+    await harness.drain();
+    expect(occurrences).toEqual([
+      expect.objectContaining({
+        generation: 0,
+        currentTime: firstDue,
+        previousResult: null,
+        previousRunAt: null,
+        recipeTitle: GOOGLE_RECIPE_TITLE,
+        calendarTitles: expect.arrayContaining([AUTOMATIC_FAMILY_DATE.title]),
+      }),
+    ]);
+    expect(
+      harness.linq.messages.filter(
+        (message) => message.providerConversationId === FAMILY_GROUP && message.text === firstResult,
+      ),
+    ).toHaveLength(1);
+    const firstDelivery = harness.linq.messages.find(
+      (message) => message.providerConversationId === FAMILY_GROUP && message.text === firstResult,
+    );
+    if (!firstDelivery) throw new Error("The first scheduled dinner plan was not delivered");
+    const firstReceipt = harness.linq.ledger.sent.get(firstDelivery.idempotencyKey);
+    if (firstReceipt?.status !== "committed" || !firstReceipt.providerReceiptId) {
+      throw new Error("The first scheduled dinner plan lost its Linq receipt");
+    }
+    const requestSourceId = inboundSourceId("event-schedule-sunday-dinner-planning");
+    const scheduledWorkId = deterministicUuid(`family-work\0${requestSourceId}`);
+    const terminalSuffix = "family-work:terminal:0:1";
+    const terminalSourceId = deterministicUuid(
+      `proactive-outbound\0${scheduledWorkId}\0${digest(terminalSuffix)}`,
+    );
+    await harness.store.completeOutbound({
+      sourceId: terminalSourceId,
+      providerMessageId: firstReceipt.providerReceiptId,
+      sentAt: firstReceipt.occurredAt,
+    });
+    await harness.drain();
+    expect(occurrences).toHaveLength(1);
+    expect(harness.linq.messages.filter((message) => message.text === firstResult)).toHaveLength(1);
+    expect(
+      harness.linq.sendMessageAttempts.filter(
+        (message) => message.idempotencyKey === firstDelivery.idempotencyKey,
+      ),
+    ).toHaveLength(1);
+    await harness.assertDatabase(
+      "The first Sunday result did not rearm the same family task for the next occurrence",
+      `(select count(*)=1 from proactive_work
+        where kind='family_task' and objective=${sqlLiteral(objective)} and status='active'
+          and reminder_schedule->'schedule'=${sqlLiteral(JSON.stringify(schedule))}::jsonb
+          and reminder_schedule->>'previousResult'=${sqlLiteral(firstResult)}
+          and reminder_schedule->'occurrenceActive'='false'::jsonb
+          and next_check_at=${sqlLiteral(secondDue)}::timestamptz
+          and last_run_at=${sqlLiteral(firstDue)}::timestamptz
+          and current_conclusion=${sqlLiteral(firstResult)}
+          and task_state->>'generation'='1'
+          and task_state->>'phase'='ready' and task_state->'terminal'='null'::jsonb)`,
+    );
+
+    await harness.accept("group", "save-sheet-pan-fajitas", addedRecipeRequest, "partner");
+    await harness.drain();
+    harness.state.calendarEvents.set("family-open-house-for-second-dinner-plan", {
+      providerEventId: "family-open-house-for-second-dinner-plan",
+      providerRevision: "family-open-house-for-second-dinner-plan-revision-1",
+      providerUpdatedAt: "2026-08-23T22:00:00.000Z",
+      status: "confirmed",
+      busy: true,
+      title: addedCalendarTitle,
+      location: "Muir Elementary",
+      intervalKind: "all_day",
+      allDay: true,
+      startDate: "2026-08-27",
+      endDate: "2026-08-28",
+    });
+
+    harness.state.now = Date.parse(secondDue);
+    await harness.drain();
+    expect(occurrences).toEqual([
+      expect.objectContaining({ generation: 0 }),
+      expect.objectContaining({
+        generation: 1,
+        currentTime: secondDue,
+        previousResult: firstResult,
+        previousRunAt: firstDue,
+        recipeTitle: addedRecipeTitle,
+        calendarTitles: expect.arrayContaining([addedCalendarTitle]),
+      }),
+    ]);
+    expect(
+      harness.linq.messages.filter(
+        (message) => message.providerConversationId === FAMILY_GROUP && message.text === secondResult,
+      ),
+    ).toHaveLength(1);
+    await harness.drain();
+    expect(occurrences).toHaveLength(2);
+    expect(harness.linq.messages.filter((message) => message.text === secondResult)).toHaveLength(1);
+    await harness.assertDatabase(
+      "The second Sunday result lost its prior result or failed to advance the same task",
+      `(select count(*)=1 from proactive_work
+        where kind='family_task' and objective=${sqlLiteral(objective)} and status='active'
+          and reminder_schedule->'schedule'=${sqlLiteral(JSON.stringify(schedule))}::jsonb
+          and reminder_schedule->>'previousResult'=${sqlLiteral(secondResult)}
+          and reminder_schedule->'occurrenceActive'='false'::jsonb
+          and next_check_at=${sqlLiteral(thirdDue)}::timestamptz
+          and last_run_at=${sqlLiteral(secondDue)}::timestamptz
+          and current_conclusion=${sqlLiteral(secondResult)}
+          and task_state->>'generation'='2')`,
+    );
+
+    await harness.accept("group", "partner-cancel-sunday-dinner-planning", cancelRequest, "partner");
+    await harness.drain();
+    expect(
+      harness.linq.messages.filter(
+        (message) =>
+          message.providerConversationId === FAMILY_GROUP && message.text === cancelAcknowledgement,
+      ),
+    ).toHaveLength(1);
+    harness.state.now = Date.parse(thirdDue);
+    await harness.drain();
+    expect(occurrences).toHaveLength(2);
+    await harness.assertDatabase(
+      "The partner's cancellation left another Sunday dinner-plan occurrence armed",
+      `(select count(*)=1 from proactive_work
+        where kind='family_task' and objective=${sqlLiteral(objective)}
+          and status='cancelled' and next_check_at is null)`,
+    );
+  }, 20_000);
+
   test("keeps a private durable task private while it reads private context and commits Family Calendar work", async () => {
     const request =
       "Check my school-form email, then add a Family Calendar block for us to sign Maya’s form Tuesday.";
@@ -2812,6 +3143,7 @@ release("Florence parent journeys", () => {
                 operation: "create",
                 workId: null,
                 objective,
+                schedule: null,
                 instruction: null,
               },
             })
@@ -3014,6 +3346,7 @@ release("Florence parent journeys", () => {
                 operation: "create",
                 workId: null,
                 objective: "Open the camp registration form.",
+                schedule: null,
                 instruction: null,
               },
             })
@@ -8972,6 +9305,12 @@ function sqlLiteral(value: string): string {
 
 function digest(value: string): string {
   return createHash("sha256").update(value).digest("hex");
+}
+
+function deterministicUuid(value: string): string {
+  const hex = digest(value);
+  const variant = ((Number.parseInt(hex[16] ?? "0", 16) & 3) | 8).toString(16);
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-5${hex.slice(13, 16)}-${variant}${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
 }
 
 function inboundSourceId(providerEventId: string): string {

@@ -737,6 +737,13 @@ describe("Florence reasoner capability cutover", () => {
 
     const plannedCall = await reasoner.continueFamilyWork(input, reads);
     if (plannedCall.kind !== "continue") throw new Error("Dentist call was not planned");
+    expect(String(modelRequests[0]?.instructions)).toContain(
+      "An exact parent instruction that already requests the proposed outside commitment is authorization",
+    );
+    expect(plannedCall.state).toMatchObject({
+      phase: "tool_pending",
+      pendingCall: { name: "phone_agent_call" },
+    });
     const started = await reasoner.continueFamilyWork({ ...input, state: plannedCall.state }, reads);
     if (started.kind !== "continue") throw new Error("Dentist call did not start");
     expect(started.progressText).toBeNull();
@@ -1275,7 +1282,7 @@ describe("Florence reasoner capability cutover", () => {
     ]);
   });
 
-  test("durable work uploads a camp form, follows review scope, then submits once", async () => {
+  test("durable work prepares a camp form, asks once before the unrequested submission, then submits once", async () => {
     const portalUrl = "https://camp.example/register";
     const liveViewUrl = "https://www.browserbase.com/sessions/session-1";
     const gmail = conversationalGmailSource();
@@ -1655,6 +1662,13 @@ describe("Florence reasoner capability cutover", () => {
     if (awaitingApproval.kind !== "waiting") {
       throw new Error("Camp registration did not wait for final authorization");
     }
+    expect(String(modelRequests[0]?.instructions)).toContain(
+      "whose requested endpoint leaves the family free to choose does not authorize",
+    );
+    expect(awaitingApproval.state).toMatchObject({ phase: "waiting", pendingCall: null });
+    expect(browserOperations.some((operation) => operation.kind === "click" && operation.ref === "e12")).toBe(
+      false,
+    );
 
     const submitSteeringState = steerFamilyWorkState(awaitingApproval.state, {
       sourceId: "00000000-0000-4000-8000-000000000003",

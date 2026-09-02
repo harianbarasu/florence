@@ -1,5 +1,4 @@
 import type {
-  CompleteFamilyOnboardingInput,
   FamilyMemberMutationInput,
   PatchFactInput,
   PatchWatchInput,
@@ -8,7 +7,7 @@ import type {
 } from "@florence/contracts";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  completeFamilyOnboarding,
+  completeOwnOnboarding,
   createSession,
   deleteGoogleDerivedData,
   deleteSession,
@@ -72,9 +71,9 @@ export function useFamilyCalendarMonth(month: string) {
   });
 }
 
-export function useCompleteFamilyOnboarding() {
+export function useCompleteOwnOnboarding() {
   return useMutation({
-    mutationFn: (input: CompleteFamilyOnboardingInput) => completeFamilyOnboarding(input),
+    mutationFn: completeOwnOnboarding,
   });
 }
 

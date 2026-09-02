@@ -1321,6 +1321,46 @@ a {
   white-space: pre-wrap;
 }
 
+.vault-checklist {
+  display: grid;
+  gap: 8px;
+}
+
+.vault-checklist-count,
+.vault-checklist-empty {
+  color: var(--secondary);
+  font-size: 12px;
+}
+
+.vault-checklist ul {
+  display: grid;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.vault-checklist label {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 9px;
+  align-items: center;
+  min-height: 34px;
+  cursor: pointer;
+}
+
+.vault-checklist input {
+  width: 17px;
+  height: 17px;
+  margin: 0;
+  accent-color: var(--text);
+}
+
+.vault-checklist-item-checked {
+  color: var(--secondary);
+  text-decoration: line-through;
+}
+
 .library-tags {
   display: flex;
   flex-wrap: wrap;
@@ -1621,49 +1661,6 @@ a {
 
 .connector-copy .google-data-disclosure {
   margin-top: 10px;
-}
-
-.setup-review-list {
-  display: grid;
-  overflow: hidden;
-  border: 1px solid #e5e7eb;
-  border-radius: 14px;
-}
-
-.setup-review-row {
-  display: grid;
-  gap: 3px;
-  width: 100%;
-  min-height: 64px;
-  padding: 12px 14px;
-  border: 0;
-  border-bottom: 1px solid #e5e7eb;
-  background: #ffffff;
-  color: #101113;
-  cursor: pointer;
-  text-align: left;
-}
-
-.setup-review-row:last-child {
-  border-bottom: 0;
-}
-
-.setup-review-row:hover {
-  background: #f7f7f8;
-}
-
-.setup-review-row span {
-  font-size: 14px;
-  font-weight: 500;
-}
-
-.setup-review-row strong {
-  overflow: hidden;
-  color: rgb(16 17 19 / 60%);
-  font-size: 13px;
-  font-weight: 400;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .setup-secondary-action {

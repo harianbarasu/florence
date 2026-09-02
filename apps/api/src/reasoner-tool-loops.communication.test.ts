@@ -1322,10 +1322,13 @@ describe("Florence reasoner capability cutover", () => {
     expect(retried.observation.kind).toBe("uncertain_effect");
   });
 
-  test("Kernel keeps one household profile, composes browser tactics, and saves owner sign-in", async () => {
-    const profileName = kernelProfileName("household-kernel-1");
+  test("Kernel keeps each adult's profile private, composes browser tactics, and saves owner sign-in", async () => {
+    const profileName = kernelProfileName("household-kernel-1", "adult-1");
+    const partnerProfileName = kernelProfileName("household-kernel-1", "adult-2");
     expect(profileName).toMatch(/^florence-[a-f0-9]{40}$/u);
     expect(profileName).not.toContain("household-kernel-1");
+    expect(profileName).not.toContain("adult-1");
+    expect(partnerProfileName).not.toBe(profileName);
 
     let profileExists = false;
     const createdBrowsers: Record<string, unknown>[] = [];
@@ -1446,6 +1449,18 @@ describe("Florence reasoner capability cutover", () => {
       stealth: true,
       timeout_seconds: 259_200,
     });
+
+    await expect(
+      client.run({
+        householdId: "household-kernel-1",
+        workId: "kernel-work-2",
+        ownerAdultId: "adult-2",
+        callId: "snapshot-partner-kernel",
+        attempt: 1,
+        session: navigated.session,
+        operation: { kind: "snapshot" },
+      }),
+    ).rejects.toMatchObject({ code: "session_expired", retryable: false });
 
     const playwright = await client.run({
       householdId: "household-kernel-1",

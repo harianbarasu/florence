@@ -86,14 +86,23 @@ export function foregroundInput(): FlorenceReasonerInput {
 }
 
 export function ordinaryDecision(
-  input: { bubbleText?: string; researchUrls?: string[] } = {},
+  input: {
+    participation?: FlorenceDecision["conversation"]["participation"];
+    bubbleText?: string;
+    researchUrls?: string[];
+  } = {},
 ): FlorenceDecision {
+  const participation = input.participation ?? "respond";
   return {
-    policy: { retain: true, schedule: true, stopMessaging: false },
+    policy:
+      participation === "observe"
+        ? { retain: false, schedule: false, stopMessaging: false }
+        : { retain: true, schedule: true, stopMessaging: false },
     conversation: {
+      participation,
       replyToCurrentMessage: false,
       reaction: null,
-      bubbles: [{ text: input.bubbleText ?? "Done.", delayMs: 0 }],
+      bubbles: participation === "observe" ? [] : [{ text: input.bubbleText ?? "Done.", delayMs: 0 }],
       nativeMoves: null,
     },
     facts: [],
@@ -104,6 +113,7 @@ export function ordinaryDecision(
     docketCompletions: null,
     interest: null,
     calendar: null,
+    secondAdultPlan: null,
     householdUpdate: null,
     webAccessPath: null,
     researchUrls: input.researchUrls ?? null,

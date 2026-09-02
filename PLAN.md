@@ -2,7 +2,7 @@
 
 ## Product contract
 
-Florence is Instinct for a household: a warm, proactive, general-purpose noncoding agent whose primary home is the two-parent iMessage group. A parent should be able to state an arbitrary practical objective in ordinary language, have Florence plan and compose the relevant tools, and receive a useful outcome without managing a workflow. Florence is not a router over hardcoded task categories or a catalog of named household workflows.
+Florence is Instinct for parents: a warm, proactive, general-purpose noncoding agent that starts in one parent's private iMessage thread and becomes a household coordinator when another adult joins. A parent should be able to state an arbitrary practical objective in ordinary language, have Florence plan and compose the relevant tools, and receive a useful outcome without managing a workflow. Florence is not a router over hardcoded task categories or a catalog of named household workflows.
 
 Florence is judged by the lived family experience, not architecture, tool count, policy machinery, or test count. “I can help” followed by no work is a failure. An ordinary request ends in a result, useful partial findings plus one genuinely blocking question, or an honest explanation that Florence cannot do it yet.
 
@@ -16,7 +16,7 @@ Social presence is part of the capability, not decoration added after the work. 
 
 Linq's first-party native messaging surface is mapped in `docs/research/linq-human-messaging-capabilities.md`. Use its read state, private/group typing, replies, reactions, mentions, polls, rich links, media, and other native affordances when the conversational moment calls for them. They are general moves available to the same agent, never automatic garnish or new household workflow categories.
 
-- Every ordinary parent message gets a visible response. Florence never chooses silence because a classifier was unsure.
+- Every private parent message and every family-group message directed to Florence gets a visible response. In the group, Florence quietly observes conversation that is clearly between the parents; if who is being addressed is ambiguous, she responds rather than letting uncertainty create silence.
 - A natural reaction can be the whole response when a low-content human acknowledgement genuinely needs nothing more; a question, request, correction, or substantive update still gets a useful reply. The same agent chooses reactions from the conversational moment, and tool execution never emits a mechanical default reaction or uses one as a status signal.
 - Quick lookups finish in the current turn. Longer work is acknowledged immediately, keeps going while the family chats, accepts natural corrections or cancellation, and reports meaningful progress plus a real terminal result.
 - Acknowledgements, progress, and closure are written from the actual objective and evidence. Presentation-only typing or retry cues do not enter Florence's conversational memory, and lifecycle events never dictate canned provider-status prose.
@@ -27,21 +27,21 @@ Linq's first-party native messaging surface is mapped in `docs/research/linq-hum
 
 ## Household foundation
 
-The standard pilot household has:
+Every household begins with one independently enrolled adult, one private iMessage relationship, and that adult's private Google connection. That parent can finish setup and use Florence without adding a second adult. The standard pilot household then expands to:
 
 - two independently enrolled participating adults;
 - represented children, not child accounts;
 - one private iMessage relationship with each adult;
 - one exact three-person family iMessage group;
 - one private Google connection owned by each adult;
-- one new Florence-created shared family calendar; and
+- one Florence-created calendar, owned by the first parent and shared in place when another adult joins; and
 - a calm mobile-web Workspace, Vault, Calendar, and Preferences experience.
 
-A limited solo setup may exist, but the real product benchmark is the two-adult household.
+Private-only Florence is a completed product state, not an incomplete household. The two-adult household remains Florence's defining coordination benchmark.
 
-Setup is conversational from the first message. Each adult completes their own private setup and Google connection. The founder can ask Florence to invite the partner; Florence sends the partner's setup text herself. Invitation links should survive a normal human response delay or be refreshed automatically rather than sending the partner back to the founder.
+Setup is conversational from the first message. The browser handoff is limited to identity, truthful disclosure, and provider authorization; adding another adult and learning family context must not block the first useful private result. Each adult completes their own private setup and Google connection. An enrolled founder can later name another parent or caregiver and give Florence their mobile number in ordinary private Messages. Florence asks only for the missing detail, then shows one exact review with the masked destination: the existing Florence Calendar and the saved family profile will become shared, while Gmail, personal Calendars, private Messages, and facts derived only from those private sources will not. Florence texts that adult only after explicit approval. The founder can correct or cancel the plan before it sends and can revoke an issued invitation while the other adult remains unverified; a later invitation starts a fresh review. Invitation links should survive a normal human response delay or be refreshed automatically rather than sending the invited adult back to the founder.
 
-Completing setup gets immediate feedback. Florence confirms that the adult's side is ready and says what happens next. Once both adults are ready, Florence creates the exact group and family calendar, introduces herself, and starts a useful first household pass without waiting to be handed a task.
+Completing setup gets immediate feedback. Florence confirms that the adult's side is ready, creates that parent's Florence Calendar, and says what happens next. Once both adults are ready, Florence creates the exact group and shares the same calendar with the second adult. The group introduction may contain no retained or Calendar detail, and Florence waits for the provider-confirmed Calendar share before claiming it is ready or starting the first household pass. No household briefing may reveal Calendar or retained context before that share succeeds.
 
 ## The family conversation
 
@@ -50,6 +50,7 @@ The family group is Florence's primary shared surface. Both adults are equal par
 In the group Florence:
 
 - responds when addressed, replied to, or given a task;
+- stays quiet during conversation clearly addressed from one parent to the other while retaining that conversation as shared context;
 - uses reactions and short acknowledgements naturally;
 - coordinates shared dates, handoffs, reminders, decisions, and unfinished work;
 - gives prioritized next actions rather than raw source recaps; and
@@ -64,6 +65,15 @@ that exact adult one focused question in their private thread, treats the answer
 the same task, and closes the loop back in the family group. The answer must not become an unrelated
 private conversation or a second task, and an ambiguous reply must never be attached to the wrong
 household objective.
+
+The family may assign that same shared work to one exact enrolled adult. Responsibility is separate
+from private-data authority: Florence may privately give the responsible parent one neutral,
+specific nudge and accept completion or reassignment there, but the family thread receives only the
+minimum shared status or confirmed result—not quoted excuses or unrelated private detail. A timed
+first nudge uses the existing scheduled family-work path; waiting for the parent's correlated reply
+does not create another reminder engine or repeated nagging loop. Reassignment from that private
+reply changes the current occurrence atomically; changing the responsible parent for a recurring
+series remains an explicit family-thread update to that series.
 
 A clear private request to tell the household may become a concise group update. Otherwise, a personal source remains in that adult's private context until there is a useful shared conclusion or the owner asks to share it.
 
@@ -86,19 +96,36 @@ Google review uses only the distinction the family experience needs: a conclusio
 
 Foreground conversation is different: Florence may run a focused Gmail search, open a supported Gmail attachment, list calendars, and read the primary, selected, or all readable calendars needed for the current question.
 
-The parental unit is the knowledge unit for validated family facts. Raw private email and personal Calendar details do not need to become a second adult's feed. One specific boundary applies to personal Calendar dates: if a potentially shared family date exists only on one adult's personal Calendar, Florence asks that owner before copying or naming it in the family Calendar. Once intentionally added to the family Calendar, Florence may describe it normally as household truth.
+The parental unit is the knowledge unit for validated family facts. Raw private email and personal Calendar details do not need to become a second adult's feed. Context Florence derives while only one parent is enrolled remains private to that parent unless they explicitly promote it during household expansion. One specific boundary applies to personal Calendar dates: if a potentially shared family date exists only on one adult's personal Calendar, Florence asks that owner before copying or naming it in the Florence Calendar. Once intentionally added to a shared Florence Calendar, Florence may describe it normally as household truth.
 
 The Vault is one household knowledge store with useful views, not a collection of per-person silos or domain runtimes. It should show retained facts, preferences and routines, people, active work, and reusable artifacts such as recipes, lists, plans, notes, and references, with understandable sources and simple correction/deletion controls. A reusable artifact keeps enough detail to use and revise later: for a recipe, that includes the ingredients or canonical source, method, and family-specific substitutions or preferences. Categories such as Cookbook, School, or Trips may be UI facets and evaluation coverage; they do not route agent execution. Memory must be detailed and searchable enough for Florence to use in later action, not just display as trivia. The Vault should not appear empty after Florence has clearly learned useful family context.
 
+A grocery, packing, or other reusable checklist is one current Vault artifact, not a chat transcript or
+a separate list service. Either parent may add, check, uncheck, rename, or remove exact items in
+ordinary Messages, including several changes at once, and both parents see the same resulting shared
+list. Florence reads and changes the exact existing list rather than silently creating duplicates;
+when more than one list could match, she asks one focused question. Private lists remain private
+until their owner explicitly promotes them. Stable item identity and item-level updates let two
+parents' different edits compose without replacing unrelated items, while the Vault presents the
+current checked and remaining state directly.
+
 Memory is a utility-driven compilation of experience into current household state, not a transcript archive pretending to be understanding. When new evidence arrives or real work finishes, Florence distinguishes three things: what durably changes the family's beliefs, preferences, routines, or reusable resources; what active commitment moved forward; and what is merely transient noise. Stable meaning belongs in the source-linked Vault, unfinished dependencies belong in the existing docket and family-work state, and an unchanged background observation produces no interruption. A direct parent message still always receives a visible conversational move. Corrections replace obsolete current meaning without losing its valid provenance, and later differently worded objectives should retrieve and use the revised meaning automatically.
 
-Proactivity should connect those memories to the family's current situation. The benchmark is not announcing “pasta night is Saturday”; it is noticing the family plan, recalling the recipe or preference that makes it concrete, inferring the next piece of work, and offering to remove that work. Once accepted, Florence should prepare or execute the outcome, show a meaningful artifact or choice only when useful, accept corrections, and close the loop after the real result is known.
+Proactivity should connect those memories to the family's current situation. The benchmark is not announcing “pasta night is Saturday”; it is noticing the family plan, recalling the recipe or preference that makes it concrete, inferring the next piece of work, and offering to remove that work. Once accepted, Florence should prepare or execute the outcome, show a meaningful artifact or choice only when useful, accept corrections, and close the loop after the real result is known. One current job does not block Florence from starting a second clearly unrelated job when both are tied to different exact unresolved household items; when that independence is not certain, Florence offers the next move or stays quiet instead of risking duplicate work.
 
 ## Family Calendar
 
-After both adults connect, Florence creates a new shared secondary Google Calendar and gives both adults normal access. It does not adopt an arbitrary existing calendar.
+After the first parent connects, Florence creates a new secondary Google Calendar owned by that parent. Private requests can add, change, or remove dates there with Google-confirmed completion. If another adult later joins, Florence shares that same calendar in place rather than migrating history or adopting an arbitrary existing calendar.
 
-Clear family dates can be suggested or added in the shared family conversation. Ambiguous dates get one focused question. Personal Calendar titles are not silently copied into the group. Calendar changes are reported only after Google confirms them.
+Clear dates can be requested in the enrolled parent's private conversation or, after expansion, in the shared family conversation. Ambiguous dates get one focused question. Personal Calendar titles are not silently copied into the group. Calendar changes are reported only after Google confirms them.
+
+When a parent sends a flyer, photo, or PDF containing a clear date in their private conversation or
+the family group, Florence reads the actual attachment, checks the relevant Florence Calendar
+window, and shows the extracted title, date or time, time zone, and location in Messages before an
+attachment-derived event is written. A normal text approval of that still-current review is enough;
+it does not require an unexplained iMessage gesture. A duplicate already on the Calendar is reported
+instead of offered again, nothing is written before approval, and success is reported only after
+Google confirms the exact event. A private review and its result stay in that parent's thread.
 
 Resetting Florence removes the database state, invalidates setup links, and deletes Florence-created calendars and other Florence-created provider artifacts so the family can start cleanly.
 
@@ -108,7 +135,16 @@ Reminders are a first-class conversational capability. A parent can create, list
 
 Finite monitoring is for an unresolved deadline, decision, risk, or handoff whose evidence may change. It speaks only when something materially changes or attention is needed. It does not resend stale wording on a timer.
 
-Longer work is also first-class. Florence can accept a research, comparison, planning, document, travel, or local-service task, continue after the initial reply, survive a process restart, accept steering and cancellation, and deliver the result once. The implementation should deepen Florence's existing PostgreSQL due-work path rather than add a second workflow engine.
+Longer work is also first-class. Florence can accept a research, comparison, planning, document, travel, or local-service task, continue after the initial reply, survive a process restart, accept steering and cancellation, and deliver the result once. Unrelated jobs may remain in flight together. A parent's direct iMessage reply to one Florence task message binds steering or cancellation to that exact job, including after a restart; without that exact reply, Florence asks one focused question whenever several jobs plausibly match. The implementation should deepen Florence's existing PostgreSQL due-work path rather than add a second workflow engine.
+
+A parent may explicitly opt into one concise morning or evening briefing in ordinary Messages.
+That briefing is recurring family work using the current Florence Calendar, relevant Vault memory,
+and the complete visible unresolved docket—not an onboarding default, canned digest, or separate
+scheduler. Morning emphasizes today's consequential commitments and moves; evening emphasizes
+tomorrow's early commitments, preparation, and unresolved loose ends. Florence leads with at most
+three useful items, omits filler and source dumps, and gives a truthful one-line all-clear only after
+complete coverage. Either parent may change, pause, resume, run, or stop a shared briefing in normal
+language; a private or solo-parent briefing stays in that parent's thread.
 
 ## Broad operator capabilities
 

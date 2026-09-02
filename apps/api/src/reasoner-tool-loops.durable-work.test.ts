@@ -532,6 +532,7 @@ Compare the family options.
                       objective:
                         "Email the school that Violet's enrollment paperwork is complete and ask them to confirm her status is current.",
                       schedule: null,
+                      briefing: null,
                       instruction: null,
                       candidateIds: [],
                     },
@@ -1347,6 +1348,225 @@ Compare the family options.
       completionOutputDigest(confirmed?.output),
     );
     expect(terminal.state.completionEvidence?.[0]).not.toHaveProperty("output");
+  });
+
+  test("a correlated private reply can verify the responsible adult's physical completion", async () => {
+    const completionCondition = "Maya's permission slip is signed and back in her backpack.";
+    const confirmationSourceId = "participant-reply-permission-slip";
+    const reviewRequests: Record<string, unknown>[] = [];
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        parse(request: Record<string, unknown>) {
+          if (JSON.stringify(request.text).includes("florence_family_work_completion_review")) {
+            reviewRequests.push(request);
+            return {
+              status: "completed",
+              output_parsed: {
+                verdict: "verified",
+                reason: null,
+                condition: completionCondition,
+                basisKind: "human_confirmation",
+                summary: "Alex's correlated private reply confirms the signed slip is in Maya's backpack.",
+                humanConfirmationSourceId: confirmationSourceId,
+                evidenceCallIds: [],
+                evidenceSelections: [],
+              },
+              output: [],
+            };
+          }
+          return {
+            status: "completed",
+            output_parsed: {
+              outcome: "succeeded",
+              text: completionCondition,
+              resumeAt: null,
+              progressText: null,
+              selectedImageAssetIds: [],
+              selectedFileAssetIds: [],
+              docket: null,
+            },
+            output: [],
+          };
+        },
+      },
+    } as never);
+    const state: FamilyWorkStateV1 = {
+      kind: "family_work_v1",
+      version: 1,
+      generation: 1,
+      responsibleAdultId: "adult-2",
+      completionCondition,
+      phase: "ready",
+      claim: null,
+      activePhoneCall: null,
+      activeTextMessage: null,
+      pendingParticipantRequest: null,
+      browserSession: null,
+      completionEvidence: [],
+      completionRejection: null,
+      continuationItems: [],
+      pendingCall: null,
+      steering: [
+        {
+          sourceId: confirmationSourceId,
+          text: "Done—I signed it and put it in Maya's backpack.",
+          occurredAt: "2026-08-27T20:06:00.000Z",
+          privateParticipantReply: true,
+        },
+      ],
+      progressRevision: 0,
+      terminal: null,
+    };
+
+    const result = await reasoner.continueFamilyWork(
+      {
+        workId: "family-work-permission-slip",
+        scheduledOccurrence: null,
+        objective: "Have Alex sign Maya's permission slip and put it in her backpack.",
+        visibility: "household",
+        ownerAdultId: null,
+        initiatingAdultId: "adult-1",
+        origin: familyWorkOrigin("Alex owns Maya's permission slip."),
+        household: {
+          householdId: "household-1",
+          familyLabel: "Test family",
+          timeZone: "America/Los_Angeles",
+          postalCode: "90045",
+          adults: [
+            { adultId: "adult-1", firstName: "Hari", displayName: "Hari Anbarasu" },
+            { adultId: "adult-2", firstName: "Alex", displayName: "Alex Anbarasu" },
+          ],
+          children: [],
+        },
+        state,
+        currentTime: NOW,
+      },
+      {},
+    );
+
+    expect(reviewRequests).toHaveLength(1);
+    const reviewRequest = reviewRequests[0];
+    const reviewInput = reviewRequest?.input as
+      | { content?: { type?: string; text?: string }[] }[]
+      | undefined;
+    const reviewPayload = JSON.parse(reviewInput?.[0]?.content?.[0]?.text ?? "{}") as {
+      taskContext?: {
+        responsibleAdult?: { displayName?: string } | null;
+        steering?: Array<{
+          sourceId?: string;
+          privateParticipantReply?: boolean;
+        }>;
+      };
+    };
+    expect(reviewPayload.taskContext).toMatchObject({
+      responsibleAdult: { displayName: "Alex Anbarasu" },
+      steering: [{ sourceId: confirmationSourceId, privateParticipantReply: true }],
+    });
+    expect(String(reviewRequest?.instructions)).toContain(
+      "Human confirmation never establishes a Calendar or browser change",
+    );
+    expect(JSON.stringify(reviewRequest?.text)).toContain("human_confirmation");
+    expect(result).toMatchObject({
+      kind: "terminal",
+      outcome: "succeeded",
+      text: completionCondition,
+      state: {
+        terminal: {
+          completionBasis: {
+            condition: completionCondition,
+            summary: "Alex's correlated private reply confirms the signed slip is in Maya's backpack.",
+            evidenceCallIds: [],
+          },
+        },
+        completionEvidence: [],
+      },
+    });
+  });
+
+  test("household work cannot expose a browser owner-handoff URL in group copy", async () => {
+    const liveViewUrl = "https://browser.example/live/private-session";
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        parse() {
+          return {
+            status: "completed",
+            output_parsed: {
+              outcome: "waiting",
+              text: `Please sign in here: ${liveViewUrl}`,
+              resumeAt: null,
+              progressText: null,
+              selectedImageAssetIds: [],
+              selectedFileAssetIds: [],
+              docket: {
+                owner: "Hari Anbarasu",
+                nextAction: "Sign in to the school portal.",
+                waitingOn: "Hari to finish signing in.",
+                needsAnswer: true,
+                completionCondition: "The school portal form is submitted and confirmed.",
+              },
+            },
+            output: [],
+          };
+        },
+      },
+    } as never);
+    const state: FamilyWorkStateV1 = {
+      kind: "family_work_v1",
+      version: 1,
+      generation: 1,
+      completionCondition: "The school portal form is submitted and confirmed.",
+      phase: "ready",
+      claim: null,
+      activePhoneCall: null,
+      activeTextMessage: null,
+      pendingParticipantRequest: null,
+      browserSession: null,
+      completionEvidence: [],
+      completionRejection: null,
+      continuationItems: [
+        {
+          type: "function_call_output",
+          call_id: "browser-owner-handoff",
+          output: JSON.stringify({
+            outcome: "succeeded",
+            output: {
+              kind: "owner_handoff",
+              liveViewUrl,
+            },
+            error: null,
+          }),
+        },
+      ],
+      pendingCall: null,
+      steering: [],
+      progressRevision: 0,
+      terminal: null,
+    };
+
+    await expect(
+      reasoner.continueFamilyWork(
+        {
+          workId: "family-work-school-portal",
+          scheduledOccurrence: null,
+          objective: "Submit the school portal form.",
+          visibility: "household",
+          ownerAdultId: null,
+          initiatingAdultId: "adult-1",
+          origin: familyWorkOrigin("Please submit the school portal form."),
+          household: {
+            householdId: "household-1",
+            familyLabel: "Test family",
+            timeZone: "America/Los_Angeles",
+            postalCode: "90045",
+            adults: [{ adultId: "adult-1", firstName: "Hari", displayName: "Hari Anbarasu" }],
+            children: [],
+          },
+          state,
+          currentTime: NOW,
+        },
+        {},
+      ),
+    ).rejects.toThrow("A household family-work result exposed a private browser owner-handoff URL");
   });
 
   test("persisted completion rejection closes unchanged success with one truthful disposition", async () => {

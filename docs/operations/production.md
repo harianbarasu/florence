@@ -57,15 +57,15 @@ Required:
 | `GOOGLE_OAUTH_CLIENT_SECRET` | Google OAuth web client secret |
 | `GOOGLE_OAUTH_REDIRECT_URI` | Exact `<origin>/oauth/google/callback`; its origin is also used for setup links |
 | `GOOGLE_CREDENTIAL_KEY` | Canonical base64 encoding of exactly 32 random bytes |
+| `KERNEL_API_KEY` | Required for the parent pilot; enables persistent, per-adult browser work, screenshots, uploads, downloads, and private owner handoff |
 
-Optional browser provider:
+Browser settings:
 
 | Variable | Contract |
 | --- | --- |
-| `KERNEL_API_KEY` | Enables Florence's primary persistent browser operator: in-browser Playwright, native computer control, screenshots, uploads, and owner live handoff |
 | `KERNEL_PROJECT_ID` | Optional Kernel project ID |
-| `BROWSERBASE_API_KEY` | Temporary rollout fallback used only when Kernel is not configured |
-| `BROWSERBASE_PROJECT_ID` | Optional Browserbase project ID for the temporary fallback |
+| `BROWSERBASE_API_KEY` | Development-only compatibility fallback; production refuses to start without Kernel because this provider cannot complete the parent-pilot browser journey |
+| `BROWSERBASE_PROJECT_ID` | Optional Browserbase project ID for that development fallback |
 
 Optional phone providers:
 
@@ -302,7 +302,13 @@ follow the reconciliation instructions above instead of starting the API.
     family-Calendar create/update/delete, correction, Vault deletion, the
     read-only web Calendar, and a Google disconnect/delete/reconnect that
     suppresses queued Google-derived output while preserving sent Messages and
-    provider-created family Calendar events.
+    provider-created family Calendar events. Complete one synthetic school-form
+    journey through Kernel as well: upload the exact Gmail attachment, deliver
+    sign-in/MFA handoff only in the initiating adult's private thread, restart
+    after sign-in and again after the provider mutation, read back the provider
+    result, add the approved family event with Google readback, and close once in
+    the family group. Repeat the sign-in boundary with the second adult and
+    confirm the two adults never share browser cookies or portal sessions.
 10. Enable autodeploy only after the full synthetic journey and the two-phone experience pass.
 
 ## Recovery

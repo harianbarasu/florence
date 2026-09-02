@@ -13,6 +13,10 @@ import type { ComputerBatchParams } from "@onkernel/sdk/resources/browsers/compu
  * `capture_browser_image.ts`). Florence keeps OpenInstinct's persistent profile,
  * in-browser Playwright, native computer control, visual observation, and live
  * handoff primitives inside Florence's existing durable PostgreSQL work loop.
+ * Adult-isolated persistent identity is an adapted port of Hermes Agent commit
+ * 6dcebea7fc5d0cc4f621eeaddf52b7d877a5f882
+ * (`tools/browser_camofox_state.py`): Florence scopes the stable profile to the
+ * exact household plus execution adult instead of a single Hermes profile.
  *
  * Existing ref-based operations remain an adapted port of Hermes Agent commit
  * 6dcebea7fc5d0cc4f621eeaddf52b7d877a5f882. The exact CLI dependency is
@@ -213,6 +217,7 @@ export interface FlorenceBrowserObservation {
 export interface FlorenceBrowserRunInput {
   readonly householdId: string;
   readonly workId: string;
+  /** Adult whose private persistent browser sign-in state this work may use. */
   readonly ownerAdultId: string;
   readonly callId: string;
   readonly attempt: number;
@@ -606,13 +611,28 @@ export class KernelBrowserClient implements FlorenceBrowserClient {
 
     try {
       const browser = await this.#kernel.browsers.retrieve(input.session.sessionId, {}, { signal });
-      return this.#sessionDetails(browser, input.householdId);
+      const profileName = kernelProfileName(input.householdId, input.ownerAdultId);
+      let profileId: string | undefined;
+      if (!browser.profile?.name) {
+        try {
+          profileId = (await this.#kernel.profiles.retrieve(profileName, { signal })).id;
+        } catch (error) {
+          if (kernelErrorStatus(error) !== 404) throw error;
+          throw this.#profileMismatchError(error);
+        }
+      }
+      return this.#sessionDetails(browser, profileName, profileId);
     } catch (error) {
-      if (kernelErrorStatus(error) === 404 || kernelErrorStatus(error) === 410) {
+      const sessionUnavailable =
+        kernelErrorStatus(error) === 404 ||
+        kernelErrorStatus(error) === 410 ||
+        (error instanceof FlorenceBrowserError && error.code === "session_expired");
+      if (sessionUnavailable) {
         if (input.operation.kind === "navigate") {
           this.#forgetSession(input.session.sessionId);
           return this.#createSession(input, false, input.operation.url, signal);
         }
+        if (error instanceof FlorenceBrowserError) throw error;
         throw new FlorenceBrowserError(
           "session_expired",
           "That browser session is no longer running. Navigate to the page again to continue.",
@@ -629,12 +649,12 @@ export class KernelBrowserClient implements FlorenceBrowserClient {
     startUrl: string,
     signal: AbortSignal,
   ): Promise<KernelSessionDetails> {
-    const profileName = kernelProfileName(input.householdId);
+    const profileName = kernelProfileName(input.householdId, input.ownerAdultId);
     const activeWriter = this.#profileWriters.get(profileName);
     if (saveChanges && activeWriter) {
       throw new FlorenceBrowserError(
         "transient",
-        "Another browser session is saving this household's sign-in state. Florence can continue after it finishes.",
+        "Another browser session is saving this parent's sign-in state. Florence can continue after it finishes.",
         { retryable: true },
       );
     }
@@ -644,7 +664,7 @@ export class KernelBrowserClient implements FlorenceBrowserClient {
       if (providerWriter) {
         throw new FlorenceBrowserError(
           "transient",
-          "Another browser session is saving this household's sign-in state. Florence can continue after it finishes.",
+          "Another browser session is saving this parent's sign-in state. Florence can continue after it finishes.",
           { retryable: true },
         );
       }
@@ -663,7 +683,7 @@ export class KernelBrowserClient implements FlorenceBrowserClient {
       },
       { signal },
     );
-    const details = this.#sessionDetails(browser, input.householdId);
+    const details = this.#sessionDetails(browser, profileName, profile.id);
     this.#commandGenerations.set(details.session.sessionId, 0);
     this.#rememberSession(details);
     return details;
@@ -713,14 +733,17 @@ export class KernelBrowserClient implements FlorenceBrowserClient {
       readonly profile_save_changes?: boolean;
       readonly timeout_seconds: number;
     },
-    householdId: string,
+    profileName: string,
+    profileId?: string,
   ): KernelSessionDetails {
-    const profileName = kernelProfileName(householdId);
     if (!browser.profile?.id) {
       throw invalidProviderResponse("Kernel returned a browser without its persistent profile.");
     }
-    if (browser.profile.name && browser.profile.name !== profileName) {
-      throw invalidProviderResponse("Kernel returned a browser for a different household profile.");
+    if (
+      (browser.profile.name && browser.profile.name !== profileName) ||
+      (!browser.profile.name && (!profileId || browser.profile.id !== profileId))
+    ) {
+      throw this.#profileMismatchError();
     }
     const timeoutSeconds = boundedInteger(
       browser.timeout_seconds,
@@ -740,6 +763,14 @@ export class KernelBrowserClient implements FlorenceBrowserClient {
       profileName,
       saveChanges: browser.profile_save_changes === true,
     };
+  }
+
+  #profileMismatchError(cause?: unknown): FlorenceBrowserError {
+    return new FlorenceBrowserError(
+      "session_expired",
+      "That browser session no longer matches this parent's private sign-in state. Navigate to the page again to continue.",
+      { retryable: false, cause },
+    );
   }
 
   async #executePlaywright(
@@ -2046,10 +2077,11 @@ export class BrowserbaseBrowserClient implements FlorenceBrowserClient {
   }
 }
 
-export function kernelProfileName(householdId: string): string {
+export function kernelProfileName(householdId: string, executionAdultId: string): string {
   validateNonEmptyInput(householdId, "Browser household ID", 500);
+  validateNonEmptyInput(executionAdultId, "Browser adult ID", 500);
   return `florence-${createHash("sha256")
-    .update(`florence-kernel-profile\0${householdId}`)
+    .update(`florence-kernel-profile\0${householdId}\0${executionAdultId}`)
     .digest("hex")
     .slice(0, 40)}`;
 }

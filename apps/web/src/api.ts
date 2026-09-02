@@ -1,5 +1,4 @@
 import {
-  type CompleteFamilyOnboardingInput,
   type DeleteGoogleDerivedDataResponse,
   type DisconnectGoogleConnectionInput,
   type DisconnectGoogleConnectionResponse,
@@ -80,11 +79,8 @@ export async function getFamilyCalendarMonth(month: string): Promise<FamilyCalen
   );
 }
 
-export function completeFamilyOnboarding(input: CompleteFamilyOnboardingInput): Promise<WorkspaceView> {
-  return requestWorkspace("/api/v1/vault/household", {
-    method: "PUT",
-    body: JSON.stringify(input),
-  });
+export function completeOwnOnboarding(): Promise<WorkspaceView> {
+  return requestWorkspace("/api/v1/onboarding/complete", { method: "POST" });
 }
 
 export function putFamilyMember(memberId: string, input: FamilyMemberMutationInput): Promise<WorkspaceView> {

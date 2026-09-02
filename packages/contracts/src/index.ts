@@ -82,11 +82,11 @@ export const familyMemberProfileSchema = z
   })
   .strict()
   .superRefine((member, context) => {
-    if (member.kind === "adult" && member.lastName === null) {
+    if (member.kind === "adult" && member.status === "verified" && member.lastName === null) {
       context.addIssue({
         code: "custom",
         path: ["lastName"],
-        message: "An adult needs a last name.",
+        message: "A verified adult needs a last name.",
       });
     }
     if (member.kind === "adult" && member.age !== undefined) {
@@ -175,6 +175,61 @@ export const memoryPresentationSchema = z
 export type MemoryPresentation = z.infer<typeof memoryPresentationSchema>;
 const storedMemoryPresentationSchema = memoryPresentationSchema.required();
 
+export const vaultListItemSchema = z
+  .object({
+    id: idSchema,
+    text: nonempty(500),
+    checked: z.boolean(),
+  })
+  .strict();
+export type VaultListItem = z.infer<typeof vaultListItemSchema>;
+
+export const vaultListItemUpdateSchema = z
+  .object({
+    itemId: idSchema,
+    text: nonempty(500).nullable(),
+    checked: z.boolean().nullable(),
+  })
+  .strict()
+  .superRefine((update, context) => {
+    if (update.text === null && update.checked === null) {
+      context.addIssue({ code: "custom", message: "Change the list item's text or checked state." });
+    }
+  });
+export type VaultListItemUpdate = z.infer<typeof vaultListItemUpdateSchema>;
+
+export const vaultListDeltaSchema = z
+  .object({
+    add: z.array(nonempty(500)).max(100),
+    updates: z.array(vaultListItemUpdateSchema).max(100),
+    removeItemIds: z.array(idSchema).max(100),
+  })
+  .strict()
+  .superRefine((delta, context) => {
+    const normalizedAdditions = delta.add.map((text) => text.toLocaleLowerCase("en-US"));
+    if (new Set(normalizedAdditions).size !== normalizedAdditions.length) {
+      context.addIssue({ code: "custom", path: ["add"], message: "New list items must be unique." });
+    }
+    const updateIds = delta.updates.map((update) => update.itemId);
+    if (new Set(updateIds).size !== updateIds.length) {
+      context.addIssue({ code: "custom", path: ["updates"], message: "Update each list item at most once." });
+    }
+    if (new Set(delta.removeItemIds).size !== delta.removeItemIds.length) {
+      context.addIssue({
+        code: "custom",
+        path: ["removeItemIds"],
+        message: "Remove each list item at most once.",
+      });
+    }
+    if (delta.removeItemIds.some((itemId) => updateIds.includes(itemId))) {
+      context.addIssue({
+        code: "custom",
+        message: "A list item cannot be updated and removed together.",
+      });
+    }
+  });
+export type VaultListDelta = z.infer<typeof vaultListDeltaSchema>;
+
 export const vaultFileSchema = z
   .object({
     artifactId: idSchema,
@@ -201,6 +256,18 @@ export function decodeMemoryPresentation(value: unknown): MemoryPresentation {
   });
 }
 
+/** Lists added before structured checklist support retain their plain-text details. */
+export function decodeVaultListItems(value: unknown): VaultListItem[] {
+  if (!isUnknownRecord(value) || !Object.hasOwn(value, "listItems")) {
+    return [];
+  }
+  return z.array(vaultListItemSchema).max(500).parse(value.listItems);
+}
+
+export function isStructuredVaultList(value: unknown): boolean {
+  return isUnknownRecord(value) && Object.hasOwn(value, "listItems");
+}
+
 export const vaultFactSchema = memoryPresentationSchema
   .safeExtend({
     id: idSchema,
@@ -211,6 +278,8 @@ export const vaultFactSchema = memoryPresentationSchema
     editable: z.boolean(),
     deletable: z.boolean(),
     files: z.array(vaultFileSchema).default([]),
+    listItems: z.array(vaultListItemSchema).max(500).default([]),
+    listStructured: z.boolean().default(false),
   })
   .strict();
 export type VaultFact = z.infer<typeof vaultFactSchema>;
@@ -303,6 +372,17 @@ export const googleConnectionSummarySchema = z
   .strict();
 export type GoogleConnectionSummary = z.infer<typeof googleConnectionSummarySchema>;
 
+export const setupAttentionSchema = z.enum([
+  "calendar_reconnect",
+  "calendar_manual_review",
+  "calendar_name_review",
+  "family_group_review",
+  "family_thread_announcement_review",
+  "private_review_delivery",
+  "family_briefing_delivery",
+]);
+export type SetupAttention = z.infer<typeof setupAttentionSchema>;
+
 export const setupChecklistSchema = z
   .object({
     ownOnboardingComplete: z.boolean(),
@@ -312,7 +392,9 @@ export const setupChecklistSchema = z
     bothAdultsGoogleConnected: z.boolean(),
     familyGroupConnected: z.boolean(),
     familyCalendarConnected: z.boolean(),
+    familyCalendarShared: z.boolean(),
     initialBriefing: z.enum(["not_ready", "preparing", "sent"]),
+    setupAttention: setupAttentionSchema.nullable(),
   })
   .strict();
 
@@ -346,6 +428,7 @@ export const workspaceViewSchema = z
         adultId: idSchema,
         displayName: nonempty(160).nullable(),
         lastName: nonempty(160).nullable(),
+        isFounder: z.boolean(),
       })
       .strict(),
     workspace: z
@@ -454,22 +537,19 @@ const familyOnboardingChildSchema = z
   })
   .strict();
 
-const familyOnboardingBase = {
-  postalCode: postalCodeSchema,
-  children: z.array(familyOnboardingChildSchema).min(1).max(20),
-};
-
 export const completeFamilyOnboardingInputSchema = z.discriminatedUnion("mode", [
   z
     .object({
-      ...familyOnboardingBase,
+      postalCode: postalCodeSchema,
+      children: z.array(familyOnboardingChildSchema).min(1).max(20),
       mode: z.literal("two_adult"),
       partner: familyOnboardingPartnerSchema,
     })
     .strict(),
   z
     .object({
-      ...familyOnboardingBase,
+      postalCode: postalCodeSchema.nullable(),
+      children: z.array(familyOnboardingChildSchema).max(20),
       mode: z.literal("solo"),
       partner: z.null(),
     })
@@ -508,11 +588,21 @@ export const sessionResponseSchema = z
   .strict();
 export type SessionResponse = z.infer<typeof sessionResponseSchema>;
 
-export const patchFactInputSchema = z
-  .object({
-    statement: nonempty(4_000),
-  })
-  .strict();
+export const patchFactInputSchema = z.union([
+  z.object({ statement: nonempty(4_000) }).strict(),
+  z
+    .object({ list: vaultListDeltaSchema })
+    .strict()
+    .superRefine((input, context) => {
+      if (
+        input.list.add.length === 0 &&
+        input.list.updates.length === 0 &&
+        input.list.removeItemIds.length === 0
+      ) {
+        context.addIssue({ code: "custom", message: "Change at least one list item." });
+      }
+    }),
+]);
 export type PatchFactInput = z.infer<typeof patchFactInputSchema>;
 
 export const patchWatchInputSchema = z

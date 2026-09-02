@@ -237,7 +237,7 @@ export type GoogleFamilyCalendarProvisioningResult = {
   calendarId: string;
   summary: string;
   founderConnectionId: string;
-  partnerConnectionId: string;
+  partnerConnectionId: string | null;
   occurredAt: string;
 };
 
@@ -1131,8 +1131,10 @@ export class GoogleConnection {
     householdId: string;
     founderAdultId: string;
     founderConnectionId: string;
-    partnerAdultId: string;
-    partnerConnectionId: string;
+    partner: Readonly<{
+      adultId: string;
+      connectionId: string;
+    }> | null;
     summary: string;
     timeZone: string;
     /** Supply the returned ID when resuming after a transient post-creation failure. */
@@ -1141,12 +1143,14 @@ export class GoogleConnection {
     const householdId = required(input.householdId, "household ID");
     const founderAdultId = required(input.founderAdultId, "founder adult ID");
     const founderConnectionId = required(input.founderConnectionId, "founder Google connection ID");
-    const partnerAdultId = required(input.partnerAdultId, "partner adult ID");
-    const partnerConnectionId = required(input.partnerConnectionId, "partner Google connection ID");
-    if (founderAdultId === partnerAdultId) {
+    const partnerAdultId =
+      input.partner === null ? null : required(input.partner.adultId, "partner adult ID");
+    const partnerConnectionId =
+      input.partner === null ? null : required(input.partner.connectionId, "partner Google connection ID");
+    if (partnerAdultId !== null && founderAdultId === partnerAdultId) {
       throw new Error("Family Calendar adults must be different");
     }
-    if (founderConnectionId === partnerConnectionId) {
+    if (partnerConnectionId !== null && founderConnectionId === partnerConnectionId) {
       throw new Error("Family Calendar Google connections must be different");
     }
     const summary = required(input.summary, "Family Calendar title").trim();
@@ -1157,19 +1161,23 @@ export class GoogleConnection {
     const provisioningMarker = familyCalendarProvisioningMarker(householdId);
     const description = familyCalendarDescription(provisioningMarker);
 
-    const [founderCredential, partnerCredential, founderConnections, partnerConnections] = await Promise.all([
+    const [founderCredential, founderConnections, partnerGoogle] = await Promise.all([
       this.#store.readActiveGoogleCredential({
         connectionId: founderConnectionId,
         householdId,
         ownerAdultId: founderAdultId,
       }),
-      this.#store.readActiveGoogleCredential({
-        connectionId: partnerConnectionId,
-        householdId,
-        ownerAdultId: partnerAdultId,
-      }),
       this.#store.listActive({ householdId, ownerAdultId: founderAdultId }),
-      this.#store.listActive({ householdId, ownerAdultId: partnerAdultId }),
+      partnerAdultId === null || partnerConnectionId === null
+        ? Promise.resolve(null)
+        : Promise.all([
+            this.#store.readActiveGoogleCredential({
+              connectionId: partnerConnectionId,
+              householdId,
+              ownerAdultId: partnerAdultId,
+            }),
+            this.#store.listActive({ householdId, ownerAdultId: partnerAdultId }),
+          ]),
     ]);
     const founderConnection = exactActiveConnection(
       founderConnections,
@@ -1177,27 +1185,29 @@ export class GoogleConnection {
       founderAdultId,
       founderConnectionId,
     );
-    const partnerConnection = exactActiveConnection(
-      partnerConnections,
-      householdId,
-      partnerAdultId,
-      partnerConnectionId,
-    );
     if (!founderCredential || !founderConnection) {
       throw new GoogleConnectionError("The founder Google connection is no longer active", "not_found");
     }
-    if (!partnerCredential || !partnerConnection) {
+    const partnerCredential = partnerGoogle?.[0] ?? null;
+    const partnerConnection =
+      partnerGoogle === null || partnerAdultId === null || partnerConnectionId === null
+        ? null
+        : exactActiveConnection(partnerGoogle[1], householdId, partnerAdultId, partnerConnectionId);
+    if (partnerGoogle !== null && (!partnerCredential || !partnerConnection)) {
       throw new GoogleConnectionError("The partner Google connection is no longer active", "not_found");
     }
     const founderEmail = required(founderConnection.emailLabel ?? "", "founder Google email");
-    const partnerEmail = required(partnerConnection.emailLabel ?? "", "partner Google email");
+    const partnerEmail =
+      partnerConnection === null
+        ? null
+        : required(partnerConnection.emailLabel ?? "", "partner Google email");
 
     let founderAccessToken: string;
-    let partnerAccessToken: string;
+    let partnerAccessToken: string | null;
     try {
       [founderAccessToken, partnerAccessToken] = await Promise.all([
         this.#calendarAccessToken(founderCredential),
-        this.#calendarAccessToken(partnerCredential),
+        partnerCredential === null ? Promise.resolve(null) : this.#calendarAccessToken(partnerCredential),
       ]);
     } catch (error) {
       if (error instanceof DefinitiveCalendarError) {
@@ -1248,8 +1258,10 @@ export class GoogleConnection {
           "provider_rejected",
         );
       }
-      await this.#ensureOwnerAcl(founderAccessToken, calendarId, partnerEmail);
-      await this.#ensurePartnerCalendarList(partnerAccessToken, calendarId, summary, timeZone);
+      if (partnerEmail !== null && partnerAccessToken !== null) {
+        await this.#ensureOwnerAcl(founderAccessToken, calendarId, partnerEmail);
+        await this.#ensurePartnerCalendarList(partnerAccessToken, calendarId, summary, timeZone);
+      }
       return {
         calendarId,
         summary,

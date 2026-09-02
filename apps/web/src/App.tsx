@@ -1,11 +1,11 @@
 import type {
-  CompleteFamilyOnboardingInput,
   FamilyCalendarEvent,
   FamilyMemberProfile,
   GoogleProviderRevocation,
   PatchFactInput,
   PatchWatchInput,
   PreferencesInput,
+  SetupAttention,
   SetupSessionInput,
   VaultFact,
   VaultWatch,
@@ -27,12 +27,12 @@ import {
   RefreshCw,
   Trash2,
 } from "lucide-react";
-import { type FormEvent, useEffect, useState } from "react";
+import { type FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import { createSession, FlorenceRequestError } from "./api";
 import { MemberEditor } from "./components/MemberEditor";
 import {
   queryKeys,
-  useCompleteFamilyOnboarding,
+  useCompleteOwnOnboarding,
   useCreateSession,
   useDeleteFact,
   useDeleteGoogleDerivedData,
@@ -72,6 +72,59 @@ type CalendarMonthCell = {
 type VaultDocket = NonNullable<WorkspaceView["vault"]>["docket"];
 type VaultActiveWork = NonNullable<WorkspaceView["vault"]>["activeWork"][number];
 
+function setupAttentionCopy(
+  attention: SetupAttention,
+  privateOnly: boolean,
+): { title: string; detail: string } {
+  switch (attention) {
+    case "calendar_reconnect":
+      return {
+        title: "Reconnect Google to finish your Florence Calendar",
+        detail: privateOnly
+          ? "Your private Messages conversation still works. Reconnect Google in Florence before Calendar actions can resume."
+          : "Both private Messages conversations still work. Reconnect the affected Google account in Florence before Florence retries Calendar sharing or creates the family group.",
+      };
+    case "calendar_manual_review":
+      return {
+        title: "Your Florence Calendar needs review",
+        detail: privateOnly
+          ? "Your private Messages conversation still works. Florence couldn’t safely confirm the Google Calendar setup, so Calendar actions are paused until the Calendar is reviewed and repaired."
+          : "Both private Messages conversations still work. Florence couldn’t safely confirm the Calendar share, so she did not create the family group. The Google Calendar needs review and repair before setup can continue.",
+      };
+    case "calendar_name_review":
+      return {
+        title: "Your Florence Calendar name needs review",
+        detail:
+          "The Calendar is ready and Messages still work. Florence couldn’t update its display name, so she kept the last confirmed name while setup continues.",
+      };
+    case "family_group_review":
+      return {
+        title: "Your family group needs review",
+        detail:
+          "Both private Messages conversations and the shared Florence Calendar still work. Florence couldn’t safely confirm the exact family group, so group setup needs review before setup can continue.",
+      };
+    case "family_thread_announcement_review":
+      return {
+        title: "A family-thread message needs review",
+        detail:
+          "Both private Messages conversations, the exact family group, and the shared Florence Calendar still work. Florence couldn’t confirm the Calendar-ready message and did not undo the setup.",
+      };
+    case "private_review_delivery":
+      return {
+        title: "A private review didn’t arrive",
+        detail: privateOnly
+          ? "Your private Messages conversation and Florence Calendar still work. Florence couldn’t confirm your private Google review was delivered, so its findings remain private until delivery is reviewed."
+          : "Both private Messages conversations and the shared Florence Calendar still work. Florence couldn’t confirm one adult’s private review was delivered, so its details will not enter the family briefing until delivery is reviewed.",
+      };
+    case "family_briefing_delivery":
+      return {
+        title: "Your first family briefing didn’t fully arrive",
+        detail:
+          "The family group and shared Florence Calendar still work. Florence stopped the remaining briefing messages after the delivery failure so they would not arrive out of order.",
+      };
+  }
+}
+
 export function AppShell() {
   const directEntry = onboardingEntry.setupToken !== null || onboardingEntry.accessToken !== null;
   const session = useSession(!directEntry);
@@ -91,7 +144,7 @@ export function AppShell() {
     return <GoogleSetupGate status={onboardingEntry.googleStatus} />;
   }
   if (!workspace.data.workspace.setup.ownOnboardingComplete) {
-    return <FamilySetupPage view={workspace.data} />;
+    return <CompleteOwnSetup isFounder={workspace.data.viewer.isFounder} />;
   }
   if (onboardingEntry.googleStatus && window.location.pathname !== "/preferences") {
     window.location.replace(`/preferences?google=${encodeURIComponent(onboardingEntry.googleStatus)}`);
@@ -151,7 +204,6 @@ function SetupPage({ setupToken }: { setupToken: string }) {
   const [step, setStep] = useState<"profile" | "permission" | "google">("profile");
   const [firstNameValue, setFirstNameValue] = useState("");
   const [lastNameValue, setLastNameValue] = useState("");
-  const [privateConflictBusySharingEnabled, setPrivateConflictBusySharingEnabled] = useState(false);
   const [token, setToken] = useState<string | null>(setupToken);
   const [error, setError] = useState<string | null>(null);
 
@@ -177,7 +229,7 @@ function SetupPage({ setupToken }: { setupToken: string }) {
       timeZone,
       guardianAttested: true,
       proactiveUseAccepted: true,
-      privateConflictBusySharingEnabled,
+      privateConflictBusySharingEnabled: false,
     };
     try {
       await createSession.mutateAsync({ setupToken: token, profile });
@@ -226,21 +278,9 @@ function SetupPage({ setupToken }: { setupToken: string }) {
             <input name="guardianAttested" type="checkbox" required />
             <span>I’m a parent, guardian, or caregiver for the children I add.</span>
           </label>
-          <label className="setup-attestation">
-            <input
-              name="privateConflictBusySharingEnabled"
-              type="checkbox"
-              checked={privateConflictBusySharingEnabled}
-              onChange={(event) => setPrivateConflictBusySharingEnabled(event.target.checked)}
-            />
-            <span>
-              Florence may tell our family chat when I’m busy, without sharing the event name or personal
-              details.
-            </span>
-          </label>
           <p className="setup-footnote">
-            Personal details stay private unless you ask Florence to share them. Once both parents finish
-            setup, Florence will create a new shared family calendar for you.
+            Personal details stay private unless you ask Florence to share them. If you later set up a family
+            chat, you can separately choose whether Florence may share title-free busy times there.
           </p>
           {error && <SetupError>{error}</SetupError>}
           <button className="button primary wide" type="submit" disabled={createSession.isPending}>
@@ -256,7 +296,7 @@ function SetupPage({ setupToken }: { setupToken: string }) {
       <form className="setup-form" onSubmit={continueFromName}>
         <SetupHeading
           title="What’s your name?"
-          detail="Florence will use it when she texts you and your family."
+          detail="Florence will use it when she texts you and, if you add them later, your family."
         />
         <label className="field">
           <span>First name</span>
@@ -355,491 +395,42 @@ function GoogleSetupSuccess({ view }: { view: WorkspaceView }) {
   );
 }
 
-type ChildDraft = {
-  id: string;
-  firstName: string;
-  lastName: string;
-  age: string;
-  grade: string;
-  school: string;
-  activities: string;
-};
-
-type FamilySetupScreen =
-  | { kind: "partner" }
-  | { kind: "partner-phone" }
-  | { kind: "child-name"; childId: string; returnToReview?: boolean }
-  | { kind: "child-age-grade"; childId: string; returnToReview?: boolean }
-  | { kind: "child-school"; childId: string; returnToReview?: boolean }
-  | { kind: "child-activities"; childId: string; returnToReview?: boolean }
-  | { kind: "more-children" }
-  | { kind: "postal-code" }
-  | { kind: "review" };
-
-function FamilySetupPage({ view }: { view: WorkspaceView }) {
-  const complete = useCompleteFamilyOnboarding();
-  const [partnerFirstName, setPartnerFirstName] = useState("");
-  const [partnerLastName, setPartnerLastName] = useState("");
-  const [partnerPhone, setPartnerPhone] = useState("");
-  const [postalCode, setPostalCode] = useState("");
-  const viewerLastName = view.viewer.lastName ?? "Family";
-  const familyLabel = familyLabelFromSurnames(viewerLastName, partnerLastName);
-  const [children, setChildren] = useState<ChildDraft[]>(() => [newChildDraft()]);
-  const [screen, setScreen] = useState<FamilySetupScreen>({ kind: "partner" });
+function CompleteOwnSetup({ isFounder }: { isFounder: boolean }) {
+  const { isPending, mutate } = useCompleteOwnOnboarding();
+  const started = useRef(false);
   const [error, setError] = useState<string | null>(null);
 
-  function updateChild(id: string, patch: Partial<ChildDraft>) {
-    setChildren((current) => current.map((child) => (child.id === id ? { ...child, ...patch } : child)));
-  }
-
-  function showScreen(next: FamilySetupScreen) {
+  const finish = useCallback(() => {
+    if (started.current) return;
+    started.current = true;
     setError(null);
-    setScreen(next);
-  }
-
-  function continueFromPartner(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    setPartnerFirstName((current) => current.trim());
-    setPartnerLastName((current) => current.trim());
-    showScreen({ kind: "partner-phone" });
-  }
-
-  function continueFromChildName(event: FormEvent<HTMLFormElement>, child: ChildDraft) {
-    event.preventDefault();
-    if (!child.firstName.trim()) {
-      setError("Add your child’s first name.");
-      return;
-    }
-    updateChild(child.id, { firstName: child.firstName.trim(), lastName: child.lastName.trim() });
-    showScreen({
-      kind: "child-age-grade",
-      childId: child.id,
-      ...(screen.kind === "child-name" && screen.returnToReview ? { returnToReview: true } : {}),
+    mutate(undefined, {
+      onSuccess: () => window.location.replace("/?setup=complete"),
+      onError: (cause) => {
+        started.current = false;
+        setError(cause instanceof Error ? cause.message : "Florence could not finish your setup.");
+      },
     });
-  }
+  }, [mutate]);
 
-  function continueFromChildAgeGrade(event: FormEvent<HTMLFormElement>, child: ChildDraft) {
-    event.preventDefault();
-    try {
-      parseChildAge(child.age);
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Add a valid age or leave it blank.");
-      return;
-    }
-    updateChild(child.id, { age: child.age.trim(), grade: child.grade.trim() });
-    showScreen({
-      kind: "child-school",
-      childId: child.id,
-      ...(screen.kind === "child-age-grade" && screen.returnToReview ? { returnToReview: true } : {}),
-    });
-  }
+  useEffect(() => finish(), [finish]);
 
-  function continueFromChildSchool(event: FormEvent<HTMLFormElement>, child: ChildDraft) {
-    event.preventDefault();
-    updateChild(child.id, { school: child.school.trim() });
-    showScreen({
-      kind: "child-activities",
-      childId: child.id,
-      ...(screen.kind === "child-school" && screen.returnToReview ? { returnToReview: true } : {}),
-    });
-  }
-
-  function continueFromChildActivities(event: FormEvent<HTMLFormElement>, child: ChildDraft) {
-    event.preventDefault();
-    updateChild(child.id, { activities: child.activities.trim() });
-    showScreen(
-      screen.kind === "child-activities" && screen.returnToReview
-        ? { kind: "review" }
-        : { kind: "more-children" },
-    );
-  }
-
-  function addChild() {
-    const child = newChildDraft();
-    setChildren((current) => [...current, child]);
-    showScreen({ kind: "child-name", childId: child.id });
-  }
-
-  function discardChild(id: string) {
-    setChildren((current) => current.filter((child) => child.id !== id));
-    showScreen({ kind: "more-children" });
-  }
-
-  async function submit() {
-    setError(null);
-    try {
-      const family = {
-        postalCode: postalCode.trim(),
-        children: children.map((child) => {
-          const age = parseChildAge(child.age);
-          const activities = listValues(child.activities);
-          return {
-            firstName: child.firstName.trim(),
-            ...(child.lastName.trim() ? { lastName: child.lastName.trim() } : {}),
-            ...(age !== undefined ? { age } : {}),
-            ...(child.grade.trim() ? { grade: child.grade.trim() } : {}),
-            ...(child.school.trim() ? { school: child.school.trim() } : {}),
-            ...(activities.length ? { activities } : {}),
-          };
-        }),
-      };
-      const input: CompleteFamilyOnboardingInput = {
-        ...family,
-        mode: "two_adult",
-        partner: {
-          firstName: partnerFirstName.trim(),
-          lastName: partnerLastName.trim(),
-          phoneNumber: partnerPhone,
-        },
-      };
-      if (input.children.some((child) => !child.firstName)) {
-        setError("Add each child’s first name.");
-        return;
-      }
-      await complete.mutateAsync(input);
-      window.location.replace("/?setup=complete");
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Florence could not save your family setup.");
-    }
-  }
-
-  const activeChild = "childId" in screen ? children.find((child) => child.id === screen.childId) : undefined;
-
-  if (screen.kind === "partner") {
-    return (
-      <SetupFrame>
-        <form className="setup-form" onSubmit={continueFromPartner}>
-          <SetupHeading
-            title={`Who runs family life with you, ${firstName(view.viewer.displayName ?? "there")}?`}
-            detail="Florence will ask before texting them. They’ll set up their own account."
-          />
-          <label className="field">
-            <span>First name</span>
-            <input
-              value={partnerFirstName}
-              onChange={(event) => setPartnerFirstName(event.target.value)}
-              autoComplete="given-name"
-              placeholder="First name"
-              required
-            />
-          </label>
-          <label className="field">
-            <span>Last name</span>
-            <input
-              value={partnerLastName}
-              onChange={(event) => setPartnerLastName(event.target.value)}
-              autoComplete="family-name"
-              placeholder="Last name"
-              required
-            />
-          </label>
-          <button className="button primary wide" type="submit">
-            Continue
-          </button>
-        </form>
-      </SetupFrame>
-    );
-  }
-
-  if (screen.kind === "partner-phone") {
-    return (
-      <SetupFrame>
-        <form
-          className="setup-form"
-          onSubmit={(event) => {
-            event.preventDefault();
-            showScreen({ kind: "child-name", childId: children[0]?.id ?? "" });
-          }}
-        >
-          <SetupHeading
-            title={`What’s ${partnerFirstName}’s number?`}
-            detail="Florence won’t text them until she asks you in Messages."
-          />
-          <label className="field">
-            <span>US mobile number</span>
-            <input
-              value={formatUsPhoneNumber(partnerPhone)}
-              onChange={(event) => setPartnerPhone(usPhoneDigits(event.target.value))}
-              autoComplete="tel"
-              inputMode="numeric"
-              placeholder="415 555 0123"
-              pattern="[0-9]{3} [0-9]{3} [0-9]{4}"
-              maxLength={12}
-              required
-            />
-          </label>
-          <p className="setup-footnote">No country code needed.</p>
-          <button className="button primary wide" type="submit">
-            Continue
-          </button>
-        </form>
-      </SetupFrame>
-    );
-  }
-
-  if (screen.kind === "child-name" && activeChild) {
-    return (
-      <SetupFrame>
-        <form className="setup-form" onSubmit={(event) => continueFromChildName(event, activeChild)}>
-          <SetupHeading
-            title="Who should Florence know about?"
-            detail="Add one child at a time. Florence uses this to recognize the family details that reach your inbox."
-          />
-          <label className="field">
-            <span>Child’s first name</span>
-            <input
-              value={activeChild.firstName}
-              onChange={(event) => updateChild(activeChild.id, { firstName: event.target.value })}
-              autoComplete="given-name"
-              placeholder="First name"
-              required
-            />
-          </label>
-          <label className="field">
-            <span>Last name (optional)</span>
-            <input
-              value={activeChild.lastName}
-              onChange={(event) => updateChild(activeChild.id, { lastName: event.target.value })}
-              autoComplete="family-name"
-              placeholder="Last name"
-            />
-          </label>
-          {error && <SetupError>{error}</SetupError>}
-          <button className="button primary wide" type="submit">
-            Continue
-          </button>
-          {children.length > 1 && !screen.returnToReview && (
-            <button
-              className="setup-secondary-action"
-              type="button"
-              onClick={() => discardChild(activeChild.id)}
-            >
-              Never mind
-            </button>
-          )}
-        </form>
-      </SetupFrame>
-    );
-  }
-
-  if (screen.kind === "child-age-grade" && activeChild) {
-    return (
-      <SetupFrame>
-        <form className="setup-form" onSubmit={(event) => continueFromChildAgeGrade(event, activeChild)}>
-          <SetupHeading
-            title={`How old is ${firstName(activeChild.firstName)}?`}
-            detail="Age and grade help Florence match the right school and activity details. Both are optional."
-          />
-          <label className="field">
-            <span>Current age (optional)</span>
-            <input
-              type="number"
-              min={0}
-              max={120}
-              step={1}
-              inputMode="numeric"
-              value={activeChild.age}
-              onChange={(event) => updateChild(activeChild.id, { age: event.target.value })}
-              placeholder="Age"
-            />
-          </label>
-          <label className="field">
-            <span>Grade or year (optional)</span>
-            <input
-              value={activeChild.grade}
-              onChange={(event) => updateChild(activeChild.id, { grade: event.target.value })}
-              maxLength={80}
-              autoComplete="off"
-              placeholder="3rd grade, Kindergarten, Year 4"
-            />
-          </label>
-          {error && <SetupError>{error}</SetupError>}
-          <button className="button primary wide" type="submit">
-            {activeChild.age.trim() || activeChild.grade.trim() ? "Continue" : "Skip for now"}
-          </button>
-        </form>
-      </SetupFrame>
-    );
-  }
-
-  if (screen.kind === "child-school" && activeChild) {
-    return (
-      <SetupFrame>
-        <form className="setup-form" onSubmit={(event) => continueFromChildSchool(event, activeChild)}>
-          <SetupHeading
-            title={`Where does ${firstName(activeChild.firstName)} go during the day?`}
-            detail="A school, daycare, or preschool helps Florence recognize schedules and messages."
-          />
-          <label className="field">
-            <span>School or daycare (optional)</span>
-            <input
-              value={activeChild.school}
-              onChange={(event) => updateChild(activeChild.id, { school: event.target.value })}
-              autoComplete="off"
-              placeholder="School or daycare"
-            />
-          </label>
-          <button className="button primary wide" type="submit">
-            {activeChild.school.trim() ? "Continue" : "Skip for now"}
-          </button>
-        </form>
-      </SetupFrame>
-    );
-  }
-
-  if (screen.kind === "child-activities" && activeChild) {
-    return (
-      <SetupFrame>
-        <form className="setup-form" onSubmit={(event) => continueFromChildActivities(event, activeChild)}>
-          <SetupHeading
-            title={`What is ${firstName(activeChild.firstName)} into?`}
-            detail="Add any recurring activities that tend to create practices, pickups, or calendar events."
-          />
-          <label className="field">
-            <span>Activities (optional)</span>
-            <input
-              value={activeChild.activities}
-              onChange={(event) => updateChild(activeChild.id, { activities: event.target.value })}
-              autoComplete="off"
-              placeholder="Soccer, piano, robotics"
-            />
-          </label>
-          <button className="button primary wide" type="submit">
-            {activeChild.activities.trim() ? "Continue" : "Skip for now"}
-          </button>
-        </form>
-      </SetupFrame>
-    );
-  }
-
-  if (screen.kind === "more-children") {
-    const names = children.map((child) => firstName(child.firstName)).join(", ");
-    return (
-      <SetupFrame>
-        <div className="setup-form">
-          <SetupHeading
-            title="Anyone else?"
-            detail={`${names} ${children.length === 1 ? "is" : "are"} in. You can add another child or keep going.`}
-          />
-          <button
-            className="button primary wide"
-            type="button"
-            onClick={() => showScreen({ kind: "postal-code" })}
-          >
-            Review family
-          </button>
-          {children.length < 20 && (
-            <button className="setup-secondary-action" type="button" onClick={addChild}>
-              Add another child
-            </button>
-          )}
-        </div>
-      </SetupFrame>
-    );
-  }
-
-  if (screen.kind === "postal-code") {
-    return (
-      <SetupFrame>
-        <form
-          className="setup-form"
-          onSubmit={(event) => {
-            event.preventDefault();
-            showScreen({ kind: "review" });
-          }}
-        >
-          <SetupHeading
-            title="What’s your ZIP code?"
-            detail="This helps Florence find nearby school and family activities."
-          />
-          <label className="field">
-            <span>ZIP code</span>
-            <input
-              value={postalCode}
-              onChange={(event) => setPostalCode(event.target.value)}
-              inputMode="numeric"
-              autoComplete="postal-code"
-              placeholder="94110"
-              pattern="[0-9]{5}(-[0-9]{4})?"
-              required
-            />
-          </label>
-          <button className="button primary wide" type="submit">
-            Continue
-          </button>
-        </form>
-      </SetupFrame>
-    );
-  }
-
-  if (screen.kind === "review") {
-    return (
-      <SetupFrame>
-        <div className="setup-form">
-          <SetupHeading
-            title="Does this look right?"
-            detail={`Florence will call you the ${familyLabel}. After both parents finish, she’ll automatically create your shared calendar.`}
-          />
-          <div className="setup-review-list">
-            <button
-              className="setup-review-row"
-              type="button"
-              onClick={() => showScreen({ kind: "partner" })}
-            >
-              <span>Partner or co-parent</span>
-              <strong>{`${partnerFirstName} ${partnerLastName} · ${formatUsPhoneNumber(partnerPhone)}`}</strong>
-            </button>
-            {children.map((child) => (
-              <button
-                className="setup-review-row"
-                type="button"
-                key={child.id}
-                onClick={() => showScreen({ kind: "child-name", childId: child.id, returnToReview: true })}
-              >
-                <span>{`${child.firstName} ${child.lastName}`.trim()}</span>
-                <strong>
-                  {[
-                    child.age.trim() ? `Age ${child.age.trim()}` : "",
-                    child.grade,
-                    child.school,
-                    child.activities,
-                  ]
-                    .filter(Boolean)
-                    .join(" · ") || "No details added"}
-                </strong>
-              </button>
-            ))}
-            <button
-              className="setup-review-row"
-              type="button"
-              onClick={() => showScreen({ kind: "postal-code" })}
-            >
-              <span>Family</span>
-              <strong>{`${familyLabel} · ZIP ${postalCode}`}</strong>
-            </button>
-          </div>
-          {error && <SetupError>{error}</SetupError>}
-          <button
-            className="button primary wide"
-            type="button"
-            onClick={() => void submit()}
-            disabled={complete.isPending}
-          >
-            {complete.isPending ? "Saving your family…" : "Finish setup"}
-          </button>
-          <button
-            className="setup-secondary-action"
-            type="button"
-            onClick={() => showScreen({ kind: "more-children" })}
-          >
-            Add another child
-          </button>
-        </div>
-      </SetupFrame>
-    );
-  }
-
-  return <PageLoader />;
+  return error ? (
+    <SetupFrame>
+      <div className="setup-form">
+        <SetupHeading
+          title="Florence couldn’t finish setup"
+          detail={`Your Google account is connected. Try finishing ${isFounder ? "your private Florence" : "your side of the family setup"} again.`}
+        />
+        <SetupError>{error}</SetupError>
+        <button className="button primary wide" type="button" onClick={finish} disabled={isPending}>
+          {isPending ? "Finishing…" : "Try again"}
+        </button>
+      </div>
+    </SetupFrame>
+  ) : (
+    <PageLoader />
+  );
 }
 
 function GoogleSetupStep({
@@ -913,12 +504,14 @@ function GoogleDataDisclosure({ title = "Before you connect" }: { title?: string
       <p>
         Florence will use the Google data you authorize to review Gmail and calendars, find and work with
         Drive files and Workspace documents, manage tasks and contacts, and maintain the Florence-created
-        family calendar. Google content may be sent to Florence’s AI service providers only to complete your
-        requests and household follow-up.
+        Calendar. Google content may be sent to Florence’s AI service providers only to complete your requests
+        and follow-up.
       </p>
       <p>
-        Your personal Google content stays private unless you ask Florence to share it or add it to the family
-        calendar. Florence may retain useful family context and review history as described in the{" "}
+        Your personal Google content stays private unless you ask Florence to share it or add it to the
+        Florence Calendar. Anything already on that Calendar will become visible to another adult if you later
+        approve sharing it during household setup. Florence may retain useful context and review history as
+        described in the{" "}
         <a href="https://tryflorence.com/privacy" target="_blank" rel="noreferrer">
           Privacy Policy
         </a>
@@ -953,7 +546,14 @@ export function WorkspacePage() {
   if (!view) return <PageLoader />;
 
   const { setup } = view.workspace;
-  const partnerState =
+  const privateOnly = setup.ownOnboardingComplete && !setup.secondAdultAdded;
+  const otherAdult = view.vault?.members.find(
+    (member) => member.kind === "adult" && member.id !== view.viewer.adultId,
+  );
+  const joiningAdultName = view.viewer.isFounder
+    ? otherAdult?.firstName
+    : (view.viewer.displayName ?? undefined);
+  const otherAdultState =
     setup.partnerInvitation === "connected"
       ? "Private Messages connected"
       : setup.partnerInvitation === "invited"
@@ -963,54 +563,115 @@ export function WorkspacePage() {
           : setup.partnerInvitation === "ready"
             ? "Ready to invite"
             : "Not added yet";
-  const googleState = setup.bothAdultsGoogleConnected
-    ? "Both parents connected"
-    : view.workspace.googleConnections.length
-      ? "Your account is connected"
-      : "Not connected";
+  const googleState =
+    setup.setupAttention === "calendar_reconnect"
+      ? "Reconnect needed"
+      : setup.bothAdultsGoogleConnected
+        ? "Both adults connected"
+        : view.workspace.googleConnections.length
+          ? "Your account is connected"
+          : "Not connected";
+  const privateCalendarState =
+    setup.setupAttention === "calendar_reconnect"
+      ? "Waiting for Google reconnect"
+      : setup.setupAttention === "calendar_manual_review"
+        ? "Needs manual review"
+        : setup.setupAttention === "calendar_name_review"
+          ? "Ready—name review needed"
+          : setup.familyCalendarConnected
+            ? "Ready"
+            : "Preparing";
+  const familyGroupState =
+    setup.setupAttention === "family_group_review"
+      ? "Needs review—not created"
+      : setup.setupAttention === "family_thread_announcement_review"
+        ? "Exact group ready—message review needed"
+        : setup.familyGroupConnected
+          ? "Exact group ready"
+          : "Not created yet";
+  const familyCalendarState =
+    setup.setupAttention === "calendar_reconnect"
+      ? "Waiting for Google reconnect"
+      : setup.setupAttention === "calendar_manual_review"
+        ? "Needs manual review"
+        : setup.setupAttention === "calendar_name_review"
+          ? "Ready—name review needed"
+          : setup.familyCalendarShared
+            ? "Shared calendar ready"
+            : setup.familyCalendarConnected
+              ? "Ready—sharing waits for both adults"
+              : "Not created yet";
+  const familyBriefingState =
+    setup.setupAttention === "calendar_reconnect" || setup.setupAttention === "calendar_manual_review"
+      ? "Waiting for Calendar recovery"
+      : setup.setupAttention === "family_group_review"
+        ? "Waiting for family group review"
+        : setup.setupAttention === "private_review_delivery"
+          ? "Waiting for private delivery review"
+          : setup.setupAttention === "family_briefing_delivery"
+            ? "Delivery needs review"
+            : !setup.familyCalendarShared
+              ? "Waiting for calendar sharing"
+              : setup.initialBriefing === "sent"
+                ? "Sent in Messages"
+                : setup.initialBriefing === "preparing"
+                  ? "Preparing"
+                  : "Waiting for household setup";
 
-  let currentTitle = "Bring your partner into Florence";
+  let currentTitle = "Florence is ready in your private Messages";
   let currentDetail =
-    "Continue in your private Messages conversation. Florence will ask before sending a private invitation.";
-  if (setup.partnerInvitation === "ready") {
-    currentTitle = "Invite your partner in Messages";
+    "Text Florence or send a voice note with whatever needs doing. She can review your Google account and keep working with you privately.";
+  if (setup.setupAttention) {
+    const attention = setupAttentionCopy(setup.setupAttention, privateOnly);
+    currentTitle = attention.title;
+    currentDetail = attention.detail;
+  } else if (!privateOnly && setup.partnerInvitation === "ready") {
+    currentTitle = joiningAdultName
+      ? `Invite ${joiningAdultName} in Messages`
+      : "Invite another parent or caregiver in Messages";
     currentDetail =
-      "Florence is waiting for your okay in your private conversation. Your partner will complete their own setup.";
-  } else if (setup.partnerInvitation === "approved") {
+      "Florence is waiting for your okay in your private conversation. The other adult will complete their own setup.";
+  } else if (!privateOnly && setup.partnerInvitation === "approved") {
     currentTitle = "Florence has your okay";
-    currentDetail =
-      "She’ll confirm in your private conversation once your partner’s invitation is delivered.";
-  } else if (setup.partnerInvitation === "invited") {
-    currentTitle = "Your partner has the next step";
+    currentDetail = "She’ll confirm in your private conversation once the invitation is delivered.";
+  } else if (!privateOnly && setup.partnerInvitation === "invited") {
+    currentTitle = joiningAdultName
+      ? `${joiningAdultName} has the next step`
+      : "The other adult has the next step";
     currentDetail =
       "They’ll finish in their own private Messages conversation and connect their own Google account.";
-  } else if (!setup.bothAdultsMessagesConnected) {
-    currentTitle = "Connect both parents in Messages";
+  } else if (!privateOnly && !setup.bothAdultsMessagesConnected) {
+    currentTitle = "Connect both adults in Messages";
     currentDetail =
-      "Each parent needs a separate private conversation before Florence creates the family group.";
-  } else if (!setup.bothAdultsGoogleConnected) {
-    currentTitle = "One Google connection to go";
-    currentDetail =
-      "Your partner completes this privately. Florence keeps each parent’s Gmail, Calendar, and personal details separate.";
-  } else if (!setup.familyGroupConnected) {
+      "Each adult needs a separate private conversation before Florence creates the family group.";
+  } else if (!privateOnly && !setup.bothAdultsGoogleConnected) {
+    currentTitle = "Google setup isn’t complete";
+    currentDetail = view.workspace.googleConnections.length
+      ? `${joiningAdultName ?? "The other adult"} completes this privately. Florence keeps each adult’s Gmail, Calendar, and personal details separate.`
+      : "Reconnect your Google account privately. Florence keeps each adult’s Gmail, Calendar, and personal details separate.";
+  } else if (!privateOnly && !setup.familyCalendarShared) {
+    currentTitle = setup.familyCalendarConnected
+      ? "Florence is sharing your family calendar"
+      : "Next, Florence creates your family calendar";
+    currentDetail = setup.familyCalendarConnected
+      ? "The Florence Calendar is ready. Florence will create the family group once Google confirms both adults can use it."
+      : "Both adults will have equal Florence authority over the shared family calendar.";
+  } else if (!privateOnly && !setup.familyGroupConnected) {
     currentTitle = "Next, Florence creates your family group";
     currentDetail =
       "The exact three-person Messages group will be the main place for family plans, follow-ups, and decisions.";
-  } else if (!setup.familyCalendarConnected) {
-    currentTitle = "Next, Florence creates your family calendar";
-    currentDetail = "Both parents will have equal Florence authority over the new shared family calendar.";
-  } else if (setup.initialBriefing === "preparing") {
+  } else if (!privateOnly && setup.initialBriefing === "preparing") {
     currentTitle = "Florence is preparing your first family briefing";
     currentDetail =
-      "She’s reviewing each parent’s side privately and will put only the useful shared picture in your family group.";
-  } else if (setup.initialBriefing === "not_ready") {
+      "She’s reviewing each adult’s side privately and will put only the useful shared picture in your family group.";
+  } else if (!privateOnly && setup.initialBriefing === "not_ready") {
     currentTitle = "Florence is starting your first family briefing";
     currentDetail =
-      "Your household is connected. Florence will review each parent’s side before she writes in the family group.";
-  } else {
+      "Your household is connected. Florence will review each adult’s side before she writes in the family group.";
+  } else if (!privateOnly) {
     currentTitle = "Florence is ready in your family group";
     currentDetail =
-      "Both parents, the exact family group, and the shared calendar are ready. Your first family briefing was sent in Messages.";
+      "Both adults, the exact family group, and the shared calendar are ready. Your first family briefing was sent in Messages.";
   }
 
   return (
@@ -1028,33 +689,47 @@ export function WorkspacePage() {
             </a>
           )}
         </div>
-        <dl className="workspace-state-list" aria-label="Household readiness">
-          <div className="workspace-state-row">
-            <dt>Partner</dt>
-            <dd>{partnerState}</dd>
-          </div>
+        <dl
+          className="workspace-state-list"
+          aria-label={privateOnly ? "Florence readiness" : "Household readiness"}
+        >
+          {privateOnly ? (
+            <div className="workspace-state-row">
+              <dt>Florence</dt>
+              <dd>Ready in private Messages</dd>
+            </div>
+          ) : (
+            <div className="workspace-state-row">
+              <dt>{joiningAdultName ?? "Other adult"}</dt>
+              <dd>{otherAdultState}</dd>
+            </div>
+          )}
           <div className="workspace-state-row">
             <dt>Google</dt>
             <dd>{googleState}</dd>
           </div>
-          <div className="workspace-state-row">
-            <dt>Family group</dt>
-            <dd>{setup.familyGroupConnected ? "Exact group ready" : "Not created yet"}</dd>
-          </div>
-          <div className="workspace-state-row">
-            <dt>Family calendar</dt>
-            <dd>{setup.familyCalendarConnected ? "Shared calendar ready" : "Not created yet"}</dd>
-          </div>
-          <div className="workspace-state-row">
-            <dt>First family briefing</dt>
-            <dd>
-              {setup.initialBriefing === "sent"
-                ? "Sent in Messages"
-                : setup.initialBriefing === "preparing"
-                  ? "Preparing"
-                  : "Waiting for household setup"}
-            </dd>
-          </div>
+          {privateOnly && (
+            <div className="workspace-state-row">
+              <dt>Florence Calendar</dt>
+              <dd>{privateCalendarState}</dd>
+            </div>
+          )}
+          {!privateOnly && (
+            <>
+              <div className="workspace-state-row">
+                <dt>Family group</dt>
+                <dd>{familyGroupState}</dd>
+              </div>
+              <div className="workspace-state-row">
+                <dt>{setup.familyCalendarShared ? "Family calendar" : "Florence Calendar"}</dt>
+                <dd>{familyCalendarState}</dd>
+              </div>
+              <div className="workspace-state-row">
+                <dt>First family briefing</dt>
+                <dd>{familyBriefingState}</dd>
+              </div>
+            </>
+          )}
         </dl>
       </section>
     </Page>
@@ -1063,7 +738,9 @@ export function WorkspacePage() {
 
 export function CalendarPage() {
   const queryClient = useQueryClient();
-  const householdTimeZone = queryClient.getQueryData<WorkspaceView>(queryKeys.workspace)?.vault?.timeZone;
+  const workspace = queryClient.getQueryData<WorkspaceView>(queryKeys.workspace);
+  const householdTimeZone = workspace?.vault?.timeZone;
+  const calendarShared = workspace?.workspace.setup.familyCalendarShared ?? false;
   const [month, setMonth] = useState(() => currentCalendarMonth(householdTimeZone));
   const [selectedDate, setSelectedDate] = useState(() => currentCalendarDate(householdTimeZone));
   const query = useFamilyCalendarMonth(month);
@@ -1085,7 +762,13 @@ export function CalendarPage() {
   return (
     <Page
       title="Calendar"
-      intro="Your family group is where plans happen. This is the shared calendar Florence keeps for both parents."
+      intro={
+        calendarShared
+          ? "Your family group is where plans happen. This is the shared Florence Calendar for both adults."
+          : workspace?.workspace.setup.secondAdultAdded
+            ? "This Florence Calendar stays private until both adults finish setup and Florence confirms the share."
+            : "This is the Florence Calendar you control from your private Messages conversation."
+      }
     >
       <section className="calendar-section" aria-live="polite">
         <CalendarToolbar
@@ -1110,13 +793,17 @@ export function CalendarPage() {
           />
         ) : query.data?.status === "not_ready" ? (
           <CalendarState
-            title="Your family calendar is on the way"
-            detail="Florence will make it automatically after both parents finish setup. She’ll tell you in your family group when it’s ready."
+            title="Your Florence Calendar is on the way"
+            detail={
+              calendarShared
+                ? "Florence is finishing it now and will confirm in your family group."
+                : "Florence is finishing it now. You can keep using your private Messages conversation meanwhile."
+            }
           />
         ) : query.data?.status === "temporarily_unavailable" ? (
           <CalendarState
             title="Google Calendar isn’t available right now"
-            detail="Nothing changed. Try loading your family calendar again in a moment."
+            detail="Nothing changed. Try loading your Florence Calendar again in a moment."
             action={
               <button className="button pill" type="button" onClick={() => void query.refetch()}>
                 <RefreshCw size={14} /> Try again
@@ -1130,6 +817,7 @@ export function CalendarPage() {
             timeZone={query.data.timeZone}
             events={query.data.events}
             truncated={query.data.truncated}
+            calendarShared={calendarShared}
             onSelectDate={setSelectedDate}
           />
         ) : (
@@ -1180,6 +868,7 @@ function CalendarMonth({
   timeZone,
   events,
   truncated,
+  calendarShared,
   onSelectDate,
 }: {
   month: string;
@@ -1187,6 +876,7 @@ function CalendarMonth({
   timeZone: string;
   events: FamilyCalendarEvent[];
   truncated: boolean;
+  calendarShared: boolean;
   onSelectDate: (date: string) => void;
 }) {
   const weeks = calendarMonthWeeks(month);
@@ -1197,8 +887,8 @@ function CalendarMonth({
     <>
       {!events.length && (
         <div className="calendar-empty-month">
-          <strong>Nothing on the family calendar this month</strong>
-          <p>When Florence adds a family plan, it’ll appear here for both parents.</p>
+          <strong>Nothing on the Florence Calendar this month</strong>
+          <p>When Florence adds a plan, it’ll appear here.</p>
         </div>
       )}
       <div className="calendar-layout">
@@ -1266,10 +956,17 @@ function CalendarMonth({
       </div>
       <div className="calendar-message-note">
         <MessageCircle size={16} aria-hidden="true" />
-        <p>
-          To add or change a plan, text Florence in your family group. She’ll keep this calendar up to date
-          for both parents.
-        </p>
+        {calendarShared ? (
+          <p>
+            To add or change a plan, text Florence privately or in your family group. The shared Florence
+            Calendar—and any change made to it—is visible to both parents.
+          </p>
+        ) : (
+          <p>
+            To add or change a plan, text Florence in your private Messages conversation. She’ll keep your
+            Florence Calendar up to date.
+          </p>
+        )}
       </div>
     </>
   );
@@ -1337,7 +1034,7 @@ function CalendarState({
 
 function CalendarSkeleton() {
   return (
-    <div className="calendar-skeleton" role="status" aria-label="Loading family calendar">
+    <div className="calendar-skeleton" role="status" aria-label="Loading Florence Calendar">
       <div className="calendar-skeleton-grid" aria-hidden="true">
         {CALENDAR_SKELETON_CELLS.map((cell) => (
           <span className="calendar-skeleton-cell" key={cell} />
@@ -1381,11 +1078,16 @@ export function VaultPage() {
   );
   const library = vault.facts.filter((fact) => fact.memoryKind === "artifact");
   const foundingAdult = adults.find((member) => member.postalCode !== undefined) ?? null;
+  const privateOnly = !view.workspace.setup.secondAdultAdded;
 
   return (
     <Page
       title="Vault"
-      intro="The people, knowledge, and reusable things Florence remembers for your household."
+      intro={
+        privateOnly
+          ? "The people, knowledge, and reusable things Florence remembers for you."
+          : "The people, knowledge, and reusable things Florence remembers for your household."
+      }
     >
       {editing && (
         <MemberEditor
@@ -1400,7 +1102,7 @@ export function VaultPage() {
       )}
 
       {vault.activeWork.length > 0 && (
-        <VaultSection label="Florence is working">
+        <VaultSection label="Florence’s work">
           <ActiveWorkList work={vault.activeWork} timeZone={vault.timeZone} />
         </VaultSection>
       )}
@@ -1410,6 +1112,7 @@ export function VaultPage() {
           docket={vault.docket}
           timeZone={vault.timeZone}
           reviewState={view.workspace.setup.initialBriefing}
+          privateOnly={privateOnly}
         />
       </VaultSection>
 
@@ -1429,7 +1132,11 @@ export function VaultPage() {
           <FactList
             facts={ordinaryFacts}
             emptyTitle="No facts visible yet"
-            emptyDetail="Useful household knowledge Florence learns will appear here."
+            emptyDetail={
+              privateOnly
+                ? "Useful knowledge Florence learns will appear here."
+                : "Useful household knowledge Florence learns will appear here."
+            }
             isSaving={patchFact.isPending || deleteFact.isPending}
             onCorrect={(factId, input) => patchFact.mutateAsync({ factId, input })}
             onDelete={(factId) => deleteFact.mutateAsync(factId)}
@@ -1442,7 +1149,11 @@ export function VaultPage() {
           <FactList
             facts={preferencesAndRoutines}
             emptyTitle="No preferences or routines yet"
-            emptyDetail="Family preferences, constraints, and recurring routines Florence learns will appear here."
+            emptyDetail={
+              privateOnly
+                ? "Preferences, constraints, and recurring routines Florence learns will appear here."
+                : "Family preferences, constraints, and recurring routines Florence learns will appear here."
+            }
             isSaving={patchFact.isPending || deleteFact.isPending}
             onCorrect={(factId, input) => patchFact.mutateAsync({ factId, input })}
             onDelete={(factId) => deleteFact.mutateAsync(factId)}
@@ -1454,18 +1165,22 @@ export function VaultPage() {
         <VaultSection label="Saved knowledge">
           <EmptyVaultRow
             title={
-              view.workspace.setup.initialBriefing === "preparing"
-                ? "Florence is still learning what matters"
-                : view.workspace.setup.initialBriefing === "not_ready"
-                  ? "Saved knowledge isn’t ready yet"
-                  : "Nothing saved yet"
+              privateOnly
+                ? "Nothing saved yet"
+                : view.workspace.setup.initialBriefing === "preparing"
+                  ? "Florence is still learning what matters"
+                  : view.workspace.setup.initialBriefing === "not_ready"
+                    ? "Saved knowledge isn’t ready yet"
+                    : "Nothing saved yet"
             }
             detail={
-              view.workspace.setup.initialBriefing === "preparing"
-                ? "Recipes, facts, preferences, and routines will appear here as the first review finishes."
-                : view.workspace.setup.initialBriefing === "not_ready"
-                  ? "Florence will fill this after household setup and the first review are complete."
-                  : "Recipes, facts, preferences, and routines Florence remembers will appear here."
+              privateOnly
+                ? "Recipes, facts, preferences, and routines Florence remembers will appear here."
+                : view.workspace.setup.initialBriefing === "preparing"
+                  ? "Recipes, facts, preferences, and routines will appear here as the first review finishes."
+                  : view.workspace.setup.initialBriefing === "not_ready"
+                    ? "Florence will fill this after household setup and the first review are complete."
+                    : "Recipes, facts, preferences, and routines Florence remembers will appear here."
             }
           />
         </VaultSection>
@@ -1593,12 +1308,22 @@ function DocketList({
   docket,
   timeZone,
   reviewState,
+  privateOnly,
 }: {
   docket: VaultDocket;
   timeZone: string;
   reviewState: WorkspaceView["workspace"]["setup"]["initialBriefing"];
+  privateOnly: boolean;
 }) {
   if (docket.items.length === 0) {
+    if (privateOnly) {
+      return (
+        <EmptyVaultRow
+          title="Nothing needs attention right now."
+          detail="New private to-dos and decisions will appear here."
+        />
+      );
+    }
     if (reviewState === "preparing") {
       return (
         <EmptyVaultRow
@@ -1618,7 +1343,7 @@ function DocketList({
     return (
       <EmptyVaultRow
         title="Nothing needs attention right now."
-        detail="New household to-dos and decisions will appear here."
+        detail="New family to-dos and decisions will appear here."
       />
     );
   }
@@ -1720,7 +1445,7 @@ function HomePostalCode({
             </span>
             <div className="vault-data-copy">
               <strong>{postalCode ?? "Add your home ZIP"}</strong>
-              <p>Florence uses this to find useful things near your family.</p>
+              <p>Florence uses this to find useful things near you and your family.</p>
             </div>
             <div className="row-actions">
               <button
@@ -1799,8 +1524,8 @@ function PreferencesEditor({ initial }: { initial: PreferencesInput }) {
             onChange={(enabled) => changePermission("proactiveGoogleEnabled", enabled)}
           />
           <PermissionSetting
-            title="Add clear dates to the family calendar"
-            detail="Florence may automatically add a school, activity, appointment, or family-travel date when an official source is completely clear. If anything is uncertain, she asks in the family chat first. This works only while both parents leave it on."
+            title="Add clear dates to the Florence Calendar"
+            detail="Florence may automatically add a school, activity, appointment, or family-travel date when an official source is completely clear. If anything is uncertain, she asks before adding it."
             checked={draft.automaticFamilyCalendarEnabled}
             onChange={(enabled) => changePermission("automaticFamilyCalendarEnabled", enabled)}
           />
@@ -1850,12 +1575,15 @@ function GoogleConnector({ view, callbackStatus }: { view: WorkspaceView; callba
   const disconnect = useDisconnectGoogleConnection();
   const deleteGoogleData = useDeleteGoogleDerivedData();
   const accounts = view.workspace.googleConnections;
+  const privateOnly = !view.workspace.setup.secondAdultAdded;
   const [confirmation, setConfirmation] = useState<
     { kind: "disconnect" | "reconnect"; connectionId: string; emailLabel: string } | { kind: "delete" } | null
   >(null);
   const [resultNotice, setResultNotice] = useState<string | null>(() =>
     callbackStatus === "connected"
-      ? "Google is reconnected. Florence is reviewing the last 90 days now; your existing family setup stayed in place."
+      ? privateOnly
+        ? "Google is reconnected. Florence is reviewing the last 90 days now; your private Florence setup stayed in place."
+        : "Google is reconnected. Florence is reviewing the last 90 days now; your family setup stayed in place."
       : callbackStatus
         ? googleSetupError(callbackStatus)
         : null,
@@ -1909,13 +1637,13 @@ function GoogleConnector({ view, callbackStatus }: { view: WorkspaceView; callba
         {accounts.some((account) => !account.historyReviewReady) && (
           <p>
             Reconnect Google so Florence can finish reviewing the last 90 days across all of your calendars.
-            Your family setup will stay in place.
+            Your Florence setup will stay in place.
           </p>
         )}
         {accounts.some((account) => account.historyReviewReady && !account.assistantWorkReady) && (
           <p>
             Reconnect Google to let Florence finish work in Gmail, Drive, Docs, Sheets, Slides, Tasks, and
-            Contacts. Your family setup and existing calendar stay in place.
+            Contacts. Your Florence setup and existing calendar stay in place.
           </p>
         )}
         <GoogleDataDisclosure
@@ -2056,7 +1784,7 @@ function googleActionResult(
       : providerRevocation === "unconfirmed"
         ? `${localAccess}, though Google did not confirm the separate revoke.`
         : `${localAccess}; there was no Google token left to revoke.`;
-  const unchanged = kind === "delete" ? " Messages already sent and shared-calendar events remain." : "";
+  const unchanged = kind === "delete" ? " Messages already sent and Florence Calendar events remain." : "";
   return `${result}${providerResult}${unchanged}`;
 }
 
@@ -2102,7 +1830,7 @@ function GoogleActionConfirmation({
           <p id={detailId}>
             This disconnects Google and permanently deletes Florence’s retained facts, watches, and source
             details from Gmail and Calendar, plus queued updates and actions based on that Google data.
-            Messages already sent and events already added to the shared calendar remain.
+            Messages already sent and events already added to the Florence Calendar remain.
           </p>
         ) : isReconnect ? (
           <div id={detailId}>
@@ -2112,7 +1840,8 @@ function GoogleActionConfirmation({
               that succeeds with the same account.
             </p>
             <p>
-              Your family, profile, group chat, and shared calendar will stay in place while you reconnect.
+              Your profile, Messages conversations, and Florence Calendar will stay in place while you
+              reconnect.
             </p>
           </div>
         ) : (
@@ -2123,7 +1852,7 @@ function GoogleActionConfirmation({
             </p>
             <p>
               Previously retained facts and source details remain, along with Messages already sent and
-              changes already made to the shared calendar. Florence’s local access is removed even if Google
+              changes already made to the Florence Calendar. Florence’s local access is removed even if Google
               does not confirm its separate revocation request.
             </p>
           </div>
@@ -2433,6 +2162,8 @@ function ArtifactCard({
   const [statement, setStatement] = useState(artifact.statement);
   const [error, setError] = useState<string | null>(null);
   const title = artifact.title ?? artifact.statement;
+  const isList = artifact.artifactKind === "list";
+  const isStructuredList = isList && artifact.listStructured;
 
   async function correct(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -2452,6 +2183,21 @@ function ArtifactCard({
       await onDelete(artifact.id);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Florence could not delete this library item.");
+    }
+  }
+
+  async function setListItemChecked(itemId: string, checked: boolean) {
+    setError(null);
+    try {
+      await onCorrect(artifact.id, {
+        list: {
+          add: [],
+          updates: [{ itemId, text: null, checked }],
+          removeItemIds: [],
+        },
+      });
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Florence could not update this list.");
     }
   }
 
@@ -2478,10 +2224,38 @@ function ArtifactCard({
             <span className="artifact-kind-label">{artifactKindLabel(artifact.artifactKind)}</span>
             <h3>{title}</h3>
           </header>
-          {artifact.title && artifact.statement !== artifact.title && (
+          {!isStructuredList && artifact.title && artifact.statement !== artifact.title && (
             <p className="library-summary">{artifact.statement}</p>
           )}
-          {artifact.details && <p className="library-details">{artifact.details}</p>}
+          {!isStructuredList && artifact.details && <p className="library-details">{artifact.details}</p>}
+          {isStructuredList && (
+            <div className="vault-checklist">
+              <p className="vault-checklist-count">
+                {artifact.listItems.filter((item) => !item.checked).length} remaining
+              </p>
+              {artifact.listItems.length > 0 ? (
+                <ul aria-label={`${title} items`}>
+                  {artifact.listItems.map((item) => (
+                    <li key={item.id}>
+                      <label>
+                        <input
+                          type="checkbox"
+                          checked={item.checked}
+                          disabled={isSaving}
+                          onChange={(event) => void setListItemChecked(item.id, event.target.checked)}
+                        />
+                        <span className={item.checked ? "vault-checklist-item-checked" : undefined}>
+                          {item.text}
+                        </span>
+                      </label>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="vault-checklist-empty">No items yet. Text Florence to add something.</p>
+              )}
+            </div>
+          )}
           {!!artifact.files.length && (
             <ul className="library-files" aria-label="Saved files">
               {artifact.files.map((file) => (
@@ -2508,7 +2282,7 @@ function ArtifactCard({
           <footer className="library-card-footer">
             <p>{factSourceSummary(artifact)}</p>
             <div className="row-actions">
-              {artifact.editable && (
+              {artifact.editable && !isStructuredList && (
                 <button className="text-button" type="button" onClick={() => setEditing(true)}>
                   Correct summary
                 </button>
@@ -2572,15 +2346,28 @@ function PeopleList({
     return <EmptyVaultRow title="None added yet" detail="Add the people Florence should know." />;
   return (
     <div className="people-list">
-      {members.map((member) => (
-        <button className="person-row" type="button" key={member.id} onClick={() => onEdit(member)}>
-          <span className="initials">{initials(member.displayName)}</span>
-          <span>
-            <strong>{member.displayName}</strong>
-            <small>{memberSummary(member)}</small>
-          </span>
-        </button>
-      ))}
+      {members.map((member) => {
+        const changesBelongInMessages = member.kind === "adult" && member.status === "planned";
+        return (
+          <button
+            className="person-row"
+            type="button"
+            key={member.id}
+            disabled={changesBelongInMessages}
+            onClick={changesBelongInMessages ? undefined : () => onEdit(member)}
+          >
+            <span className="initials">{initials(member.displayName)}</span>
+            <span>
+              <strong>{member.displayName}</strong>
+              <small>
+                {changesBelongInMessages
+                  ? `${memberSummary(member)} · Change in private Messages`
+                  : memberSummary(member)}
+              </small>
+            </span>
+          </button>
+        );
+      })}
     </div>
   );
 }
@@ -2639,7 +2426,7 @@ function DesktopSidebar() {
     <aside className="sidebar">
       <Brand />
       <nav aria-label="Primary navigation">
-        <NavItem to="/" label="Messages" />
+        <NavItem to="/" label="Workspace" />
         <NavItem to="/calendar" label="Calendar" />
         <NavItem to="/vault" label="Vault" />
       </nav>
@@ -2653,7 +2440,7 @@ function MobileHeader() {
     <header className="mobile-header">
       <Brand />
       <nav aria-label="Primary navigation">
-        <NavItem to="/" label="Messages" />
+        <NavItem to="/" label="Workspace" />
         <NavItem to="/calendar" label="Calendar" />
         <NavItem to="/vault" label="Vault" />
       </nav>
@@ -2971,18 +2758,6 @@ function memberSummary(member: FamilyMemberProfile) {
   );
 }
 
-function familyLabelFromSurnames(founderLastName: string, partnerLastName: string): string {
-  const surnames = [founderLastName, partnerLastName]
-    .map((surname) => surname.trim())
-    .filter((surname, index, all) => {
-      if (!surname) return false;
-      return (
-        all.findIndex((candidate) => candidate.toLocaleLowerCase() === surname.toLocaleLowerCase()) === index
-      );
-    });
-  return `${surnames.join("–") || "Family"}${surnames.length ? " Family" : ""}`;
-}
-
 function initials(name: string) {
   return name
     .split(/\s+/)
@@ -2990,46 +2765,6 @@ function initials(name: string) {
     .map((part) => part[0])
     .join("")
     .toUpperCase();
-}
-
-function newChildDraft(): ChildDraft {
-  return {
-    id: crypto.randomUUID(),
-    firstName: "",
-    lastName: "",
-    age: "",
-    grade: "",
-    school: "",
-    activities: "",
-  };
-}
-
-function parseChildAge(value: string): number | undefined {
-  const text = value.trim();
-  if (!text) return undefined;
-  const age = Number(text);
-  if (!Number.isInteger(age) || age < 0 || age > 120) {
-    throw new Error("Age must be a whole number from 0 to 120.");
-  }
-  return age;
-}
-
-function listValues(value: string): string[] {
-  return value
-    .split(",")
-    .map((item) => item.trim())
-    .filter(Boolean);
-}
-
-function usPhoneDigits(value: string): string {
-  return value.replace(/\D/g, "").slice(0, 10);
-}
-
-function formatUsPhoneNumber(value: string): string {
-  const digits = usPhoneDigits(value);
-  if (digits.length <= 3) return digits;
-  if (digits.length <= 6) return `${digits.slice(0, 3)} ${digits.slice(3)}`;
-  return `${digits.slice(0, 3)} ${digits.slice(3, 6)} ${digits.slice(6)}`;
 }
 
 function consumeOnboardingEntry(): {
@@ -3057,7 +2792,7 @@ function consumeOnboardingEntry(): {
 
 function setupError(cause: unknown): string {
   if (cause instanceof FlorenceRequestError && (cause.status === 401 || cause.status === 410)) {
-    return "This setup link is no longer valid. If someone invited you, ask them to have Florence send a fresh invitation. Otherwise, return to the Messages conversation where you started and ask Florence for a new link.";
+    return "This setup link is no longer valid. Return to your private Messages conversation with Florence and ask for a fresh setup link.";
   }
   if (cause instanceof FlorenceRequestError && cause.status === 409) {
     return "Florence is already set up. Return to the Messages conversation you started.";
@@ -3092,8 +2827,4 @@ function isTimeZone(value: string): boolean {
   } catch {
     return false;
   }
-}
-
-function firstName(value: string): string {
-  return value.trim().split(/\s+/, 1)[0] ?? value;
 }

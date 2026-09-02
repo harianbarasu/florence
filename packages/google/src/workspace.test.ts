@@ -43,6 +43,7 @@ function refreshTokenEnvelope(input: {
   connectionId: string;
   householdId: string;
   ownerAdultId: string;
+  refreshToken?: string;
 }): string {
   const nonce = Buffer.alloc(12, 7);
   const cipher = createCipheriv("aes-256-gcm", input.key, nonce);
@@ -51,7 +52,10 @@ function refreshTokenEnvelope(input: {
       `florence-google-refresh-v1\0${input.connectionId}\0${input.householdId}\0${input.ownerAdultId}`,
     ),
   );
-  const ciphertext = Buffer.concat([cipher.update("refresh-token", "utf8"), cipher.final()]);
+  const ciphertext = Buffer.concat([
+    cipher.update(input.refreshToken ?? "refresh-token", "utf8"),
+    cipher.final(),
+  ]);
   return [
     "g1",
     nonce.toString("base64url"),
@@ -596,6 +600,240 @@ describe("Gmail inbound attachment reads", () => {
       attachmentBytes.map((bytes) => bytes.toString("hex")),
     );
     expect(readAttachmentIds.sort()).toEqual(attachmentBytes.map((_, index) => `attachment-${index}`).sort());
+  });
+});
+
+describe("Family Calendar solo expansion", () => {
+  test("creates for one parent, shares that calendar in place later, and makes the retry read-only", async () => {
+    const householdId = "household-calendar";
+    const founderAdultId = "adult-founder";
+    const founderConnectionId = "connection-founder";
+    const partnerAdultId = "adult-partner";
+    const partnerConnectionId = "connection-partner";
+    const founderEmail = "founder@example.com";
+    const partnerEmail = "partner@example.com";
+    const calendarId = "florence-family-calendar";
+    const summary = "De la Cruz Family";
+    const timeZone = "America/Los_Angeles";
+    const key = Buffer.alloc(32, 9);
+    const tokenRefreshes: string[] = [];
+    const calendarWrites: string[] = [];
+    const partnerProviderRequests: string[] = [];
+    let calendarDescription: string | null = null;
+    let partnerOwnerInstalled = false;
+    let partnerCalendarListInstalled = false;
+    let creationLatchCalls = 0;
+
+    const connectionView = (input: { connectionId: string; ownerAdultId: string; emailLabel: string }) => ({
+      ...input,
+      householdId,
+      status: "active" as const,
+      grantedScopes: [],
+      lastError: null,
+      createdAt: "2026-08-31T12:00:00.000Z",
+      updatedAt: "2026-08-31T12:00:00.000Z",
+    });
+    const founderConnection = connectionView({
+      connectionId: founderConnectionId,
+      ownerAdultId: founderAdultId,
+      emailLabel: founderEmail,
+    });
+    const partnerConnection = connectionView({
+      connectionId: partnerConnectionId,
+      ownerAdultId: partnerAdultId,
+      emailLabel: partnerEmail,
+    });
+    const credential = (input: { connectionId: string; ownerAdultId: string; refreshToken: string }) => ({
+      connectionId: input.connectionId,
+      householdId,
+      ownerAdultId: input.ownerAdultId,
+      refreshTokenEnvelope: refreshTokenEnvelope({ key, householdId, ...input }),
+    });
+    const founderCredential = credential({
+      connectionId: founderConnectionId,
+      ownerAdultId: founderAdultId,
+      refreshToken: "founder-refresh-token",
+    });
+    const partnerCredential = credential({
+      connectionId: partnerConnectionId,
+      ownerAdultId: partnerAdultId,
+      refreshToken: "partner-refresh-token",
+    });
+
+    const store = {
+      async readActiveGoogleCredential(input: {
+        connectionId: string;
+        householdId: string;
+        ownerAdultId: string;
+      }) {
+        if (input.householdId !== householdId) return null;
+        if (input.connectionId === founderConnectionId && input.ownerAdultId === founderAdultId) {
+          return founderCredential;
+        }
+        if (input.connectionId === partnerConnectionId && input.ownerAdultId === partnerAdultId) {
+          return partnerCredential;
+        }
+        return null;
+      },
+      async listActive(input: { householdId: string; ownerAdultId: string }) {
+        if (input.householdId !== householdId) return [];
+        if (input.ownerAdultId === founderAdultId) return [founderConnection];
+        if (input.ownerAdultId === partnerAdultId) return [partnerConnection];
+        return [];
+      },
+      async beginFamilyCalendarCreation() {
+        creationLatchCalls += 1;
+        return { createAllowed: true, calendarId: null };
+      },
+    } as unknown as GoogleConnectionStore;
+    const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
+      const url = new URL(String(input));
+      const method = init?.method ?? "GET";
+      if (url.origin === "https://oauth2.googleapis.com") {
+        const refreshToken = new URLSearchParams(String(init?.body)).get("refresh_token");
+        if (!refreshToken) throw new Error("Expected a Google refresh token");
+        tokenRefreshes.push(refreshToken);
+        return jsonResponse({
+          access_token:
+            refreshToken === "founder-refresh-token" ? "founder-access-token" : "partner-access-token",
+          token_type: "Bearer",
+        });
+      }
+      if (url.origin !== "https://www.googleapis.com") {
+        throw new Error(`Unexpected provider request: ${method} ${url}`);
+      }
+
+      const authorization = new Headers(init?.headers).get("authorization");
+      if (authorization === "Bearer partner-access-token") {
+        partnerProviderRequests.push(`${method} ${url.pathname}`);
+      }
+      if (method !== "GET") calendarWrites.push(`${method} ${url.pathname}`);
+
+      if (url.pathname === "/calendar/v3/users/me/calendarList" && method === "GET") {
+        return jsonResponse({ items: [] });
+      }
+      if (url.pathname === "/calendar/v3/calendars" && method === "POST") {
+        const body = JSON.parse(String(init?.body)) as {
+          summary: string;
+          description: string;
+          timeZone: string;
+        };
+        expect(body).toMatchObject({ summary, timeZone });
+        calendarDescription = body.description;
+        return jsonResponse({ id: calendarId });
+      }
+      if (url.pathname === `/calendar/v3/calendars/${calendarId}` && method === "GET") {
+        return jsonResponse({ id: calendarId, summary, description: calendarDescription, timeZone });
+      }
+      if (url.pathname === `/calendar/v3/calendars/${calendarId}/acl` && method === "GET") {
+        return jsonResponse({
+          items: [
+            {
+              id: "founder-owner-rule",
+              role: "owner",
+              scope: { type: "user", value: founderEmail },
+            },
+            ...(partnerOwnerInstalled
+              ? [
+                  {
+                    id: "partner-owner-rule",
+                    role: "owner",
+                    scope: { type: "user", value: partnerEmail },
+                  },
+                ]
+              : []),
+          ],
+        });
+      }
+      if (url.pathname === `/calendar/v3/calendars/${calendarId}/acl` && method === "POST") {
+        expect(JSON.parse(String(init?.body))).toEqual({
+          role: "owner",
+          scope: { type: "user", value: partnerEmail },
+        });
+        partnerOwnerInstalled = true;
+        return jsonResponse({
+          id: "partner-owner-rule",
+          role: "owner",
+          scope: { type: "user", value: partnerEmail },
+        });
+      }
+      if (url.pathname === `/calendar/v3/users/me/calendarList/${calendarId}` && method === "GET") {
+        return partnerCalendarListInstalled
+          ? jsonResponse({
+              id: calendarId,
+              summary,
+              timeZone,
+              accessRole: "owner",
+              selected: true,
+              primary: false,
+            })
+          : new Response(null, { status: 404 });
+      }
+      if (url.pathname === "/calendar/v3/users/me/calendarList" && method === "POST") {
+        expect(JSON.parse(String(init?.body))).toEqual({ id: calendarId, selected: true });
+        partnerCalendarListInstalled = true;
+        return jsonResponse({
+          id: calendarId,
+          summary,
+          timeZone,
+          accessRole: "owner",
+          selected: true,
+          primary: false,
+        });
+      }
+      throw new Error(`Unexpected provider request: ${method} ${url}`);
+    });
+    const google = new GoogleConnection({
+      store,
+      clientId: "client-id",
+      clientSecret: "client-secret",
+      redirectUri: "https://app.tryflorence.com/oauth/google/callback",
+      encryptionKey: key,
+      fetch: fetchMock,
+    });
+    const baseInput = {
+      householdId,
+      founderAdultId,
+      founderConnectionId,
+      summary,
+      timeZone,
+    } as const;
+
+    const solo = await google.provisionFamilyCalendar({ ...baseInput, partner: null });
+    expect(solo).toMatchObject({ calendarId, founderConnectionId, partnerConnectionId: null });
+    expect(tokenRefreshes).toEqual(["founder-refresh-token"]);
+    expect(calendarWrites).toEqual(["POST /calendar/v3/calendars"]);
+    expect(partnerProviderRequests).toEqual([]);
+    expect(creationLatchCalls).toBe(1);
+
+    const shared = await google.provisionFamilyCalendar({
+      ...baseInput,
+      calendarId: solo.calendarId,
+      partner: { adultId: partnerAdultId, connectionId: partnerConnectionId },
+    });
+    expect(shared).toMatchObject({ calendarId, founderConnectionId, partnerConnectionId });
+    expect(calendarWrites).toEqual([
+      "POST /calendar/v3/calendars",
+      `POST /calendar/v3/calendars/${calendarId}/acl`,
+      "POST /calendar/v3/users/me/calendarList",
+    ]);
+    expect(partnerProviderRequests).toEqual([
+      `GET /calendar/v3/users/me/calendarList/${calendarId}`,
+      "POST /calendar/v3/users/me/calendarList",
+      `GET /calendar/v3/users/me/calendarList/${calendarId}`,
+    ]);
+    expect(creationLatchCalls).toBe(1);
+
+    const writesAfterSharing = [...calendarWrites];
+    const retried = await google.provisionFamilyCalendar({
+      ...baseInput,
+      calendarId: solo.calendarId,
+      partner: { adultId: partnerAdultId, connectionId: partnerConnectionId },
+    });
+    expect(retried).toMatchObject({ calendarId, founderConnectionId, partnerConnectionId });
+    expect(calendarWrites).toEqual(writesAfterSharing);
+    expect(creationLatchCalls).toBe(1);
+    expect(tokenRefreshes.filter((token) => token === "partner-refresh-token")).toHaveLength(2);
   });
 });
 

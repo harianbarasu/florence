@@ -941,7 +941,7 @@ describe("Florence reasoner capability cutover", () => {
     expect(settled).toMatchObject({ kind: "continue", state: { phase: "ready", pendingCall: null } });
   });
 
-  test("household work privately asks one exact other adult and waits without polling the group", async () => {
+  test("household work privately asks one exact enrolled adult and waits without polling the group", async () => {
     const modelRequests: Record<string, unknown>[] = [];
     const question = "Can Violet stay for the full field-trip day on Friday?";
     const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
@@ -952,8 +952,8 @@ describe("Florence reasoner capability cutover", () => {
             status: "completed",
             output_parsed: null,
             output: [
-              functionCall("ask-hari", "participant_request", {
-                targetAdultName: "Hari Anbarasu",
+              functionCall("ask-jackson", "participant_request", {
+                targetAdultName: "Jackson Williams",
                 question,
               }),
             ],
@@ -985,6 +985,7 @@ describe("Florence reasoner capability cutover", () => {
         kind: "family_work_v1" as const,
         version: 1 as const,
         generation: 0,
+        responsibleAdultId: "adult-2",
         completionCondition:
           "Violet's full field-trip-day attendance is decided and the family plan is complete.",
         phase: "ready" as const,
@@ -1008,9 +1009,9 @@ describe("Florence reasoner capability cutover", () => {
         return {
           status: "queued" as const,
           requestId: "participant-request-1",
-          targetAdultId: "adult-1",
-          targetAdultName: "Hari Anbarasu",
-          channelId: "private-channel-1",
+          targetAdultId: "adult-2",
+          targetAdultName: "Jackson Williams",
+          channelId: "private-channel-2",
           questionSourceId: "private-question-1",
           question,
           askedAt: NOW,
@@ -1039,14 +1040,14 @@ describe("Florence reasoner capability cutover", () => {
           pendingCall: null,
           pendingParticipantRequest: expect.objectContaining({
             requestId: "participant-request-1",
-            targetAdultId: "adult-1",
-            targetAdultName: "Hari Anbarasu",
-            channelId: "private-channel-1",
+            targetAdultId: "adult-2",
+            targetAdultName: "Jackson Williams",
+            channelId: "private-channel-2",
             questionSourceId: "private-question-1",
             question,
           }),
           waitingDocket: {
-            owner: "Hari Anbarasu",
+            owner: "Jackson Williams",
             nextAction: "Answer Florence's private question.",
             waitingOn: question,
             needsAnswer: true,
@@ -1057,7 +1058,7 @@ describe("Florence reasoner capability cutover", () => {
       }),
     );
     expect(waiting).not.toHaveProperty("question");
-    expect(queuedRequests).toEqual([{ targetAdultName: "Hari Anbarasu", question }]);
+    expect(queuedRequests).toEqual([{ targetAdultName: "Jackson Williams", question }]);
     expect(modelRequests).toHaveLength(1);
     const [modelRequest] = modelRequests;
     if (!modelRequest) throw new Error("Participant request was not presented to the model");
@@ -1067,10 +1068,16 @@ describe("Florence reasoner capability cutover", () => {
     expect(participantTool).toMatchObject({
       parameters: {
         properties: {
-          targetAdultName: { enum: ["Hari Anbarasu"] },
+          targetAdultName: { enum: ["Hari Anbarasu", "Jackson Williams"] },
         },
       },
     });
+    const familyWorkInput = JSON.parse(
+      String(
+        ((modelRequest.input as Array<{ content?: Array<{ text?: string }> }>)?.[0]?.content ?? [])[0]?.text,
+      ),
+    ) as { responsibleAdult?: { displayName?: string } | null };
+    expect(familyWorkInput.responsibleAdult).toEqual({ displayName: "Jackson Williams" });
   });
 
   test("participant replies are matched semantically and acknowledged for the actual moment", async () => {
@@ -1079,9 +1086,11 @@ describe("Florence reasoner capability cutover", () => {
       {
         belongsToRequest: false,
         acknowledgement: null,
+        reassignToAdultName: null,
       },
       {
         belongsToRequest: true,
+        reassignToAdultName: null,
         acknowledgement: {
           kind: "text" as const,
           text: "Got it—thanks for letting me know. I’ll update the plan.",
@@ -1108,31 +1117,124 @@ describe("Florence reasoner capability cutover", () => {
     };
 
     const unrelated = await reasoner.interpretParticipantReply({
+      audience: "group",
+      adultNames: ["Hari Anbarasu", "Alex Anbarasu"],
       pendingRequest,
       currentMessage: {
-        text: "Can you add milk to the grocery list?",
+        senderName: "Alex Anbarasu",
+        text: "Hari, Friday works for you too, right?",
         occurredAt: "2026-08-27T20:05:00.000Z",
         explicitlyRepliesToQuestion: false,
+        replyTo: {
+          senderName: "Hari Anbarasu",
+          text: "I think Friday is probably easiest.",
+        },
       },
     });
-    expect(unrelated).toEqual({ belongsToRequest: false, acknowledgement: null });
+    expect(unrelated).toEqual({
+      belongsToRequest: false,
+      acknowledgement: null,
+      reassignToAdultName: null,
+    });
 
     const refusal = await reasoner.interpretParticipantReply({
+      audience: "private",
+      adultNames: ["Hari Anbarasu", "Alex Anbarasu"],
       pendingRequest,
       currentMessage: {
+        senderName: "Alex Anbarasu",
         text: "No, she needs to come home right after lunch.",
         occurredAt: "2026-08-27T20:06:00.000Z",
         explicitlyRepliesToQuestion: true,
+        replyTo: {
+          senderName: "Florence",
+          text: pendingRequest.question,
+        },
       },
     });
     expect(refusal).toEqual({
       belongsToRequest: true,
+      reassignToAdultName: null,
       acknowledgement: {
         kind: "text",
         text: "Got it—thanks for letting me know. I’ll update the plan.",
       },
     });
     expect(requests).toHaveLength(2);
-    expect(JSON.stringify(requests[0])).toContain("Can Maya stay for the whole field-trip day");
+    const unrelatedRequest = JSON.stringify(requests[0]);
+    expect(unrelatedRequest).toContain("Can Maya stay for the whole field-trip day");
+    expect(unrelatedRequest).toContain("Hari, Friday works for you too, right?");
+    expect(unrelatedRequest).toContain("belongs to that adult-to-adult conversation");
+  });
+
+  test("a family-group Calendar approval cannot borrow context from the other parent", async () => {
+    const requests: Record<string, unknown>[] = [];
+    const outputs = [
+      { approve: false, standaloneExplicit: false },
+      { approve: true, standaloneExplicit: false },
+    ];
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        parse(request: Record<string, unknown>) {
+          requests.push(request);
+          return {
+            status: "completed",
+            output_parsed: outputs.shift() ?? null,
+            output: [],
+          };
+        },
+      },
+    } as never);
+    const event = {
+      intervalKind: "all_day" as const,
+      title: "Maya’s camp decision day",
+      startDate: "2026-06-15",
+      endDate: "2026-06-16",
+      location: null,
+    };
+
+    await expect(
+      reasoner.interpretCalendarApproval({
+        audience: "group",
+        adultNames: ["Hari Anbarasu", "Alex Anbarasu"],
+        approvalPromptCurrent: false,
+        currentMessage: {
+          senderName: "Alex Anbarasu",
+          text: "Hari, yes, add that date to your calendar.",
+          occurredAt: "2026-08-27T20:07:00.000Z",
+          replyTo: {
+            senderName: "Hari Anbarasu",
+            text: "Would June 15 work for you too?",
+          },
+        },
+        event,
+      }),
+    ).resolves.toEqual({ approve: false, standaloneExplicit: false });
+
+    await expect(
+      reasoner.interpretCalendarApproval({
+        audience: "group",
+        adultNames: ["Hari Anbarasu", "Alex Anbarasu"],
+        approvalPromptCurrent: true,
+        currentMessage: {
+          senderName: "Alex Anbarasu",
+          text: "Yes, add that exact event.",
+          occurredAt: "2026-08-27T20:08:00.000Z",
+          replyTo: {
+            senderName: "Florence",
+            text: "Should I add Maya’s camp decision day on June 15?",
+          },
+        },
+        event,
+      }),
+    ).resolves.toEqual({ approve: true, standaloneExplicit: false });
+
+    expect(requests).toHaveLength(2);
+    const otherParentRequest = JSON.stringify(requests[0]);
+    const currentOfferRequest = JSON.stringify(requests[1]);
+    expect(otherParentRequest).toContain('\\"approvalPromptCurrent\\":false');
+    expect(currentOfferRequest).toContain('\\"approvalPromptCurrent\\":true');
+    expect(otherParentRequest).toContain("replying to the other enrolled adult never approves");
+    expect(otherParentRequest).toContain("Hari, yes, add that date to your calendar");
   });
 });

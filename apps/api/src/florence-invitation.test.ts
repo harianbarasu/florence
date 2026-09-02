@@ -23,6 +23,7 @@ describe("expired partner setup", () => {
       stopMessaging: false,
       declineInvitation: false,
       requestsFreshLink: true,
+      continueWithAvailableWork: false,
       bubbles: [],
     }));
     const invitation = {
@@ -45,6 +46,7 @@ describe("expired partner setup", () => {
     const store = {
       readUnboundPartnerInvitation,
       refreshMessagesEnrollment,
+      beginMessagesEnrollmentDelivery: vi.fn(async () => undefined),
       confirmMessagesEnrollmentDelivery,
       expirePartnerInvitations,
       scopeHouseholdLinqIdempotencyKey: vi.fn(
@@ -163,6 +165,7 @@ describe("expired partner setup", () => {
       stopMessaging: false,
       declineInvitation: true,
       requestsFreshLink: false,
+      continueWithAvailableWork: false,
       bubbles: [{ text: "Understood.", delayMs: 0 }],
     }));
     const store = {

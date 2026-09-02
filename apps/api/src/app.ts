@@ -1,4 +1,5 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import { existsSync } from "node:fs";
 import { basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import helmet from "@fastify/helmet";
@@ -10,7 +11,6 @@ import {
   normalizeHeicToJpeg,
 } from "@florence/artifacts";
 import {
-  completeFamilyOnboardingInputSchema,
   disconnectGoogleConnectionInputSchema,
   familyCalendarMonthQuerySchema,
   familyMemberMutationInputSchema,
@@ -84,6 +84,14 @@ export function createDefaultDependencies(env: NodeJS.ProcessEnv = process.env):
   const kernelProjectId = env.KERNEL_PROJECT_ID?.trim();
   const browserbaseApiKey = env.BROWSERBASE_API_KEY?.trim();
   const browserbaseProjectId = env.BROWSERBASE_PROJECT_ID?.trim();
+  if (env.NODE_ENV === "production" && !kernelApiKey) {
+    throw new Error(
+      "KERNEL_API_KEY is required in production so Florence can finish browser-backed family work",
+    );
+  }
+  if (kernelApiKey && !existsSync(defaultAgentBrowserExecutable)) {
+    throw new Error("Florence's bundled browser executable is unavailable");
+  }
   const browser = kernelApiKey
     ? new KernelBrowserClient({
         apiKey: kernelApiKey,
@@ -157,7 +165,7 @@ export function createDefaultDependencies(env: NodeJS.ProcessEnv = process.env):
     callerResolver,
     ready: () => store.ready(),
     close: async () => {
-      florence.stop();
+      await florence.stop();
       await store.close();
     },
   };
@@ -275,13 +283,12 @@ export async function buildApp(
     return dependencies.florence.familyCalendarMonthForAdult(caller.adultId, query.data.month);
   });
 
-  app.put("/api/v1/vault/household", async (request, reply) => {
+  app.post("/api/v1/onboarding/complete", async (request, reply) => {
     const caller = await requireAdult(request, reply, dependencies.callerResolver);
     if (!caller) return;
-    const input = completeFamilyOnboardingInputSchema.safeParse(request.body);
-    if (!input.success) return invalidRequest(reply);
+    if (request.body !== undefined) return invalidRequest(reply);
     return {
-      workspace: await dependencies.florence.completeFamilyOnboarding(caller.adultId, input.data),
+      workspace: await dependencies.florence.completeOwnOnboarding(caller.adultId),
     };
   });
 
@@ -303,11 +310,10 @@ export async function buildApp(
     const body = patchFactInputSchema.safeParse(request.body);
     if (!params.success || !body.success) return invalidRequest(reply);
     return {
-      workspace: await dependencies.florence.correctFact(
-        caller.adultId,
-        params.data.factId,
-        body.data.statement,
-      ),
+      workspace:
+        "statement" in body.data
+          ? await dependencies.florence.correctFact(caller.adultId, params.data.factId, body.data.statement)
+          : await dependencies.florence.mutateFactList(caller.adultId, params.data.factId, body.data.list),
     };
   });
 
@@ -404,13 +410,15 @@ export async function buildApp(
         return reply.redirect("/?google=authorization_cancelled");
       }
       try {
+        const completingOnboarding = !(await dependencies.florence.workspaceForAdult(caller.adultId))
+          .workspace.setup.ownOnboardingComplete;
         await dependencies.florence.finishGoogle({
           adultId: caller.adultId,
           state: request.query.state,
           code: request.query.code,
           sessionBindingDigest,
         });
-        return reply.redirect("/?google=connected");
+        return reply.redirect(completingOnboarding ? "/?setup=complete" : "/?google=connected");
       } catch (error) {
         if (error instanceof GoogleConnectionError) {
           return reply.redirect(`/?google=${encodeURIComponent(error.code)}`);

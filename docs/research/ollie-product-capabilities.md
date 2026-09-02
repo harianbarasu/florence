@@ -121,3 +121,107 @@ The core remains an artifact interface; `recipe` is one useful artifact type alo
 Do not infer from Ollie's marketing that it has a universal browser agent, arbitrary external-service completion, reliable long-running jobs, or perfect memory. Public pages do not document the underlying planner, queue, retry/recovery behavior, provider receipts, or performance. They also do not show that every Explore example is available to every plan or connection.
 
 The worthwhile benchmark is observable behavior: Florence should feel like one household teammate who remembers usable things, connects them to the present situation, takes the next step across whatever tools are available, and follows through without being re-prompted.
+
+## 2026-08-31 recursive follow-up: what Ollie's "multiplayer" actually is
+
+This follow-up was prompted by [Brian Distelburger's reply](https://x.com/bdistel/status/2094417512997818467) to Scott Belsky, which identifies Bill Lennon and Ollie as the closest product he has seen to the desired multi-person family-agent experience. `@blennon_` is not a separate product: it is the account of **Bill Lennon, Ollie's co-founder and CEO**. Ollie is operated by Confabulation Corporation. Its other co-founders are Christy Shannon (CMO) and Rushabh Doshi (CPTO). ([Ollie team](https://ollie.ai/about/))
+
+### Bottom line
+
+Ollie's public multiplayer model is **one Ollie identity inside one ordinary family group text**. The company says a spouse, nanny, home manager, or child can contribute to the same thread; official examples show multiple participants adding list items, resolving conflicts, supplying trip details, and receiving responsibility-specific reminders. One paid subscription covers the family group chat. ([homepage](https://ollie.ai/), [Explore](https://ollie.ai/explore/), [family calendar](https://ollie.ai/family-calendar/), [family reminders](https://ollie.ai/family-reminder/), [pricing](https://ollie.ai/pricing/))
+
+That is real shared-assistant functionality, but it is not the architecture requested in the Instinct discussion:
+
+- no public evidence shows one separately owned agent per adult;
+- no public evidence shows agent-to-agent negotiation or controlled context exchange;
+- no public material explains independent partner verification, per-adult authority, per-source visibility, private surprise planning, or conflict resolution between two connected accounts; and
+- the live onboarding route does not collect or verify a second adult. It merely asks whether the user wants to start a group chat or keep a private one-to-one chat, then gives the same Ollie phone number and tells the user to create the thread.
+
+This is therefore best classified as **shared-thread multiplayer**, not **federated personal-agent multiplayer**. The latter may exist privately, but the researched public contract does not establish it.
+
+### Live onboarding, inspected August 31
+
+Despite the homepage promise "No app, no login, just a text," clicking Get Started opens a six-step web flow at [ollie.ai/onboarding](https://ollie.ai/onboarding/):
+
+1. Choose an initial job: Calendar, Email, Reminders, or All of it.
+2. Choose a calendar provider (Google, Outlook, iCloud, Yahoo, or "something else").
+3. Choose an email provider (Gmail, Outlook, iCloud, Yahoo, or "something else").
+4. Supply a first name and time zone; the name is skippable.
+5. Choose a writing voice: Sharp & Efficient, Warm & Reassuring, Relaxed & Easygoing, or Fun & Playful.
+6. Choose **Start a group chat** ("You + your household share one thread with Ollie") or **Just me for now** ("Keep it a private one-on-one chat"), then scan a QR code or text Ollie's number.
+
+This is notable for Florence: Ollie already uses an individual-or-household expansion choice and does not require a second adult to obtain value. But the choice occurs before the first useful result, and the public flow treats group creation as a messaging operation rather than a two-adult trust and account-linking ceremony.
+
+The current web flow appears to be a direct product response to an early failure. On launch day, [Car Dealership Guy said](https://x.com/GuyDealership/status/2061973558083846383) he deleted Ollie after 20–30 setup texts required to add the 3–4 calendars and email accounts he and his wife used; he explicitly asked for web onboarding. Lennon replied that the team had web-based ideas to try. The new web provider selector reduces that friction, although it still does not explain which adult owns each connected source.
+
+There is also a scope contradiction inside onboarding: the Email step says Ollie "reads only what you ask about," while Ollie's core product promise and privacy policy describe continuous inbox monitoring, unsolicited alerts, shared briefings, and deadline/conflict detection. A parent cannot give meaningful consent if the setup copy describes request-scoped reading while the product is actually offering proactive watching.
+
+### What Ollie claims the household layer does
+
+The strongest company claim is on its [Ollie-versus-Poke page](https://ollie.ai/vs/poke/): it says Ollie has a household-spanning "memory graph," a joint briefing, shared visibility, partner coordination, and knowledge of a partner's calendar, children's schools, and shared routines. Its [Explore page](https://ollie.ai/explore/) supplies observable product examples of:
+
+- detecting a practice/recital collision in a family group;
+- attributing shared-list additions to specific people;
+- retaining trip ideas contributed by multiple participants;
+- confirming a dinner plan and then assigning a babysitter follow-up;
+- identifying whose turn it is for pickup; and
+- updating a common calendar or household list.
+
+These examples establish the intended product behavior, not reliability or the underlying data model. Some are labeled by Ollie as a "Real moment," but they remain company-curated rather than independently reproducible tests.
+
+### Firsthand X evidence
+
+The independently attributable public user corpus is much thinner than Ollie's marketing corpus, but it includes two strong longitudinal reports:
+
+- [Cynthia Bell McGillis, June 11](https://x.com/cynthiamcgillis/status/2065184775745486987): after connecting personal email, she said Ollie reliably texted her about important messages; she also sent a screenshot of events and said calendar creation worked flawlessly. On [August 21](https://x.com/cynthiamcgillis/status/2090970074920386948), she identified herself as a paying user and recommended it for surfacing time-sensitive Gmail/Calendar work.
+- [Christian / OptionsCJP, July 6](https://x.com/optionscjp/status/2074308637317796347): after several months, he reported connecting email, calendars, and work iMessage group chats; receiving morning and evening briefings; and using Ollie for group answers and recaps. He explicitly said the post was not paid and there was no referral program.
+- [The same user, August 19](https://x.com/optionscjp/status/2090207786089238773): he reported a regression in group chats. Although Ollie agreed to stay in the background unless spoken to, it repeatedly answered everyone's messages. Bill Lennon replied asking for the user's Ollie phone number so the team could fix it.
+- [Brooke K. Travis, August 24](https://x.com/btravisNYC/status/2091936494889939283): after 24 hours, she described setup as seamless and the text interface as useful for juggling, but did not yet document a completed household workflow.
+- [Car Dealership Guy, June 2](https://x.com/GuyDealership/status/2061973558083846383): he abandoned and deleted the product because connecting multiple household calendars and email accounts took 20–30 back-and-forth texts. His follow-up says he and his wife needed 3–4 sources connected to capture the family picture.
+
+The July-to-August OptionsCJP sequence is especially important: a shared agent must have **participation discipline**, not merely access to the shared thread. It needs a durable, auditable rule for when it is addressed, when it should stay silent, who owns a request, and when a new message changes an existing obligation.
+
+### Trust, privacy, and authority boundary
+
+Ollie now has a public [Trust Center](https://trust.ollie.ai/) and announced [SOC 2 compliance on August 21](https://x.com/heyollieai/status/2090853850135801900). Its current [privacy policy](https://ollie.ai/privacy-policy/) says:
+
+- messages and media may be retained for up to 24 months unless deletion is requested;
+- connected email and calendar data may be stored while active as needed to support product functionality;
+- connected-account data is deleted from core services on account deletion and removed from logs/backups within up to 30 days;
+- group participation is collected;
+- service providers include Google, Stripe, Anthropic, OpenAI, Groq, Composio, Linqapp, Raindrop, Instacart, Amazon, and Walmart; and
+- Ollie uses email/calendar data for alerts, shared family briefings, conflicts, deadlines, and user-requested monitoring.
+
+There are public-contract inconsistencies worth tracking:
+
+- On August 22, [Bill Lennon said](https://x.com/blennon_/status/2091270163475919288) Ollie "doesn't index/store your emails." The privacy policy, updated August 21, says connected email/calendar content may be stored while active as needed. The policy is the safer statement to rely on.
+- The homepage invites users to add "even the kids" to the group, while the [Terms](https://ollie.ai/terms-of-service/) say the service is for adults and children may not independently use it. A child appearing in an adult-managed thread may be intended, but the boundary is not explained.
+- The Terms make the inviting user responsible for having permission to include others and warn that all group-thread messages may be visible to all participants. They do not document independent consent or granular visibility for each adult.
+- The comparison page advertises Telegram, while the current Terms and privacy policy enumerate SMS, MMS, RCS, and iMessage. The live product surface should be treated as ahead of or inconsistent with the legal copy until clarified.
+
+The homepage's security section still contains stale "in progress" SOC 2 wording even though its footer, Trust Center, privacy policy, and official X account now say Ollie is SOC 2 Type I compliant.
+
+### Technical-claim boundary
+
+Bill Lennon's [launch thread](https://x.com/blennon_/status/2061868938443550842) says an "army of AI agents" scans email and messages, extracts what matters, plans the day, maintains memory, and works overnight. Ollie's older recipe material likewise describes collections of specialist agents. The public FAQ names Auth0/JWT authentication, OAuth-connected providers, HMAC-verified webhooks, and API-based model use. The privacy policy names multiple model and integration vendors.
+
+These are company claims. There is no public source code, architecture document, reliability evaluation, or independent trace establishing that "army of agents" is more than an implementation/marketing description. The defensible benchmark remains the external behavior, not the claimed agent count.
+
+The public action boundary also appears narrower than Instinct's. In a [June 3 founder reply](https://x.com/blennon_/status/2062189005878239668), Lennon says Ollie "doesn't make decisions for you"; it surfaces information so the couple can coordinate and decide. His example is revealing: his wife used Ollie to research summer-camp options, then he submitted the registration. Public evidence is strong for noticing, summarizing, reminders, lists, calendars, drafts, and coordination; it is weak for broad external purchasing, booking, negotiation, form submission, or calls. This is a company-stated product philosophy plus an evidence gap, not proof that those actions are impossible.
+
+### Product consequence for Florence
+
+Ollie removes the easy positioning whitespace. "A family AI in your texts that shares memory, watches school email, coordinates calendars, briefs both parents, and reduces nagging" is already an active competitor's exact promise.
+
+Florence's defensible differentiation has to be deeper and demonstrable:
+
+1. independently verify each adult and connect each adult's account privately;
+2. preserve owner-private evidence while promoting only intentionally validated household truth;
+3. let adults coordinate through one shared Florence without exposing private context;
+4. resolve conflicting facts and responsibilities instead of merely sharing a thread;
+5. distinguish a reminder, a request to another adult, a provider action, and provider-confirmed completion; and
+6. stay appropriately silent in ambient group conversation while reliably owning assigned work.
+
+Ollie is nevertheless the best public onboarding and distribution benchmark found for Florence so far: text-native, useful alone, household-expandable, and priced once for the family. Florence should not copy its shallow trust boundary, but it must match the simplicity of its lived surface.
+
+One pricing detail cuts against ambient multiplayer: Ollie charges by **messages from Ollie**, including every reply it sends. At $25/month the family receives 150 monthly replies plus 10 daily replies; at $100/month it receives 1,000 monthly plus 15 daily. Because the documented failure mode is replying too often inside a group, the meter can make interruption mistakes feel financially punitive. Florence should meter completed value or usage less visibly, not make every conversational contribution feel like a scarce family resource.

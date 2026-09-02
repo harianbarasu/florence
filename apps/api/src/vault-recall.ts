@@ -1,6 +1,12 @@
 import { createHash } from "node:crypto";
 import { decodeFactFileArtifacts, type FileArtifactReference } from "@florence/artifacts";
-import { decodeMemoryPresentation, type MemoryPresentation } from "@florence/contracts";
+import {
+  decodeMemoryPresentation,
+  decodeVaultListItems,
+  isStructuredVaultList,
+  type MemoryPresentation,
+  type VaultListItem,
+} from "@florence/contracts";
 import type { FactRecord, SourceRecord } from "@florence/database";
 
 /**
@@ -66,6 +72,8 @@ export type VaultMemory = Readonly<{
   title: string | null;
   details: string | null;
   tags: readonly string[];
+  listItems?: readonly VaultListItem[];
+  listStructured?: boolean;
   files: readonly VaultFileResource[];
   visibility: FactRecord["visibility"];
   updatedAt: string;
@@ -107,6 +115,8 @@ type IndexedFact = Readonly<{
   uri: string;
   statement: string;
   presentation: MemoryPresentation;
+  listItems: readonly VaultListItem[];
+  listStructured: boolean;
   files: readonly FileArtifactReference[];
   abstract: string;
   fields: readonly SearchField[];
@@ -171,6 +181,8 @@ export class VaultRecall {
     for (const fact of authorizedFacts) {
       if (byId.has(fact.id)) throw new Error(`Vault contains duplicate fact ${fact.id}`);
       const presentation = decodeMemoryPresentation(fact.value);
+      const listItems = decodeVaultListItems(fact.value);
+      const listStructured = isStructuredVaultList(fact.value);
       const files = decodeFactFileArtifacts(fact.value);
       const statement = factStatement(fact);
       const indexed = {
@@ -178,10 +190,12 @@ export class VaultRecall {
         uri: `${FACT_URI_PREFIX}${fact.id}`,
         statement,
         presentation,
+        listItems,
+        listStructured,
         files,
         abstract: memoryAbstract(fact, statement, presentation),
-        fields: searchFields(fact, statement, presentation, files),
-        semanticChunks: semanticChunks(fact, statement, presentation, files),
+        fields: searchFields(fact, statement, presentation, listItems, files),
+        semanticChunks: semanticChunks(fact, statement, presentation, listItems, files),
       } satisfies IndexedFact;
       byId.set(fact.id, indexed);
     }
@@ -394,6 +408,8 @@ function exactMemory(indexed: IndexedFact, abstract: boolean): VaultMemory {
     title: presentation.title,
     details: abstract ? null : presentation.details,
     tags: presentation.tags,
+    listItems: abstract ? [] : indexed.listItems,
+    listStructured: indexed.listStructured,
     files: abstract ? [] : indexed.files.map((artifact) => vaultFileResource(fact.id, artifact)),
     visibility: fact.visibility,
     updatedAt: fact.updatedAt,
@@ -559,6 +575,7 @@ function searchFields(
   fact: FactRecord,
   statement: string,
   presentation: MemoryPresentation,
+  listItems: readonly VaultListItem[],
   files: readonly FileArtifactReference[],
 ): readonly SearchField[] {
   return [
@@ -568,6 +585,7 @@ function searchFields(
     searchField(fact.slot, 7),
     searchField(statement, 6),
     searchField(presentation.details, 4),
+    searchField(listItems.map((item) => item.text).join(" "), 5),
     searchField(`${presentation.memoryKind} ${presentation.artifactKind ?? ""} ${fact.kind}`, 3),
     searchField(files.map((file) => `${file.filename} ${file.mimeType}`).join(" "), 3),
     searchField(
@@ -581,6 +599,7 @@ function semanticChunks(
   fact: FactRecord,
   statement: string,
   presentation: MemoryPresentation,
+  listItems: readonly VaultListItem[],
   files: readonly FileArtifactReference[],
 ): readonly string[] {
   const text = [
@@ -590,6 +609,9 @@ function semanticChunks(
     `Slot: ${fact.slot}`,
     `Memory: ${statement}`,
     presentation.details ? `Details: ${presentation.details}` : "",
+    listItems.length > 0
+      ? `List items:\n${listItems.map((item) => `${item.checked ? "[x]" : "[ ]"} ${item.text}`).join("\n")}`
+      : "",
     `Kind: ${presentation.memoryKind} ${presentation.artifactKind ?? ""} ${fact.kind}`,
     files.length > 0 ? `Files: ${files.map((file) => `${file.filename} (${file.mimeType})`).join(", ")}` : "",
     fact.sources.length > 0

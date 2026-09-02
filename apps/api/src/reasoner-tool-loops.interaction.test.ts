@@ -103,18 +103,57 @@ describe("Florence reasoner capability cutover", () => {
     });
   });
 
-  test("ordinary parent turns still cannot be totally silent", async () => {
-    const decision = ordinaryDecision();
-    decision.conversation.bubbles = [];
-    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+  test("only intentional family-group observation can be totally silent", async () => {
+    const silentResponse = ordinaryDecision();
+    silentResponse.conversation.bubbles = [];
+    const privateReasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
       responses: {
-        stream: () => fakeStream({ status: "completed", output_parsed: decision, output: [] }),
+        stream: () => fakeStream({ status: "completed", output_parsed: silentResponse, output: [] }),
       },
     } as never);
 
-    await expect(reasoner.decide(foregroundInput(), inertReads())).rejects.toMatchObject({
+    await expect(privateReasoner.decide(foregroundInput(), inertReads())).rejects.toMatchObject({
       code: "invalid_output",
       message: expect.stringContaining("no visible conversational move"),
+    });
+
+    const observation = ordinaryDecision({ participation: "observe" });
+    let groupRequest: Record<string, unknown> | null = null;
+    const groupReasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        stream: (request: Record<string, unknown>) => {
+          groupRequest = request;
+          return fakeStream({
+            status: "completed",
+            output_parsed: observation,
+            output: [completedWebSearch(PUBLIC_URL)],
+          });
+        },
+      },
+    } as never);
+    const groupInput = foregroundInput();
+    groupInput.audience = "group";
+    groupInput.googleConnections = [
+      { emailLabel: "Family", calendarAvailable: true, kind: "family", writesEnabled: false },
+    ];
+
+    await expect(groupReasoner.decide(groupInput, inertReads())).resolves.toMatchObject({
+      policy: { retain: false, schedule: false },
+      conversation: { participation: "observe", bubbles: [], nativeMoves: null },
+    });
+    expect(JSON.stringify(groupRequest)).toContain("clearly addressed only to the other enrolled adult");
+    expect(JSON.stringify(groupRequest)).toContain("ordinary family request or task with no named addressee");
+
+    const noisyObservation = ordinaryDecision({ participation: "observe" });
+    noisyObservation.conversation.bubbles = [{ text: "I’m listening.", delayMs: 0 }];
+    const noisyReasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        stream: () => fakeStream({ status: "completed", output_parsed: noisyObservation, output: [] }),
+      },
+    } as never);
+    await expect(noisyReasoner.decide(groupInput, inertReads())).rejects.toMatchObject({
+      code: "invalid_output",
+      message: expect.stringContaining("observed"),
     });
   });
 
@@ -134,6 +173,8 @@ describe("Florence reasoner capability cutover", () => {
       objective: "Compare the supplied options and report the best one with the reasons.",
       completionCondition:
         "The supplied options are compared and the best one is identified with supporting reasons.",
+      responsibleAdultName: null,
+      briefing: null,
       schedule: null,
       instruction: null,
       candidateIds: [],
@@ -217,6 +258,8 @@ describe("Florence reasoner capability cutover", () => {
       objective:
         "Keep checking the supplied public status page until it explicitly says that registration is open.",
       completionCondition,
+      responsibleAdultName: null,
+      briefing: null,
       schedule: null,
       instruction: null,
       candidateIds: [],
@@ -261,6 +304,8 @@ describe("Florence reasoner capability cutover", () => {
         workId: "work-1",
         objective: "Complete the corrected request.",
         completionCondition: replacement,
+        responsibleAdultName: null,
+        briefing: null,
         schedule: null,
         instruction: null,
       },
@@ -269,6 +314,7 @@ describe("Florence reasoner capability cutover", () => {
         workId: "work-1",
         objective: null,
         completionCondition: replacement,
+        responsibleAdultName: null,
         schedule: null,
         instruction: "Use the corrected requested result.",
       },
@@ -343,6 +389,8 @@ describe("Florence reasoner capability cutover", () => {
       workId: null,
       objective: "Find three good dinner options for Saturday and compare them.",
       completionCondition: "Three suitable Saturday dinner options and their tradeoffs are reported.",
+      responsibleAdultName: null,
+      briefing: null,
       schedule: null,
       instruction: null,
       candidateIds: [],
@@ -397,6 +445,8 @@ describe("Florence reasoner capability cutover", () => {
       workId: null,
       objective: "Keep checking until the signed field-trip form is confirmed received by the school.",
       completionCondition: "The signed form is confirmed received by the school.",
+      responsibleAdultName: null,
+      briefing: null,
       schedule: null,
       instruction: null,
       candidateIds: [],
@@ -485,7 +535,7 @@ describe("Florence reasoner capability cutover", () => {
     expect(florenceHouseholdBriefingInputSchema.shape.candidates.safeParse(candidates).success).toBe(true);
   });
 
-  test("a household wake can page through Vault and start one objective from the complete docket", async () => {
+  test("a household wake can start one provably distinct objective alongside current work", async () => {
     const candidates = Array.from({ length: 101 }, (_, index) => ({
       candidateId: `candidate-${index + 1}`,
       category: "loose_end" as const,
@@ -508,7 +558,21 @@ describe("Florence reasoner capability cutover", () => {
         postalCode: "90045",
       },
       householdDocket: { totalItems: candidates.length, items: candidates },
-      activeWork: [],
+      activeWork: [
+        {
+          workId: "work-1",
+          candidateIds: ["candidate-1"],
+          objective: "Finish the first family item.",
+          currentProgress: "The first item is already moving.",
+          status: "working",
+          owner: "Florence",
+          nextAction: "Complete the remaining step for family item 1.",
+          waitingOn: null,
+          needsAnswer: false,
+          completionCondition: "Family item 1 is completed and confirmed.",
+          nextCheckAt: null,
+        },
+      ],
       lastInterruption: null,
       familyCalendar: {
         timeMin: NOW,
@@ -632,6 +696,38 @@ describe("Florence reasoner capability cutover", () => {
     expect((initialInput.householdDocket as { items: unknown[] }).items).toHaveLength(101);
     expect(initialInput).not.toHaveProperty("memory");
     expect(requests.every((request) => !("max_tool_calls" in request))).toBe(true);
+
+    for (const candidateIds of [["candidate-1"], []]) {
+      const ambiguousReasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+        responses: {
+          parse: () => ({
+            status: "completed",
+            output_parsed: {
+              message: "I noticed another useful move and I’m starting it now.",
+              nextJob: {
+                objective: "Start another family objective.",
+                candidateIds,
+              },
+            },
+            output: [],
+          }),
+        },
+      } as never);
+
+      await expect(
+        ambiguousReasoner.decideHouseholdNextAction(input, {
+          async searchVault() {
+            throw new Error("Unexpected Vault search");
+          },
+          async readVault() {
+            throw new Error("Unexpected Vault read");
+          },
+        }),
+      ).rejects.toMatchObject({
+        code: "invalid_output",
+        message: expect.stringContaining("provably distinct"),
+      });
+    }
   });
 
   test("a natural text mention can acknowledge work Florence starts in the family group", async () => {
@@ -649,6 +745,8 @@ describe("Florence reasoner capability cutover", () => {
       workId: null,
       objective: "Find three good dinner options for Saturday and compare them.",
       completionCondition: "Three suitable Saturday dinner options and their tradeoffs are reported.",
+      responsibleAdultName: null,
+      briefing: null,
       schedule: null,
       instruction: null,
       candidateIds: [],
@@ -677,6 +775,8 @@ describe("Florence reasoner capability cutover", () => {
       workId: null,
       objective: "Make sure the school form is submitted.",
       completionCondition: "The school confirms the form was received.",
+      responsibleAdultName: null,
+      briefing: null,
       schedule: null,
       instruction: null,
       candidateIds: ["candidate-1"],
@@ -710,6 +810,8 @@ describe("Florence reasoner capability cutover", () => {
         workId: "work-1",
         objective: "Handle the school paperwork.",
         candidateIds: ["candidate-1"],
+        responsibleAdultName: null,
+        briefing: null,
         currentProgress: null,
         schedule: null,
         paused: false,
@@ -724,6 +826,70 @@ describe("Florence reasoner capability cutover", () => {
     await expect(reasoner.decide(input, inertReads())).rejects.toMatchObject({
       code: "invalid_output",
       message: expect.stringContaining("already in progress"),
+    });
+  });
+
+  test("an inline task reply cannot steer a different visible task", async () => {
+    const decision = ordinaryDecision();
+    decision.familyWork = {
+      operation: "steer",
+      workId: "work-1",
+      objective: null,
+      completionCondition: null,
+      responsibleAdultName: null,
+      schedule: null,
+      instruction: "Use Friday instead.",
+    };
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        stream: () => fakeStream({ status: "completed", output_parsed: decision, output: [] }),
+      },
+    } as never);
+    const input = foregroundInput();
+    input.currentMessage.moveKind = "reply";
+    input.currentMessage.replyTo = {
+      sourceId: "progress-2",
+      familyWorkId: "work-2",
+      senderName: "Florence",
+      text: "I’m comparing the afternoon camp options now.",
+      occurredAt: NOW,
+    };
+    input.visibleFamilyWork = [
+      {
+        workId: "work-1",
+        objective: "Compare the morning camp options.",
+        candidateIds: [],
+        responsibleAdultName: null,
+        briefing: null,
+        currentProgress: "Comparing Monday and Tuesday.",
+        schedule: null,
+        paused: false,
+        status: "active",
+        nextAt: null,
+        lastRunAt: null,
+        lastResult: null,
+        createdAt: NOW,
+      },
+      {
+        workId: "work-2",
+        objective: "Compare the afternoon camp options.",
+        candidateIds: [],
+        responsibleAdultName: null,
+        briefing: null,
+        currentProgress: "Comparing Thursday and Friday.",
+        schedule: null,
+        paused: false,
+        status: "active",
+        nextAt: null,
+        lastRunAt: null,
+        lastResult: null,
+        createdAt: NOW,
+      },
+    ];
+
+    await expect(reasoner.decide(input, inertReads())).rejects.toMatchObject({
+      code: "invalid_output",
+      message: expect.stringContaining("direct task reply"),
     });
   });
 

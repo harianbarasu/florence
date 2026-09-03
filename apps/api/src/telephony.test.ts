@@ -17,7 +17,11 @@ describe("ProviderTelephonyClient provider contracts", () => {
   test("starts a Bland task call with Florence correlation metadata", async () => {
     const fetchMock = vi.fn<typeof fetch>(async () => jsonResponse({ call_id: "bland-call-1" }));
     const client = new ProviderTelephonyClient({
-      bland: { apiKey: "bland-secret", baseUrl: "https://bland.test/v1" },
+      bland: {
+        apiKey: "bland-secret",
+        fromPhoneNumber: "+13105550100",
+        baseUrl: "https://bland.test/v1",
+      },
       fetch: fetchMock,
     });
 
@@ -29,7 +33,10 @@ describe("ProviderTelephonyClient provider contracts", () => {
         provider: "bland",
         to: "+1 (415) 555-0123",
         task: "Ask the dentist for Tuesday or Wednesday openings and report what they say.",
+        timeZone: "America/Denver",
         firstSentence: "Hi, I'm calling for the Williams family.",
+        summaryPrompt: "State whether the dentist booked the requested cleaning.",
+        dispositions: ["booked", "no_availability"],
       },
     });
 
@@ -42,16 +49,56 @@ describe("ProviderTelephonyClient provider contracts", () => {
     const [url, init] = fetchMock.mock.calls[0] ?? [];
     expect(String(url)).toBe("https://bland.test/v1/calls");
     expect(new Headers(init?.headers).get("authorization")).toBe("bland-secret");
-    expect(JSON.parse(String(init?.body))).toMatchObject({
+    const requestBody = JSON.parse(String(init?.body));
+    expect(requestBody).toMatchObject({
       phone_number: "+14155550123",
-      model: "enhanced",
-      record: true,
+      from: "+13105550100",
+      model: "base",
+      timezone: "America/Denver",
+      max_duration: 10,
+      record: false,
       wait_for_greeting: true,
+      first_sentence: "Hi, this is Florence, an AI assistant. I'm calling for the Williams family.",
+      summary_prompt: expect.stringContaining("Distinguish a confirmed commitment"),
+      dispositions: [
+        "objective_completed",
+        "option_found_not_committed",
+        "family_decision_required",
+        "callback_expected",
+        "voicemail_reached",
+        "no_contact",
+        "wrong_number",
+        "provider_declined",
+        "do_not_contact",
+        "booked",
+        "no_availability",
+      ],
       metadata: {
         florence_work_id: "work-123",
         florence_operation_id: operationDigest,
       },
     });
+    expect(requestBody.summary_prompt).toContain("start and end time or duration");
+    expect(requestBody.summary_prompt).toContain("State whether the dentist booked");
+    await expect(
+      client.run({
+        workId: runIdentity.workId,
+        callId: "recorded-call",
+        attempt: 1,
+        operation: {
+          kind: "ai_call_start",
+          provider: "bland",
+          to: "+14155550123",
+          task: "Ask the dentist for an opening.",
+          timeZone: "America/Denver",
+          record: true,
+        },
+      }),
+    ).rejects.toMatchObject({
+      code: "invalid_input",
+      safeMessage: expect.stringContaining("does not record"),
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   test("reconciles an ambiguous Bland create by its Florence metadata without another POST", async () => {
@@ -72,7 +119,11 @@ describe("ProviderTelephonyClient provider contracts", () => {
       });
     });
     const client = new ProviderTelephonyClient({
-      bland: { apiKey: "bland-secret", baseUrl: "https://bland.test/v1" },
+      bland: {
+        apiKey: "bland-secret",
+        fromPhoneNumber: "+13105550100",
+        baseUrl: "https://bland.test/v1",
+      },
       fetch: fetchMock,
     });
     const operation = {
@@ -80,6 +131,7 @@ describe("ProviderTelephonyClient provider contracts", () => {
       provider: "bland",
       to: "+14155550123",
       task: "Ask for appointment openings.",
+      timeZone: "America/Denver",
     } as const;
 
     const first = await client.run({ ...runIdentity, attempt: 1, operation });
@@ -104,13 +156,23 @@ describe("ProviderTelephonyClient provider contracts", () => {
     expect(listUrl.searchParams.get("end_date")).toBeTruthy();
   });
 
-  test("keeps a durable correlation handle when an ambiguous Bland call is not visible yet", async () => {
+  test("keeps a durable correlation handle across interruption without redialing, then ends recovery", async () => {
+    const requestedAt = Date.parse("2026-09-02T16:00:00.000Z");
+    const now = vi.spyOn(Date, "now").mockReturnValue(requestedAt);
+    const controller = new AbortController();
     const fetchMock = vi.fn<typeof fetch>(async (_input, init) => {
-      if (init?.method === "POST") throw new TypeError("connection closed after upload");
+      if (init?.method === "POST") {
+        controller.abort(new Error("The parent changed the task"));
+        throw new DOMException("The request was interrupted after upload", "AbortError");
+      }
       return jsonResponse({ calls: [] });
     });
     const client = new ProviderTelephonyClient({
-      bland: { apiKey: "bland-secret", baseUrl: "https://bland.test/v1" },
+      bland: {
+        apiKey: "bland-secret",
+        fromPhoneNumber: "+13105550100",
+        baseUrl: "https://bland.test/v1",
+      },
       fetch: fetchMock,
     });
     const operation = {
@@ -118,19 +180,58 @@ describe("ProviderTelephonyClient provider contracts", () => {
       provider: "bland",
       to: "+14155550123",
       task: "Ask for appointment openings.",
+      timeZone: "America/Denver",
     } as const;
 
-    const first = await client.run({ ...runIdentity, attempt: 1, operation });
+    const first = await client.run({ ...runIdentity, attempt: 1, operation }, controller.signal);
     const retry = await client.run({ ...runIdentity, attempt: 2, operation });
 
     expect(first).toMatchObject({
-      kind: "progress",
-      providerId: expect.stringMatching(/^pending_bland_[0-9a-f]{64}_/),
+      kind: "uncertain_effect",
+      providerId: expect.stringMatching(/^pending_bland_[0-9a-z]+_[0-9a-f]{64}_/),
       providerStatus: "reconciling",
     });
-    expect(first.reason).toContain("not visible yet");
+    expect(first.reason).toContain("kept the correlation handle");
     expect(retry).toMatchObject({ kind: "progress", providerId: first.providerId });
     expect(fetchMock.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(1);
+    if (!first.providerId) throw new Error("Bland did not return a pending correlation handle");
+
+    now.mockReturnValue(requestedAt + 10 * 60 * 1_000);
+    const stillReconciling = await client.run({
+      workId: runIdentity.workId,
+      callId: "status-still-reconciling-call",
+      attempt: 1,
+      operation: {
+        kind: "ai_call_status",
+        provider: "bland",
+        providerCallId: first.providerId,
+      },
+    });
+    expect(stillReconciling).toMatchObject({
+      kind: "progress",
+      providerId: first.providerId,
+      providerStatus: "reconciling",
+    });
+
+    now.mockReturnValue(requestedAt + 40 * 60 * 1_000);
+    const unresolved = await client.run({
+      workId: runIdentity.workId,
+      callId: "status-unresolved-call",
+      attempt: 1,
+      operation: {
+        kind: "ai_call_status",
+        provider: "bland",
+        providerCallId: first.providerId,
+      },
+    });
+
+    expect(unresolved).toMatchObject({
+      kind: "failed",
+      providerId: first.providerId,
+      providerStatus: "confirmation-unknown",
+    });
+    expect(unresolved.reason).toContain("will not dial again automatically");
+    now.mockRestore();
   });
 
   test("resolves a durable pending Bland handle when the matching call becomes visible later", async () => {
@@ -156,7 +257,11 @@ describe("ProviderTelephonyClient provider contracts", () => {
       });
     });
     const client = new ProviderTelephonyClient({
-      bland: { apiKey: "bland-secret", baseUrl: "https://bland.test/v1" },
+      bland: {
+        apiKey: "bland-secret",
+        fromPhoneNumber: "+13105550100",
+        baseUrl: "https://bland.test/v1",
+      },
       fetch: fetchMock,
     });
 
@@ -168,11 +273,12 @@ describe("ProviderTelephonyClient provider contracts", () => {
         provider: "bland",
         to: "+14155550123",
         task: "Ask for appointment openings.",
+        timeZone: "America/Denver",
       },
     });
     expect(ambiguousCreate).toMatchObject({
       kind: "progress",
-      providerId: expect.stringMatching(/^pending_bland_[0-9a-f]{64}_/),
+      providerId: expect.stringMatching(/^pending_bland_[0-9a-z]+_[0-9a-f]{64}_/),
       providerStatus: "reconciling",
     });
     if (!ambiguousCreate.providerId) throw new Error("Bland did not return a pending correlation handle");
@@ -198,20 +304,59 @@ describe("ProviderTelephonyClient provider contracts", () => {
     expect(listReads).toBe(2);
   });
 
-  test("waits for Bland post-call output after its documented completion fields", async () => {
+  test("waits for transcript-backed Bland output and stops when post-call processing never finishes", async () => {
+    const finishedAt = Date.parse("2026-09-02T16:00:00.000Z");
+    const now = vi.spyOn(Date, "now").mockReturnValue(finishedAt);
     const fetchMock = vi
       .fn<typeof fetch>()
-      .mockResolvedValueOnce(jsonResponse({ queue_status: "Complete", completed: true }))
       .mockResolvedValueOnce(
         jsonResponse({
           queue_status: "Complete",
           completed: true,
+          end_at: new Date(finishedAt).toISOString(),
+          disposition_tag: "objective_completed",
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          queue_status: "Complete",
+          completed: true,
+          end_at: new Date(finishedAt).toISOString(),
           summary: "The dentist booked Tuesday at 3 PM.",
-          disposition: "booked",
+          concatenated_transcript: "Dentist: Tuesday from 3:00 to 3:45 PM is confirmed. Florence: Thank you.",
+          disposition_tag: "objective_completed",
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          queue_status: "Complete",
+          completed: true,
+          end_at: new Date(finishedAt).toISOString(),
+          disposition_tag: "objective_completed",
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          queue_status: "complete_error",
+          started_at: new Date(finishedAt - 45_000).toISOString(),
+          corrected_duration: "45",
+          concatenated_transcript: "Dentist: The appointment is confirmed. Florence: Thank you.",
+          disposition_tag: "objective_completed",
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          status: "unknown",
+          created_at: new Date(finishedAt).toISOString(),
+          call_length: 0,
         }),
       );
     const client = new ProviderTelephonyClient({
-      bland: { apiKey: "bland-secret", baseUrl: "https://bland.test/v1" },
+      bland: {
+        apiKey: "bland-secret",
+        fromPhoneNumber: "+13105550100",
+        baseUrl: "https://bland.test/v1",
+      },
       fetch: fetchMock,
     });
     const statusInput = {
@@ -226,19 +371,41 @@ describe("ProviderTelephonyClient provider contracts", () => {
 
     const processing = await client.run(statusInput);
     const ready = await client.run(statusInput);
+    now.mockReturnValue(finishedAt + 10 * 60 * 1_000);
+    const unavailable = await client.run(statusInput);
+    const recoveredAfterCompleteError = await client.run(statusInput);
+    const unknown = await client.run(statusInput);
 
     expect(processing).toMatchObject({
       kind: "progress",
       providerStatus: "completed",
       summary: null,
+      disposition: "objective_completed",
     });
     expect(processing.reason).toContain("still preparing");
     expect(ready).toMatchObject({
       kind: "completed",
       providerStatus: "completed",
       summary: "The dentist booked Tuesday at 3 PM.",
-      disposition: "booked",
+      disposition: "objective_completed",
     });
+    expect(ready.transcript).toContain("3:00 to 3:45 PM");
+    expect(unavailable).toMatchObject({
+      kind: "failed",
+      providerStatus: "completed",
+      summary: null,
+      transcript: null,
+    });
+    expect(unavailable.reason).toContain("cannot verify");
+    expect(recoveredAfterCompleteError).toMatchObject({
+      kind: "completed",
+      providerStatus: "complete-error",
+      durationSeconds: 45,
+      transcript: expect.stringContaining("appointment is confirmed"),
+    });
+    expect(unknown).toMatchObject({ kind: "failed", providerStatus: "unknown" });
+    expect(unknown.reason).toContain("will not call again automatically");
+    now.mockRestore();
   });
 
   test("keeps a Bland stop request in progress until the call itself is terminal", async () => {
@@ -246,7 +413,11 @@ describe("ProviderTelephonyClient provider contracts", () => {
       jsonResponse({ status: "success", message: "Call ended successfully." }),
     );
     const client = new ProviderTelephonyClient({
-      bland: { apiKey: "bland-secret", baseUrl: "https://bland.test/v1" },
+      bland: {
+        apiKey: "bland-secret",
+        fromPhoneNumber: "+13105550100",
+        baseUrl: "https://bland.test/v1",
+      },
       fetch: fetchMock,
     });
 

@@ -8,6 +8,7 @@ import {
   KernelBrowserClient,
   kernelProfileName,
 } from "./browser.js";
+import type { FlorenceMapsRequest, FlorenceMapsResult } from "./maps.js";
 import { FlorenceReasoner } from "./reasoner.js";
 import {
   browserArguments,
@@ -23,8 +24,12 @@ import {
 import type { FlorenceTelephonyOperation, FlorenceTelephonyResult } from "./telephony.js";
 
 describe("Florence reasoner capability cutover", () => {
-  test("durable household work calls a business and reports the transcript-backed outcome", async () => {
+  test("durable household work calls a business, saves the appointment, and reports the transcript-backed outcome", async () => {
+    const calendarRef = "calendar-family";
+    const completionCondition =
+      "Westside Pediatric Dental has confirmed Violet’s cleaning on Tuesday or Wednesday after 3 PM within the family’s stated bounds, and the matching event is committed to the Florence Calendar.";
     const modelRequests: Record<string, unknown>[] = [];
+    const completionReviewRequests: Record<string, unknown>[] = [];
     const usefulProgress = {
       outcome: "progress",
       text: null,
@@ -42,6 +47,16 @@ describe("Florence reasoner capability cutover", () => {
         status: "completed",
         output_parsed: null,
         output: [
+          functionCall("find-dentist", "maps_search", {
+            query: "Westside Pediatric Dental near 90045",
+            limit: 5,
+          }),
+        ],
+      },
+      {
+        status: "completed",
+        output_parsed: null,
+        output: [
           functionCall("call-dentist", "phone_agent_call", {
             operation: "start",
             to: "+13105550144",
@@ -50,8 +65,9 @@ describe("Florence reasoner capability cutover", () => {
             firstSentence: "Hi, I’m calling for the Williams family about a cleaning appointment.",
             voice: null,
             maxDurationMinutes: 5,
-            record: true,
-            summaryPrompt: "State whether an appointment was booked and give the exact date and time.",
+            record: false,
+            summaryPrompt:
+              "State whether an appointment was booked and give its exact local date, start and end time or duration, location, and confirmation reference.",
             dispositions: ["booked", "availability_found", "no_availability"],
           }),
         ],
@@ -114,9 +130,46 @@ describe("Florence reasoner capability cutover", () => {
       },
       {
         status: "completed",
+        output_parsed: null,
+        output: [functionCall("list-family-calendar", "list_calendars", {})],
+      },
+      {
+        status: "completed",
+        output_parsed: null,
+        output: [
+          functionCall("read-family-calendar", "read_calendar_window", {
+            timeMin: "2026-09-02T07:00:00.000Z",
+            timeMax: "2026-09-03T07:00:00.000Z",
+            pageSize: 50,
+            cursor: null,
+            scope: "selected",
+            calendarRefs: [calendarRef],
+          }),
+        ],
+      },
+      {
+        status: "completed",
+        output_parsed: null,
+        output: [
+          functionCall("save-dentist-appointment", "family_calendar_work", {
+            operation: "create",
+            event: {
+              intervalKind: "timed",
+              title: "Violet dental cleaning",
+              startsAt: "2026-09-02T22:30:00.000Z",
+              endsAt: "2026-09-02T23:15:00.000Z",
+              timeZone: "America/Los_Angeles",
+              location: "1234 Sepulveda Boulevard, Los Angeles, CA 90045",
+            },
+            target: null,
+          }),
+        ],
+      },
+      {
+        status: "completed",
         output_parsed: {
           outcome: "succeeded",
-          text: "Violet’s cleaning is booked for Wednesday at 3:30 PM. The office confirmed it on the call.",
+          text: "Violet’s cleaning is confirmed for Wednesday, September 2, from 3:30 to 4:15 PM at Westside Pediatric Dental. Confirmation DENT-42 is on the Florence Calendar.",
         },
         output: [],
       },
@@ -124,8 +177,32 @@ describe("Florence reasoner capability cutover", () => {
     const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
       responses: {
         parse(request: Record<string, unknown>) {
-          const review = defaultFamilyWorkCompletionReview(request);
-          if (review) return review;
+          if (JSON.stringify(request.text).includes("florence_family_work_completion_review")) {
+            completionReviewRequests.push(request);
+            return {
+              status: "completed",
+              output_parsed: {
+                verdict: "verified",
+                reason: null,
+                condition: completionCondition,
+                basisKind: "capability_evidence",
+                summary:
+                  "The completed phone call confirms the booking, and the Calendar receipt confirms the matching event was saved.",
+                evidenceCallIds: ["check-dentist-call", "save-dentist-appointment"],
+                evidenceSelections: [
+                  {
+                    callId: "check-dentist-call",
+                    pointers: ["/summary", "/disposition", "/providerStatus"],
+                  },
+                  {
+                    callId: "save-dentist-appointment",
+                    pointers: ["/status", "/providerEventId"],
+                  },
+                ],
+              },
+              output: [],
+            };
+          }
           modelRequests.push(request);
           const response = modelResponses.shift();
           if (!response) throw new Error("Unexpected dentist-call model turn");
@@ -136,12 +213,13 @@ describe("Florence reasoner capability cutover", () => {
     const input = {
       workId: "family-work-dentist-call",
       scheduledOccurrence: null,
-      objective: "Call the dentist and arrange Violet’s cleaning Tuesday or Wednesday after 3 PM.",
+      objective:
+        "Call Westside Pediatric Dental near 90045 and arrange Violet’s cleaning Tuesday or Wednesday after 3 PM.",
       visibility: "household" as const,
       ownerAdultId: null,
       initiatingAdultId: "adult-jackson",
       origin: familyWorkOrigin(
-        "Call the dentist and arrange Violet’s cleaning Tuesday or Wednesday after 3 PM.",
+        "Call Westside Pediatric Dental near 90045 and arrange Violet’s cleaning Tuesday or Wednesday after 3 PM.",
         "adult-jackson",
       ),
       household: {
@@ -165,11 +243,20 @@ describe("Florence reasoner capability cutover", () => {
           },
         ],
       },
+      googleConnections: [
+        {
+          emailLabel: "Florence Calendar",
+          calendarAvailable: true,
+          kind: "family" as const,
+          writesEnabled: true,
+        },
+      ],
       state: {
         kind: "family_work_v1" as const,
         version: 1 as const,
         generation: 0,
-        acknowledgementText: "I’ll call the dentist and work within those times.",
+        acknowledgementText: "I’ll call Westside Pediatric Dental and work within those times.",
+        completionCondition,
         phase: "ready" as const,
         claim: null,
         activePhoneCall: null,
@@ -185,8 +272,44 @@ describe("Florence reasoner capability cutover", () => {
       currentTime: NOW,
     };
     const operations: FlorenceTelephonyOperation[] = [];
+    const mapOperations: FlorenceMapsRequest[] = [];
+    const calendarOperations: unknown[] = [];
+    const calendarReads: unknown[] = [];
     const reads = {
       telephonyProviders: ["bland"] as const,
+      async runMaps(operation: FlorenceMapsRequest): Promise<FlorenceMapsResult> {
+        mapOperations.push(operation);
+        return {
+          operation: "search",
+          query: "Westside Pediatric Dental near 90045",
+          count: 1,
+          results: [
+            {
+              name: "Westside Pediatric Dental",
+              displayName: "Westside Pediatric Dental, Los Angeles, California",
+              address: "1234 Sepulveda Boulevard, Los Angeles, CA 90045",
+              lat: 33.959,
+              lon: -118.396,
+              type: "dentist",
+              category: "amenity",
+              osmType: "node",
+              osmId: "123456789",
+              boundingBox: null,
+              importance: 0.7,
+              mapsUrl: "https://www.openstreetmap.org/node/123456789",
+              phone: "+13105550144",
+              website: "https://westside-pediatric-dental.example/",
+            },
+          ],
+          attribution: [
+            {
+              provider: "OpenStreetMap",
+              label: "© OpenStreetMap contributors",
+              url: "https://www.openstreetmap.org/copyright",
+            },
+          ],
+        };
+      },
       async runTelephony(operation: FlorenceTelephonyOperation): Promise<FlorenceTelephonyResult> {
         operations.push(operation);
         if (operation.kind === "ai_call_start") {
@@ -215,12 +338,69 @@ describe("Florence reasoner capability cutover", () => {
             operation: operation.kind,
             providerId: "bland-call-1",
             providerStatus: "completed",
-            summary: "Cleaning booked for Wednesday at 3:30 PM.",
+            summary:
+              "Westside Pediatric Dental booked Violet’s cleaning for Wednesday, September 2, from 3:30 to 4:15 PM at 1234 Sepulveda Boulevard. Confirmation DENT-42.",
             disposition: "booked",
-            transcript: "Office: We can do Wednesday at 3:30. Florence: Please book it.",
+            transcript:
+              "Office: Violet is confirmed Wednesday, September 2, from 3:30 to 4:15 PM at 1234 Sepulveda Boulevard. The confirmation is DENT-42. Florence: Thank you.",
           });
         }
         throw new Error(`Unexpected telephony operation ${operation.kind}`);
+      },
+      async listCalendars() {
+        return {
+          status: "complete" as const,
+          calendars: [
+            {
+              calendarRef,
+              label: "Florence Calendar",
+              timeZone: "America/Los_Angeles",
+              primary: null,
+              accessRole: null,
+              eventCoverage: "readable" as const,
+            },
+          ],
+          totalCalendarCount: 1,
+          nextCursor: null,
+        };
+      },
+      async readCalendarWindow(operation: unknown) {
+        calendarReads.push(operation);
+        return {
+          status: "complete" as const,
+          calendars: [
+            {
+              calendarRef,
+              label: "Florence Calendar",
+              timeZone: "America/Los_Angeles",
+              primary: null,
+              accessRole: null,
+              status: "complete" as const,
+              eventCount: 0,
+            },
+          ],
+          totalCalendarCount: 1,
+          calendarCoverage: {
+            complete: true,
+            observedCalendarCount: 1,
+            completeCalendarCount: 1,
+            missingCalendarCount: 0,
+            unavailableCalendarCount: 0,
+            digest: "2".repeat(64),
+          },
+          events: [],
+          totalEventCount: 0,
+          nextCursor: null,
+        };
+      },
+      async runFamilyCalendarWork(operation: { operation: string }) {
+        calendarOperations.push(operation);
+        return {
+          status: "committed" as const,
+          operation: "create" as const,
+          providerEventId: "provider-dentist",
+          providerRevision: "revision-1",
+        };
       },
     };
 
@@ -236,7 +416,7 @@ describe("Florence reasoner capability cutover", () => {
     const started = await reasoner.continueFamilyWork({ ...input, state: plannedCall.state }, reads);
     if (started.kind !== "continue") throw new Error("Dentist call did not start");
     expect(started.progressText).toBeNull();
-    expect(started.nextCheckDelayMs).toBe(0);
+    expect(started.nextCheckDelayMs).toBe(15_000);
     expect(started.state.activePhoneCall).toEqual({
       provider: "bland",
       kind: "agent",
@@ -289,23 +469,106 @@ describe("Florence reasoner capability cutover", () => {
     if (completed.kind !== "continue") throw new Error("Dentist call status did not settle");
     expect(completed.nextCheckDelayMs).toBe(0);
     expect(completed.state.activePhoneCall).toBeNull();
-    expect(JSON.stringify(completed.state.continuationItems)).toContain("Wednesday at 3:30 PM");
+    expect(JSON.stringify(completed.state.continuationItems)).toContain("3:30 to 4:15 PM");
 
-    const terminal = await reasoner.continueFamilyWork({ ...input, state: completed.state }, reads);
+    const calendarPlanned = await reasoner.continueFamilyWork({ ...input, state: completed.state }, reads);
+    if (calendarPlanned.kind !== "continue") throw new Error("Dentist calendar write was not planned");
+    expect(calendarPlanned.state).toMatchObject({
+      phase: "tool_pending",
+      pendingCall: { name: "family_calendar_work" },
+    });
+    const calendarSettled = await reasoner.continueFamilyWork(
+      { ...input, state: calendarPlanned.state },
+      reads,
+    );
+    if (calendarSettled.kind !== "continue") throw new Error("Dentist calendar write did not settle");
+
+    const terminal = await reasoner.continueFamilyWork({ ...input, state: calendarSettled.state }, reads);
     expect(terminal).toMatchObject({
       kind: "terminal",
       outcome: "succeeded",
-      text: expect.stringContaining("Wednesday at 3:30 PM"),
+      text: expect.stringContaining("Florence Calendar"),
+      state: {
+        terminal: {
+          completionBasis: {
+            condition: completionCondition,
+            evidenceCallIds: ["check-dentist-call", "save-dentist-appointment"],
+          },
+        },
+        completionEvidence: [
+          expect.objectContaining({ callId: "check-dentist-call", capabilityName: "phone_agent_call" }),
+          expect.objectContaining({
+            callId: "save-dentist-appointment",
+            capabilityName: "family_calendar_work",
+          }),
+        ],
+      },
     });
+    expect(completionReviewRequests).toHaveLength(1);
+    const completionReviewInput = completionReviewRequests[0]?.input as
+      | Array<{ content?: Array<{ type?: string; text?: string }> }>
+      | undefined;
+    const completionReviewText =
+      completionReviewInput?.[0]?.content?.find((part) => part.type === "input_text")?.text ?? "{}";
+    const completionReviewPayload = JSON.parse(completionReviewText) as {
+      successfulCapabilityResults?: Array<{ callId?: string; output?: unknown }>;
+    };
+    expect(completionReviewPayload.successfulCapabilityResults).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          callId: "check-dentist-call",
+          output: expect.objectContaining({
+            summary: expect.stringContaining("3:30 to 4:15 PM"),
+            disposition: "booked",
+            transcript: expect.stringContaining("confirmation is DENT-42"),
+          }),
+        }),
+        expect.objectContaining({
+          callId: "save-dentist-appointment",
+          output: expect.objectContaining({
+            status: "committed",
+            providerEventId: "provider-dentist",
+          }),
+        }),
+      ]),
+    );
+    expect(JSON.stringify(terminal.state.completionEvidence)).not.toContain("confirmation is DENT-42");
+    expect(mapOperations).toEqual([
+      { operation: "search", query: "Westside Pediatric Dental near 90045", limit: 5 },
+    ]);
     expect(operations).toEqual([
-      expect.objectContaining({ kind: "ai_call_start", to: "+13105550144" }),
+      expect.objectContaining({
+        kind: "ai_call_start",
+        to: "+13105550144",
+        timeZone: "America/Los_Angeles",
+        record: false,
+      }),
       { kind: "ai_call_status", provider: "bland", providerCallId: "bland-call-1" },
       { kind: "ai_call_status", provider: "bland", providerCallId: "bland-call-1" },
     ]);
-    expect(JSON.stringify(modelRequests[3]?.input)).toContain(
-      "I’ll call the dentist and work within those times.",
+    expect(calendarOperations).toEqual([
+      expect.objectContaining({
+        operation: "create",
+        event: expect.objectContaining({
+          title: "Violet dental cleaning",
+          startsAt: "2026-09-02T22:30:00.000Z",
+          endsAt: "2026-09-02T23:15:00.000Z",
+          location: "1234 Sepulveda Boulevard, Los Angeles, CA 90045",
+        }),
+      }),
+    ]);
+    expect(calendarReads).toEqual([
+      expect.objectContaining({
+        scope: "selected",
+        calendarRefs: [calendarRef],
+        timeMin: "2026-09-02T07:00:00.000Z",
+        timeMax: "2026-09-03T07:00:00.000Z",
+      }),
+    ]);
+    expect(JSON.stringify(modelRequests[4]?.input)).toContain(
+      "I’ll call Westside Pediatric Dental and work within those times.",
     );
-    const reviewInput = modelRequests[3]?.input as Array<{
+    const reviewInput = modelRequests[4]?.input as Array<{
       content: Array<{ text: string }>;
     }>;
     const reviewContext = JSON.parse(reviewInput[0]?.content[0]?.text ?? "{}") as {
@@ -330,10 +593,10 @@ describe("Florence reasoner capability cutover", () => {
       to: "+13105550144",
       task: "Ask the dentist for an appointment.",
       providerCallId: null,
-      firstSentence: null,
+      firstSentence: "I’m calling for the Williams family about an appointment.",
       voice: null,
       maxDurationMinutes: null,
-      record: true,
+      record: false,
       summaryPrompt: null,
       dispositions: [],
     };

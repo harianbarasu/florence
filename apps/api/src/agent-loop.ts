@@ -644,7 +644,21 @@ function continuationItems(output: readonly ResponseOutputItem[]): ResponseInput
         readonly parsed_arguments?: unknown;
       };
       items.push(call);
-    } else if (item.type === "message" || item.type === "reasoning" || item.type === "web_search_call") {
+    } else if (item.type === "message") {
+      // Parsed Responses add SDK-only `parsed` values to structured output_text
+      // parts. They are useful to the caller but are not valid Responses input,
+      // so keep the assistant's canonical text while removing parser metadata
+      // before a correction turn replays the message.
+      items.push({
+        ...item,
+        content: item.content.map((content) => {
+          const { parsed: _parsed, ...inputContent } = content as typeof content & {
+            readonly parsed?: unknown;
+          };
+          return inputContent;
+        }),
+      });
+    } else if (item.type === "reasoning" || item.type === "web_search_call") {
       items.push(item);
     }
   }

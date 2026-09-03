@@ -25,6 +25,7 @@ const GOOGLE_POLL_INTERVAL_MS = 2 * 60_000;
 const INTEREST_CHECK_INTERVAL_MS = 7 * 24 * 60 * 60_000;
 const LINQ_RECEIPT_CLOCK_SKEW_MS = 5 * 60_000;
 const FAMILY_WORK_INITIAL_DELAY_MS = 1_000;
+const INBOUND_TURN_CLAIM_LEASE_MS = 2 * 60_000;
 const FAMILY_WORK_CLAIM_LEASE_MS = 2 * 60_000;
 const FAMILY_WORK_DELIVERY_RECOVERY_DELAY_MS = 5_000;
 const PARTNER_INVITATION_CLAIM_LEASE_MS = 2 * 60_000;
@@ -855,6 +856,7 @@ export type VisibleFamilyWork = {
   workId: string;
   candidateIds: readonly string[];
   objective: string;
+  completionCondition: string | null;
   responsibleAdultName: string | null;
   currentProgress: string;
   schedule: ReminderSchedule | null;
@@ -865,6 +867,8 @@ export type VisibleFamilyWork = {
   lastRunAt: string | null;
   lastResult: string | null;
   createdAt: string;
+  /** This adult may answer the exact waiting household question from this private thread. */
+  privateParticipantReply: boolean;
 };
 
 export type VisibleActiveFamilyWork = {
@@ -1461,6 +1465,7 @@ export type UnboundPartnerInvitation =
   | {
       adultId: string;
       state: "declined";
+      messagingStopped: boolean;
     }
   | (ReissuablePartnerInvitation & {
       state: "expired";
@@ -1471,6 +1476,11 @@ export type UnboundPartnerInvitation =
     });
 
 export type InboundTurn = {
+  /** Durable ownership of this conversation turn while Florence reasons and commits. */
+  inboundClaim: {
+    claimId: string;
+    leaseUntil: string;
+  };
   message: ConversationTurn & { speaker: string };
   supersededMessages: readonly (ConversationTurn & { speaker: string })[];
   replyTarget: ConversationTurn | null;
@@ -1625,27 +1635,6 @@ export type OutboundDraft = {
   notBefore: string;
 };
 
-export type FamilyWorkReplyCandidate = {
-  kind: "participant_request" | "waiting";
-  workId: string;
-  generation: number;
-  progressRevision: number;
-  questionSourceId: string;
-  requestId: string | null;
-  targetAdultName: string;
-  question: string;
-  askedAt: string;
-  taskObjective: string;
-  explicitlyRepliesToQuestion: boolean;
-};
-
-export type FamilyWorkReplyAcknowledgement =
-  | {
-      kind: "reaction";
-      reaction: "love" | "like" | "dislike" | "laugh" | "emphasize" | "question";
-    }
-  | { kind: "text"; text: string };
-
 export type CalendarEventDraft =
   | {
       intervalKind: "timed";
@@ -1683,6 +1672,7 @@ export type CalendarActionDraft = {
 export type CalendarOfferDraft = {
   id: string;
   basisSourceId: string;
+  approvalPromptSourceId: string;
   mutation: Extract<FamilyCalendarMutation, { operation: "create" }>;
 };
 
@@ -1848,6 +1838,7 @@ export type CalendarOffer = {
 
 export type CommitTurnInput = {
   sourceId: string;
+  inboundClaimId: string;
   googleEvidence?: readonly GoogleEvidenceDraft[];
   googleConnectionIdsUsed?: readonly string[];
   facts?: readonly FactDraft[];
@@ -7150,6 +7141,7 @@ export class PostgresFlorenceStore {
       limit 1
     `;
     if (!row) return null;
+    const messagingStopped = jsonString(row.preferences, "partnerInvitationDeclineKind") === "carrier_opt_out";
     const refreshLineage = partnerInvitationRefreshLineage(row.preferences);
     const lineageMessageId = refreshLineage?.messageId ?? row.invitation_message_id;
     if (row.state === "declined" || !row.has_active_approval) {
@@ -7168,7 +7160,9 @@ export class PostgresFlorenceStore {
           and direction='outbound'
         limit 1
       `;
-      if (terminalNotice) return { adultId: row.adult_id, state: "declined" };
+      if (terminalNotice) {
+        return { adultId: row.adult_id, state: "declined", messagingStopped };
+      }
       const [expiryNotice] = await this.#sql<{ source_id: string; link_issued: boolean }[]>`
         select source_id,(text like '%setup link expired%') as link_issued
         from messages where source_id=${expiryNoticeSourceId}
@@ -7217,7 +7211,7 @@ export class PostgresFlorenceStore {
       };
     }
     if (row.state === "declined") {
-      return { adultId: row.adult_id, state: row.state };
+      return { adultId: row.adult_id, state: row.state, messagingStopped };
     }
     return {
       adultId: row.adult_id,
@@ -7361,7 +7355,9 @@ export class PostgresFlorenceStore {
       const stopped = await sql`
         update people set invitation_consumed_at=${occurredAt},
           invitation_approval_source_id=null,invitation_approved_at=null,
-          invitation_retry_at=null,invitation_last_error=null,updated_at=${occurredAt}
+          invitation_retry_at=null,invitation_last_error=null,
+          preferences=preferences||${sql.json({ partnerInvitationDeclineKind: "carrier_opt_out" })},
+          updated_at=${occurredAt}
         where id=${invitation.adult_id} and invitation_consumed_at is null
           and invitation_issued_at is null
         returning id
@@ -7383,6 +7379,7 @@ export class PostgresFlorenceStore {
     providerConversationId: string;
     identitySubjectDigest: string;
     occurredAt: string;
+    kind: "carrier_opt_out" | "conversation_decline";
   }): Promise<boolean> {
     assertUuid(input.adultId, "Invited partner adult ID");
     const providerConversationId = required(
@@ -7425,7 +7422,7 @@ export class PostgresFlorenceStore {
         for update of partner
       `;
       if (invitation) {
-        return terminalizeIssuedPartnerInvitation(sql, invitation, occurredAt, "declined");
+        return terminalizeIssuedPartnerInvitation(sql, invitation, occurredAt, "declined", input.kind);
       }
       const recovered = await readRecoveredExpiredPartnerInvitation(sql, {
         adultId: input.adultId,
@@ -7434,6 +7431,14 @@ export class PostgresFlorenceStore {
       });
       if (!recovered) return false;
       if (recovered.invitation_consumed_at !== null) {
+        if (input.kind === "carrier_opt_out") {
+          await sql`
+            update people set
+              preferences=preferences||${sql.json({ partnerInvitationDeclineKind: input.kind })},
+              updated_at=greatest(updated_at,${occurredAt})
+            where id=${recovered.adult_id}
+          `;
+        }
         await stagePartnerInvitationTerminalNotice(sql, {
           invitation: recovered,
           reason: "declined",
@@ -7443,7 +7448,7 @@ export class PostgresFlorenceStore {
         });
         return true;
       }
-      return terminalizeIssuedPartnerInvitation(sql, recovered, occurredAt, "declined");
+      return terminalizeIssuedPartnerInvitation(sql, recovered, occurredAt, "declined", input.kind);
     });
   }
 
@@ -10429,88 +10434,110 @@ export class PostgresFlorenceStore {
     });
   }
 
-  async stageRetryCue(input: { sourceId: string; occurredAt: string }): Promise<string | null> {
-    assertUuid(input.sourceId, "Inbound source ID");
-    const occurredAt = instant(input.occurredAt);
-    return this.#sql.begin(async (sql) => {
-      const [turn] = await sql<
-        {
-          source_id: string;
-          household_id: string;
-          channel_id: string;
-          visibility: Visibility;
-          owner_adult_id: string | null;
-          metadata: JsonValue;
-        }[]
-      >`
-        select m.source_id,s.household_id,m.channel_id,s.visibility,s.owner_adult_id,s.metadata
-        from messages m join sources s on s.id=m.source_id join linq_channels c on c.id=m.channel_id
-        where m.source_id=${input.sourceId} and m.direction='inbound' and m.status='received'
-          and coalesce(m.retry_at,m.not_before)<=${occurredAt}
-          and c.revoked_at is null and c.stopped_at is null
-        for update of m
-      `;
-      if (!turn) return null;
-      const rootSourceId = await supersessionRoot(sql, turn.channel_id, turn.source_id, turn.metadata);
-      const cueTurnId = deterministicUuid(`cue-turn\0${rootSourceId}`);
-      const sourceId = deterministicUuid(`cue\0${rootSourceId}\0retry`);
-      await insertOutbound(sql, {
-        sourceId,
-        idempotencyKey: `cue:${rootSourceId}:retry`,
-        moveKind: "message",
-        text: "One sec—I hit a snag, but I’m trying that again.",
-        replyToSourceId: turn.source_id,
-        turnPart: 1,
-        turnId: cueTurnId,
-        notBefore: occurredAt.toISOString(),
-        householdId: turn.household_id,
-        channelId: turn.channel_id,
-        visibility: turn.visibility,
-        ownerAdultId: turn.owner_adult_id,
-        metadata: { presentationCue: true },
-        occurredAt,
-      });
-      await sql`
-        update messages set status='pending',sending_at=null,retry_at=null,last_error=null,
-          reply_to_source_id=${turn.source_id},not_before=${occurredAt}
-        where source_id=${sourceId} and direction='outbound' and status='failed'
-          and last_error='Superseded before delivery by a newer message in this conversation'
-      `;
-      return sourceId;
-    });
-  }
-
-  async readNextInbound(now: string = new Date().toISOString()): Promise<InboundTurn | null> {
+  async readNextInbound(
+    now: string = new Date().toISOString(),
+    options: { excludeChannelIds?: readonly string[] } = {},
+  ): Promise<InboundTurn | null> {
     const current = instant(now);
+    const excludeChannelIds = unique(options.excludeChannelIds ?? []);
+    for (const channelId of excludeChannelIds) assertUuid(channelId, "Excluded inbound channel ID");
     await this.#sql`
       update documents set content_envelope=null
       where retained=false and discard_after<=${current} and content_envelope is not null
     `;
-    const [row] = await this.#sql<
-      {
-        source_id: string;
-        household_id: string;
-        channel_id: string;
-        sender_adult_id: string;
-        move_kind: "message" | "reply" | "reaction";
-        text: string | null;
-        reaction: string | null;
-        images: JsonValue;
-        reply_to_source_id: string | null;
-        metadata: JsonValue;
-        occurred_at: Date;
-      }[]
-    >`
-      select m.source_id,s.household_id,m.channel_id,m.sender_adult_id,m.move_kind,m.text,m.reaction,m.images,
-             m.reply_to_source_id,s.metadata,s.occurred_at
-      from messages m join sources s on s.id=m.source_id
-      join linq_channels c on c.id=m.channel_id
-      where m.direction='inbound' and m.status='received'
-        and coalesce(m.retry_at,m.not_before)<=${current}
-        and c.revoked_at is null and c.stopped_at is null
-      order by coalesce(m.retry_at,m.not_before),s.occurred_at,m.source_id limit 1
-    `;
+    const claimId = randomUUID();
+    const leaseUntil = new Date(current.getTime() + INBOUND_TURN_CLAIM_LEASE_MS);
+    // Reuse the received Message's retry/receipt state for a short processing lease: different
+    // households can reason in parallel while every conversation still has one exact owner.
+    const row = await this.#sql.begin(async (sql) => {
+      const excludedChannels =
+        excludeChannelIds.length > 0
+          ? sql`and m.channel_id not in ${sql(excludeChannelIds)}`
+          : sql``;
+      const [candidate] = await sql<
+        {
+          source_id: string;
+          household_id: string;
+          channel_id: string;
+          sender_adult_id: string;
+          move_kind: "message" | "reply" | "reaction";
+          text: string | null;
+          reaction: string | null;
+          images: JsonValue;
+          reply_to_source_id: string | null;
+          metadata: JsonValue;
+          occurred_at: Date;
+        }[]
+      >`
+        select m.source_id,s.household_id,m.channel_id,m.sender_adult_id,m.move_kind,m.text,m.reaction,
+               m.images,m.reply_to_source_id,s.metadata,s.occurred_at
+        from messages m join sources s on s.id=m.source_id
+        join linq_channels c on c.id=m.channel_id
+        where m.direction='inbound' and m.status='received'
+          and coalesce(m.retry_at,m.not_before)<=${current}
+          and c.revoked_at is null and c.stopped_at is null
+          ${excludedChannels}
+          and not exists (
+            select 1 from messages active_claim
+            where active_claim.channel_id=m.channel_id and active_claim.direction='inbound'
+              and active_claim.status='received' and active_claim.retry_at>${current}
+              and nullif(active_claim.receipt_detail->'inboundClaim'->>'claimId','') is not null
+          )
+        order by coalesce(m.retry_at,m.not_before),s.occurred_at,m.source_id
+        limit 1 for update of m,c skip locked
+      `;
+      if (!candidate) return null;
+      const claimed = await sql`
+        update messages set retry_at=${leaseUntil},
+          receipt_detail=coalesce(receipt_detail,'{}'::jsonb)||${sql.json({
+            inboundClaim: { claimId, leaseUntil: leaseUntil.toISOString() },
+          })}
+        where source_id=${candidate.source_id} and direction='inbound' and status='received'
+        returning source_id
+      `;
+      if (claimed.length !== 1) {
+        throw new FlorenceStoreConflict("The inbound message changed before Florence could claim it");
+      }
+      return candidate;
+    });
     if (!row) return null;
+    const claimBuildStartedAt = Date.now();
+    let buildClaimRenewal: Promise<void> | null = null;
+    let buildClaimRenewalError: unknown = null;
+    let currentClaim: InboundTurn["inboundClaim"] = {
+      claimId,
+      leaseUntil: leaseUntil.toISOString(),
+    };
+    const renewalNow = (): string =>
+      new Date(current.getTime() + Math.max(0, Date.now() - claimBuildStartedAt)).toISOString();
+    const renewBuildClaim = (): void => {
+      if (buildClaimRenewal || buildClaimRenewalError) return;
+      buildClaimRenewal = this.renewInboundClaim({
+        sourceId: row.source_id,
+        claimId,
+        now: renewalNow(),
+      })
+        .then((renewed) => {
+          if (!renewed) {
+            throw new FlorenceStoreConflict(
+              "The inbound claim changed while Florence was assembling its conversation context",
+            );
+          }
+          currentClaim = renewed;
+        })
+        .catch((error: unknown) => {
+          buildClaimRenewalError = error;
+        })
+        .finally(() => {
+          buildClaimRenewal = null;
+        });
+    };
+    const buildClaimHeartbeat = setInterval(
+      renewBuildClaim,
+      Math.floor(INBOUND_TURN_CLAIM_LEASE_MS / 3),
+    );
+    buildClaimHeartbeat.unref();
+    try {
     const [channel] = await this.#sql<ChannelRow[]>`select * from linq_channels where id=${row.channel_id}`;
     const [household] = await this.#sql<
       {
@@ -10528,7 +10555,10 @@ export class PostgresFlorenceStore {
              family_calendar_partner_connection_id,family_calendar_label,family_calendar_created_at
       from households where id=${row.household_id}
     `;
-    if (!channel || !household) return null;
+    if (!channel || !household) {
+      await this.releaseInboundClaim({ sourceId: row.source_id, claimId });
+      return null;
+    }
     const members = await this.#sql<PersonRow[]>`
       select * from people where household_id=${row.household_id} order by adult_slot nulls last,created_at,id
     `;
@@ -10765,8 +10795,7 @@ export class PostgresFlorenceStore {
       join sources basis_source on basis_source.id=action.basis_source_id
       join messages approval_prompt on approval_prompt.source_id=action.approval_prompt_source_id
         and approval_prompt.channel_id=${channel.id} and approval_prompt.direction='outbound'
-        and approval_prompt.move_kind in ('message','reply') and approval_prompt.turn_part=0
-        and approval_prompt.status='sent'
+        and approval_prompt.move_kind in ('message','reply') and approval_prompt.status='sent'
       where action.household_id=${row.household_id} and action.status='offered'
         and (
           ${groupCalendarIsActive}
@@ -10856,6 +10885,10 @@ export class PostgresFlorenceStore {
           and (
             (${channel.audience === "private"} and visibility='private'
               and owner_adult_id=${row.sender_adult_id})
+            or (${channel.audience === "private"} and visibility='household'
+              and owner_adult_id is null and status='paused' and task_state->>'phase'='waiting'
+              and task_state->'pendingParticipantRequest'->>'targetAdultId'=${row.sender_adult_id}
+              and task_state->'pendingParticipantRequest'->>'channelId'=${channel.id})
             or (${channel.audience === "group"} and visibility='household'
               and owner_adult_id is null)
           )
@@ -11017,7 +11050,8 @@ export class PostgresFlorenceStore {
         order by bound_at,id
       `,
     });
-    return {
+    const turn: InboundTurn = {
+      inboundClaim: currentClaim,
       message: {
         sourceId: row.source_id,
         speaker: row.sender_adult_id,
@@ -11123,9 +11157,16 @@ export class PostgresFlorenceStore {
         limit: null,
         now: current.toISOString(),
       }),
-      visibleFamilyWork: familyWorkRows.map((work) => ({
-        ...visibleFamilyWork(work, responsibleAdultNames),
-      })),
+      visibleFamilyWork: familyWorkRows.map((work) => {
+        const participantRequest = familyWorkState(work.task_state).pendingParticipantRequest;
+        return {
+          ...visibleFamilyWork(work, responsibleAdultNames),
+          privateParticipantReply:
+            channel.audience === "private" &&
+            participantRequest?.targetAdultId === row.sender_adult_id &&
+            participantRequest.channelId === channel.id,
+        };
+      }),
       visibleReminders: reminderRows.map((reminder) => ({
         reminderId: reminder.id,
         action: reminder.objective,
@@ -11168,430 +11209,66 @@ export class PostgresFlorenceStore {
       ),
       pendingPartnerInvitation,
     };
-  }
-
-  /**
-   * Returns the one exact paused family-work question that this Message could
-   * answer. Exact iMessage replies bind to their stored question; an unthreaded
-   * Message is eligible only when this conversation has one waiting question.
-   * This is intentionally structural selection: Florence still decides whether
-   * the parent's words actually belong to the question.
-   */
-  async readFamilyWorkReplyCandidate(input: {
-    sourceId: string;
-    readAt: string;
-  }): Promise<FamilyWorkReplyCandidate | null> {
-    assertUuid(input.sourceId, "Family-work reply source ID");
-    const readAt = instant(input.readAt);
-    const [turn] = await this.#sql<
-      (ChannelRow & {
-        source_id: string;
-        sender_adult_id: string;
-        sender_name: string;
-        move_kind: "message" | "reply" | "reaction";
-        text: string | null;
-        reply_to_source_id: string | null;
-        status: "received" | "handled";
-        visibility: Visibility;
-        occurred_at: Date;
-      })[]
-    >`
-      select channel.*,message.source_id,message.sender_adult_id,adult.display_name as sender_name,
-        message.move_kind,message.text,message.reply_to_source_id,message.status,
-        source.visibility,source.occurred_at
-      from messages message
-      join sources source on source.id=message.source_id
-      join linq_channels channel on channel.id=message.channel_id
-      join people adult on adult.id=message.sender_adult_id and adult.household_id=channel.household_id
-      where message.source_id=${input.sourceId} and message.direction='inbound'
-        and coalesce(message.retry_at,message.not_before)<=${readAt}
-    `;
-    if (
-      turn?.status !== "received" ||
-      turn.move_kind === "reaction" ||
-      !turn.text?.trim() ||
-      turn.revoked_at !== null ||
-      turn.stopped_at !== null ||
-      (turn.audience === "private" && turn.visibility !== "private") ||
-      (turn.audience === "group" && turn.visibility !== "household")
-    ) {
-      return null;
-    }
-
-    type ReplyWorkRow = ProactiveWorkRow & {
-      question_source_id: string;
-      question_text: string;
-      question_asked_at: Date;
-    };
-    const participantWorks = await this.#sql<ReplyWorkRow[]>`
-      select work.*,question.source_id as question_source_id,
-        question.text as question_text,question_source.occurred_at as question_asked_at
-      from proactive_work work
-      join messages question
-        on question.source_id=(work.task_state->'pendingParticipantRequest'->>'questionSourceId')::uuid
-      join sources question_source on question_source.id=question.source_id
-      where work.household_id=${turn.household_id} and work.kind='family_task'
-        and ${turn.audience}='private' and ${turn.visibility}='private'
-        and work.visibility='household' and work.owner_adult_id is null
-        and work.status='paused' and work.task_state->>'phase'='waiting'
-        and work.task_state->'pendingParticipantRequest'->>'targetAdultId'=${turn.sender_adult_id}
-        and work.task_state->'pendingParticipantRequest'->>'channelId'=${turn.id}
-        and question.channel_id=${turn.id} and question.direction='outbound'
-        and question.move_kind in ('message','reply') and question.status='sent'
-        and question.provider_message_id is not null
-        and question_source.metadata->>'familyWorkGeneration'=work.task_state->>'generation'
-        and question_source.metadata->>'familyWorkProgressRevision'=
-          work.task_state->>'progressRevision'
-        and question_source.metadata->>'participantRequestId'=
-          work.task_state->'pendingParticipantRequest'->>'requestId'
-        and (question_source.occurred_at,question_source.id)
-          < (${turn.occurred_at},${turn.source_id}::uuid)
-        and (${turn.reply_to_source_id}::uuid is null
-          or question.source_id=${turn.reply_to_source_id}::uuid)
-      order by
-        (work.task_state->'pendingParticipantRequest'->>'askedAt')::timestamptz,
-        work.created_at,work.id
-      limit ${turn.reply_to_source_id === null ? 2 : 1}
-    `;
-    const waitingWorks = await this.#sql<ReplyWorkRow[]>`
-      select work.*,question.source_id as question_source_id,
-        question.text as question_text,question_source.occurred_at as question_asked_at
-      from proactive_work work
-      join sources question_source
-        on question_source.metadata->>'familyWorkId'=work.id::text
-        and question_source.metadata->>'familyWorkDeliveryKind'='waiting'
-      join messages question on question.source_id=question_source.id
-      where work.household_id=${turn.household_id} and work.kind='family_task'
-        and work.status='paused' and work.task_state->>'phase'='waiting'
-        and work.task_state->'pendingParticipantRequest'='null'::jsonb
-        and question.channel_id=${turn.id} and question.direction='outbound'
-        and question.move_kind in ('message','reply') and question.status='sent'
-        and question.provider_message_id is not null
-        and question_source.visibility=work.visibility
-        and ${turn.visibility}=work.visibility
-        and question_source.owner_adult_id is not distinct from work.owner_adult_id
-        and question_source.metadata->>'familyWorkGeneration'=work.task_state->>'generation'
-        and question_source.metadata->>'familyWorkProgressRevision'=
-          work.task_state->>'progressRevision'
-        and (question_source.occurred_at,question_source.id)
-          < (${turn.occurred_at},${turn.source_id}::uuid)
-        and (${turn.reply_to_source_id}::uuid is null
-          or question.source_id=${turn.reply_to_source_id}::uuid)
-        and ((work.visibility='private' and work.owner_adult_id=${turn.sender_adult_id}
-            and ${turn.audience}='private')
-          or (work.visibility='household' and work.owner_adult_id is null
-            and ${turn.audience}='group'
-            and (${turn.sender_adult_id}=${turn.adult_one_id}
-              or ${turn.sender_adult_id}=${turn.adult_two_id})))
-      order by question_source.occurred_at,work.created_at,work.id
-      limit ${turn.reply_to_source_id === null ? 2 : 1}
-    `;
-
-    const candidates = [
-      ...participantWorks.map((work) => ({ kind: "participant_request" as const, work })),
-      ...waitingWorks.map((work) => ({ kind: "waiting" as const, work })),
-    ];
-    const selected = candidates.length === 1 ? candidates[0] : null;
-    if (!selected) return null;
-    const state = familyWorkState(selected.work.task_state);
-    if (selected.kind === "participant_request") {
-      const request = state.pendingParticipantRequest;
-      if (
-        !request ||
-        request.targetAdultId !== turn.sender_adult_id ||
-        request.channelId !== turn.id ||
-        request.questionSourceId !== selected.work.question_source_id ||
-        (turn.reply_to_source_id !== null && request.questionSourceId !== turn.reply_to_source_id)
-      ) {
-        return null;
-      }
-      return {
-        kind: selected.kind,
-        workId: selected.work.id,
-        generation: state.generation,
-        progressRevision: state.progressRevision,
-        questionSourceId: request.questionSourceId,
-        requestId: request.requestId,
-        targetAdultName: request.targetAdultName,
-        question: request.question,
-        askedAt: request.askedAt,
-        taskObjective: required(selected.work.objective ?? "", "Participant task objective"),
-        explicitlyRepliesToQuestion: turn.reply_to_source_id !== null,
-      };
-    }
-    return {
-      kind: selected.kind,
-      workId: selected.work.id,
-      generation: state.generation,
-      progressRevision: state.progressRevision,
-      questionSourceId: selected.work.question_source_id,
-      requestId: null,
-      targetAdultName: turn.sender_name,
-      question: limitedRequiredString(selected.work.question_text, 10_000, "Family-work question"),
-      askedAt: selected.work.question_asked_at.toISOString(),
-      taskObjective: required(selected.work.objective ?? "", "Family-work task objective"),
-      explicitlyRepliesToQuestion: turn.reply_to_source_id !== null,
-    };
-  }
-
-  /**
-   * Atomically revalidates and consumes the exact waiting question Florence
-   * classified. An unrelated turn never reaches this commit.
-   */
-  async commitFamilyWorkReply(input: {
-    sourceId: string;
-    kind: "participant_request" | "waiting";
-    workId: string;
-    generation: number;
-    progressRevision: number;
-    questionSourceId: string;
-    requestId: string | null;
-    reassignToAdultId: string | null;
-    acknowledgement: FamilyWorkReplyAcknowledgement;
-    handledAt: string;
-  }): Promise<"committed" | "not_family_work" | "superseded"> {
-    assertUuid(input.sourceId, "Family-work reply source ID");
-    assertUuid(input.workId, "Family-work reply task ID");
-    assertUuid(input.questionSourceId, "Family-work question source ID");
-    familyWorkCounter(input.generation, "Family-work reply generation");
-    familyWorkCounter(input.progressRevision, "Family-work reply progress revision");
-    if (input.kind === "participant_request") {
-      assertUuid(input.requestId ?? "", "Participant request ID");
-      if (input.reassignToAdultId !== null) {
-        assertUuid(input.reassignToAdultId, "Family-work reply reassignment adult ID");
-      }
-    } else if (input.requestId !== null || input.reassignToAdultId !== null) {
-      throw new FlorenceStoreConflict(
-        "A same-thread family-work reply cannot name a participant request or reassign responsibility",
-      );
-    }
-    const handledAt = instant(input.handledAt);
-    const acknowledgement =
-      input.acknowledgement.kind === "text"
-        ? {
-            kind: "text" as const,
-            text: bounded(required(input.acknowledgement.text, "Family-work acknowledgement"), 2_000),
-          }
-        : input.acknowledgement;
-    return this.#sql.begin("isolation level serializable", async (sql) => {
-      const [turn] = await sql<
-        (ChannelRow & {
-          source_id: string;
-          sender_adult_id: string;
-          move_kind: "message" | "reply" | "reaction";
-          text: string | null;
-          reply_to_source_id: string | null;
-          status: "received" | "handled";
-          visibility: Visibility;
-          occurred_at: Date;
-        })[]
-      >`
-        select channel.*,message.source_id,message.sender_adult_id,message.move_kind,
-          message.text,message.reply_to_source_id,message.status,source.visibility,
-          source.occurred_at
-        from messages message
-        join sources source on source.id=message.source_id
-        join linq_channels channel on channel.id=message.channel_id
-        where message.source_id=${input.sourceId} and message.direction='inbound'
-          and coalesce(message.retry_at,message.not_before)<=${handledAt}
-        for update of message,source
-      `;
-      if (turn?.status !== "received") return "superseded";
-      if (
-        turn.move_kind === "reaction" ||
-        !turn.text?.trim() ||
-        turn.revoked_at !== null ||
-        turn.stopped_at !== null
-      ) {
-        return "not_family_work";
-      }
-
-      const structurallyEligible = await sql<
-        { work_id: string; question_source_id: string; kind: "participant_request" | "waiting" }[]
-      >`
-        with candidates as (
-          select work.id as work_id,question.source_id as question_source_id,
-            'participant_request'::text as kind,question_source.occurred_at,work.created_at
-          from proactive_work work
-          join messages question
-            on question.source_id=(work.task_state->'pendingParticipantRequest'->>'questionSourceId')::uuid
-          join sources question_source on question_source.id=question.source_id
-          where work.household_id=${turn.household_id} and work.kind='family_task'
-            and ${turn.audience}='private' and ${turn.visibility}='private'
-            and work.visibility='household' and work.owner_adult_id is null
-            and work.status='paused' and work.task_state->>'phase'='waiting'
-            and work.task_state->'pendingParticipantRequest'->>'targetAdultId'=${turn.sender_adult_id}
-            and work.task_state->'pendingParticipantRequest'->>'channelId'=${turn.id}
-            and question.channel_id=${turn.id} and question.direction='outbound'
-            and question.move_kind in ('message','reply') and question.status='sent'
-            and question.provider_message_id is not null
-            and question_source.metadata->>'familyWorkGeneration'=work.task_state->>'generation'
-            and question_source.metadata->>'familyWorkProgressRevision'=
-              work.task_state->>'progressRevision'
-            and question_source.metadata->>'participantRequestId'=
-              work.task_state->'pendingParticipantRequest'->>'requestId'
-            and (question_source.occurred_at,question_source.id)
-              < (${turn.occurred_at},${turn.source_id}::uuid)
-            and (${turn.reply_to_source_id}::uuid is null
-              or question.source_id=${turn.reply_to_source_id}::uuid)
-          union all
-          select work.id as work_id,question.source_id as question_source_id,
-            'waiting'::text as kind,question_source.occurred_at,work.created_at
-          from proactive_work work
-          join sources question_source
-            on question_source.metadata->>'familyWorkId'=work.id::text
-            and question_source.metadata->>'familyWorkDeliveryKind'='waiting'
-          join messages question on question.source_id=question_source.id
-          where work.household_id=${turn.household_id} and work.kind='family_task'
-            and work.status='paused' and work.task_state->>'phase'='waiting'
-            and work.task_state->'pendingParticipantRequest'='null'::jsonb
-            and question.channel_id=${turn.id} and question.direction='outbound'
-            and question.move_kind in ('message','reply') and question.status='sent'
-            and question.provider_message_id is not null
-            and question_source.visibility=work.visibility
-            and ${turn.visibility}=work.visibility
-            and question_source.owner_adult_id is not distinct from work.owner_adult_id
-            and question_source.metadata->>'familyWorkGeneration'=work.task_state->>'generation'
-            and question_source.metadata->>'familyWorkProgressRevision'=
-              work.task_state->>'progressRevision'
-            and (question_source.occurred_at,question_source.id)
-              < (${turn.occurred_at},${turn.source_id}::uuid)
-            and (${turn.reply_to_source_id}::uuid is null
-              or question.source_id=${turn.reply_to_source_id}::uuid)
-            and ((work.visibility='private' and work.owner_adult_id=${turn.sender_adult_id}
-                and ${turn.audience}='private')
-              or (work.visibility='household' and work.owner_adult_id is null
-                and ${turn.audience}='group'
-                and (${turn.sender_adult_id}=${turn.adult_one_id}
-                  or ${turn.sender_adult_id}=${turn.adult_two_id})))
-        )
-        select work_id,question_source_id,kind from candidates
-        order by occurred_at,created_at,work_id limit 2
-      `;
-      const eligible = structurallyEligible.length === 1 ? structurallyEligible[0] : null;
-      if (
-        !eligible ||
-        eligible.kind !== input.kind ||
-        eligible.work_id !== input.workId ||
-        eligible.question_source_id !== input.questionSourceId
-      ) {
-        return "not_family_work";
-      }
-      const [work] = await sql<ProactiveWorkRow[]>`
-        select * from proactive_work where id=${input.workId} and household_id=${turn.household_id}
-          and kind='family_task' and status='paused' and task_state->>'phase'='waiting'
-        for update
-      `;
-      if (!work) return "not_family_work";
-      const state = familyWorkState(work.task_state);
-      if (state.generation !== input.generation || state.progressRevision !== input.progressRevision) {
-        return "not_family_work";
-      }
-      const request = state.pendingParticipantRequest;
-      if (input.kind === "participant_request") {
-        if (
-          turn.audience !== "private" ||
-          turn.visibility !== "private" ||
-          !request ||
-          request.requestId !== input.requestId ||
-          request.targetAdultId !== turn.sender_adult_id ||
-          request.channelId !== turn.id ||
-          request.questionSourceId !== input.questionSourceId ||
-          (turn.reply_to_source_id !== null && request.questionSourceId !== turn.reply_to_source_id)
-        ) {
-          return "not_family_work";
-        }
-      } else if (
-        request !== null ||
-        (work.visibility === "private" &&
-          (turn.audience !== "private" || work.owner_adult_id !== turn.sender_adult_id)) ||
-        (work.visibility === "household" &&
-          (turn.audience !== "group" ||
-            work.owner_adult_id !== null ||
-            (turn.sender_adult_id !== turn.adult_one_id && turn.sender_adult_id !== turn.adult_two_id)))
-      ) {
-        return "not_family_work";
-      }
-      let stateWithResponsibility = state;
-      if (input.reassignToAdultId !== null) {
-        await validateFamilyWorkResponsibleAdult(sql, {
-          householdId: work.household_id,
-          channelId: null,
-          requestingAdultId: turn.sender_adult_id,
-          responsibleAdultId: input.reassignToAdultId,
-          observedAt: handledAt,
-        });
-        stateWithResponsibility = familyWorkState({
-          ...state,
-          responsibleAdultId: input.reassignToAdultId,
-        });
-      }
-      const nextState = steerFamilyWorkState(stateWithResponsibility, {
-        sourceId: turn.source_id,
-        text: bounded(required(turn.text, "Family-work reply"), 4_000),
-        occurredAt: turn.occurred_at.toISOString(),
-        privateParticipantReply: input.kind === "participant_request",
-      });
-      await terminalizeUnsentFamilyWorkOutbounds(sql, work.id, "steering");
-      await sql`
-        insert into proactive_work_sources (work_id,source_id)
-        values (${work.id},${turn.source_id}) on conflict do nothing
-      `;
-      await sql`
-        update sources set metadata=metadata||${sql.json({
-          ...(request ? { participantRequestId: request.requestId } : {}),
-          familyWorkReplyKind: input.kind,
-          familyWorkSteeringForId: work.id,
-        })}
-        where id=${turn.source_id} and household_id=${turn.household_id}
-      `;
-      const [resumed] = await sql`
-        update proactive_work set task_state=${sql.json(nextState)},status='active',
-          next_check_at=${handledAt},current_conclusion='Resuming with the family’s answer.',
-          last_error=null
-        where id=${work.id} and status='paused'
-          and task_state->>'generation'=${String(input.generation)}
-          and task_state->>'progressRevision'=${String(input.progressRevision)}
-        returning id
-      `;
-      if (!resumed) {
-        throw new FlorenceStoreConflict("The family-work question changed before its reply was committed");
-      }
-
-      const acknowledgementTurnId = deterministicUuid(`family-work-reply-ack-turn\0${turn.source_id}`);
-      await insertOutbound(sql, {
-        sourceId: deterministicUuid(`family-work-reply-ack\0${turn.source_id}`),
-        idempotencyKey: `family-work-reply-ack:${turn.source_id}`,
-        moveKind: acknowledgement.kind === "reaction" ? "reaction" : "reply",
-        text: acknowledgement.kind === "text" ? acknowledgement.text : null,
-        reaction: acknowledgement.kind === "reaction" ? acknowledgement.reaction : null,
-        replyToSourceId: turn.source_id,
-        turnId: acknowledgementTurnId,
-        turnPart: acknowledgement.kind === "reaction" ? -1 : 0,
-        notBefore: handledAt.toISOString(),
-        householdId: turn.household_id,
-        channelId: turn.id,
-        visibility: request ? "private" : work.visibility,
-        ownerAdultId: request ? turn.sender_adult_id : work.owner_adult_id,
-        metadata: {
-          ...(request ? { participantRequestId: request.requestId } : {}),
-          familyWorkReplyKind: input.kind,
-          familyWorkSteeringForId: work.id,
-        },
-        occurredAt: handledAt,
-      });
-      const handled = await sql`
-        update messages set status='handled',handled_at=${handledAt},retry_at=null,last_error=null
-        where source_id=${turn.source_id} and status='received' returning source_id
-      `;
-      if (handled.length !== 1) {
-        throw new FlorenceStoreConflict("The family-work reply changed before commit");
-      }
-      return "committed";
+    clearInterval(buildClaimHeartbeat);
+    const pendingRenewal = buildClaimRenewal;
+    if (pendingRenewal) await pendingRenewal;
+    if (buildClaimRenewalError) throw buildClaimRenewalError;
+    const renewedClaim = await this.renewInboundClaim({
+      sourceId: row.source_id,
+      claimId,
+      now: renewalNow(),
     });
+    if (!renewedClaim) return null;
+    return { ...turn, inboundClaim: renewedClaim };
+    } catch (error) {
+      await this.releaseInboundClaim({ sourceId: row.source_id, claimId });
+      throw error;
+    } finally {
+      clearInterval(buildClaimHeartbeat);
+    }
+  }
+
+  async renewInboundClaim(input: {
+    sourceId: string;
+    claimId: string;
+    now: string;
+  }): Promise<InboundTurn["inboundClaim"] | null> {
+    assertUuid(input.sourceId, "Inbound source ID");
+    assertUuid(input.claimId, "Inbound claim ID");
+    const current = instant(input.now);
+    const leaseUntil = new Date(current.getTime() + INBOUND_TURN_CLAIM_LEASE_MS);
+    const renewed = await this.#sql`
+      update messages message set retry_at=${leaseUntil},
+        receipt_detail=coalesce(message.receipt_detail,'{}'::jsonb)||${this.#sql.json({
+          inboundClaim: { claimId: input.claimId, leaseUntil: leaseUntil.toISOString() },
+        })}
+      where message.source_id=${input.sourceId} and message.direction='inbound'
+        and message.status='received'
+        and message.receipt_detail->'inboundClaim'->>'claimId'=${input.claimId}
+        and exists (
+          select 1 from linq_channels channel where channel.id=message.channel_id
+            and channel.revoked_at is null and channel.stopped_at is null
+        )
+      returning message.source_id
+    `;
+    return renewed.length === 1 ? { claimId: input.claimId, leaseUntil: leaseUntil.toISOString() } : null;
+  }
+
+  async releaseInboundClaim(input: { sourceId: string; claimId: string }): Promise<boolean> {
+    assertUuid(input.sourceId, "Inbound source ID");
+    assertUuid(input.claimId, "Inbound claim ID");
+    const released = await this.#sql`
+      update messages set retry_at=null,
+        receipt_detail=nullif(coalesce(receipt_detail,'{}'::jsonb)-'inboundClaim','{}'::jsonb)
+      where source_id=${input.sourceId} and direction='inbound' and status='received'
+        and receipt_detail->'inboundClaim'->>'claimId'=${input.claimId}
+      returning source_id
+    `;
+    return released.length === 1;
   }
 
   async commitTurn(input: CommitTurnInput): Promise<CommitTurnResult> {
+    assertUuid(input.inboundClaimId, "Inbound claim ID");
     const handledAt = instant(input.handledAt);
     const completeDocketCandidateIds = input.completeDocketCandidateIds ?? [];
     if (new Set(completeDocketCandidateIds).size !== completeDocketCandidateIds.length) {
@@ -11634,7 +11311,7 @@ export class PostgresFlorenceStore {
           c.identity_two_digest,c.authority_digest,c.bound_at,s.metadata as source_metadata
         from messages m join sources s on s.id=m.source_id join linq_channels c on c.id=m.channel_id
         where m.source_id=${input.sourceId} and m.direction='inbound'
-          and coalesce(m.retry_at,m.not_before)<=${handledAt}
+          and m.receipt_detail->'inboundClaim'->>'claimId'=${input.inboundClaimId}
         for update of m,s
       `;
       if (!turn) throw new FlorenceStoreConflict("The inbound message is no longer awaiting a turn");
@@ -11653,6 +11330,7 @@ export class PostgresFlorenceStore {
       if (newer) {
         await sql`
           update messages set status='handled',handled_at=${handledAt},retry_at=null,
+            receipt_detail=nullif(coalesce(receipt_detail,'{}'::jsonb)-'inboundClaim','{}'::jsonb),
             last_error='Superseded by a newer message in this conversation'
           where source_id=${turn.source_id} and direction='inbound' and status='received'
         `;
@@ -11685,8 +11363,10 @@ export class PostgresFlorenceStore {
         }
         await stopMessagesChannel(sql, turn.channel_id, handledAt);
         const handled = await sql`
-          update messages set status='handled',handled_at=${handledAt},retry_at=null,last_error=null
+          update messages set status='handled',handled_at=${handledAt},retry_at=null,last_error=null,
+            receipt_detail=nullif(coalesce(receipt_detail,'{}'::jsonb)-'inboundClaim','{}'::jsonb)
           where source_id=${turn.source_id} and direction='inbound' and status='received'
+            and receipt_detail->'inboundClaim'->>'claimId'=${input.inboundClaimId}
           returning source_id
         `;
         if (handled.length !== 1) throw new FlorenceStoreConflict("The inbound turn changed before commit");
@@ -11717,11 +11397,6 @@ export class PostgresFlorenceStore {
         ) {
           throw new FlorenceStoreUnauthorized(
             "A household update requires the current adult's private Message or voice note",
-          );
-        }
-        if (input.outbound?.some((outbound) => outbound.moveKind !== "reaction")) {
-          throw new FlorenceStoreConflict(
-            "A private turn cannot send conversation bubbles alongside a household update",
           );
         }
         householdUpdateText = required(input.householdUpdate.text, "Household update");
@@ -11860,39 +11535,25 @@ export class PostgresFlorenceStore {
           turn.move_kind === "reaction" ||
           (!conversationAuthorship(turn.source_metadata).authoredText?.trim() &&
             !conversationAuthorship(turn.source_metadata).voiceTranscriptPresent) ||
-          input.partnerInvitationApproval !== undefined ||
-          input.householdUpdate !== undefined ||
-          (input.googleEvidence?.length ?? 0) > 0 ||
-          (input.googleConnectionIdsUsed?.length ?? 0) > 0 ||
-          (input.facts?.length ?? 0) > 0 ||
-          (input.listMutations?.length ?? 0) > 0 ||
-          (input.deleteFactIds?.length ?? 0) > 0 ||
-          (input.finiteMonitors?.length ?? 0) > 0 ||
-          (input.finiteMonitorUpdates?.length ?? 0) > 0 ||
-          (input.cancelMonitorIds?.length ?? 0) > 0 ||
-          input.interestMutation != null ||
-          input.reminderMutation != null ||
-          input.familyWorkMutation != null ||
-          (input.familyWorkRetainedDocuments?.length ?? 0) > 0 ||
-          input.docketMutation != null ||
-          (input.completeDocketCandidateIds?.length ?? 0) > 0 ||
-          (input.calendarOffers?.length ?? 0) > 0 ||
-          (input.approveCalendarOffers?.length ?? 0) > 0 ||
-          (input.calendarActions?.length ?? 0) > 0 ||
-          (input.outbound ?? []).some((outbound) => outbound.moveKind === "reaction")
+          input.partnerInvitationApproval !== undefined
         ) {
           throw new FlorenceStoreUnauthorized(
             "Another adult can be changed only from the current founder's private instruction",
           );
         }
-        const [prompt] = input.outbound ?? [];
+        const prompt =
+          change.operation === "plan"
+            ? input.outbound?.find((outbound) => outbound.sourceId === change.approvalPromptSourceId)
+            : input.outbound?.find(
+                (outbound) =>
+                  (outbound.moveKind === "message" || outbound.moveKind === "reply") &&
+                  Boolean(outbound.text?.trim()),
+              );
         if (
-          input.outbound?.length !== 1 ||
           !prompt ||
-          prompt.moveKind !== "reply" ||
-          prompt.replyToSourceId !== turn.source_id ||
           !prompt.text?.trim() ||
-          (change.operation === "plan" && prompt.sourceId !== change.approvalPromptSourceId)
+          (prompt.moveKind !== "message" && prompt.moveKind !== "reply") ||
+          (prompt.moveKind === "reply" && prompt.replyToSourceId !== turn.source_id)
         ) {
           throw new FlorenceStoreConflict(
             "Another adult change requires one exact application-owned reply",
@@ -12253,7 +11914,9 @@ export class PostgresFlorenceStore {
         }
         if (
           !approvalPromptSourceId ||
-          (turn.reply_to_source_id !== null && turn.reply_to_source_id !== approvalPromptSourceId)
+          (!input.partnerInvitationApproval.standaloneExplicit &&
+            turn.reply_to_source_id !== null &&
+            turn.reply_to_source_id !== approvalPromptSourceId)
         ) {
           throw new FlorenceStoreUnauthorized(
             "The founder must approve the exact current adult after Florence's sharing review was sent",
@@ -12713,7 +12376,12 @@ export class PostgresFlorenceStore {
             where id=${mutation.workId} and household_id=${turn.household_id} and kind='family_task'
               and ((${turn.audience}='group' and visibility='household' and owner_adult_id is null)
                 or (${turn.audience}='private' and visibility='private'
-                  and owner_adult_id=${turn.sender_adult_id}))
+                  and owner_adult_id=${turn.sender_adult_id})
+                or (${turn.audience}='private' and ${mutation.operation === "steer"}
+                  and visibility='household' and owner_adult_id is null
+                  and status='paused' and task_state->>'phase'='waiting'
+                  and task_state->'pendingParticipantRequest'->>'targetAdultId'=${turn.sender_adult_id}
+                  and task_state->'pendingParticipantRequest'->>'channelId'=${turn.channel_id}))
             for update
           `;
           if (!work) {
@@ -12724,6 +12392,26 @@ export class PostgresFlorenceStore {
             values (${work.id},${turn.source_id}) on conflict do nothing
           `;
           const state = familyWorkState(work.task_state);
+          const pendingParticipantRequest = state.pendingParticipantRequest;
+          const privateParticipantReply = Boolean(
+            turn.audience === "private" &&
+              work.visibility === "household" &&
+              work.owner_adult_id === null &&
+              mutation.operation === "steer" &&
+              pendingParticipantRequest?.targetAdultId === turn.sender_adult_id &&
+              pendingParticipantRequest.channelId === turn.channel_id &&
+              (turn.reply_to_source_id === null ||
+                turn.reply_to_source_id === pendingParticipantRequest.questionSourceId),
+          );
+          if (
+            turn.audience === "private" &&
+            work.visibility === "household" &&
+            !privateParticipantReply
+          ) {
+            throw new FlorenceStoreUnauthorized(
+              "A private adult may steer shared work only by answering their exact waiting question",
+            );
+          }
           if (state.responsibleAdultId && work.visibility !== "household") {
             throw new FlorenceStoreConflict(
               "Only household family work can retain a responsible adult",
@@ -12741,7 +12429,7 @@ export class PostgresFlorenceStore {
             }
             await validateFamilyWorkResponsibleAdult(sql, {
               householdId: turn.household_id,
-              channelId: turn.channel_id,
+              channelId: privateParticipantReply ? null : turn.channel_id,
               requestingAdultId: turn.sender_adult_id,
               responsibleAdultId: mutation.responsibleAdultId,
               observedAt: handledAt,
@@ -12903,7 +12591,7 @@ export class PostgresFlorenceStore {
               sourceId: turn.source_id,
               text: instruction,
               occurredAt: turn.occurred_at.toISOString(),
-              privateParticipantReply: false,
+              privateParticipantReply,
             };
             const stateWithCompletionCondition =
               mutation.completionCondition === null
@@ -12945,6 +12633,16 @@ export class PostgresFlorenceStore {
                   reminder_schedule=${scheduled ? sql.json(scheduled) : null},
                   status='active',next_check_at=${handledAt},
                   last_error=null where id=${work.id}
+              `;
+            }
+            if (privateParticipantReply && pendingParticipantRequest) {
+              await sql`
+                update sources set metadata=metadata||${sql.json({
+                  participantRequestId: pendingParticipantRequest.requestId,
+                  familyWorkReplyKind: "participant_request",
+                  familyWorkSteeringForId: work.id,
+                })}
+                where id=${turn.source_id} and household_id=${turn.household_id}
               `;
             }
           } else if (mutation.operation === "pause") {
@@ -13158,12 +12856,14 @@ export class PostgresFlorenceStore {
         await assertSourcesVisible(sql, turn.household_id, turn.audience, turn.sender_adult_id, [
           offer.basisSourceId,
         ]);
+        assertUuid(offer.approvalPromptSourceId, "Calendar offer approval prompt source ID");
         const [approvalPrompt] = await sql<{ source_id: string }[]>`
           select message.source_id from messages message join sources source on source.id=message.source_id
-          where source.parent_source_id=${turn.source_id} and message.channel_id=${turn.channel_id}
+          where message.source_id=${offer.approvalPromptSourceId}
+            and source.parent_source_id=${turn.source_id} and message.channel_id=${turn.channel_id}
             and message.direction='outbound' and message.move_kind in ('message','reply')
-            and message.turn_part=0 and message.status='pending'
-          order by source.occurred_at,message.source_id limit 1 for share of message,source
+            and message.status='pending'
+          for share of message,source
         `;
         if (!approvalPrompt) {
           throw new FlorenceStoreConflict("A Calendar suggestion requires its exact review prompt");
@@ -13178,7 +12878,7 @@ export class PostgresFlorenceStore {
           insert into calendar_actions (
             id,household_id,basis_source_id,approval_prompt_source_id,payload,status,retry_at,created_at
           ) values (${offer.id},${turn.household_id},${offer.basisSourceId},
-            ${approvalPrompt.source_id},${sql.json(offer.mutation)},'offered',${handledAt},${handledAt})
+            ${offer.approvalPromptSourceId},${sql.json(offer.mutation)},'offered',${handledAt},${handledAt})
         `;
       }
 
@@ -13262,7 +12962,6 @@ export class PostgresFlorenceStore {
               where offer_message.source_id=action.approval_prompt_source_id
                 and offer_message.channel_id=${turn.channel_id} and offer_message.direction='outbound'
                 and offer_message.move_kind in ('message','reply') and offer_message.status='sent'
-                and offer_message.turn_part=0
                 and (offer_source.occurred_at,offer_source.id)
                   < (${turn.occurred_at},${turn.source_id}::uuid)
             )
@@ -13314,24 +13013,42 @@ export class PostgresFlorenceStore {
       }
 
       const handled = await sql`
-        update messages set status='handled',handled_at=${handledAt},retry_at=null,last_error=null
-        where source_id=${turn.source_id} and status='received' returning source_id
+        update messages set status='handled',handled_at=${handledAt},retry_at=null,last_error=null,
+          receipt_detail=nullif(coalesce(receipt_detail,'{}'::jsonb)-'inboundClaim','{}'::jsonb)
+        where source_id=${turn.source_id} and status='received'
+          and receipt_detail->'inboundClaim'->>'claimId'=${input.inboundClaimId}
+        returning source_id
       `;
       if (handled.length !== 1) throw new FlorenceStoreConflict("The inbound turn changed before commit");
       return "committed";
     });
   }
 
-  async retryInbound(input: { sourceId: string; retryAt: string; error: string }): Promise<void> {
+  async retryInbound(input: {
+    sourceId: string;
+    claimId: string;
+    retryAt: string;
+    error: string;
+  }): Promise<void> {
+    assertUuid(input.sourceId, "Inbound source ID");
+    assertUuid(input.claimId, "Inbound claim ID");
     const updated = await this.#sql`
-      update messages set retry_at=${instant(input.retryAt)},last_error=${bounded(input.error, 2_000)}
-      where source_id=${input.sourceId} and direction='inbound' and status='received' returning source_id
+      update messages set retry_at=${instant(input.retryAt)},last_error=${bounded(input.error, 2_000)},
+        receipt_detail=nullif(coalesce(receipt_detail,'{}'::jsonb)-'inboundClaim','{}'::jsonb)
+      where source_id=${input.sourceId} and direction='inbound' and status='received'
+        and receipt_detail->'inboundClaim'->>'claimId'=${input.claimId}
+      returning source_id
     `;
     if (updated.length !== 1) throw new FlorenceStoreConflict("The inbound message is no longer retryable");
   }
 
-  async readNextOutbound(now: string = new Date().toISOString()): Promise<OutboundMessage | null> {
+  async readNextOutbound(
+    now: string = new Date().toISOString(),
+    options: { excludeChannelIds?: readonly string[] } = {},
+  ): Promise<OutboundMessage | null> {
     const current = instant(now);
+    const excludeChannelIds = unique(options.excludeChannelIds ?? []);
+    for (const channelId of excludeChannelIds) assertUuid(channelId, "Excluded outbound channel ID");
     const stale = new Date(current.getTime() - 2 * 60_000);
     await this.#sql`
       update messages set status='failed',last_error='Reaction delivery became ambiguous and was not retried'
@@ -13417,9 +13134,25 @@ export class PostgresFlorenceStore {
             and earlier.direction='outbound' and earlier.status='failed'
         )
     `;
+    const excludedChannels =
+      excludeChannelIds.length > 0
+        ? this.#sql`and m.channel_id not in ${this.#sql(excludeChannelIds)}`
+        : this.#sql``;
     const [row] = await this.#sql<{ source_id: string }[]>`
       select m.source_id from messages m join sources s on s.id=m.source_id
       where m.direction='outbound' and m.status='pending'
+        ${excludedChannels}
+        and not exists (
+          select 1 from messages active_send
+          where active_send.channel_id=m.channel_id and active_send.direction='outbound'
+            and active_send.status='sending'
+        )
+        and not exists (
+          select 1 from messages active_claim
+          where active_claim.channel_id=m.channel_id and active_claim.direction='inbound'
+            and active_claim.status='received' and active_claim.retry_at>${current}
+            and nullif(active_claim.receipt_detail->'inboundClaim'->>'claimId','') is not null
+        )
         and (s.metadata->>'familyWorkId' is null
           or s.metadata->>'familyWorkDeliverySupersededBy' is null)
         and coalesce(m.retry_at,m.not_before)<=${current}
@@ -13450,8 +13183,9 @@ export class PostgresFlorenceStore {
   }
 
   async beginOutbound(input: { sourceId: string; now: string }): Promise<OutboundMessage | null> {
+    const now = instant(input.now);
     const started = await this.#sql`
-      update messages m set status='sending',sending_at=${instant(input.now)},last_error=null
+      update messages m set status='sending',sending_at=${now},last_error=null
       from linq_channels c,sources s where m.source_id=${input.sourceId} and m.channel_id=c.id
         and s.id=m.source_id
         and m.direction='outbound' and m.status='pending'
@@ -13477,6 +13211,17 @@ export class PostgresFlorenceStore {
             where earlier.turn_id=m.turn_id and earlier.turn_part<m.turn_part
               and earlier.direction='outbound' and earlier.status in ('pending','sending')
           )
+        )
+        and not exists (
+          select 1 from messages active_send
+          where active_send.channel_id=m.channel_id and active_send.direction='outbound'
+            and active_send.status='sending' and active_send.source_id<>m.source_id
+        )
+        and not exists (
+          select 1 from messages active_claim
+          where active_claim.channel_id=m.channel_id and active_claim.direction='inbound'
+            and active_claim.status='received' and active_claim.retry_at>${now}
+            and nullif(active_claim.receipt_detail->'inboundClaim'->>'claimId','') is not null
         )
         and not exists (
           select 1
@@ -13525,9 +13270,9 @@ export class PostgresFlorenceStore {
         )
         and (
           source.metadata->>'familyWorkId' is null
+          or source.metadata->>'familyWorkDeliverySupersededBy' is not null
           or (
-            source.metadata->>'familyWorkDeliverySupersededBy' is null
-            and exists (
+            exists (
               select 1 from proactive_work work
               where work.id::text=source.metadata->>'familyWorkId' and work.kind='family_task'
                 and work.task_state->>'generation'=source.metadata->>'familyWorkGeneration'
@@ -15758,7 +15503,11 @@ async function terminalizeIssuedPartnerInvitation(
   invitation: IssuedPartnerInvitationRow,
   occurredAt: Date,
   reason: "declined" | "expired",
+  declineKind?: "carrier_opt_out" | "conversation_decline",
 ): Promise<boolean> {
+  if (reason === "declined" && declineKind === undefined) {
+    throw new FlorenceStoreConflict("A declined partner invitation requires its messaging disposition");
+  }
   const invalidated = await sql`
     update people set invitation_digest=null,invitation_expires_at=null,
       invitation_consumed_at=${occurredAt},messages_address=null,
@@ -15766,7 +15515,11 @@ async function terminalizeIssuedPartnerInvitation(
         then invitation_approval_source_id else null end,
       invitation_approved_at=case when ${reason}='expired'
         then invitation_approved_at else null end,
-      invitation_retry_at=null,invitation_last_error=null,updated_at=${occurredAt}
+      invitation_retry_at=null,invitation_last_error=null,
+      preferences=case when ${reason}='declined'
+        then preferences||${sql.json({ partnerInvitationDeclineKind: declineKind ?? null })}
+        else preferences end,
+      updated_at=${occurredAt}
     where id=${invitation.adult_id} and invitation_consumed_at is null
       and messages_address is not null
       and invitation_message_id=${invitation.invitation_message_id}
@@ -16297,7 +16050,7 @@ async function isCalendarAdultApprovalBound(
     where approval.source_id=${action.approval_source_id}
       and approval.direction='inbound'
       and prompt.direction='outbound' and prompt.move_kind in ('message','reply')
-      and prompt.status='sent' and prompt.turn_part=0
+      and prompt.status='sent'
       and prompt.channel_id=approval.channel_id
       and (prompt_source.occurred_at,prompt_source.id)
         < (approval_source.occurred_at,approval_source.id)
@@ -20794,13 +20547,14 @@ function visibleActiveFamilyWorkStatus(
 function visibleFamilyWork(
   row: VisibleFamilyWorkRow,
   responsibleAdultNames: ReadonlyMap<string, string>,
-): VisibleFamilyWork {
+): Omit<VisibleFamilyWork, "privateParticipantReply"> {
   const scheduled = scheduledFamilyWork(row.reminder_schedule);
   const state = familyWorkState(row.task_state);
   return {
     workId: row.id,
     candidateIds: [...(state.docketCandidateIds ?? [])],
     objective: row.objective,
+    completionCondition: state.completionCondition ?? null,
     responsibleAdultName: state.responsibleAdultId
       ? (responsibleAdultNames.get(state.responsibleAdultId) ?? null)
       : null,
@@ -29471,6 +29225,7 @@ async function markInboundSuperseded(
   }
   await sql`
     update messages set status='handled',handled_at=${handledAt},retry_at=null,
+      receipt_detail=nullif(coalesce(receipt_detail,'{}'::jsonb)-'inboundClaim','{}'::jsonb),
       last_error='Superseded by a newer message in this conversation'
     where source_id=${priorSourceId} and direction='inbound' and status='received'
   `;
@@ -29481,7 +29236,7 @@ async function markInboundSuperseded(
   await sql`
     update messages set status='failed',sending_at=null,retry_at=null,
       last_error='Superseded before delivery by a newer message in this conversation'
-    where direction='outbound' and status in ('pending','sending')
+    where direction='outbound' and status='pending'
       and turn_id in (${finalTurnId},${cueTurnId})
   `;
   await sql`
@@ -29494,12 +29249,14 @@ async function markInboundSuperseded(
   await sql`
     update calendar_actions set status='failed',retry_at=${handledAt},
       last_error='Superseded before provider execution by a newer message in this conversation'
-    where status='pending' and approval_source_id=${priorSourceId}
+    where status='pending' and last_error is null and approval_source_id=${priorSourceId}
   `;
   await sql`
     update people set invitation_approval_source_id=null,invitation_approved_at=null,
       invitation_retry_at=null,invitation_last_error=null,updated_at=${handledAt}
     where invitation_issued_at is null and invitation_approval_source_id=${priorSourceId}
+      and coalesce(invitation_last_error,'') not like
+        ${`${PARTNER_INVITATION_SEND_STARTED_PREFIX}%`}
   `;
 }
 
@@ -29698,7 +29455,8 @@ async function insertInbound(
       join sources pending_source on pending_source.id=pending.source_id
       join messages inbound on inbound.source_id=pending_source.parent_source_id
       join sources inbound_source on inbound_source.id=inbound.source_id
-      where pending.channel_id=${channel.id} and pending.direction='outbound' and pending.status='pending'
+      where pending.channel_id=${channel.id} and pending.direction='outbound'
+        and pending.status in ('pending','sending')
         and inbound.direction='inbound' and inbound.move_kind in ('message','reply')
       order by inbound_source.occurred_at desc,inbound.source_id desc limit 1
       for update of inbound,inbound_source

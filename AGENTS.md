@@ -39,6 +39,27 @@ Use Florence-owned code for the family-specific experience and concrete provider
 - Reminders support ordinary create/list/change/cancel/pause/resume/run/recurrence language. Longer work survives conversation turns, accepts steering or cancellation, and reports meaningful progress and a real terminal result.
 - Keep the small Pi/Hermes-derived typed tool-execution kernel. Do not grow it into a universal policy, evidence, delivery, approval, or connector framework.
 
+## Defensive-rule discipline
+
+- Be defensive at consequence boundaries: verified identity and audience, private-data movement,
+  retention or deletion, external effects and duplicate execution, provider-confirmed truth, and an
+  objective's real definition of done.
+- Every guard that can stop a turn must name the concrete person, data, effect, or truth claim it
+  protects and live in the deepest existing module that owns that consequence.
+- Internal formatting, bookkeeping, schema, classifier, or model-draft failures are repaired inside
+  the agent loop or normalized deterministically. They do not become a generic apology or make the
+  parent repeat an ordinary request.
+- Mark a parent-authored Message handled only after a valid semantic decision. Interpreter failure
+  keeps that same inbound pending for in-transcript correction or durable retry; it is never itself
+  a completed product outcome and never emits a generic error or retry bubble.
+- Recover in this order when safe: deterministic normalization, in-transcript agent correction,
+  bounded provider-request retry, the existing durable retry or replanning path, then an honest
+  partial result or exact blocker.
+- Preserve safe conversational value when rejecting an unsafe optional mutation. Do not discard the
+  whole response merely because one non-effect field is malformed.
+- A test that proves only rejection, silence, or fallback is insufficient when Florence could safely
+  recover and produce the requested parent-visible outcome.
+
 ## Household foundation
 
 - The standard household has two independently verified adults, represented children, a private Messages thread with each adult, one exact family group, each adult's own Google connection, and one Florence-created shared family calendar.

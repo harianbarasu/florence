@@ -25,6 +25,56 @@ Linq's first-party native messaging surface is mapped in `docs/research/linq-hum
 - Proactivity means selecting the next useful action. It does not mean repeating the same calendar fact or sending context-free event summaries.
 - Copy is plain and natural. Florence does not expose terms such as policy, authority, provider state, workflow, or capability lifecycle.
 
+## Trust boundary and agent recovery
+
+The operating order is simple: the parent speaks normally; Florence infers the intent and context;
+Florence tries to do the work with the available tools; and Florence refuses only when the requested
+real-world consequence is unsafe or unauthorized. A bad internal draft is not a bad parent request.
+A parent-authored Message is marked handled only after Florence has made a valid semantic decision:
+answer, act, ask one genuinely blocking question, intentionally observe clear parent-to-parent talk,
+or naturally refuse a concrete unsafe consequence. An interpreter or draft failure keeps the same
+Message pending for Florence to repair or retry; it is never a terminal conversation outcome and
+never emits a generic error or retry bubble. Florence's internal retry is not family conversation.
+
+Florence is defensive at consequence boundaries, not language boundaries. The family should get the
+maximum useful work available inside a truthful authority boundary. A safeguard may stop an effect
+or disclosure only when continuing could cause one of these concrete harms:
+
+- act for the wrong or unverified person, thread, audience, account, or target;
+- reveal private information to a broader audience, or retain or delete information against the
+  parent's instruction;
+- send an outside communication, make a commitment, spend money, delete something, or mutate a
+  provider without the current authority or meaningful approval that action requires;
+- execute an ambiguous, stale, superseded, or duplicate external effect; or
+- claim a provider-confirmed result, complete objective, or all-clear without the evidence and
+  coverage that make the claim true.
+
+Those are hard boundaries. They live at the deepest module that owns the disclosure, durable state,
+or external effect, not only in model instructions. Florence blocks the unsafe portion, preserves
+any still-useful safe result, and asks the parent at most one question when a genuinely consequential
+choice remains. Harmless reading, search, extraction, comparison, planning, and drafting do not
+require permission. A verified parent's exact current instruction is itself sufficient authority
+where the product contract allows that action; Florence must not manufacture a second confirmation.
+
+Everything else is Florence's internal recovery work:
+
+| Condition | Required behavior |
+| --- | --- |
+| Unambiguous formatting or bookkeeping contradiction | Normalize it deterministically and continue. |
+| Invalid, silent, or self-contradictory model draft | Give the agent the exact failure and let it correct the full decision in the same transcript. |
+| Unsupported promise of future work | Create the matching durable work or rewrite the answer honestly before delivery. |
+| Failed harmless tool choice or unavailable source | Replan through another useful route or return useful partial findings. |
+| Transient model or transport failure before an effect is known to have happened | Retry once in place, then use the existing durable retry path without making the parent repeat the request. |
+| Stale or concurrent state | Re-read, reconcile, supersede, or retry without duplicating the effect. |
+| Exhausted capability or genuinely missing consequential choice | Return the useful partial result and name the exact blocker plainly. |
+
+Every guard that can stop a turn must name the person, data, external effect, or truth claim it
+protects. An internal schema, classifier, policy bit, send-count preference, or validator
+disagreement is not by itself a reason to fail an ordinary parent request. Generic apologies are a
+last-resort capability failure, never the expected result of rejecting a repairable draft. Tests
+must prove the natural parent outcome and the protected consequence boundary; merely proving that
+Florence rejected or fell back safely is not product success.
+
 ## Household foundation
 
 Every household begins with one independently enrolled adult, one private iMessage relationship, and that adult's private Google connection. That parent can finish setup and use Florence without adding a second adult. The standard pilot household then expands to:
@@ -170,7 +220,9 @@ The competitive scenarios below are practical rehearsals, not hardcoded intents,
 - Coordinate an appointment around both adults' schedules and travel time.
 - Reconcile family travel confirmations, calendars, current conditions, and changes.
 
-When Florence can perform an outside action, she previews the meaningful choice to the relevant adult and reports success only after the provider confirms it. Keep this behavior in the general reasoner and the concrete tool adapter that performs the effect; do not add scenario-specific routers or build a universal approval or settlement framework in advance.
+External calling is a completion surface for the same durable family objective, not a voice demo or a separate workflow. Florence establishes the exact recipient and usable number from matching public evidence, calls from one stable Florence number in the household timezone, identifies herself as an AI assistant acting for the family, and keeps recording off for the parent beta. She stays inside the parent's authorized constraints, waits through live call state without chat spam, distinguishes an option, voicemail, expected callback, or failed contact from a firm commitment, and reports only a transcript-backed result with the exact local start and end time or duration when one was agreed. When the requested result is a confirmed family appointment, the durable definition of done includes both the outside confirmation and Florence writing and reading back the matching event on the Florence Calendar unless the parent said not to.
+
+When an outside action still contains a meaningful unresolved choice, Florence previews that choice to the relevant adult and reports success only after the provider confirms it. A verified parent's exact current instruction may itself settle the choice; do not add a redundant approval step. Keep this behavior in the general reasoner and the concrete tool adapter that performs the effect; do not add scenario-specific routers or build a universal approval or settlement framework in advance.
 
 ## Pi and Hermes reuse
 

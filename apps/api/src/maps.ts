@@ -213,6 +213,7 @@ const mapSearchPlaceSchema = z
   .object({
     name: z.string(),
     displayName: z.string(),
+    address: z.string(),
     lat: z.number(),
     lon: z.number(),
     type: z.string(),
@@ -222,6 +223,8 @@ const mapSearchPlaceSchema = z
     boundingBox: mapBoundingBoxResultSchema.nullable(),
     importance: z.number().nullable(),
     mapsUrl: z.string().url(),
+    phone: z.string().optional(),
+    website: z.string().optional(),
   })
   .strict();
 
@@ -544,6 +547,7 @@ const nominatimPlaceSchema = z
     boundingbox: z.array(z.union([z.string(), z.number()])).optional(),
     importance: z.number().optional(),
     address: z.record(z.string(), z.string()).optional(),
+    extratags: z.record(z.string(), z.string()).optional(),
     error: z.string().optional(),
   })
   .passthrough();
@@ -950,6 +954,7 @@ export class OpenStreetMapsClient implements FlorenceMapsClient {
       format: "jsonv2",
       limit,
       addressdetails: 1,
+      extratags: 1,
     });
     return this.#nominatimJson(url, nominatimSearchResponseSchema, signal);
   }
@@ -1245,9 +1250,27 @@ export class OpenStreetMapsClient implements FlorenceMapsClient {
 function normalizeSearchPlace(item: NominatimPlace): z.infer<typeof mapSearchPlaceSchema> {
   const lat = numeric(item.lat, "Nominatim latitude");
   const lon = numeric(item.lon, "Nominatim longitude");
+  const address = item.address ?? {};
+  const extraTags = item.extratags ?? {};
+  const phone = extraTags.phone ?? extraTags["contact:phone"];
+  const website = mapContactWebsite(extraTags.website ?? extraTags["contact:website"]);
+  const street = [address.house_number, address.road]
+    .filter((part): part is string => Boolean(part))
+    .join(" ");
+  const formattedAddress = [
+    street,
+    address.neighbourhood ?? address.suburb,
+    address.city ?? address.town ?? address.village,
+    address.state,
+    address.postcode,
+    address.country,
+  ]
+    .filter((part): part is string => Boolean(part))
+    .join(", ");
   return {
     name: item.name ?? item.display_name ?? "",
     displayName: item.display_name ?? "",
+    address: (formattedAddress || item.display_name || "").slice(0, 1_000),
     lat,
     lon,
     type: item.type ?? "",
@@ -1257,7 +1280,20 @@ function normalizeSearchPlace(item: NominatimPlace): z.infer<typeof mapSearchPla
     boundingBox: parseNominatimBounds(item.boundingbox),
     importance: item.importance ?? null,
     mapsUrl: googleMapsUrl(lat, lon),
+    ...(phone ? { phone: phone.slice(0, 100) } : {}),
+    ...(website ? { website: website.slice(0, 500) } : {}),
   };
+}
+
+function mapContactWebsite(value: string | undefined): string | null {
+  const candidate = value?.trim();
+  if (!candidate) return null;
+  try {
+    const url = new URL(candidate.includes("://") ? candidate : `https://${candidate}`);
+    return url.protocol === "http:" || url.protocol === "https:" ? url.toString() : null;
+  } catch {
+    return null;
+  }
 }
 
 function parseNominatimBounds(

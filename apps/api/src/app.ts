@@ -105,17 +105,18 @@ export function createDefaultDependencies(env: NodeJS.ProcessEnv = process.env):
           ...(browserbaseProjectId ? { projectId: browserbaseProjectId } : {}),
         })
       : null;
-  const blandApiKey = env.BLAND_API_KEY?.trim();
+  const blandConfigured = [env.BLAND_API_KEY, env.BLAND_FROM_PHONE].some((value) => Boolean(value?.trim()));
   const twilioConfigured = [env.TWILIO_ACCOUNT_SID, env.TWILIO_AUTH_TOKEN, env.TWILIO_PHONE_NUMBER].some(
     (value) => Boolean(value?.trim()),
   );
   const telephony =
-    blandApiKey || twilioConfigured
+    blandConfigured || twilioConfigured
       ? new ProviderTelephonyClient({
-          ...(blandApiKey
+          ...(blandConfigured
             ? {
                 bland: {
-                  apiKey: blandApiKey,
+                  apiKey: requiredEnv(env, "BLAND_API_KEY"),
+                  fromPhoneNumber: requiredEnv(env, "BLAND_FROM_PHONE"),
                   ...(env.BLAND_DEFAULT_VOICE?.trim()
                     ? { defaultVoice: env.BLAND_DEFAULT_VOICE.trim() }
                     : {}),

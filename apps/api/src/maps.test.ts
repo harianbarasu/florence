@@ -61,6 +61,18 @@ describe("OpenStreetMapsClient", () => {
           osm_id: 987,
           importance: 0.8,
           boundingbox: ["40.757", "40.759", "-73.987", "-73.984"],
+          address: {
+            house_number: "1560",
+            road: "Broadway",
+            city: "New York",
+            state: "New York",
+            postcode: "10036",
+            country: "United States",
+          },
+          extratags: {
+            phone: "+12125550123",
+            website: "www.timessquarenyc.org",
+          },
         },
       ]);
     });
@@ -85,7 +97,16 @@ describe("OpenStreetMapsClient", () => {
     expect(firstSearch).toMatchObject({
       operation: "search",
       count: 1,
-      results: [{ name: "Times Square", lat: 40.758, lon: -73.9855 }],
+      results: [
+        {
+          name: "Times Square",
+          address: "1560 Broadway, New York, New York, 10036, United States",
+          lat: 40.758,
+          lon: -73.9855,
+          phone: "+12125550123",
+          website: "https://www.timessquarenyc.org/",
+        },
+      ],
     });
     expect(reverse).toMatchObject({
       operation: "reverse",
@@ -100,6 +121,7 @@ describe("OpenStreetMapsClient", () => {
     expect(waits).toEqual([1_000, 1_000]);
     const firstHeaders = new Headers(fetchMock.mock.calls[0]?.[1]?.headers);
     expect(firstHeaders.get("User-Agent")).toContain("github.com/harianbarasu/florence");
+    expect(requestUrl(fetchMock.mock.calls[0]?.[0] ?? "").searchParams.get("extratags")).toBe("1");
     expect(florenceMapsResultSchema.safeParse(area).success).toBe(true);
   });
 

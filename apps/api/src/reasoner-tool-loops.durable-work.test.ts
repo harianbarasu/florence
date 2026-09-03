@@ -125,6 +125,91 @@ describe("Florence reasoner capability cutover", () => {
     expect(JSON.stringify(modelRequests[0]?.input)).toContain("recalledMemory");
   });
 
+  test("durable presentation compacts harmless draft excess around the authoritative result", async () => {
+    const authoritativeText = "The Saturday options are the library workshop and the park nature walk.";
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        parse(request: Record<string, unknown>) {
+          const review = defaultFamilyWorkCompletionReview(request);
+          if (review) return review;
+          return {
+            status: "completed",
+            output_parsed: {
+              outcome: "succeeded",
+              text: authoritativeText,
+              resumeAt: null,
+              progressText: null,
+              presentation: {
+                bubbles: [
+                  { text: "I found two good fits.", delayMs: -10 },
+                  { text: "I found two good fits.", delayMs: 200 },
+                  { text: "Both work well for a low-key Saturday.", delayMs: 9_000 },
+                  { text: authoritativeText, delayMs: 8_000 },
+                  { text: "This extra draft bubble is unnecessary.", delayMs: 0 },
+                ],
+                nativeMoves: null,
+              },
+            },
+            output: [],
+          };
+        },
+      },
+    } as never);
+    const state: FamilyWorkStateV1 = {
+      kind: "family_work_v1",
+      version: 1,
+      generation: 0,
+      phase: "ready",
+      claim: null,
+      activePhoneCall: null,
+      activeTextMessage: null,
+      pendingParticipantRequest: null,
+      browserSession: null,
+      continuationItems: [],
+      pendingCall: null,
+      steering: [],
+      progressRevision: 0,
+      terminal: null,
+    };
+
+    const result = await reasoner.continueFamilyWork(
+      {
+        workId: "family-work-saturday",
+        scheduledOccurrence: null,
+        objective: "Compare the supplied Saturday options and summarize the best fits.",
+        visibility: "private",
+        ownerAdultId: "adult-1",
+        origin: familyWorkOrigin("Which Saturday options look best?"),
+        household: {
+          householdId: "household-1",
+          familyLabel: "Test family",
+          timeZone: "America/Los_Angeles",
+          postalCode: "90045",
+          adults: [{ adultId: "adult-1", firstName: "Hari", displayName: "Hari Anbarasu" }],
+          children: [],
+        },
+        state,
+        currentTime: NOW,
+      },
+      {},
+    );
+
+    expect(result).toMatchObject({
+      kind: "terminal",
+      presentation: {
+        bubbles: [
+          { text: "I found two good fits.", delayMs: 0 },
+          {
+            text: "Both work well for a low-key Saturday.\n\nThis extra draft bubble is unnecessary.",
+            delayMs: 0,
+          },
+          { text: authoritativeText, delayMs: 5_000 },
+        ],
+        nativeMoves: null,
+      },
+    });
+  });
+
   test("durable work compacts complete history and preserves its recent tail before continuing", async () => {
     const oldResultUrl = "https://example.com/older-comparison";
     const recentResultUrl = "https://example.com/recent-comparison";
@@ -525,7 +610,7 @@ Compare the family options.
                     ...ordinaryDecision({
                       bubbleText: "I found the enrollment form. I’m sending the update now.",
                     }),
-                    policy: { retain: true, schedule: false, stopMessaging: false },
+                    policy: { retain: true, schedule: false },
                     familyWork: {
                       operation: "create",
                       workId: null,

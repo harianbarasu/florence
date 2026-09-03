@@ -71,11 +71,20 @@ Optional phone providers:
 
 | Variable | Contract |
 | --- | --- |
-| `BLAND_API_KEY` | Enables conversational outbound task calls when non-empty |
+| `BLAND_API_KEY` | Bland credential; enables conversational outbound task calls together with `BLAND_FROM_PHONE` |
+| `BLAND_FROM_PHONE` | Florence's exact owned E.164 Bland caller number; required with `BLAND_API_KEY` |
 | `BLAND_DEFAULT_VOICE` | Optional Bland voice ID; defaults to `mason` |
 | `TWILIO_ACCOUNT_SID` | Enables SMS/MMS, inbox polling, and one-way calls when all three Twilio values are present |
 | `TWILIO_AUTH_TOKEN` | Twilio account credential |
 | `TWILIO_PHONE_NUMBER` | Florence's exact E.164 Twilio sender/caller number |
+
+Before enabling Bland for a pilot, confirm the account's transcript-retention and
+redaction settings in writing and choose the shortest setting that still permits
+Florence's bounded post-call verification. `record: false` prevents Florence from
+requesting an audio recording, but Bland still processes and may retain the call
+transcript. Do not rehearse medical, financial, or other sensitive family calls
+until the applicable retention terms and provider agreement are in place; use a
+non-sensitive local-service scenario for the first live acceptance run.
 
 Optional bounded settings:
 
@@ -308,7 +317,15 @@ follow the reconciliation instructions above instead of starting the API.
     after sign-in and again after the provider mutation, read back the provider
     result, add the approved family event with Google readback, and close once in
     the family group. Repeat the sign-in boundary with the second adult and
-    confirm the two adults never share browser cookies or portal sessions.
+    confirm the two adults never share browser cookies or portal sessions. Place
+    one real local-service call from Florence's owned Bland number as well: start
+    from an ordinary parent request, establish the exact business and number,
+    identify Florence as an AI assistant calling for the family, keep recording
+    off, respect the supplied availability and commitment bounds, survive at
+    least one background poll, distinguish voicemail or an option from a firm
+    appointment, add any confirmed appointment to the Florence Calendar with
+    Google readback, and deliver the combined result once in the originating
+    private or family thread.
 10. Enable autodeploy only after the full synthetic journey and the two-phone experience pass.
 
 ## Recovery

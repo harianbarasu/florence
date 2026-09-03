@@ -14,7 +14,7 @@ import { createHash } from "node:crypto";
 const BLAND_API_BASE = "https://api.bland.ai/v1";
 const TWILIO_API_BASE = "https://api.twilio.com/2010-04-01/Accounts";
 const BLAND_DEFAULT_VOICE = "mason";
-const BLAND_DEFAULT_MODEL = "enhanced";
+const BLAND_DEFAULT_MODEL = "base";
 const TWILIO_DEFAULT_TTS_VOICE = "Polly.Joanna";
 const DEFAULT_TIMEOUT_MS = 20_000;
 const MAX_PROVIDER_RESPONSE_BYTES = 2 * 1_024 * 1_024;
@@ -22,9 +22,14 @@ const MAX_TASK_CHARS = 12_000;
 const MAX_MESSAGE_CHARS = 10_000;
 const MAX_TRANSCRIPT_CHARS = 50_000;
 const MAX_SUMMARY_CHARS = 8_000;
+const MAX_SUMMARY_PROMPT_CHARS = 2_000;
 const MAX_ERROR_CHARS = 1_000;
+const BLAND_DEFAULT_CALL_DURATION_MINUTES = 10;
+const BLAND_MAX_CALL_DURATION_MINUTES = 30;
 const BLAND_RECONCILIATION_LOOKBACK_MS = 60 * 60 * 1_000;
 const BLAND_RECONCILIATION_FUTURE_MARGIN_MS = 60 * 1_000;
+const BLAND_POST_CALL_RESULT_TIMEOUT_MS = 10 * 60 * 1_000;
+const BLAND_RECONCILIATION_TIMEOUT_MS = (BLAND_MAX_CALL_DURATION_MINUTES + 10) * 60 * 1_000;
 const BLAND_RECONCILIATION_CANDIDATE_LIMIT = 20;
 const BLAND_PENDING_CALL_PREFIX = "pending_bland_";
 const TWILIO_RECONCILIATION_LOOKBACK_MS = 60 * 60 * 1_000;
@@ -32,6 +37,20 @@ const TWILIO_RECONCILIATION_FUTURE_MARGIN_MS = 60 * 1_000;
 const TWILIO_RECONCILIATION_CANDIDATE_LIMIT = 100;
 const TWILIO_PENDING_SMS_PREFIX = "pending_twilio_sms_";
 const TWILIO_PENDING_CALL_PREFIX = "pending_twilio_call_";
+const BLAND_DEFAULT_FIRST_SENTENCE = "Hi, this is Florence, an AI assistant calling on behalf of a family.";
+const BLAND_DEFAULT_SUMMARY_PROMPT =
+  "Report the exact outcome of the family's objective. Distinguish a confirmed commitment from an available option, callback, voicemail, or failed contact. Include any confirmed date, local start and end time or duration, location, price or estimate, confirmation reference, next step, and unresolved family choice. Do not infer or invent missing details.";
+const BLAND_DEFAULT_DISPOSITIONS = [
+  "objective_completed",
+  "option_found_not_committed",
+  "family_decision_required",
+  "callback_expected",
+  "voicemail_reached",
+  "no_contact",
+  "wrong_number",
+  "provider_declined",
+  "do_not_contact",
+] as const;
 
 export type FlorenceTelephonyProvider = "bland" | "twilio";
 
@@ -41,6 +60,7 @@ export type FlorenceTelephonyOperation =
       readonly provider: "bland";
       readonly to: string;
       readonly task: string;
+      readonly timeZone: string;
       readonly firstSentence?: string;
       readonly voice?: string;
       readonly maxDurationMinutes?: number;
@@ -174,6 +194,7 @@ export interface FlorenceTelephonyClient {
 
 export interface BlandTelephonyOptions {
   readonly apiKey: string;
+  readonly fromPhoneNumber: string;
   readonly baseUrl?: string;
   readonly defaultVoice?: string;
 }
@@ -194,6 +215,7 @@ export interface ProviderTelephonyClientOptions {
 
 interface BlandConfig {
   readonly apiKey: string;
+  readonly fromPhoneNumber: string;
   readonly baseUrl: string;
   readonly defaultVoice: string;
 }
@@ -211,6 +233,12 @@ interface PendingTwilioSmsHandle {
   readonly fingerprint: string;
 }
 
+interface PendingBlandCallHandle {
+  readonly destination: string;
+  readonly operationDigest: string;
+  readonly requestedAt: number;
+}
+
 interface PendingTwilioCallHandle {
   readonly destination: string;
   readonly requestedAt: number;
@@ -225,7 +253,13 @@ const BLAND_TERMINAL_STATUSES = new Set([
   "cancelled",
   "unknown",
 ]);
-const BLAND_QUEUE_FAILURE_STATUSES = new Set(["pre-queue-error", "queue-error", "call-error"]);
+const BLAND_QUEUE_FAILURE_STATUSES = new Set([
+  "pre-queue-error",
+  "queue-error",
+  "call-error",
+  "complete-error",
+]);
+const BLAND_POSSIBLE_EFFECT_STATUSES = new Set(["unknown", "call-error", "complete-error"]);
 const TWILIO_MESSAGE_COMPLETED_STATUSES = new Set(["delivered", "read", "received"]);
 const TWILIO_MESSAGE_FAILED_STATUSES = new Set(["failed", "undelivered", "canceled"]);
 const TWILIO_CALL_FAILED_STATUSES = new Set(["failed", "busy", "no-answer", "canceled"]);
@@ -257,6 +291,7 @@ export class ProviderTelephonyClient implements FlorenceTelephonyClient {
     this.#bland = options.bland
       ? {
           apiKey: requireNonEmpty(options.bland.apiKey, "Bland API key", 10_000),
+          fromPhoneNumber: normalizePhone(options.bland.fromPhoneNumber),
           baseUrl: normalizeBaseUrl(options.bland.baseUrl ?? BLAND_API_BASE),
           defaultVoice: requireNonEmpty(
             options.bland.defaultVoice ?? BLAND_DEFAULT_VOICE,
@@ -299,11 +334,12 @@ export class ProviderTelephonyClient implements FlorenceTelephonyClient {
         case "ai_call_start": {
           const destination = normalizePhone(input.operation.to);
           const operationDigest = operationIdDigest(input.callId);
+          const requestedAt = Date.now();
           return this.#reconcileBlandCall(
             { ...input, operation: input.operation },
             destination,
             operationDigest,
-            pendingBlandCallHandle(destination, operationDigest),
+            pendingBlandCallHandle(destination, operationDigest, requestedAt),
             signal,
           );
         }
@@ -369,29 +405,32 @@ export class ProviderTelephonyClient implements FlorenceTelephonyClient {
     const operation = input.operation;
     const destination = normalizePhone(operation.to);
     const operationDigest = operationIdDigest(input.callId);
+    const requestedAt = Date.now();
+    if (operation.record === true) {
+      throw invalidInput("Florence does not record conversational calls during the parent beta.");
+    }
     const body: Record<string, unknown> = {
       phone_number: destination,
+      from: config.fromPhoneNumber,
       task: requireNonEmpty(operation.task, "Bland call task", MAX_TASK_CHARS),
       voice: optionalNonEmpty(operation.voice, "Bland voice", 200) ?? config.defaultVoice,
       model: BLAND_DEFAULT_MODEL,
-      max_duration: boundedInteger(operation.maxDurationMinutes ?? 3, 1, 30),
-      record: operation.record ?? true,
+      timezone: validTimeZone(operation.timeZone),
+      max_duration: boundedInteger(
+        operation.maxDurationMinutes ?? BLAND_DEFAULT_CALL_DURATION_MINUTES,
+        1,
+        BLAND_MAX_CALL_DURATION_MINUTES,
+      ),
+      record: false,
       wait_for_greeting: true,
       metadata: {
         florence_work_id: input.workId,
         florence_operation_id: operationDigest,
       },
     };
-    add(body, "first_sentence", optionalNonEmpty(operation.firstSentence, "Bland first sentence", 2_000));
-    add(body, "summary_prompt", optionalNonEmpty(operation.summaryPrompt, "Bland summary prompt", 4_000));
-    if (operation.dispositions) {
-      if (operation.dispositions.length > 20) {
-        throw invalidInput("Bland calls support at most 20 dispositions.");
-      }
-      body.dispositions = operation.dispositions.map((value) =>
-        requireNonEmpty(value, "Bland disposition", 300),
-      );
-    }
+    body.first_sentence = blandFirstSentence(operation.firstSentence);
+    body.summary_prompt = blandSummaryPrompt(operation.summaryPrompt);
+    body.dispositions = blandDispositions(operation.dispositions);
 
     let payload: Readonly<Record<string, unknown>>;
     try {
@@ -415,13 +454,18 @@ export class ProviderTelephonyClient implements FlorenceTelephonyClient {
       });
     } catch (error) {
       if (!(error instanceof AmbiguousMutationError)) throw error;
-      return this.#reconcileBlandCall(
-        input,
-        destination,
-        operationDigest,
-        pendingBlandCallHandle(destination, operationDigest),
-        signal,
-      );
+      const pendingHandle = pendingBlandCallHandle(destination, operationDigest, requestedAt);
+      if (signal?.aborted) {
+        return result(input, {
+          kind: "uncertain_effect",
+          providerId: pendingHandle,
+          providerStatus: "reconciling",
+          reason:
+            "The task changed while Bland was accepting the call. Florence kept the correlation handle and will not place another call.",
+          toPhoneNumberMasked: maskPhone(destination),
+        });
+      }
+      return this.#reconcileBlandCall(input, destination, operationDigest, pendingHandle, signal);
     }
   }
 
@@ -434,6 +478,11 @@ export class ProviderTelephonyClient implements FlorenceTelephonyClient {
   ): Promise<FlorenceTelephonyResult> {
     const config = this.#requireBland();
     const now = Date.now();
+    const pending = parsePendingBlandCallHandle(pendingHandle);
+    if (!pending || pending.destination !== destination || pending.operationDigest !== operationDigest) {
+      throw invalidInput("The pending Bland call handle does not match the original call.");
+    }
+    const reconciliationExpired = now - pending.requestedAt >= BLAND_RECONCILIATION_TIMEOUT_MS;
     const query = new URLSearchParams({
       to_number: destination,
       start_date: new Date(now - BLAND_RECONCILIATION_LOOKBACK_MS).toISOString(),
@@ -484,6 +533,18 @@ export class ProviderTelephonyClient implements FlorenceTelephonyClient {
         if (!match) throw invalidResponse("Bland reconciliation returned an incomplete match.");
         return normalizeBlandCall(input, match.providerId, match.payload);
       }
+      if (reconciliationExpired) {
+        return result(input, {
+          kind: "failed",
+          providerId: pendingHandle,
+          providerStatus: "confirmation-unknown",
+          reason:
+            matched.length > 1
+              ? "The provider shows more than one call matching the original request, so Florence could not safely determine which one it accepted. Florence will not dial again automatically."
+              : "The provider never exposed a call matching the original request, so Florence could not safely determine whether it accepted the call. Florence will not dial again automatically.",
+          toPhoneNumberMasked: maskPhone(destination),
+        });
+      }
       return result(input, {
         kind: "progress",
         providerId: pendingHandle,
@@ -496,6 +557,16 @@ export class ProviderTelephonyClient implements FlorenceTelephonyClient {
       });
     } catch (error) {
       if (signal?.aborted) throw error;
+      if (reconciliationExpired) {
+        return result(input, {
+          kind: "failed",
+          providerId: pendingHandle,
+          providerStatus: "confirmation-unknown",
+          reason:
+            "The provider did not make the original call confirmation safely recoverable. Florence will not dial again automatically.",
+          toPhoneNumberMasked: maskPhone(destination),
+        });
+      }
       return result(input, {
         kind: "progress",
         providerId: pendingHandle,
@@ -1083,6 +1154,43 @@ class AmbiguousMutationError extends Error {
   }
 }
 
+function blandFirstSentence(value: string | undefined): string {
+  const proposed = optionalNonEmpty(value, "Bland first sentence", 2_000);
+  if (!proposed) return BLAND_DEFAULT_FIRST_SENTENCE;
+  const purpose = proposed
+    .replace(/^(?:hi|hello|good (?:morning|afternoon|evening))[,!.\s]*/iu, "")
+    .replace(/^(?:this is|i(?:['’]m| am)) florence(?:,?\s+an ai assistant)?\s+calling\b/iu, "I'm calling")
+    .replace(/^(?:this is florence|i(?:['’]m| am) florence)(?:,?\s+an ai assistant)?[.!]?\s*/iu, "")
+    .trim();
+  if (!purpose) return BLAND_DEFAULT_FIRST_SENTENCE;
+  return boundedString(
+    `Hi, this is Florence, an AI assistant. ${purpose}`,
+    2_000,
+    BLAND_DEFAULT_FIRST_SENTENCE,
+  );
+}
+
+function blandSummaryPrompt(value: string | undefined): string {
+  const taskSpecific = optionalNonEmpty(value, "Bland summary prompt", MAX_SUMMARY_PROMPT_CHARS);
+  if (!taskSpecific) return BLAND_DEFAULT_SUMMARY_PROMPT;
+  const separator = " Task-specific focus: ";
+  const remaining = MAX_SUMMARY_PROMPT_CHARS - BLAND_DEFAULT_SUMMARY_PROMPT.length - separator.length - 1;
+  return `${BLAND_DEFAULT_SUMMARY_PROMPT}${separator}${taskSpecific.slice(0, Math.max(0, remaining))}`;
+}
+
+function blandDispositions(values: readonly string[] | undefined): readonly string[] {
+  const merged: string[] = [...BLAND_DEFAULT_DISPOSITIONS];
+  const seen = new Set(merged.map((value) => value.toLocaleLowerCase()));
+  for (const raw of values ?? []) {
+    const value = requireNonEmpty(raw, "Bland disposition", 300);
+    const identity = value.toLocaleLowerCase();
+    if (seen.has(identity)) continue;
+    seen.add(identity);
+    if (merged.length < 20) merged.push(value);
+  }
+  return merged;
+}
+
 function normalizeBlandCall(
   input: FlorenceTelephonyRunInput,
   providerId: string,
@@ -1091,35 +1199,84 @@ function normalizeBlandCall(
   const status = normalizedBlandStatus(payload);
   if (!status) throw invalidResponse("Bland returned a call without its status.");
   const summary = readRecordString(payload, "summary", MAX_SUMMARY_CHARS);
-  const disposition = readRecordString(payload, "disposition", 1_000);
+  const disposition =
+    readRecordString(payload, "disposition_tag", 1_000) ?? readRecordString(payload, "disposition", 1_000);
   const transcript = readRecordString(payload, "concatenated_transcript", MAX_TRANSCRIPT_CHARS);
   const terminal = isBlandTerminalStatus(status);
-  const resultReady = Boolean(summary || disposition || transcript);
-  const waitingForPostCallResult = status === "completed" && !resultReady;
-  const kind = waitingForPostCallResult
-    ? "progress"
-    : status === "completed"
-      ? "completed"
-      : terminal
-        ? "failed"
-        : "progress";
+  const possibleEffect = blandMayHaveReachedRecipient(payload, status);
+  const resultReady = Boolean(transcript);
+  const waitingForPostCallResult = (status === "completed" || possibleEffect) && !resultReady;
+  const postCallResultExpired = waitingForPostCallResult && blandPostCallResultExpired(payload, Date.now());
+  const kind = postCallResultExpired
+    ? "failed"
+    : waitingForPostCallResult
+      ? "progress"
+      : status === "completed" || (possibleEffect && resultReady)
+        ? "completed"
+        : terminal
+          ? "failed"
+          : "progress";
   return result(input, {
     kind,
     providerId,
     providerStatus: status,
-    reason: waitingForPostCallResult
-      ? "The call has ended, but Bland is still preparing its summary, disposition, or transcript."
-      : kind === "failed"
-        ? providerFailureReason(payload, `Bland ended the call with status ${status}.`)
-        : null,
+    reason: postCallResultExpired
+      ? "The call ended without a usable transcript-backed result, so Florence cannot verify what the recipient agreed to and will not call again automatically."
+      : waitingForPostCallResult
+        ? "The call has ended or reached an uncertain terminal state, and Bland is still preparing its transcript-backed result."
+        : kind === "failed"
+          ? providerFailureReason(payload, `Bland ended the call with status ${status}.`)
+          : null,
     answeredBy: readRecordString(payload, "answered_by", 200),
-    durationSeconds: minutesToSeconds(readRecordNumber(payload, "call_length")),
+    durationSeconds: blandDurationSeconds(payload),
     summary,
     disposition,
     transcript,
     recordingUrl: readRecordUrl(payload, "recording_url"),
     toPhoneNumberMasked: maskOptionalPhone(readRecordString(payload, "to", 100)),
   });
+}
+
+function blandMayHaveReachedRecipient(payload: Readonly<Record<string, unknown>>, status: string): boolean {
+  const queueStatus = normalizedStatusValue(readRecordString(payload, "queue_status", 100));
+  return (
+    BLAND_POSSIBLE_EFFECT_STATUSES.has(status) ||
+    (queueStatus !== null && BLAND_POSSIBLE_EFFECT_STATUSES.has(queueStatus))
+  );
+}
+
+function blandPostCallResultExpired(payload: Readonly<Record<string, unknown>>, now: number): boolean {
+  const endedAt =
+    estimatedBlandCallEnd(payload, "started_at", integerFromStringOrNumber(payload.corrected_duration)) ??
+    estimatedBlandCallEnd(
+      payload,
+      "started_at",
+      minutesToSeconds(readRecordNumber(payload, "call_length")),
+    ) ??
+    estimatedBlandCallEnd(
+      payload,
+      "created_at",
+      minutesToSeconds(readRecordNumber(payload, "call_length")),
+    ) ??
+    readRecordInstant(payload, "end_at");
+  return endedAt === null || now - endedAt >= BLAND_POST_CALL_RESULT_TIMEOUT_MS;
+}
+
+function estimatedBlandCallEnd(
+  payload: Readonly<Record<string, unknown>>,
+  timestampKey: string,
+  durationSeconds: number | null,
+): number | null {
+  const startedAt = readRecordInstant(payload, timestampKey);
+  if (startedAt === null || durationSeconds === null) return null;
+  return startedAt + durationSeconds * 1_000;
+}
+
+function blandDurationSeconds(payload: Readonly<Record<string, unknown>>): number | null {
+  return (
+    integerFromStringOrNumber(payload.corrected_duration) ??
+    minutesToSeconds(readRecordNumber(payload, "call_length"))
+  );
 }
 
 function normalizeTwilioCall(
@@ -1249,30 +1406,47 @@ function operationIdDigest(callId: string): string {
   return createHash("sha256").update(validCorrelationId(callId, "callId")).digest("hex");
 }
 
-function pendingBlandCallHandle(destination: string, operationDigest: string): string {
+function pendingBlandCallHandle(destination: string, operationDigest: string, requestedAt: number): string {
   const digest = requireNonEmpty(operationDigest, "Bland operation digest", 64);
   if (!/^[0-9a-f]{64}$/.test(digest)) throw invalidInput("The Bland operation digest is invalid.");
-  return `${BLAND_PENDING_CALL_PREFIX}${digest}_${Buffer.from(normalizePhone(destination)).toString("base64url")}`;
+  const roundedRequestedAt = Math.round(requestedAt);
+  if (!Number.isSafeInteger(roundedRequestedAt) || roundedRequestedAt <= 0) {
+    throw invalidInput("The Bland request time is invalid.");
+  }
+  return `${BLAND_PENDING_CALL_PREFIX}${roundedRequestedAt.toString(36)}_${digest}_${Buffer.from(
+    normalizePhone(destination),
+  ).toString("base64url")}`;
 }
 
-function parsePendingBlandCallHandle(
-  providerId: string,
-): { readonly destination: string; readonly operationDigest: string } | null {
+function parsePendingBlandCallHandle(providerId: string): PendingBlandCallHandle | null {
   if (!providerId.startsWith(BLAND_PENDING_CALL_PREFIX)) return null;
   const encoded = providerId.slice(BLAND_PENDING_CALL_PREFIX.length);
-  const operationDigest = encoded.slice(0, 64);
-  if (!/^[0-9a-f]{64}$/.test(operationDigest) || encoded[64] !== "_") {
+  const firstSeparator = encoded.indexOf("_");
+  const digestStart = firstSeparator + 1;
+  const destinationSeparator = digestStart + 64;
+  const encodedRequestedAt = encoded.slice(0, firstSeparator);
+  const operationDigest = encoded.slice(digestStart, destinationSeparator);
+  if (
+    firstSeparator <= 0 ||
+    encoded[destinationSeparator] !== "_" ||
+    !/^[0-9a-f]{64}$/.test(operationDigest) ||
+    !/^[0-9a-z]+$/.test(encodedRequestedAt)
+  ) {
+    throw invalidInput("The pending Bland call handle is invalid.");
+  }
+  const requestedAt = Number.parseInt(encodedRequestedAt, 36);
+  if (!Number.isSafeInteger(requestedAt) || requestedAt <= 0) {
     throw invalidInput("The pending Bland call handle is invalid.");
   }
   let destination: string;
   try {
-    destination = Buffer.from(encoded.slice(65), "base64url").toString("utf8");
+    destination = Buffer.from(encoded.slice(destinationSeparator + 1), "base64url").toString("utf8");
   } catch (error) {
     throw new FlorenceTelephonyError("invalid_input", "The pending Bland call handle is invalid.", {
       cause: error,
     });
   }
-  return { destination: normalizePhone(destination), operationDigest };
+  return { destination: normalizePhone(destination), operationDigest, requestedAt };
 }
 
 function pendingTwilioSmsHandle(
@@ -1584,10 +1758,6 @@ function providerFailureReason(payload: Readonly<Record<string, unknown>>, fallb
   );
 }
 
-function add(target: Record<string, unknown>, key: string, value: unknown): void {
-  if (value !== undefined) target[key] = value;
-}
-
 function escapeXml(value: string): string {
   return value
     .replaceAll("&", "&amp;")
@@ -1609,6 +1779,13 @@ function integerFromStringOrNumber(value: unknown): number | null {
 function readRecordNumber(value: Readonly<Record<string, unknown>>, key: string): number | null {
   const candidate = value[key];
   return typeof candidate === "number" && Number.isFinite(candidate) ? candidate : null;
+}
+
+function readRecordInstant(value: Readonly<Record<string, unknown>>, key: string): number | null {
+  const candidate = value[key];
+  if (typeof candidate !== "string") return null;
+  const instant = Date.parse(candidate);
+  return Number.isFinite(instant) ? instant : null;
 }
 
 function readRecordString(
@@ -1676,6 +1853,18 @@ function boundedInteger(value: number, minimum: number, maximum: number): number
     throw invalidInput(`Expected an integer between ${minimum} and ${maximum}.`);
   }
   return value;
+}
+
+function validTimeZone(value: string): string {
+  const normalized = requireNonEmpty(value, "Bland call timezone", 200);
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: normalized }).format(0);
+  } catch (error) {
+    throw new FlorenceTelephonyError("invalid_input", "The Bland call timezone is invalid.", {
+      cause: error,
+    });
+  }
+  return normalized;
 }
 
 function boundedString(value: string, maximumChars: number, fallback: string): string {

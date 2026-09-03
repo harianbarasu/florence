@@ -49,6 +49,57 @@ function testRegistry(executions: string[], resolvedArguments: JsonValue[]) {
 }
 
 describe("general agent capability lifecycle", () => {
+  test("removes SDK parser metadata when a structured answer is replayed for correction", async () => {
+    const requests: Array<{ readonly input?: unknown }> = [];
+    let turn = 0;
+    let followUpSent = false;
+    await runAgentLoop({
+      client: {} as never,
+      request: { model: "test-model" },
+      modelCall: (request) => {
+        requests.push(request);
+        turn += 1;
+        if (turn === 1) {
+          return {
+            status: "completed",
+            output: [
+              {
+                id: "structured-message",
+                type: "message",
+                role: "assistant",
+                status: "completed",
+                content: [
+                  {
+                    type: "output_text",
+                    text: '{"answer":"first"}',
+                    annotations: [],
+                    parsed: { answer: "first" },
+                  },
+                ],
+              },
+            ],
+            output_parsed: { answer: "first" },
+            output_text: '{"answer":"first"}',
+          } as never;
+        }
+        return response([], { answer: "second" }) as never;
+      },
+      transcript: [],
+      registry: new CapabilityRegistry<TestContext>([]),
+      getCapabilityContext: () => ({ allowWrites: false }),
+      isUsableFinal: () => true,
+      getFollowUpInput: () => {
+        if (followUpSent) return undefined;
+        followUpSent = true;
+        return [{ role: "user", content: "Correct the answer." }];
+      },
+    });
+
+    expect(requests).toHaveLength(2);
+    expect(JSON.stringify(requests[1]?.input)).toContain('{\\"answer\\":\\"first\\"}');
+    expect(JSON.stringify(requests[1]?.input)).not.toContain('"parsed"');
+  });
+
   test("continues through as many useful tool turns as the task needs by default", async () => {
     const executions: string[] = [];
     const registry = testRegistry(executions, []);

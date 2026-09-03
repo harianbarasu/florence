@@ -75,6 +75,7 @@ import type {
   JsonObject,
   LinqAuthority,
   MessagesEnrollmentResult,
+  OutboundMessage,
   OutboundNativeMove,
   OutboundNativeMoveDraft,
   PostgresFlorenceStore,
@@ -215,6 +216,8 @@ const RETRY_MS = 15_000;
 const FAMILY_WORK_RUNTIME_FAILURE_PREFIX = "family-work-runtime-failure-v1";
 const FAMILY_WORK_RUNTIME_FAILURE_LIMIT = 3;
 const LINQ_TYPING_REFRESH_MS = 60_000;
+const INBOUND_CLAIM_REFRESH_MS = 45_000;
+const MAX_CONCURRENT_CONVERSATIONS = 8;
 const SHUTDOWN_ABORT_MESSAGE = "Florence is shutting down";
 type OutboundDeliveryDisposition = "sent_now" | "already_sent" | "claimed" | "failed";
 const ARTIFACT_PURGE_INTERVAL_MS = 60 * 60_000;
@@ -227,8 +230,11 @@ type ActiveInbound = {
   latestOccurredAt: string;
   channelId: string;
   providerConversationId: string;
+  inboundClaim: InboundTurn["inboundClaim"];
   controller: AbortController;
   knownSourceIds: Set<string>;
+  renewalTimer: ReturnType<typeof setTimeout> | null;
+  promise: Promise<void> | null;
 };
 
 type InboundPresence = { stop: () => void };
@@ -250,8 +256,12 @@ export class Florence {
   readonly #linqSenderPhoneNumber: string | null;
   readonly #setupOrigin: string | null;
   readonly #now: () => Date;
-  #activeRun: Promise<boolean> | null = null;
-  #activeInbound: ActiveInbound | null = null;
+  #activeRuns = new Set<Promise<boolean>>();
+  #activeInbounds = new Map<string, ActiveInbound>();
+  #pendingInboundClaims = 0;
+  #activeBackgroundRun: Promise<boolean> | null = null;
+  #activeOutboundDeliveries = new Set<Promise<OutboundDeliveryDisposition>>();
+  #outboundSelectionTail: Promise<void> = Promise.resolve();
   #activeFamilyWork = new Map<string, { controller: AbortController; promise: Promise<void> }>();
   #pendingInboundAccepts = new Set<Promise<unknown>>();
   #nextArtifactPurgeAt = 0;
@@ -824,25 +834,50 @@ export class Florence {
     } | null = null;
 
     if (invitation) {
-      if (invitation.state === "declined") return true;
-      if (
+      if (invitation.state === "declined") {
+        if (input.carrierOptOut || invitation.messagingStopped) return true;
+        if (!this.#reasoner) {
+          throw new LinqError(
+            "provider_retryable",
+            "Florence setup interpretation is temporarily unavailable",
+            true,
+          );
+        }
+        let conversation: Awaited<ReturnType<FlorenceReasoner["converseDuringSetup"]>>;
+        try {
+          conversation = await this.#reasoner.converseDuringSetup({
+            stage: "partner_invited",
+            parentName: null,
+            currentMessage: { text: input.text, occurredAt: input.occurredAt },
+            recentMessages: [],
+            nextStep: "fresh_invitation_required",
+          });
+        } catch (error) {
+          throw new LinqError(
+            "provider_retryable",
+            `Florence could not interpret the former invited partner's reply: ${errorText(error)}`,
+            true,
+          );
+        }
+        bubbles = conversation.bubbles;
+        idempotencyPrefix = "partner-setup-reply";
+      } else if (
         (invitation.state === "issued" ||
           invitation.state === "expired" ||
           invitation.refreshProviderEventId !== undefined) &&
         Date.parse(input.occurredAt) <= Date.parse(invitation.handshakeAt)
       ) {
         return true;
-      }
-      if (input.carrierOptOut) {
+      } else if (input.carrierOptOut) {
         await this.#store.declinePartnerInvitation({
           adultId: invitation.adultId,
           providerConversationId: input.providerConversationId,
           identitySubjectDigest: input.identitySubjectDigest,
           occurredAt: input.occurredAt,
+          kind: "carrier_opt_out",
         });
         return true;
-      }
-      if (
+      } else if (
         invitation.state === "expired" ||
         (invitation.state === "awaiting_reply" && invitation.refreshProviderEventId !== undefined)
       ) {
@@ -869,12 +904,13 @@ export class Florence {
             true,
           );
         }
-        if (conversation.stopMessaging || conversation.declineInvitation) {
+        if (conversation.declineInvitation) {
           await this.#store.declinePartnerInvitation({
             adultId: invitation.adultId,
             providerConversationId: input.providerConversationId,
             identitySubjectDigest: input.identitySubjectDigest,
             occurredAt: input.occurredAt,
+            kind: "conversation_decline",
           });
           return true;
         }
@@ -895,9 +931,10 @@ export class Florence {
         });
         const setupUrl = `${this.#setupOrigin}/#s=${encodeURIComponent(setup.token)}`;
         bubbles = [
-          ...(conversation.requestsFreshLink
+          ...conversation.bubbles,
+          ...(conversation.requestsFreshLink && conversation.bubbles.length === 0
             ? [{ text: "Of course—here’s a fresh private setup link.", delayMs: 0 }]
-            : conversation.bubbles),
+            : []),
           { text: setupUrl, delayMs: 0 },
         ];
         pendingPartnerEnrollment = {
@@ -938,12 +975,13 @@ export class Florence {
             true,
           );
         }
-        if (conversation.stopMessaging || conversation.declineInvitation) {
+        if (conversation.declineInvitation) {
           await this.#store.declinePartnerInvitation({
             adultId: invitation.adultId,
             providerConversationId: input.providerConversationId,
             identitySubjectDigest: input.identitySubjectDigest,
             occurredAt: input.occurredAt,
+            kind: "conversation_decline",
           });
           return true;
         }
@@ -964,7 +1002,10 @@ export class Florence {
           });
           const setupUrl = `${this.#setupOrigin}/#s=${encodeURIComponent(setup.token)}`;
           bubbles = [
-            { text: "Thanks—here’s your private setup link.", delayMs: 0 },
+            ...conversation.bubbles,
+            ...(conversation.requestsFreshLink && conversation.bubbles.length === 0
+              ? [{ text: "Of course—here’s your private setup link.", delayMs: 0 }]
+              : []),
             { text: setupUrl, delayMs: 0 },
           ];
           pendingPartnerEnrollment = {
@@ -1010,6 +1051,7 @@ export class Florence {
                 providerConversationId: input.providerConversationId,
                 identitySubjectDigest: input.identitySubjectDigest,
                 occurredAt: input.occurredAt,
+                kind: "carrier_opt_out",
               });
             }
           }
@@ -1033,37 +1075,35 @@ export class Florence {
         occurredAt: input.occurredAt,
       });
       const setupUrl = `${this.#setupOrigin}/#s=${encodeURIComponent(setup.token)}`;
-      const fallback = {
-        stopMessaging: false,
-        declineInvitation: false,
-        requestsFreshLink: false,
-        continueWithAvailableWork: false,
-        bubbles: [
-          {
-            text: "Hey—I’m Florence. I help parents keep school, schedules, and family loose ends from becoming another job. Here’s your private setup link.",
-            delayMs: 0,
-          },
-        ],
-      };
-      let conversation = fallback;
-      if (this.#reasoner) {
-        try {
-          conversation = await this.#reasoner.converseDuringSetup({
-            stage: "unclaimed",
-            parentName: null,
-            currentMessage: { text: input.text, occurredAt: input.occurredAt },
-            recentMessages: [],
-            nextStep: "signed_link_will_follow",
-          });
-        } catch {
-          conversation = fallback;
-        }
+      if (!this.#reasoner) {
+        throw new LinqError(
+          "provider_retryable",
+          "Florence setup interpretation is temporarily unavailable",
+          true,
+        );
       }
-      if (conversation.stopMessaging || conversation.declineInvitation) return true;
+      let conversation: Awaited<ReturnType<FlorenceReasoner["converseDuringSetup"]>>;
+      try {
+        conversation = await this.#reasoner.converseDuringSetup({
+          stage: "unclaimed",
+          parentName: null,
+          currentMessage: { text: input.text, occurredAt: input.occurredAt },
+          recentMessages: [],
+          nextStep: "signed_link_will_follow",
+        });
+      } catch (error) {
+        throw new LinqError(
+          "provider_retryable",
+          `Florence could not interpret the founder's setup message: ${errorText(error)}`,
+          true,
+        );
+      }
+      if (conversation.declineInvitation) return true;
       bubbles = [
-        ...(conversation.requestsFreshLink
+        ...conversation.bubbles,
+        ...(conversation.requestsFreshLink && conversation.bubbles.length === 0
           ? [{ text: "Of course—here’s your private setup link.", delayMs: 0 }]
-          : conversation.bubbles),
+          : []),
         { text: setupUrl, delayMs: 0 },
       ];
       idempotencyPrefix = "founder-setup";
@@ -1308,8 +1348,8 @@ export class Florence {
   }
 
   async acceptInbound(input: AcceptInboundInput): Promise<AcceptInboundResult | null> {
-    const active = this.#activeInbound;
-    const sameActiveConversation = active?.providerConversationId === input.providerConversationId;
+    const active = this.#activeInbounds.get(input.providerConversationId);
+    const sameActiveConversation = active !== undefined;
     const incomingSourceId = deterministicUuid(`linq-v3\0signal\0${input.providerEventId}`);
     const supersedesActive = Boolean(
       active &&
@@ -1330,7 +1370,7 @@ export class Florence {
       if (supersedesActive) active.controller.abort();
     }
     const result = await acceptance;
-    const currentActive = this.#activeInbound;
+    const currentActive = this.#activeInbounds.get(input.providerConversationId);
     if (
       result &&
       currentActive &&
@@ -1357,8 +1397,8 @@ export class Florence {
     input: AcceptInboundEnvelopeInput,
     prepare: (context: InboundPreparationContext) => Promise<PreparedInboundContent>,
   ): Promise<AcceptInboundResult | null> {
-    const active = this.#activeInbound;
-    const sameActiveConversation = active?.providerConversationId === input.providerConversationId;
+    const active = this.#activeInbounds.get(input.providerConversationId);
+    const sameActiveConversation = active !== undefined;
     const incomingSourceId = deterministicUuid(`linq-v3\0signal\0${input.providerEventId}`);
     const supersedesActive = Boolean(
       active &&
@@ -1367,7 +1407,7 @@ export class Florence {
     );
     const acceptance = this.#store.acceptInboundWithPreparation(input, prepare, {
       resolveSupersedesSourceId: () => {
-        const currentActive = this.#activeInbound;
+        const currentActive = this.#activeInbounds.get(input.providerConversationId);
         if (
           !currentActive ||
           currentActive.providerConversationId !== input.providerConversationId ||
@@ -1393,7 +1433,7 @@ export class Florence {
       if (supersedesActive) active.controller.abort();
     }
     const result = await acceptance;
-    const currentActive = this.#activeInbound;
+    const currentActive = this.#activeInbounds.get(input.providerConversationId);
     if (
       result &&
       currentActive &&
@@ -1429,12 +1469,19 @@ export class Florence {
   }
 
   runOnce(): Promise<boolean> {
-    if (this.#activeRun) return this.#activeRun;
+    return this.#runTrackedCycle(false);
+  }
+
+  #dispatchOnce(): Promise<boolean> {
+    return this.#runTrackedCycle(true);
+  }
+
+  #runTrackedCycle(detachForeground: boolean): Promise<boolean> {
     if (this.#stopping) return Promise.resolve(false);
-    const run = this.#runCycle().finally(() => {
-      if (this.#activeRun === run) this.#activeRun = null;
+    const run = this.#runCycle(detachForeground).finally(() => {
+      this.#activeRuns.delete(run);
     });
-    this.#activeRun = run;
+    this.#activeRuns.add(run);
     return run;
   }
 
@@ -1462,38 +1509,59 @@ export class Florence {
   }
 
   hasPendingBackgroundWork(): boolean {
-    return this.#pendingInboundAccepts.size > 0 || this.#activeFamilyWork.size > 0;
+    return (
+      this.#pendingInboundAccepts.size > 0 ||
+      this.#pendingInboundClaims > 0 ||
+      this.#activeInbounds.size > 0 ||
+      this.#activeBackgroundRun !== null ||
+      this.#activeFamilyWork.size > 0
+    );
   }
 
-  async #runCycle(): Promise<boolean> {
-    let worked = false;
-    let inboundPresence: InboundPresence | null = null;
-    await this.#settleInboundAccepts();
+  async #runCycle(detachForeground: boolean): Promise<boolean> {
     if (this.#stopping) return false;
+    const inbound = await this.#claimNextInbound();
+    if (inbound) {
+      const execution = this.#executeInbound(inbound.turn, inbound.active);
+      if (detachForeground) {
+        void execution.catch((error: unknown) => console.error("Florence inbound cleanup failed", error));
+      } else {
+        await execution;
+      }
+      return true;
+    }
+    const outbound = await this.#claimNextOutbound();
+    if (outbound) {
+      const delivery = this.#launchClaimedOutbound(outbound);
+      if (detachForeground) {
+        void delivery.catch((error: unknown) => console.error("Florence outbound delivery failed", error));
+      } else {
+        await delivery;
+      }
+      return true;
+    }
+    if (this.#stopping) return false;
+    if (this.#activeBackgroundRun) {
+      return detachForeground ? false : this.#activeBackgroundRun;
+    }
+    if (this.#activeInbounds.size > 0 || this.#activeOutboundDeliveries.size > 0) return false;
+    let backgroundRun: Promise<boolean>;
+    backgroundRun = this.#runBackgroundCycle().finally(() => {
+      if (this.#activeBackgroundRun === backgroundRun) this.#activeBackgroundRun = null;
+      this.#wake();
+    });
+    this.#activeBackgroundRun = backgroundRun;
+    if (detachForeground) {
+      void backgroundRun.catch((error: unknown) => console.error("Florence background work failed", error));
+      return true;
+    }
+    return backgroundRun;
+  }
+
+  async #runBackgroundCycle(): Promise<boolean> {
+    let worked = false;
     await this.#purgeExpiredArtifacts();
     if (this.#stopping) return false;
-    const inbound = await this.#store.readNextInbound(this.#now().toISOString());
-    if (this.#stopping) return false;
-    if (inbound) {
-      inboundPresence = await this.#handleInbound(inbound);
-      worked = true;
-    }
-    try {
-      if (this.#stopping) return worked;
-      await this.#settleInboundAccepts();
-      if (this.#stopping) return worked;
-      const outbound = await this.#store.readNextOutbound(this.#now().toISOString());
-      await this.#settleInboundAccepts();
-      if (outbound) {
-        await this.#deliverOutbound(outbound.sourceId);
-        worked = true;
-      }
-    } finally {
-      inboundPresence?.stop();
-    }
-    if (this.#stopping) return worked;
-    await this.#settleInboundAccepts();
-    if (this.#stopping) return worked;
     const familyGroup = this.#linqSenderPhoneNumber
       ? await this.#store.readNextFamilyGroupCreation(this.#now().toISOString())
       : null;
@@ -1516,15 +1584,11 @@ export class Florence {
       worked = true;
     }
     if (this.#stopping) return worked;
-    await this.#settleInboundAccepts();
-    if (this.#stopping) return worked;
     const partnerInvitation = await this.#store.readNextPartnerInvitation(this.#now().toISOString());
     if (partnerInvitation) {
       await this.#executePartnerInvitation(partnerInvitation);
       worked = true;
     }
-    if (this.#stopping) return worked;
-    await this.#settleInboundAccepts();
     if (this.#stopping) return worked;
     const calendar = await this.#store.readNextCalendarAction(this.#now().toISOString());
     if (calendar) {
@@ -1550,12 +1614,19 @@ export class Florence {
   async #drainActiveWork(): Promise<void> {
     while (true) {
       const shutdownReason = new Error(SHUTDOWN_ABORT_MESSAGE);
-      this.#activeInbound?.controller.abort(shutdownReason);
+      for (const active of this.#activeInbounds.values()) {
+        if (active.renewalTimer) clearTimeout(active.renewalTimer);
+        active.renewalTimer = null;
+        active.controller.abort(shutdownReason);
+      }
       for (const active of this.#activeFamilyWork.values()) active.controller.abort(shutdownReason);
 
       const pending = [
-        ...(this.#activeRun ? [this.#activeRun] : []),
+        ...this.#activeRuns,
         ...this.#pendingInboundAccepts,
+        ...[...this.#activeInbounds.values()].flatMap((active) => (active.promise ? [active.promise] : [])),
+        ...(this.#activeBackgroundRun ? [this.#activeBackgroundRun] : []),
+        ...this.#activeOutboundDeliveries,
         ...[...this.#activeFamilyWork.values()].map((active) => active.promise),
       ];
       if (pending.length === 0) return;
@@ -1563,9 +1634,138 @@ export class Florence {
     }
   }
 
-  async #settleInboundAccepts(): Promise<void> {
-    while (this.#pendingInboundAccepts.size > 0) {
-      await Promise.allSettled([...this.#pendingInboundAccepts]);
+  async #claimNextInbound(): Promise<{ turn: InboundTurn; active: ActiveInbound } | null> {
+    if (
+      this.#stopping ||
+      this.#activeInbounds.size + this.#pendingInboundClaims >= MAX_CONCURRENT_CONVERSATIONS
+    ) {
+      return null;
+    }
+    this.#pendingInboundClaims += 1;
+    try {
+      const turn = await this.#store.readNextInbound(this.#now().toISOString(), {
+        excludeChannelIds: [...this.#activeInbounds.values()].map((active) => active.channelId),
+      });
+      if (!turn) return null;
+      if (this.#stopping || this.#activeInbounds.has(turn.authority.providerConversationId)) {
+        await this.#store.releaseInboundClaim({
+          sourceId: turn.message.sourceId,
+          claimId: turn.inboundClaim.claimId,
+        });
+        return null;
+      }
+      const latestInbound = turn.supersededMessages.reduce(
+        (latest, message) =>
+          isLaterInbound(message.occurredAt, message.sourceId, latest.occurredAt, latest.sourceId)
+            ? message
+            : latest,
+        turn.message,
+      );
+      const active: ActiveInbound = {
+        sourceId: turn.message.sourceId,
+        latestSourceId: latestInbound.sourceId,
+        latestOccurredAt: latestInbound.occurredAt,
+        channelId: turn.authority.channelId,
+        providerConversationId: turn.authority.providerConversationId,
+        inboundClaim: turn.inboundClaim,
+        controller: new AbortController(),
+        knownSourceIds: new Set([
+          ...turn.supersededMessages.map((message) => message.sourceId),
+          turn.message.sourceId,
+        ]),
+        renewalTimer: null,
+        promise: null,
+      };
+      this.#activeInbounds.set(active.providerConversationId, active);
+      return { turn, active };
+    } finally {
+      this.#pendingInboundClaims -= 1;
+    }
+  }
+
+  #executeInbound(turn: InboundTurn, active: ActiveInbound): Promise<void> {
+    const execution = this.#runClaimedInbound(turn, active).finally(async () => {
+      if (active.renewalTimer) clearTimeout(active.renewalTimer);
+      active.renewalTimer = null;
+      try {
+        await this.#store.releaseInboundClaim({
+          sourceId: active.sourceId,
+          claimId: active.inboundClaim.claimId,
+        });
+      } finally {
+        if (this.#activeInbounds.get(active.providerConversationId) === active) {
+          this.#activeInbounds.delete(active.providerConversationId);
+        }
+        this.#wake();
+      }
+    });
+    active.promise = execution;
+    return execution;
+  }
+
+  async #runClaimedInbound(turn: InboundTurn, active: ActiveInbound): Promise<void> {
+    this.#scheduleInboundClaimRenewal(active);
+    let presence: InboundPresence | null = null;
+    try {
+      presence = await this.#handleInbound(turn, active);
+      if (active.renewalTimer) clearTimeout(active.renewalTimer);
+      active.renewalTimer = null;
+      if (this.#stopping || active.controller.signal.aborted) return;
+      const outbound = await this.#claimNextOutbound(active.channelId);
+      if (outbound) await this.#launchClaimedOutbound(outbound);
+    } catch (error) {
+      if (!active.controller.signal.aborted) {
+        await this.#retryInbound(active.sourceId, active.inboundClaim.claimId, errorText(error));
+      }
+    } finally {
+      presence?.stop();
+    }
+  }
+
+  #scheduleInboundClaimRenewal(active: ActiveInbound): void {
+    if (this.#stopping || active.controller.signal.aborted) return;
+    if (active.renewalTimer) clearTimeout(active.renewalTimer);
+    active.renewalTimer = setTimeout(() => {
+      active.renewalTimer = null;
+      void this.#store
+        .renewInboundClaim({
+          sourceId: active.sourceId,
+          claimId: active.inboundClaim.claimId,
+          now: this.#now().toISOString(),
+        })
+        .then((renewed) => {
+          if (!renewed) {
+            active.controller.abort(new Error("This conversation turn is no longer claimed"));
+            return;
+          }
+          active.inboundClaim = renewed;
+          this.#scheduleInboundClaimRenewal(active);
+        })
+        .catch((error: unknown) => active.controller.abort(error));
+    }, INBOUND_CLAIM_REFRESH_MS);
+  }
+
+  async #claimNextOutbound(completedInboundChannelId?: string): Promise<OutboundMessage | null> {
+    if (this.#activeOutboundDeliveries.size >= MAX_CONCURRENT_CONVERSATIONS) return null;
+    let releaseSelection: () => void = () => undefined;
+    const previousSelection = this.#outboundSelectionTail;
+    this.#outboundSelectionTail = new Promise<void>((resolve) => {
+      releaseSelection = resolve;
+    });
+    await previousSelection;
+    try {
+      if (this.#stopping || this.#activeOutboundDeliveries.size >= MAX_CONCURRENT_CONVERSATIONS) {
+        return null;
+      }
+      const pending = await this.#store.readNextOutbound(this.#now().toISOString(), {
+        excludeChannelIds: [...this.#activeInbounds.values()]
+          .map((active) => active.channelId)
+          .filter((channelId) => channelId !== completedInboundChannelId),
+      });
+      if (!pending) return null;
+      return this.#store.beginOutbound({ sourceId: pending.sourceId, now: this.#now().toISOString() });
+    } finally {
+      releaseSelection();
     }
   }
 
@@ -1580,11 +1780,12 @@ export class Florence {
     }
   }
 
-  async #handleInbound(turn: InboundTurn): Promise<InboundPresence | null> {
+  async #handleInbound(turn: InboundTurn, active: ActiveInbound): Promise<InboundPresence | null> {
     const observed = await this.#linq.observeChat(turn.authority.providerConversationId);
     if (!sameAuthority(observed, turn.authority)) {
       await this.#store.commitTurn({
         sourceId: turn.message.sourceId,
+        inboundClaimId: active.inboundClaim.claimId,
         handledAt: this.#now().toISOString(),
       });
       return null;
@@ -1592,19 +1793,6 @@ export class Florence {
     const sender = turn.household.members.find(
       (member) => member.id === turn.authority.senderAdultId && member.kind === "adult",
     );
-    const adultNames = turn.household.members
-      .filter((member) => member.kind === "adult" && member.status === "verified")
-      .map((member) => member.displayName);
-    const replyTo = turn.replyTarget
-      ? {
-          senderName:
-            turn.replyTarget.speaker === "florence"
-              ? "Florence"
-              : (turn.household.members.find((member) => member.id === turn.replyTarget?.speaker)
-                  ?.displayName ?? "Family member"),
-          text: turnText(turn.replyTarget),
-        }
-      : null;
     const presenceInput = {
       providerConversationId: turn.authority.providerConversationId,
       expectedAuthority: {
@@ -1619,106 +1807,16 @@ export class Florence {
     if (turn.message.moveKind !== "reaction") {
       void this.#linq.markRead(presenceInput).catch(() => false);
     }
-    let presence =
-      turn.message.moveKind === "reaction" || turn.authority.audience === "group"
-        ? null
-        : this.#beginInboundPresence(presenceInput);
-    const beginGroupPresence = () => {
-      if (presence === null && turn.message.moveKind !== "reaction" && turn.authority.audience === "group") {
+    // Typing is evidence that Florence has useful work or a response in hand,
+    // not an optimistic receipt animation. Keeping it lazy prevents an
+    // internal interpretation retry from looking like a vanished reply.
+    let presence: InboundPresence | null = null;
+    const beginPresence = () => {
+      if (presence === null && turn.message.moveKind !== "reaction") {
         presence = this.#beginInboundPresence(presenceInput);
       }
     };
-    const familyWorkReplyCandidate = await this.#store.readFamilyWorkReplyCandidate({
-      sourceId: turn.message.sourceId,
-      readAt: this.#now().toISOString(),
-    });
-    if (familyWorkReplyCandidate) {
-      if (!this.#reasoner) {
-        await this.#retryInbound(
-          turn.message.sourceId,
-          "Florence family-work reply reasoning is not configured",
-          turn.authority.audience !== "group",
-        );
-        return presence;
-      }
-      let familyWorkReplyDecision: Awaited<ReturnType<FlorenceReasoner["interpretParticipantReply"]>>;
-      try {
-        familyWorkReplyDecision = await this.#reasoner.interpretParticipantReply({
-          audience: turn.authority.audience,
-          adultNames,
-          pendingRequest: {
-            replyContext: familyWorkReplyCandidate.kind,
-            targetAdultName: familyWorkReplyCandidate.targetAdultName,
-            question: familyWorkReplyCandidate.question,
-            askedAt: familyWorkReplyCandidate.askedAt,
-            taskObjective: familyWorkReplyCandidate.taskObjective,
-          },
-          currentMessage: {
-            senderName: sender?.displayName ?? "Family member",
-            text: turnText(turn.message),
-            occurredAt: turn.message.occurredAt,
-            explicitlyRepliesToQuestion: familyWorkReplyCandidate.explicitlyRepliesToQuestion,
-            replyTo,
-          },
-        });
-      } catch (error) {
-        await this.#retryInbound(
-          turn.message.sourceId,
-          errorText(error),
-          turn.authority.audience !== "group",
-        );
-        return presence;
-      }
-      if (familyWorkReplyDecision.belongsToRequest) {
-        if (!familyWorkReplyDecision.acknowledgement) {
-          await this.#retryInbound(
-            turn.message.sourceId,
-            "Florence returned no family-work reply acknowledgement",
-          );
-          return presence;
-        }
-        let reassignToAdultId: string | null = null;
-        if (familyWorkReplyDecision.reassignToAdultName !== null) {
-          const matches = turn.household.members.filter(
-            (member) =>
-              member.kind === "adult" &&
-              member.status === "verified" &&
-              member.displayName === familyWorkReplyDecision.reassignToAdultName,
-          );
-          if (
-            familyWorkReplyCandidate.kind !== "participant_request" ||
-            turn.authority.audience !== "private" ||
-            matches.length !== 1
-          ) {
-            await this.#retryInbound(
-              turn.message.sourceId,
-              "A private responsibility reassignment must name one exact enrolled adult",
-            );
-            return presence;
-          }
-          reassignToAdultId = matches[0]?.id ?? null;
-        }
-        const familyWorkReply = await this.#store.commitFamilyWorkReply({
-          sourceId: turn.message.sourceId,
-          kind: familyWorkReplyCandidate.kind,
-          workId: familyWorkReplyCandidate.workId,
-          generation: familyWorkReplyCandidate.generation,
-          progressRevision: familyWorkReplyCandidate.progressRevision,
-          questionSourceId: familyWorkReplyCandidate.questionSourceId,
-          requestId: familyWorkReplyCandidate.requestId,
-          reassignToAdultId,
-          acknowledgement: familyWorkReplyDecision.acknowledgement,
-          handledAt: this.#now().toISOString(),
-        });
-        if (familyWorkReply !== "not_family_work") {
-          if (familyWorkReply === "committed") {
-            if (familyWorkReplyDecision.acknowledgement.kind === "text") beginGroupPresence();
-            this.#wake();
-          }
-          return presence;
-        }
-      }
-    }
+    const stopPresence = () => presence?.stop();
     try {
       const googleActive =
         turn.authority.audience !== "private" ||
@@ -1732,119 +1830,20 @@ export class Florence {
       ) {
         await this.completeOwnOnboarding(sender.id);
       }
-      if (turn.authority.audience === "private" && !googleActive && !onboardingComplete) {
-        if (turn.message.moveKind === "reaction") {
-          await this.#store.commitTurn({
-            sourceId: turn.message.sourceId,
-            handledAt: this.#now().toISOString(),
-          });
-          return presence;
-        }
-        const stage = "connect_google" as const;
-        const fallbackText =
-          "I’m here. Connect your own Google account on the private setup page so I can help with real family logistics.";
-        let bubbles = [{ text: fallbackText, delayMs: 0 }];
-        let stopMessaging = false;
-        let continueWithAvailableWork = false;
-        if (this.#reasoner) {
-          try {
-            const setup = await this.#reasoner.converseDuringSetup({
-              stage,
-              parentName: sender?.displayName ?? null,
-              currentMessage: { text: turnText(turn.message), occurredAt: turn.message.occurredAt },
-              recentMessages: turn.recentMessages.slice(-8).map((message) => ({
-                sender: message.speaker === "florence" ? "florence" : "parent",
-                text: turnText(message),
-                occurredAt: message.occurredAt,
-              })),
-              nextStep: "connect_google",
-            });
-            continueWithAvailableWork = setup.continueWithAvailableWork;
-            bubbles = setup.requestsFreshLink
-              ? [{ text: "Of course—here’s a fresh link to finish setup.", delayMs: 0 }]
-              : [...setup.bubbles];
-            stopMessaging = setup.stopMessaging;
-          } catch (error) {
-            await this.#retryInbound(turn.message.sourceId, errorText(error));
-            return presence;
-          }
-        }
-        if (continueWithAvailableWork) {
-          await this.#respondEnrolled(turn);
-          return presence;
-        }
-        if (stopMessaging) {
-          await this.#store.commitTurn({
-            sourceId: turn.message.sourceId,
-            stopChannel: true,
-            handledAt: this.#now().toISOString(),
-          });
-          return presence;
-        }
-        const accessUrl = this.#issueWebAccessUrl(turn, "/");
-        if (accessUrl) bubbles.push({ text: accessUrl, delayMs: 0 });
-        await this.#store.commitTurn(
-          decisionCommit(
-            turn,
-            {
-              policy: { retain: false, schedule: false, stopMessaging: false },
-              conversation: {
-                participation: "respond",
-                replyToCurrentMessage: true,
-                reaction: null,
-                bubbles,
-                nativeMoves: null,
-              },
-              facts: [],
-              followUp: null,
-              reminder: null,
-              familyWork: null,
-              docketUpsert: null,
-              docketCompletions: null,
-              calendar: null,
-              secondAdultPlan: null,
-              householdUpdate: null,
-            },
-            this.#now(),
-          ),
-        );
-        return presence;
-      }
-      await this.#respondEnrolled(turn, turn.authority.audience === "group" ? beginGroupPresence : undefined);
+      await this.#respondEnrolled(turn, active, beginPresence);
       return presence;
     } catch (error) {
-      presence?.stop();
+      stopPresence();
       throw error;
     }
   }
 
-  async #respondEnrolled(turn: InboundTurn, onRespond?: () => void): Promise<void> {
+  async #respondEnrolled(turn: InboundTurn, active: ActiveInbound, onRespond?: () => void): Promise<void> {
     if (!this.#reasoner) {
-      await this.#retryInbound(
-        turn.message.sourceId,
-        "Florence reasoning is not configured",
-        turn.authority.audience !== "group",
-      );
-      return;
+      throw new FlorenceReasonerError("configuration", "Florence reasoning is not configured");
     }
 
-    const controller = new AbortController();
-    const sender = turn.household.members.find(
-      (member) => member.id === turn.authority.senderAdultId && member.kind === "adult",
-    );
-    const adultNames = turn.household.members
-      .filter((member) => member.kind === "adult" && member.status === "verified")
-      .map((member) => member.displayName);
-    const replyTo = turn.replyTarget
-      ? {
-          senderName:
-            turn.replyTarget.speaker === "florence"
-              ? "Florence"
-              : (turn.household.members.find((member) => member.id === turn.replyTarget?.speaker)
-                  ?.displayName ?? "Family member"),
-          text: turnText(turn.replyTarget),
-        }
-      : null;
+    const controller = active.controller;
     const commitWithPresence = async (input: CommitTurnInput) => {
       const committed = await this.#store.commitTurn(input);
       if (
@@ -1855,129 +1854,7 @@ export class Florence {
       }
       return committed;
     };
-    const latestInbound = turn.supersededMessages.reduce(
-      (latest, message) =>
-        isLaterInbound(message.occurredAt, message.sourceId, latest.occurredAt, latest.sourceId)
-          ? message
-          : latest,
-      turn.message,
-    );
-    const active: ActiveInbound = {
-      sourceId: turn.message.sourceId,
-      latestSourceId: latestInbound.sourceId,
-      latestOccurredAt: latestInbound.occurredAt,
-      channelId: turn.authority.channelId,
-      providerConversationId: turn.authority.providerConversationId,
-      controller,
-      knownSourceIds: new Set([
-        ...turn.supersededMessages.map((message) => message.sourceId),
-        turn.message.sourceId,
-      ]),
-    };
-    this.#activeInbound = active;
-
     try {
-      let approvedCalendarOffer: InboundTurn["pendingCalendarOffers"][number] | null = null;
-      let approvedCalendarOfferStandaloneExplicit = false;
-      let approvedPartnerInvitation: InboundTurn["pendingPartnerInvitation"] = null;
-      let approvedPartnerInvitationStandaloneExplicit = false;
-      let refreshPartnerInvitationReview: InboundTurn["pendingPartnerInvitation"] = null;
-      const typedApprovalText = turn.message.authoredText?.trim() || null;
-      if (
-        turn.authority.audience === "private" &&
-        turn.message.moveKind !== "reaction" &&
-        typedApprovalText !== null &&
-        turn.pendingPartnerInvitation &&
-        approvalReplyTargetsPrompt(
-          turn.message.replyToSourceId,
-          turn.pendingPartnerInvitation.approvalPromptSourceId,
-        )
-      ) {
-        try {
-          const interpretation = await this.#reasoner.interpretPartnerInvitationApproval(
-            {
-              currentMessage: { text: typedApprovalText },
-              partner: {
-                adultId: turn.pendingPartnerInvitation.adultId,
-                firstName: turn.pendingPartnerInvitation.firstName,
-                maskedPhoneNumber: turn.pendingPartnerInvitation.maskedPhoneNumber,
-              },
-            },
-            controller.signal,
-          );
-          if (interpretation.sendInvitation) {
-            if (turn.pendingPartnerInvitation.requiresFreshReview) {
-              refreshPartnerInvitationReview = turn.pendingPartnerInvitation;
-            } else if (
-              turn.pendingPartnerInvitation.approvalPromptCurrent ||
-              interpretation.standaloneExplicit
-            ) {
-              approvedPartnerInvitation = turn.pendingPartnerInvitation;
-              approvedPartnerInvitationStandaloneExplicit = interpretation.standaloneExplicit;
-            } else {
-              refreshPartnerInvitationReview = turn.pendingPartnerInvitation;
-            }
-          }
-        } catch (error) {
-          if (error instanceof FlorenceReasonerError && error.retryable) {
-            await this.#retryInbound(turn.message.sourceId, errorText(error));
-            return;
-          }
-          if (controller.signal.aborted) return;
-          if (!(error instanceof FlorenceReasonerError)) throw error;
-        }
-      }
-      if (
-        turn.message.moveKind !== "reaction" &&
-        typedApprovalText !== null &&
-        turn.pendingCalendarOffers.length === 1 &&
-        approvalReplyTargetsPrompt(
-          turn.message.replyToSourceId,
-          turn.pendingCalendarOffers[0]?.approvalPromptSourceId ?? null,
-        )
-      ) {
-        const offer = turn.pendingCalendarOffers[0];
-        if (!offer) throw new Error("The sole Calendar offer disappeared");
-        try {
-          const interpretation = await this.#reasoner.interpretCalendarApproval(
-            {
-              audience: turn.authority.audience,
-              adultNames,
-              approvalPromptCurrent: offer.approvalPromptCurrent,
-              currentMessage: {
-                senderName: sender?.displayName ?? "Family member",
-                text: typedApprovalText,
-                occurredAt: turn.message.occurredAt,
-                replyTo,
-              },
-              event: offer.event,
-            },
-            controller.signal,
-          );
-          if (interpretation.approve && (offer.approvalPromptCurrent || interpretation.standaloneExplicit)) {
-            approvedCalendarOffer = offer;
-            approvedCalendarOfferStandaloneExplicit = interpretation.standaloneExplicit;
-          }
-        } catch (error) {
-          if (error instanceof FlorenceReasonerError && error.retryable) {
-            await this.#retryInbound(
-              turn.message.sourceId,
-              errorText(error),
-              turn.authority.audience !== "group",
-            );
-            return;
-          }
-          if (controller.signal.aborted) return;
-          if (!(error instanceof FlorenceReasonerError)) throw error;
-        }
-      }
-      const attachmentJob =
-        turn.message.images.length > 0 ||
-        (turn.currentDocuments?.length ?? 0) > 0 ||
-        turn.supersededMessages.some((message) => message.images.length > 0) ||
-        (turn.replyTarget?.images.length ?? 0) > 0 ||
-        turn.replyTargetSupersededMessages.some((message) => message.images.length > 0);
-      let substantiveWorkStarted = false;
       let turnCommitted = false;
       const retainedImageClaims: Array<{
         householdId: string;
@@ -1996,55 +1873,140 @@ export class Florence {
           ),
         );
       };
-      const startWork = () => {
-        substantiveWorkStarted = true;
-      };
       try {
-        if (attachmentJob) substantiveWorkStarted = true;
         controller.signal.throwIfAborted();
         const context = await this.#reasonerContext(turn, controller.signal);
         controller.signal.throwIfAborted();
+        const prepareDecision = (candidate: FlorenceDecision, includeWebAccess: boolean) => {
+          const enforced = candidate;
+          const calendarApprovalSelection = (enforced.approvals ?? []).find(
+            (approval) => approval.kind === "calendar_offer",
+          );
+          const partnerApprovalSelection = (enforced.approvals ?? []).find(
+            (approval) => approval.kind === "partner_invitation",
+          );
+          const approval = calendarApprovalSelection
+            ? (turn.pendingCalendarOffers.find(
+                (offer) => offer.id === calendarApprovalSelection.proposalId,
+              ) ?? null)
+            : null;
+          const selectedPartnerInvitation = partnerApprovalSelection
+            ? turn.pendingPartnerInvitation?.adultId === partnerApprovalSelection.adultId
+              ? turn.pendingPartnerInvitation
+              : null
+            : null;
+          if (calendarApprovalSelection && !approval) {
+            throw new FlorenceReasonerError(
+              "invalid_output",
+              "The selected Calendar approval is no longer pending",
+            );
+          }
+          if (partnerApprovalSelection && !selectedPartnerInvitation) {
+            throw new FlorenceReasonerError(
+              "invalid_output",
+              "The selected partner approval is no longer pending",
+            );
+          }
+          const partnerApproval =
+            selectedPartnerInvitation && !selectedPartnerInvitation.requiresFreshReview
+              ? selectedPartnerInvitation
+              : null;
+          if (partnerApproval && enforced.secondAdultPlan) {
+            throw new FlorenceReasonerError(
+              "invalid_output",
+              "The already-approved partner invitation cannot also be replaced or cancelled",
+            );
+          }
+          const partnerReviewRefresh = partnerApproval ? null : selectedPartnerInvitation;
+          if (partnerReviewRefresh && enforced.secondAdultPlan) {
+            throw new FlorenceReasonerError(
+              "invalid_output",
+              "The application-owned fresh invitation review cannot also be replaced or cancelled",
+            );
+          }
+          let withApplicationActions: FlorenceDecision;
+          if (approval || partnerApproval) {
+            withApplicationActions = {
+              ...enforced,
+              policy: { ...enforced.policy, schedule: true },
+              conversation: approvedActionConversation(
+                approval,
+                partnerApproval,
+                approvedCalendarOfferLabel(turn, approval),
+                enforced.conversation,
+              ),
+            };
+          } else if (partnerReviewRefresh) {
+            const review = partnerInvitationReviewDecision(turn, partnerReviewRefresh);
+            withApplicationActions = {
+              ...enforced,
+              conversation: enforced.conversation,
+              secondAdultPlan: review.secondAdultPlan,
+            };
+          } else {
+            withApplicationActions = enforced;
+          }
+          const committedDecision = includeWebAccess
+            ? this.#appendRequestedWebAccess(turn, withApplicationActions)
+            : withApplicationActions;
+          const observing = committedDecision.conversation.participation === "observe";
+          // Read tools are harmless, but a model that recognizes the turn as adult-to-adult only
+          // after a read must still leave no provider evidence, durable work, or visible interruption.
+          const googleEvidence = observing ? [] : context.googleEvidence();
+          const googleConnectionIdsUsed = observing ? [] : context.googleConnectionIdsUsed();
+          return {
+            approval,
+            partnerApproval,
+            partnerReviewRefresh,
+            calendarApprovalStandaloneExplicit:
+              calendarApprovalSelection?.kind === "calendar_offer"
+                ? calendarApprovalSelection.standaloneExplicit
+                : false,
+            partnerApprovalStandaloneExplicit:
+              partnerApprovalSelection?.kind === "partner_invitation"
+                ? partnerApprovalSelection.standaloneExplicit
+                : false,
+            committedDecision,
+            googleEvidence,
+            googleConnectionIdsUsed,
+          };
+        };
         const decision = await this.#reasoner.decide(context.input, context.reads, controller.signal, {
-          onWorkStarted: startWork,
+          ...(onRespond ? { onWorkStarted: onRespond } : {}),
+          admitDecision: (candidate) => {
+            const prepared = prepareDecision(candidate, false);
+            decisionCommit(turn, prepared.committedDecision, this.#now(), {
+              approveCalendarOffer: prepared.approval,
+              approveCalendarOfferStandaloneExplicit: prepared.calendarApprovalStandaloneExplicit,
+              approvePartnerInvitation: prepared.partnerApproval,
+              approvePartnerInvitationStandaloneExplicit: prepared.partnerApprovalStandaloneExplicit,
+              googleEvidence: prepared.googleEvidence,
+              googleConnectionIdsUsed: prepared.googleConnectionIdsUsed,
+              retainedDocketDocuments: [],
+              retainedFamilyWorkDocuments: [],
+              resolveCalendarEventTarget: context.resolveCalendarEventTarget,
+              resolveCalendarDuplicate: context.resolveCalendarDuplicate,
+            });
+          },
         });
         controller.signal.throwIfAborted();
-        const requested = this.#appendRequestedWebAccess(turn, enforcePolicy(decision));
-        const approval = requested.conversation.participation === "respond" ? approvedCalendarOffer : null;
-        const partnerApproval = requested.policy.stopMessaging ? null : approvedPartnerInvitation;
-        const partnerReviewRefresh =
-          requested.policy.stopMessaging || partnerApproval ? null : refreshPartnerInvitationReview;
-        const committedDecision =
-          approval || partnerApproval
-            ? {
-                ...requested,
-                policy: { ...requested.policy, schedule: true, stopMessaging: false },
-                conversation: approvedActionConversation(
-                  approval,
-                  partnerApproval,
-                  approvedCalendarOfferLabel(turn, approval),
-                ),
-                docketUpsert: null,
-                calendar: null,
-                secondAdultPlan: null,
-                householdUpdate: null,
-                webAccessPath: null,
-              }
-            : partnerReviewRefresh
-              ? partnerInvitationReviewDecision(turn, partnerReviewRefresh)
-              : requested;
-        const observing = committedDecision.conversation.participation === "observe";
-        // Read tools are harmless, but a model that recognizes the turn as adult-to-adult only
-        // after a read must still leave no provider evidence, durable work, or visible interruption.
-        const googleEvidence = observing || partnerReviewRefresh ? [] : context.googleEvidence();
-        const googleConnectionIdsUsed =
-          observing || partnerReviewRefresh ? [] : context.googleConnectionIdsUsed();
+        const {
+          approval,
+          partnerApproval,
+          calendarApprovalStandaloneExplicit,
+          partnerApprovalStandaloneExplicit,
+          committedDecision,
+          googleEvidence,
+          googleConnectionIdsUsed,
+        } = prepareDecision(decision, true);
         const retainedMessageDocuments: Array<{
           documentId: string;
           contentDigest: string;
           contentEnvelope: Uint8Array;
         }> = [];
         const createsFamilyWork = committedDecision.familyWork?.operation === "create";
-        if (committedDecision.docketUpsert || createsFamilyWork) {
+        const retainsDocket = committedDecision.policy.retain && committedDecision.docketUpsert !== null;
+        if (retainsDocket || createsFamilyWork) {
           const replyEvidenceMessages =
             turn.replyTarget &&
             (createsFamilyWork ||
@@ -2115,40 +2077,43 @@ export class Florence {
             }
           }
         }
+        let finalCommittedDecision = committedDecision;
+        const commitOptions = {
+          approveCalendarOffer: approval,
+          approveCalendarOfferStandaloneExplicit: calendarApprovalStandaloneExplicit,
+          approvePartnerInvitation: partnerApproval,
+          approvePartnerInvitationStandaloneExplicit: partnerApprovalStandaloneExplicit,
+          googleEvidence,
+          googleConnectionIdsUsed,
+          retainedDocketDocuments: retainsDocket ? retainedMessageDocuments : [],
+          retainedFamilyWorkDocuments: createsFamilyWork ? retainedMessageDocuments : [],
+          resolveCalendarEventTarget: context.resolveCalendarEventTarget,
+          resolveCalendarDuplicate: context.resolveCalendarDuplicate,
+        };
         let committed = await commitWithPresence(
-          decisionCommit(turn, committedDecision, this.#now(), {
-            approveCalendarOffer: approval,
-            approveCalendarOfferStandaloneExplicit:
-              approval === null ? false : approvedCalendarOfferStandaloneExplicit,
-            approvePartnerInvitation: partnerApproval,
-            approvePartnerInvitationStandaloneExplicit:
-              partnerApproval === null ? false : approvedPartnerInvitationStandaloneExplicit,
-            googleEvidence,
-            googleConnectionIdsUsed,
-            retainedDocketDocuments: committedDecision.docketUpsert ? retainedMessageDocuments : [],
-            retainedFamilyWorkDocuments: createsFamilyWork ? retainedMessageDocuments : [],
-            resolveCalendarEventTarget: context.resolveCalendarEventTarget,
-            resolveCalendarDuplicate: context.resolveCalendarDuplicate,
-          }),
+          decisionCommit(turn, finalCommittedDecision, this.#now(), commitOptions),
         );
         if (committed === "second_adult_phone_unavailable") {
-          await releaseUncommittedImageClaims();
           const plan = committedDecision.secondAdultPlan;
           if (plan?.operation !== "plan") {
             throw new Error("A second-adult phone correction requires a rejected invitation plan");
           }
+          finalCommittedDecision = withoutUnavailableSecondAdultPlan(committedDecision, plan.firstName);
           committed = await commitWithPresence(
-            decisionCommit(turn, unavailableSecondAdultPhoneDecision(plan.firstName), this.#now()),
+            decisionCommit(turn, finalCommittedDecision, this.#now(), commitOptions),
           );
         }
         turnCommitted = committed === "committed";
         if (!turnCommitted) await releaseUncommittedImageClaims();
-        if (committed === "committed" && committedDecision.familyWork?.operation === "cancel") {
+        if (committed === "committed" && finalCommittedDecision.familyWork !== null) {
+          this.#wake();
+        }
+        if (committed === "committed" && finalCommittedDecision.familyWork?.operation === "cancel") {
           this.#activeFamilyWork
-            .get(committedDecision.familyWork.workId)
+            .get(finalCommittedDecision.familyWork.workId)
             ?.controller.abort(new Error("The family task was cancelled"));
           const resources = await this.#store.takeCancelledFamilyWorkResources(
-            committedDecision.familyWork.workId,
+            finalCommittedDecision.familyWork.workId,
           );
           if (resources?.browserSession && this.#browser) {
             try {
@@ -2159,12 +2124,12 @@ export class Florence {
           }
           if (resources?.activePhoneCall) {
             const stopped = await this.#stopFamilyWorkPhoneCall(
-              committedDecision.familyWork.workId,
+              finalCommittedDecision.familyWork.workId,
               resources.activePhoneCall,
             );
             if (stopped) {
               await this.#store.clearCancelledFamilyWorkPhoneCall(
-                committedDecision.familyWork.workId,
+                finalCommittedDecision.familyWork.workId,
                 resources.activePhoneCall,
               );
             }
@@ -2173,133 +2138,10 @@ export class Florence {
       } catch (error) {
         if (!turnCommitted) await releaseUncommittedImageClaims();
         if (controller.signal.aborted) return;
-        if (error instanceof FlorenceReasonerError && !error.retryable) {
-          if (turn.authority.audience === "group") {
-            await this.#retryInbound(turn.message.sourceId, errorText(error), false);
-            return;
-          }
-          const fallbackCalendarApproval =
-            turn.authority.audience === "private" ? approvedCalendarOffer : null;
-          if (fallbackCalendarApproval || approvedPartnerInvitation) {
-            await commitWithPresence(
-              decisionCommit(
-                turn,
-                {
-                  policy: { retain: false, schedule: true, stopMessaging: false },
-                  conversation: approvedActionConversation(
-                    fallbackCalendarApproval,
-                    approvedPartnerInvitation,
-                    approvedCalendarOfferLabel(turn, fallbackCalendarApproval),
-                  ),
-                  facts: [],
-                  followUp: null,
-                  reminder: null,
-                  familyWork: null,
-                  docketUpsert: null,
-                  docketCompletions: null,
-                  calendar: null,
-                  secondAdultPlan: null,
-                  householdUpdate: null,
-                },
-                this.#now(),
-                {
-                  approveCalendarOffer: fallbackCalendarApproval,
-                  approveCalendarOfferStandaloneExplicit: approvedCalendarOfferStandaloneExplicit,
-                  approvePartnerInvitation: approvedPartnerInvitation,
-                  approvePartnerInvitationStandaloneExplicit: approvedPartnerInvitationStandaloneExplicit,
-                },
-              ),
-            );
-          } else if (refreshPartnerInvitationReview) {
-            const refreshed = await commitWithPresence(
-              decisionCommit(
-                turn,
-                partnerInvitationReviewDecision(turn, refreshPartnerInvitationReview),
-                this.#now(),
-              ),
-            );
-            if (refreshed === "second_adult_phone_unavailable") {
-              await commitWithPresence(
-                decisionCommit(
-                  turn,
-                  unavailableSecondAdultPhoneDecision(refreshPartnerInvitationReview.firstName),
-                  this.#now(),
-                ),
-              );
-            }
-          } else {
-            await commitWithPresence(
-              substantiveWorkStarted
-                ? decisionCommit(
-                    turn,
-                    {
-                      policy: { retain: false, schedule: false, stopMessaging: false },
-                      conversation: {
-                        participation: "respond",
-                        replyToCurrentMessage: true,
-                        reaction: null,
-                        nativeMoves: null,
-                        bubbles: [
-                          {
-                            text: "I couldn’t finish that just now. I didn’t change anything. Want me to try again?",
-                            delayMs: 0,
-                          },
-                        ],
-                      },
-                      facts: [],
-                      followUp: null,
-                      reminder: null,
-                      familyWork: null,
-                      docketUpsert: null,
-                      docketCompletions: null,
-                      calendar: null,
-                      secondAdultPlan: null,
-                      householdUpdate: null,
-                    },
-                    this.#now(),
-                  )
-                : turn.message.moveKind === "reaction"
-                  ? { sourceId: turn.message.sourceId, handledAt: this.#now().toISOString() }
-                  : decisionCommit(
-                      turn,
-                      {
-                        policy: { retain: false, schedule: false, stopMessaging: false },
-                        conversation: {
-                          participation: "respond",
-                          replyToCurrentMessage: true,
-                          reaction: null,
-                          nativeMoves: null,
-                          bubbles: [
-                            {
-                              text: "Sorry—I hit a snag before I could answer. Try me again and I’ll take another run at it.",
-                              delayMs: 0,
-                            },
-                          ],
-                        },
-                        facts: [],
-                        followUp: null,
-                        reminder: null,
-                        familyWork: null,
-                        docketUpsert: null,
-                        docketCompletions: null,
-                        calendar: null,
-                        secondAdultPlan: null,
-                        householdUpdate: null,
-                      },
-                      this.#now(),
-                    ),
-            );
-          }
-          return;
-        }
-        await this.#retryInbound(
-          turn.message.sourceId,
-          errorText(error),
-          turn.authority.audience !== "group",
-        );
+        throw error;
       }
     } finally {
-      if (this.#activeInbound === active) this.#activeInbound = null;
+      // Claim release and per-conversation ownership are handled by #executeInbound.
     }
   }
 
@@ -2405,10 +2247,9 @@ export class Florence {
       string,
       { mimeType: "image/jpeg" | "image/png" | "image/webp"; bytes: Uint8Array }
     >();
-    const currentImages = [] as typeof candidateImages;
+    const currentImages = [...candidateImages];
     for (const image of candidateImages) {
       if (!this.#imageVault) {
-        currentImages.push(image);
         continue;
       }
       try {
@@ -2417,7 +2258,6 @@ export class Florence {
           signalId: image.signalId,
           image,
         });
-        currentImages.push(image);
         currentImageReads.set(image.assetId, read);
       } catch (error) {
         if (
@@ -2614,6 +2454,7 @@ export class Florence {
       visibleFamilyWork: (sharedHouseholdAccess ? turn.visibleFamilyWork : []).map((work) => ({
         workId: work.workId,
         objective: work.objective,
+        completionCondition: work.completionCondition,
         candidateIds: [...work.candidateIds],
         responsibleAdultName: work.responsibleAdultName,
         currentProgress: work.currentProgress,
@@ -2628,6 +2469,7 @@ export class Florence {
         lastRunAt: work.lastRunAt,
         lastResult: work.lastResult,
         createdAt: work.createdAt,
+        privateParticipantReply: work.privateParticipantReply,
       })),
       visibleInterests: (sharedHouseholdAccess ? turn.visibleInterests : []).map((interest) => ({
         interestWorkId: interest.interestWorkId,
@@ -2640,7 +2482,18 @@ export class Florence {
         proposalId: offer.id,
         event: offer.event,
         sourceIds: [offer.approvalPromptSourceId],
+        approvalPromptCurrent: offer.approvalPromptCurrent,
       })),
+      pendingPartnerInvitation:
+        sharedHouseholdAccess && turn.pendingPartnerInvitation
+          ? {
+              adultId: turn.pendingPartnerInvitation.adultId,
+              firstName: turn.pendingPartnerInvitation.firstName,
+              maskedPhoneNumber: turn.pendingPartnerInvitation.maskedPhoneNumber,
+              approvalPromptCurrent: turn.pendingPartnerInvitation.approvalPromptCurrent,
+              requiresFreshReview: turn.pendingPartnerInvitation.requiresFreshReview,
+            }
+          : null,
       googleConnections: activeGoogleConnection
         ? [
             {
@@ -3239,6 +3092,26 @@ export class Florence {
       if (status === "pending" || status === "sending") return "claimed";
       return "failed";
     }
+    return this.#launchClaimedOutbound(outbound, retryTransient);
+  }
+
+  #launchClaimedOutbound(
+    outbound: OutboundMessage,
+    retryTransient = true,
+  ): Promise<OutboundDeliveryDisposition> {
+    const delivery = this.#deliverClaimedOutbound(outbound, retryTransient).finally(() => {
+      this.#activeOutboundDeliveries.delete(delivery);
+      this.#wake();
+    });
+    this.#activeOutboundDeliveries.add(delivery);
+    return delivery;
+  }
+
+  async #deliverClaimedOutbound(
+    outbound: OutboundMessage,
+    retryTransient = true,
+  ): Promise<OutboundDeliveryDisposition> {
+    const sourceId = outbound.sourceId;
     try {
       const observed = await this.#linq.observeChat(outbound.providerConversationId);
       const groupObservation = await this.reconcileObservedFamilyGroup({
@@ -3428,26 +3301,11 @@ export class Florence {
     return { type: "message", parts };
   }
 
-  async #tryRetryCue(sourceId: string): Promise<boolean> {
-    try {
-      const cueSourceId = await this.#store.stageRetryCue({
-        sourceId,
-        occurredAt: this.#now().toISOString(),
-      });
-      if (!cueSourceId) return false;
-      const disposition = await this.#deliverOutbound(cueSourceId, false);
-      return disposition === "sent_now" || disposition === "already_sent";
-    } catch {
-      // A progress cue is optional. The substantive answer remains the product outcome.
-      return false;
-    }
-  }
-
-  async #retryInbound(sourceId: string, error: string, announce = true): Promise<void> {
-    if (announce) await this.#tryRetryCue(sourceId);
+  async #retryInbound(sourceId: string, claimId: string, error: string): Promise<void> {
     try {
       await this.#store.retryInbound({
         sourceId,
+        claimId,
         retryAt: later(this.#now(), RETRY_MS),
         error,
       });
@@ -8582,12 +8440,31 @@ export class Florence {
       turn.message.moveKind !== "reaction" &&
       Boolean(turn.message.authoredText?.trim());
     const accessUrl = authorized && accessPath ? this.#issueWebAccessUrl(turn, accessPath) : null;
-    if (!accessUrl) return { ...decision, webAccessPath: null };
+    if (!accessUrl) {
+      const hasVisibleConversation =
+        decision.conversation.bubbles.length > 0 ||
+        decision.conversation.reaction !== null ||
+        (decision.conversation.nativeMoves?.length ?? 0) > 0;
+      if (
+        accessPath !== null &&
+        decision.conversation.participation === "respond" &&
+        !hasVisibleConversation
+      ) {
+        throw new FlorenceReasonerError(
+          "invalid_output",
+          "The requested web-access link is unavailable in this conversation",
+        );
+      }
+      return { ...decision, webAccessPath: null };
+    }
     const bubbles = decision.conversation.bubbles.map((bubble) => ({ ...bubble }));
-    if (bubbles.length < 3) bubbles.push({ text: accessUrl, delayMs: 0 });
-    else {
+    const applicationBubbleCount = decision.secondAdultPlan ? 1 : 0;
+    if (bubbles.length < 3 - applicationBubbleCount) {
+      bubbles.push({ text: accessUrl, delayMs: 0 });
+    } else {
       const last = bubbles.at(-1);
       if (last) last.text = `${last.text}\n\n${accessUrl}`;
+      else bubbles.push({ text: accessUrl, delayMs: 0 });
     }
     return {
       ...decision,
@@ -8665,15 +8542,15 @@ export class Florence {
   }
 
   #wake(): void {
-    if (this.#stopping) return;
-    void this.runOnce().catch((error: unknown) => console.error("Florence loop failed", error));
+    if (this.#stopping || !this.#started) return;
+    void this.#dispatchOnce().catch((error: unknown) => console.error("Florence loop failed", error));
   }
 
   #schedule(delayMs: number): void {
     if (!this.#started || this.#timer) return;
     this.#timer = setTimeout(() => {
       this.#timer = null;
-      void this.runOnce()
+      void this.#dispatchOnce()
         .then((worked) => this.#schedule(worked ? 0 : LOOP_IDLE_MS))
         .catch((error: unknown) => {
           console.error("Florence loop failed", error);
@@ -9496,73 +9373,37 @@ function searchMemorySources(sources: readonly FlorenceSource[], query: string):
     .map(({ source }) => source);
 }
 
-function enforcePolicy(decision: FlorenceDecision): FlorenceDecision {
-  if (decision.policy.stopMessaging) {
-    return {
-      policy: decision.policy,
-      conversation: {
-        participation: "respond",
-        replyToCurrentMessage: false,
-        reaction: null,
-        bubbles: [],
-        nativeMoves: null,
-      },
-      facts: [],
-      followUp: null,
-      reminder: null,
-      familyWork: null,
-      docketUpsert: null,
-      docketCompletions: null,
-      interest: null,
-      calendar: null,
-      secondAdultPlan: null,
-      householdUpdate: null,
-      webAccessPath: null,
-    };
-  }
-  const retain = decision.policy.retain;
-  const schedule = decision.policy.schedule;
-  const calendar = schedule ? decision.calendar : null;
-  const interest =
-    decision.interest?.operation === "stop"
-      ? decision.interest
-      : retain && schedule
-        ? (decision.interest ?? null)
-        : null;
-  return {
-    policy: decision.policy,
-    conversation: decision.conversation,
-    facts: retain ? decision.facts : decision.facts.filter((fact) => fact.operation === "forget"),
-    followUp:
-      decision.followUp?.operation === "update" ? (schedule ? decision.followUp : null) : decision.followUp,
-    reminder: decision.reminder,
-    familyWork: decision.familyWork,
-    docketUpsert: retain ? decision.docketUpsert : null,
-    docketCompletions: decision.docketCompletions,
-    interest,
-    calendar,
-    secondAdultPlan: decision.secondAdultPlan,
-    householdUpdate: decision.householdUpdate,
-    webAccessPath: decision.webAccessPath ?? null,
-    ...(decision.researchUrls ? { researchUrls: [...decision.researchUrls] } : {}),
-  };
-}
-
 function appendResearchSourceBubble(
   bubbles: readonly { text: string; delayMs: number }[],
   researchUrls: readonly string[],
 ): { text: string; delayMs: number }[] {
   const main = bubbles.map((bubble) => ({ ...bubble }));
-  if (researchUrls.length === 0) return main;
+  if (researchUrls.length === 0) return compactConversationBubbles(main, 3);
   const sourceBubble = {
     text: researchUrls.length === 1 ? (researchUrls[0] ?? "") : `Links:\n${researchUrls.join("\n")}`,
     delayMs: 0,
   };
   if (main.length < 3) return [...main, sourceBubble];
-  const first = main[0] as { text: string; delayMs: number };
-  const second = main[1] as { text: string; delayMs: number };
-  const third = main[2] as { text: string; delayMs: number };
-  return [first, { text: `${second.text}\n\n${third.text}`, delayMs: second.delayMs }, sourceBubble];
+  return [...compactConversationBubbles(main, 2), sourceBubble];
+}
+
+function compactConversationBubbles(
+  bubbles: readonly { text: string; delayMs: number }[],
+  maximum: number,
+): { text: string; delayMs: number }[] {
+  if (maximum < 1) return [];
+  if (bubbles.length <= maximum) return bubbles.map((bubble) => ({ ...bubble }));
+  const kept = bubbles.slice(0, maximum - 1).map((bubble) => ({ ...bubble }));
+  const tail = bubbles.slice(maximum - 1);
+  const firstTail = tail[0];
+  if (!firstTail) return kept;
+  return [
+    ...kept,
+    {
+      text: tail.map((bubble) => bubble.text).join("\n\n"),
+      delayMs: firstTail.delayMs,
+    },
+  ];
 }
 
 function decisionCommit(
@@ -9597,7 +9438,6 @@ function decisionCommit(
   if (
     decision.conversation.participation === "observe" &&
     (turn.authority.audience !== "group" ||
-      decision.policy.stopMessaging ||
       decision.policy.retain ||
       decision.policy.schedule ||
       decision.conversation.replyToCurrentMessage ||
@@ -9627,13 +9467,6 @@ function decisionCommit(
       "invalid_output",
       "An observed family-group turn cannot stage output, retention, or application work",
     );
-  }
-  if (decision.policy.stopMessaging) {
-    return {
-      sourceId: turn.message.sourceId,
-      stopChannel: true,
-      handledAt: now.toISOString(),
-    };
   }
   if (
     turn.message.moveKind === "reaction" &&
@@ -9715,23 +9548,7 @@ function decisionCommit(
           typeof member.messagesInvitationApproved !== "boolean",
       ) ||
       turn.household.familyCalendarPartnerConnectionId !== null ||
-      decision.conversation.reaction !== null ||
-      decision.facts.length > 0 ||
-      decision.followUp !== null ||
-      decision.reminder !== null ||
-      decision.familyWork !== null ||
-      decision.docketUpsert !== null ||
-      (decision.docketCompletions?.length ?? 0) > 0 ||
-      decision.interest != null ||
-      decision.calendar !== null ||
-      decision.householdUpdate !== null ||
-      decision.webAccessPath != null ||
-      (decision.researchUrls?.length ?? 0) > 0 ||
-      (decision.conversation.nativeMoves?.length ?? 0) > 0 ||
-      (options.googleEvidence?.length ?? 0) > 0 ||
-      (options.googleConnectionIdsUsed?.length ?? 0) > 0 ||
-      (options.retainedDocketDocuments?.length ?? 0) > 0 ||
-      (options.retainedFamilyWorkDocuments?.length ?? 0) > 0)
+      options.approvePartnerInvitation != null)
   ) {
     throw new FlorenceReasonerError(
       "invalid_output",
@@ -9762,66 +9579,72 @@ function decisionCommit(
       "A conversation can complete only supplied household docket items",
     );
   }
-  const baseBubbles = decision.householdUpdate
-    ? []
-    : decision.secondAdultPlan
-      ? [
-          {
-            text:
-              decision.secondAdultPlan.operation === "plan"
-                ? secondAdultSharingReviewText(
-                    decision.secondAdultPlan,
-                    turn.household.familyCalendarLabel ?? turn.household.name,
-                  )
-                : plannedSecondAdults[0]?.messagesIdentity === "invited"
-                  ? `Okay—I stopped ${plannedSecondAdults[0].displayName}’s invitation. They won’t be able to use the setup link, and Florence will stay private with you.`
-                  : `Okay—I won’t invite ${plannedSecondAdults[0]?.displayName ?? "them"}. Florence will stay private with you.`,
-            delayMs: 0,
-          },
-        ]
-      : decision.calendar
-        ? calendarDuplicate
-          ? [
-              ...(decision.familyWork ? decision.conversation.bubbles : []),
-              {
-                text: calendarDuplicateText(calendarDuplicate.observedEvent, calendarLabel),
-                delayMs: 0,
-              },
-            ]
-          : decision.calendar.mode === "offer"
-            ? [
-                {
-                  // Calendar offers persist turn part zero as their exact approval prompt. Keep a
-                  // mixed family-work acknowledgement visible in that same canonical prompt so
-                  // neither mutation becomes silent and a later “yes” still targets the preview.
-                  text: [
-                    ...(decision.familyWork
-                      ? decision.conversation.bubbles.map((bubble) => bubble.text)
-                      : []),
-                    calendarOfferText(decision.calendar.mutation.event, calendarLabel),
-                  ].join("\n\n"),
-                  delayMs: 0,
-                },
-              ]
-            : decision.familyWork
-              ? decision.conversation.bubbles
-              : []
-        : decision.conversation.bubbles;
+  const applicationBubbles: Array<{
+    kind: "second_adult" | "calendar_offer" | "calendar_duplicate";
+    text: string;
+    delayMs: number;
+  }> = [];
+  if (decision.secondAdultPlan) {
+    applicationBubbles.push({
+      kind: "second_adult",
+      text:
+        decision.secondAdultPlan.operation === "plan"
+          ? secondAdultSharingReviewText(
+              decision.secondAdultPlan,
+              turn.household.familyCalendarLabel ?? turn.household.name,
+            )
+          : plannedSecondAdults[0]?.messagesIdentity === "invited"
+            ? `Okay—I stopped ${plannedSecondAdults[0].displayName}’s invitation. They won’t be able to use the setup link, and Florence will stay private with you.`
+            : `Okay—I won’t invite ${plannedSecondAdults[0]?.displayName ?? "them"}. Florence will stay private with you.`,
+      delayMs: 0,
+    });
+  }
+  if (calendarDuplicate) {
+    applicationBubbles.push({
+      kind: "calendar_duplicate",
+      text: calendarDuplicateText(calendarDuplicate.observedEvent, calendarLabel),
+      delayMs: 0,
+    });
+  } else if (decision.calendar?.mode === "offer") {
+    applicationBubbles.push({
+      kind: "calendar_offer",
+      text: calendarOfferText(decision.calendar.mutation.event, calendarLabel),
+      delayMs: 0,
+    });
+  }
   const nativeResearchUrls = new Set(
     (decision.conversation.nativeMoves ?? []).flatMap((move) =>
       move.type === "rich_link" || move.type === "media" ? [move.url] : [],
     ),
   );
-  const bubbles = decision.householdUpdate
-    ? []
-    : appendResearchSourceBubble(
-        baseBubbles,
-        (decision.researchUrls ?? []).filter((url) => !nativeResearchUrls.has(url)),
-      );
+  const ordinaryBubbles = compactConversationBubbles(
+    appendResearchSourceBubble(
+      decision.conversation.bubbles,
+      (decision.researchUrls ?? []).filter((url) => !nativeResearchUrls.has(url)),
+    ),
+    3 - applicationBubbles.length,
+  );
+  const bubbles = [...ordinaryBubbles, ...applicationBubbles];
+  const secondAdultPromptIndex = applicationBubbles.findIndex((bubble) => bubble.kind === "second_adult");
+  const calendarOfferPromptIndex = applicationBubbles.findIndex((bubble) => bubble.kind === "calendar_offer");
+  const secondAdultApprovalPromptSourceId =
+    decision.secondAdultPlan?.operation === "plan" && secondAdultPromptIndex >= 0
+      ? deterministicUuid(`outbound\0${turnId}\0${ordinaryBubbles.length + secondAdultPromptIndex}`)
+      : null;
+  const calendarApprovalPromptSourceId =
+    calendarOfferPromptIndex >= 0
+      ? deterministicUuid(`outbound\0${turnId}\0${ordinaryBubbles.length + calendarOfferPromptIndex}`)
+      : null;
+  const includeReaction = Boolean(
+    decision.conversation.reaction && !options.omitReaction && bubbles.length < 3,
+  );
   const facts: FactDraft[] = [];
   const listMutations: NonNullable<CommitTurnInput["listMutations"]>[number][] = [];
   const deleteFactIds: string[] = [];
-  for (const [index, change] of decision.facts.entries()) {
+  const permittedFactChanges = decision.policy.retain
+    ? decision.facts
+    : decision.facts.filter((change) => change.operation === "forget");
+  for (const [index, change] of permittedFactChanges.entries()) {
     if (change.operation === "forget") {
       const existing = turn.facts.find((fact) => fact.id === change.factId);
       const canDelete =
@@ -9976,7 +9799,7 @@ function decisionCommit(
   }
   const finiteMonitors: readonly [] = [];
   const finiteMonitorUpdates: FiniteMonitorUpdate[] =
-    decision.followUp?.operation === "update"
+    decision.policy.schedule && decision.followUp?.operation === "update"
       ? [
           {
             id: decision.followUp.followUpId,
@@ -9990,7 +9813,7 @@ function decisionCommit(
         ]
       : [];
   const outbound: NonNullable<CommitTurnInput["outbound"]>[number][] = [];
-  if (decision.conversation.reaction && !options.omitReaction && !decision.secondAdultPlan) {
+  if (decision.conversation.reaction && includeReaction) {
     outbound.push({
       sourceId: deterministicUuid(`outbound\0${turnId}\0reaction`),
       idempotencyKey: `turn:${turn.message.sourceId}:reaction`,
@@ -10022,6 +9845,7 @@ function decisionCommit(
   });
   for (const [nativeIndex, move] of (decision.conversation.nativeMoves ?? []).entries()) {
     if (move.type === "reaction") {
+      if (outbound.length >= 3) continue;
       outbound.push({
         sourceId: deterministicUuid(`outbound\0${turnId}\0native\0${nativeIndex}`),
         idempotencyKey: `turn:${turn.message.sourceId}:native:${nativeIndex}`,
@@ -10041,6 +9865,7 @@ function decisionCommit(
       continue;
     }
     if (move.type === "poll") {
+      if (outbound.length > 1) continue;
       const questionMove: OutboundNativeMoveDraft = {
         type: "message",
         parts: [{ type: "text", text: move.question }],
@@ -10069,6 +9894,7 @@ function decisionCommit(
       messagePart += 1;
       continue;
     }
+    if (outbound.length >= 3) continue;
     const nativeMove: OutboundNativeMoveDraft =
       move.type === "mention"
         ? (() => {
@@ -10127,35 +9953,52 @@ function decisionCommit(
     });
     messagePart += 1;
   }
-  if (outbound.length > 3 || messagePart > 3) {
-    throw new FlorenceReasonerError(
-      "invalid_output",
-      "A Florence turn can make at most three physical Messages sends",
-    );
-  }
+  const reminderDecision =
+    decision.reminder &&
+    (decision.policy.schedule ||
+      decision.reminder.operation === "cancel" ||
+      decision.reminder.operation === "list" ||
+      decision.reminder.operation === "pause")
+      ? decision.reminder
+      : null;
   const reminderMutation: CommitTurnInput["reminderMutation"] =
-    decision.reminder?.operation === "create"
+    reminderDecision?.operation === "create"
       ? {
           operation: "create",
           reminderId: deterministicUuid(`reminder\0${turn.message.sourceId}`),
-          action: decision.reminder.action,
-          schedule: decision.reminder.schedule,
+          action: reminderDecision.action,
+          schedule: reminderDecision.schedule,
           visibility: turn.authority.audience === "group" ? "household" : "private",
           ownerAdultId: turn.authority.audience === "group" ? null : turn.authority.senderAdultId,
         }
-      : decision.reminder?.operation === "update"
+      : reminderDecision?.operation === "update"
         ? {
             operation: "update",
-            reminderId: decision.reminder.reminderId,
-            action: decision.reminder.action,
-            schedule: decision.reminder.schedule,
+            reminderId: reminderDecision.reminderId,
+            action: reminderDecision.action,
+            schedule: reminderDecision.schedule,
           }
-        : decision.reminder && ["pause", "resume", "cancel", "run"].includes(decision.reminder.operation)
+        : reminderDecision && ["pause", "resume", "cancel", "run"].includes(reminderDecision.operation)
           ? {
-              operation: decision.reminder.operation as "pause" | "resume" | "cancel" | "run",
-              reminderId: decision.reminder.reminderId as string,
+              operation: reminderDecision.operation as "pause" | "resume" | "cancel" | "run",
+              reminderId: reminderDecision.reminderId as string,
             }
           : null;
+  const familyWorkDecision =
+    decision.familyWork &&
+    (decision.policy.schedule ||
+      decision.familyWork.operation === "list" ||
+      decision.familyWork.operation === "steer" ||
+      decision.familyWork.operation === "cancel" ||
+      decision.familyWork.operation === "pause" ||
+      (decision.familyWork.operation === "create" &&
+        decision.familyWork.schedule === null &&
+        decision.familyWork.briefing === null) ||
+      (decision.familyWork.operation === "update" &&
+        decision.familyWork.schedule === null &&
+        decision.familyWork.briefing === null))
+      ? decision.familyWork
+      : null;
   const familyWorkAcknowledgementText = [
     ...decision.conversation.bubbles.map((bubble) => bubble.text),
     ...(decision.conversation.nativeMoves ?? []).flatMap((move) =>
@@ -10163,16 +10006,16 @@ function decisionCommit(
     ),
   ].join("\n");
   const explicitResponsibleAdultName =
-    decision.familyWork?.operation === "create" ||
-    decision.familyWork?.operation === "update" ||
-    decision.familyWork?.operation === "steer"
-      ? decision.familyWork.responsibleAdultName
+    familyWorkDecision?.operation === "create" ||
+    familyWorkDecision?.operation === "update" ||
+    familyWorkDecision?.operation === "steer"
+      ? familyWorkDecision.responsibleAdultName
       : null;
   const selectedDocketResponsibleAdultNames =
-    decision.familyWork?.operation === "create" &&
+    familyWorkDecision?.operation === "create" &&
     turn.authority.audience === "group" &&
     explicitResponsibleAdultName === null
-      ? decision.familyWork.candidateIds.flatMap((candidateId) => {
+      ? familyWorkDecision.candidateIds.flatMap((candidateId) => {
           const owner = turn.householdDocket.items.find(
             (candidate) => candidate.candidateId === candidateId,
           )?.owner;
@@ -10186,19 +10029,26 @@ function decisionCommit(
         })
       : [];
   const inferredResponsibleAdultName =
-    decision.familyWork?.operation === "create" &&
-    decision.familyWork.candidateIds.length > 0 &&
-    selectedDocketResponsibleAdultNames.length === decision.familyWork.candidateIds.length &&
+    familyWorkDecision?.operation === "create" &&
+    familyWorkDecision.candidateIds.length > 0 &&
+    selectedDocketResponsibleAdultNames.length === familyWorkDecision.candidateIds.length &&
     new Set(selectedDocketResponsibleAdultNames).size === 1
       ? (selectedDocketResponsibleAdultNames[0] ?? null)
       : null;
   const responsibleAdultName = explicitResponsibleAdultName ?? inferredResponsibleAdultName;
+  const privateParticipantSteer = Boolean(
+    turn.authority.audience === "private" &&
+      familyWorkDecision?.operation === "steer" &&
+      turn.visibleFamilyWork.some(
+        (work) => work.workId === familyWorkDecision?.workId && work.privateParticipantReply,
+      ),
+  );
   const responsibleAdultId = responsibleAdultName
     ? (() => {
-        if (turn.authority.audience !== "group") {
+        if (turn.authority.audience !== "group" && !privateParticipantSteer) {
           throw new FlorenceReasonerError(
             "invalid_output",
-            "Only household family work can assign a responsible adult",
+            "Only household family work or its requested participant can assign a responsible adult",
           );
         }
         const matches = turn.household.members.filter(
@@ -10217,38 +10067,38 @@ function decisionCommit(
       })()
     : null;
   const familyWorkMutation: NonNullable<CommitTurnInput["familyWorkMutation"]> | null =
-    decision.familyWork?.operation === "create"
+    familyWorkDecision?.operation === "create"
       ? {
           operation: "create",
           workId: deterministicUuid(`family-work\0${turn.message.sourceId}`),
-          objective: decision.familyWork.objective,
-          completionCondition: decision.familyWork.completionCondition,
+          objective: familyWorkDecision.objective,
+          completionCondition: familyWorkDecision.completionCondition,
           ...(familyWorkAcknowledgementText ? { acknowledgementText: familyWorkAcknowledgementText } : {}),
-          schedule: decision.familyWork.schedule,
-          briefing: decision.familyWork.briefing,
+          schedule: familyWorkDecision.schedule,
+          briefing: familyWorkDecision.briefing,
           visibility: turn.authority.audience === "group" ? "household" : "private",
           ownerAdultId: turn.authority.audience === "group" ? null : turn.authority.senderAdultId,
           responsibleAdultId,
-          candidateIds: [...decision.familyWork.candidateIds],
+          candidateIds: [...familyWorkDecision.candidateIds],
         }
-      : decision.familyWork?.operation === "update"
+      : familyWorkDecision?.operation === "update"
         ? {
             operation: "update",
-            workId: decision.familyWork.workId,
-            objective: decision.familyWork.objective,
-            completionCondition: decision.familyWork.completionCondition,
-            schedule: decision.familyWork.schedule,
-            briefing: decision.familyWork.briefing,
+            workId: familyWorkDecision.workId,
+            objective: familyWorkDecision.objective,
+            completionCondition: familyWorkDecision.completionCondition,
+            schedule: familyWorkDecision.schedule,
+            briefing: familyWorkDecision.briefing,
             ...(explicitResponsibleAdultName !== null && responsibleAdultId !== null
               ? { responsibleAdultId }
               : {}),
           }
-        : decision.familyWork?.operation === "steer"
+        : familyWorkDecision?.operation === "steer"
           ? {
               operation: "steer",
-              workId: decision.familyWork.workId,
-              instruction: decision.familyWork.instruction,
-              completionCondition: decision.familyWork.completionCondition,
+              workId: familyWorkDecision.workId,
+              instruction: familyWorkDecision.instruction,
+              completionCondition: familyWorkDecision.completionCondition,
               ...(explicitResponsibleAdultName !== null && responsibleAdultId !== null
                 ? { responsibleAdultId }
                 : {}),
@@ -10256,40 +10106,42 @@ function decisionCommit(
                 ? { acknowledgementText: familyWorkAcknowledgementText }
                 : {}),
             }
-          : decision.familyWork?.operation === "run"
+          : familyWorkDecision?.operation === "run"
             ? {
                 operation: "run",
-                workId: decision.familyWork.workId,
+                workId: familyWorkDecision.workId,
                 ...(familyWorkAcknowledgementText
                   ? { acknowledgementText: familyWorkAcknowledgementText }
                   : {}),
               }
-            : decision.familyWork && ["pause", "resume", "cancel"].includes(decision.familyWork.operation)
+            : familyWorkDecision && ["pause", "resume", "cancel"].includes(familyWorkDecision.operation)
               ? {
-                  operation: decision.familyWork.operation as "pause" | "resume" | "cancel",
-                  workId: decision.familyWork.workId as string,
+                  operation: familyWorkDecision.operation as "pause" | "resume" | "cancel",
+                  workId: familyWorkDecision.workId as string,
                 }
               : null;
-  const docketMutation: NonNullable<CommitTurnInput["docketMutation"]> | null = decision.docketUpsert
-    ? decision.docketUpsert.operation === "create"
-      ? {
-          operation: "create",
-          candidateId: null,
-          candidate: { ...decision.docketUpsert.candidate },
-          sourceIds: [...new Set([turn.message.sourceId, ...decision.docketUpsert.sourceIds])],
-          retainedDocuments: [...(options.retainedDocketDocuments ?? [])],
-        }
-      : {
-          operation: "update",
-          candidateId: decision.docketUpsert.candidateId,
-          candidate: { ...decision.docketUpsert.candidate },
-          sourceIds: [...new Set([turn.message.sourceId, ...decision.docketUpsert.sourceIds])],
-          retainedDocuments: [...(options.retainedDocketDocuments ?? [])],
-        }
-    : null;
-  const calendar = calendarDuplicate
-    ? {}
-    : calendarCommit(turn, decision, options.resolveCalendarEventTarget);
+  const docketMutation: NonNullable<CommitTurnInput["docketMutation"]> | null =
+    decision.policy.retain && decision.docketUpsert
+      ? decision.docketUpsert.operation === "create"
+        ? {
+            operation: "create",
+            candidateId: null,
+            candidate: { ...decision.docketUpsert.candidate },
+            sourceIds: [...new Set([turn.message.sourceId, ...decision.docketUpsert.sourceIds])],
+            retainedDocuments: [...(options.retainedDocketDocuments ?? [])],
+          }
+        : {
+            operation: "update",
+            candidateId: decision.docketUpsert.candidateId,
+            candidate: { ...decision.docketUpsert.candidate },
+            sourceIds: [...new Set([turn.message.sourceId, ...decision.docketUpsert.sourceIds])],
+            retainedDocuments: [...(options.retainedDocketDocuments ?? [])],
+          }
+      : null;
+  const calendar =
+    !decision.policy.schedule || calendarDuplicate
+      ? {}
+      : calendarCommit(turn, decision, calendarApprovalPromptSourceId, options.resolveCalendarEventTarget);
   const approval = options.approveCalendarOffer
     ? [
         calendarApproval(
@@ -10320,7 +10172,14 @@ function decisionCommit(
           firstName: decision.secondAdultPlan.firstName,
           phoneNumber: decision.secondAdultPlan.phoneNumber,
           sourceIds: [...decision.secondAdultPlan.sourceIds],
-          approvalPromptSourceId: deterministicUuid(`outbound\0${turnId}\0${0}`),
+          approvalPromptSourceId:
+            secondAdultApprovalPromptSourceId ??
+            (() => {
+              throw new FlorenceReasonerError(
+                "invalid_output",
+                "A second-adult plan needs its exact sharing-review prompt",
+              );
+            })(),
         }
       : {
           operation: "cancel" as const,
@@ -10329,6 +10188,7 @@ function decisionCommit(
     : null;
   return {
     sourceId: turn.message.sourceId,
+    inboundClaimId: turn.inboundClaim.claimId,
     googleEvidence: options.googleEvidence ?? [],
     googleConnectionIdsUsed: options.googleConnectionIdsUsed ?? [],
     facts,
@@ -10342,7 +10202,10 @@ function decisionCommit(
     familyWorkRetainedDocuments: [...(options.retainedFamilyWorkDocuments ?? [])],
     docketMutation,
     completeDocketCandidateIds: docketCompletions,
-    interestMutation: decision.interest ?? null,
+    interestMutation:
+      decision.interest?.operation === "stop" || (decision.policy.retain && decision.policy.schedule)
+        ? (decision.interest ?? null)
+        : null,
     outbound,
     approveCalendarOffers: approval,
     ...(secondAdultPlan ? { secondAdultPlan } : {}),
@@ -10371,7 +10234,15 @@ function approvedActionConversation(
   calendarOffer: InboundTurn["pendingCalendarOffers"][number] | null,
   partnerInvitation: InboundTurn["pendingPartnerInvitation"],
   calendarLabel: string,
+  additional: FlorenceDecision["conversation"],
 ): FlorenceDecision["conversation"] {
+  if (additional.bubbles.length > 0) {
+    return {
+      ...additional,
+      participation: "respond",
+      replyToCurrentMessage: true,
+    };
+  }
   const bubbles: FlorenceDecision["conversation"]["bubbles"] = [];
   if (partnerInvitation) {
     bubbles.push({ text: `Got it—I’ll text ${partnerInvitation.firstName} now.`, delayMs: 0 });
@@ -10384,11 +10255,10 @@ function approvedActionConversation(
   }
   if (bubbles.length === 0) throw new Error("An approved action acknowledgement requires an action");
   return {
+    ...additional,
     participation: "respond",
     replyToCurrentMessage: true,
-    reaction: null,
     bubbles,
-    nativeMoves: null,
   };
 }
 
@@ -10413,7 +10283,7 @@ function partnerInvitationReviewDecision(
   invitation: NonNullable<InboundTurn["pendingPartnerInvitation"]>,
 ): FlorenceDecision {
   return {
-    policy: { retain: false, schedule: false, stopMessaging: false },
+    policy: { retain: false, schedule: false },
     conversation: {
       participation: "respond",
       replyToCurrentMessage: true,
@@ -10441,33 +10311,22 @@ function partnerInvitationReviewDecision(
   };
 }
 
-function unavailableSecondAdultPhoneDecision(firstName: string): FlorenceDecision {
+function withoutUnavailableSecondAdultPlan(decision: FlorenceDecision, firstName: string): FlorenceDecision {
   return {
-    policy: { retain: false, schedule: false, stopMessaging: false },
+    ...decision,
     conversation: {
-      participation: "respond",
+      ...decision.conversation,
+      participation: "respond" as const,
       replyToCurrentMessage: true,
-      reaction: null,
       bubbles: [
         {
           text: `I can’t use that number for a new Florence invitation. Please check it and send me a different mobile number for ${firstName}.`,
           delayMs: 0,
         },
+        ...decision.conversation.bubbles,
       ],
-      nativeMoves: null,
     },
-    facts: [],
-    followUp: null,
-    reminder: null,
-    familyWork: null,
-    docketUpsert: null,
-    docketCompletions: null,
-    interest: null,
-    calendar: null,
     secondAdultPlan: null,
-    householdUpdate: null,
-    webAccessPath: null,
-    researchUrls: null,
   };
 }
 
@@ -10556,6 +10415,7 @@ function secondAdultSharingReviewText(
 function calendarCommit(
   turn: InboundTurn,
   decision: FlorenceDecision,
+  approvalPromptSourceId: string | null,
   resolveCalendarEventTarget?: (eventRef: string) => CalendarEventTarget | null,
 ): Pick<CommitTurnInput, "calendarOffers" | "calendarActions"> {
   if (!decision.calendar) return {};
@@ -10594,9 +10454,13 @@ function calendarCommit(
   }
   const id = deterministicUuid(`calendar\0${turn.message.sourceId}`);
   if (decision.calendar.mode === "offer") {
+    if (!approvalPromptSourceId) {
+      throw new FlorenceReasonerError("invalid_output", "A Calendar offer needs its exact review prompt");
+    }
     const offer: CalendarOfferDraft = {
       id,
       basisSourceId: turn.message.sourceId,
+      approvalPromptSourceId,
       mutation: decision.calendar.mutation,
     };
     return { calendarOffers: [offer] };
@@ -11621,13 +11485,6 @@ function retainedPrivateGoogleSource(source: PrivateGoogleSourceReadResult): Flo
     occurredAt: source.occurredAt,
     text: modelSafeGmailText(text).slice(0, 50_000),
   };
-}
-
-function approvalReplyTargetsPrompt(
-  replyToSourceId: string | null,
-  approvalPromptSourceId: string | null,
-): boolean {
-  return replyToSourceId === null || replyToSourceId === approvalPromptSourceId;
 }
 
 function calendarConfirmationVerb(operation: "create" | "update" | "delete"): string {

@@ -95,9 +95,7 @@ export function ordinaryDecision(
   const participation = input.participation ?? "respond";
   return {
     policy:
-      participation === "observe"
-        ? { retain: false, schedule: false, stopMessaging: false }
-        : { retain: true, schedule: true, stopMessaging: false },
+      participation === "observe" ? { retain: false, schedule: false } : { retain: true, schedule: true },
     conversation: {
       participation,
       replyToCurrentMessage: false,

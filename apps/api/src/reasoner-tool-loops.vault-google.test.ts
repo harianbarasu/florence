@@ -938,6 +938,8 @@ describe("Florence reasoner capability cutover", () => {
         ],
       },
       { status: "completed", output_parsed: decision, output: [] },
+      { status: "completed", output_parsed: decision, output: [] },
+      { status: "completed", output_parsed: decision, output: [] },
     ];
     const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
       responses: {
@@ -1223,6 +1225,67 @@ describe("Florence reasoner capability cutover", () => {
         dismissedSourceIds: [],
       }).success,
     ).toBe(false);
+  });
+
+  test("retains a cited Google outcome when the model also labels its source dismissed", async () => {
+    const gmail = { ...privateGmailSource(), attachments: [] };
+    const fact = {
+      slot: "school:form",
+      statement: "The school form still needs review.",
+      memory: {
+        memoryKind: "fact" as const,
+        artifactKind: null,
+        title: null,
+        details: "The school form still needs review.",
+        tags: [],
+      },
+      familyRelevance: "household" as const,
+      sourceIds: [gmail.sourceId],
+    };
+    const invalidInitial = {
+      findings: [],
+      facts: [fact],
+      dismissedSourceIds: [gmail.sourceId],
+    };
+    const invalidIncremental = {
+      ...invalidInitial,
+      nextJob: null,
+    };
+    const repairedInitial = {
+      findings: [],
+      facts: [fact],
+      dismissedSourceIds: [],
+    };
+    const repairedIncremental = {
+      ...repairedInitial,
+      nextJob: null,
+    };
+    const requests: Record<string, unknown>[] = [];
+    const responses = [invalidInitial, invalidIncremental];
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        parse: (request: Record<string, unknown>) => {
+          requests.push(request);
+          const output_parsed = responses.shift();
+          if (!output_parsed) throw new Error("Unexpected private-Google repair turn");
+          return { status: "completed", output_parsed, output: [] };
+        },
+      },
+    } as never);
+
+    const reads = {
+      async readGmailAttachment(): Promise<never> {
+        throw new Error("The source has no attachment");
+      },
+    };
+
+    await expect(reasoner.classifyPrivateGoogleBatch(privateBatchInput(gmail), reads)).resolves.toEqual(
+      repairedInitial,
+    );
+    await expect(reasoner.assessGoogleChanges(privateAssessmentInput(gmail), reads)).resolves.toEqual(
+      repairedIncremental,
+    );
+    expect(requests).toHaveLength(2);
   });
 
   test("keeps every durable fact supported by one Google transport batch", async () => {

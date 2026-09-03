@@ -95,7 +95,6 @@ const REINVITE_APPROVAL = "Please invite Alex again.";
 const CONTEXTUAL_INVITE_APPROVAL = "Yes.";
 const PARTNER_INVITATION_APPROVAL_REPLY = "Got it—I’ll text Alex now.";
 const PARTNER_REINVITATION_APPROVAL_REPLY = PARTNER_INVITATION_APPROVAL_REPLY;
-const PARTNER_INVITATION_CONTRADICTION = "I can’t text Alex from here.";
 const PARTNER_SETUP_QUESTION = "What is this setup for?";
 const PARTNER_SETUP_HANDSHAKE_REPLY = "Hi Florence";
 const PARTNER_SETUP_REFUSAL = "I don’t want to join this.";
@@ -182,8 +181,6 @@ const GOOGLE_MEMORY_REPLY = "I have Maya at Muir Academy.";
 const WEB_CALENDAR_ACCESS_REQUEST = "Can you send me a fresh link to my Florence calendar?";
 const WEB_ACCESS_FOLLOW_UP = "Thanks — is that private to me?";
 const INCOMPLETE_SETUP_FRESH_LINK_REQUEST = "Can you send me a new link?";
-const INCOMPLETE_SETUP_FALSE_DENIAL =
-  "I can’t resend a setup link from here. If you’re already on the setup page, keep going there.";
 const INCOMPLETE_SETUP_FRESH_LINK_ACKNOWLEDGEMENT = "Of course—here’s a fresh link to finish setup.";
 const PRE_GOOGLE_HARMLESS_REQUEST = "Can you help me draft a quick note to Maya’s teacher?";
 const PRE_GOOGLE_HARMLESS_REPLY = "Sure—what do you want the note to say?";
@@ -195,8 +192,12 @@ const HOUSEHOLD_INITIAL_ALL_CLEAR =
   "I finished reviewing both parents’ last 90 days of Gmail and Calendar. Nothing needs attention right now, and I’ll keep watching.";
 const CONVERSATION_RECOVERY_REPLY =
   "Sorry—I hit a snag before I could answer. Try me again and I’ll take another run at it.";
+const GREETING_REPLY = "Hi! What can I help you with?";
+const PRIVATE_REASONER_FAILURE = "Fake normal private greeting returned no usable decision";
+const HOST_ADMISSION_REPAIR_REQUEST = "Can you help me sort out the school week?";
+const HOST_ADMISSION_REPAIR_REPLY = "Absolutely—what part of the school week should we tackle first?";
 const TRANSIENT_RETRY_REQUEST = "Can you check in with me?";
-const TRANSIENT_RETRY_CUE = "One sec—I hit a snag, but I’m trying that again.";
+const FORBIDDEN_GENERIC_RETRY_CUE = "One sec—I hit a snag, but I’m trying that again.";
 const TRANSIENT_RETRY_REPLY = "I’m back—what would you like me to check?";
 const NO_RETENTION_OR_SCHEDULING_REQUEST =
   "Answer this, but don’t remember it or schedule anything: the temporary code is blue.";
@@ -238,7 +239,6 @@ const PRIVATE_CALENDAR_OWNER_APPROVAL =
   "Add “Private anniversary dinner” to the family calendar exactly as shown.";
 const PRIVATE_CALENDAR_OWNER_APPROVAL_REPLY =
   "Got it—I’ll add “Private anniversary dinner” to the family calendar.";
-const PRIVATE_CALENDAR_OWNER_CONTRADICTION = "I can’t add that to the family calendar.";
 const PRIVATE_CALENDAR_GENERIC_TODAY_REPLY = "I confirmed a private calendar commitment today.";
 const PRIVATE_CALENDAR_FACT_SLOT = "child:maya:private_soccer_clinic";
 const PRIVATE_CALENDAR_FACT = "Maya’s private soccer clinic is on the parent’s calendar.";
@@ -516,7 +516,6 @@ type HarnessState = {
   silentMonitorSourceId: string | null;
   voicedMonitorSourceId: string | null;
   cancelledMonitorSourceId: string | null;
-  setupConversationFailuresRemaining: number;
   founderProductRecenterReview: boolean;
   googleRecipeArtifactExercise: boolean;
   proactiveFamilyWorkExercise: boolean;
@@ -612,7 +611,7 @@ release("Durable family work store", () => {
     } as const;
     const pendingCancelledPhoneCall = {
       ...cancelledPhoneCall,
-      providerCallId: `pending_bland_${"a".repeat(64)}_KzE1NTU1MjEyMTI`,
+      providerCallId: `pending_bland_${base.toString(36)}_${"a".repeat(64)}_KzE1NTU1MjEyMTI`,
     } as const;
     const pendingCancelledTwilioCall = {
       provider: "twilio",
@@ -1034,7 +1033,32 @@ release("Durable family work store", () => {
 
     await store.close();
     store = new PostgresFlorenceStore(databaseUrl);
+    await writeFile(
+      assertionFile,
+      `insert into sources (
+        id,household_id,kind,visibility,owner_adult_id,external_key,parent_source_id,label,metadata,
+        occurred_at
+      ) values (
+        '10000000-0000-4000-8000-000000000022',
+        '10000000-0000-4000-8000-000000000001','linq_message','private',
+        '10000000-0000-4000-8000-000000000002','interrupted-outbound',
+        '10000000-0000-4000-8000-000000000009','Interrupted outbound','{}'::jsonb,
+        ${sqlLiteral(at(-120_001))}
+      );
+      insert into messages (
+        source_id,channel_id,direction,move_kind,text,turn_id,turn_part,not_before,status,images,
+        idempotency_key,sending_at
+      ) values (
+        '10000000-0000-4000-8000-000000000022',
+        '10000000-0000-4000-8000-000000000004','outbound','message',
+        'An interrupted send must not freeze a parent correction.',
+        '10000000-0000-4000-8000-000000000023',0,${sqlLiteral(at(-120_001))},'sending',
+        '[]'::jsonb,'interrupted-outbound-idempotency',${sqlLiteral(at(-120_001))}
+      );`,
+    );
+    await migrateDatabase(databaseUrl, assertionFile);
     const inlineReply = await store.readNextInbound(at(100));
+    if (!inlineReply) throw new Error("The waiting parent reply was not claimed");
     expect(inlineReply).toMatchObject({
       message: {
         sourceId: "10000000-0000-4000-8000-000000000020",
@@ -1046,6 +1070,38 @@ release("Durable family work store", () => {
       },
       replyTargetFamilyWorkId: "10000000-0000-4000-8000-000000000003",
     });
+    await assertDatabase(
+      "Claiming a correction changed an already-started outbound send",
+      `exists (
+        select 1 from messages
+        where source_id='10000000-0000-4000-8000-000000000022'::uuid and status='sending'
+      )`,
+    );
+    await store.retryOutbound({
+      sourceId: "10000000-0000-4000-8000-000000000022",
+      retryAt: null,
+      error: "The interrupted regression send is complete",
+      occurredAt: at(101),
+    });
+    expect(await store.readNextInbound(at(100))).toBeNull();
+    const inboundTakeoverAt = new Date(Date.parse(inlineReply.inboundClaim.leaseUntil) + 1).toISOString();
+    const inboundTakeover = await store.readNextInbound(inboundTakeoverAt);
+    if (!inboundTakeover) throw new Error("The expired inbound claim was not recovered");
+    expect(inboundTakeover.inboundClaim.claimId).not.toBe(inlineReply.inboundClaim.claimId);
+    await expect(
+      store.retryInbound({
+        sourceId: inlineReply.message.sourceId,
+        claimId: inlineReply.inboundClaim.claimId,
+        retryAt: new Date(Date.parse(inboundTakeoverAt) + 100).toISOString(),
+        error: "A stale worker must not reschedule this turn",
+      }),
+    ).rejects.toThrow("The inbound message is no longer retryable");
+    expect(
+      await store.releaseInboundClaim({
+        sourceId: inboundTakeover.message.sourceId,
+        claimId: inboundTakeover.inboundClaim.claimId,
+      }),
+    ).toBe(true);
     const interrupted = await store.readNextDueProactiveWork(at(100));
     if (interrupted?.kind !== "family_task") {
       throw new Error("Persisted tool-pending work did not survive restart");
@@ -1374,10 +1430,273 @@ release("Durable family work store", () => {
           and source.metadata->>'familyWorkDeliveryEffectsAppliedAt' is not null)`,
     );
     expect(await store.readNextOutbound(at(135_400))).toBeNull();
+
+    await writeFile(
+      assertionFile,
+      `insert into sources (
+        id,household_id,kind,visibility,owner_adult_id,external_key,parent_source_id,label,metadata,
+        occurred_at
+      ) values (
+        '10000000-0000-4000-8000-000000000024',
+        '10000000-0000-4000-8000-000000000001','linq_message','private',
+        '10000000-0000-4000-8000-000000000002','effectful-parent-turn',null,
+        'Original parent instruction','{}'::jsonb,${sqlLiteral(at(135_450))}
+      ),(
+        '10000000-0000-4000-8000-000000000025',
+        '10000000-0000-4000-8000-000000000001','linq_message','private',
+        '10000000-0000-4000-8000-000000000002','started-parent-reply',
+        '10000000-0000-4000-8000-000000000024','Started reply','{}'::jsonb,
+        ${sqlLiteral(at(135_451))}
+      ),(
+        '10000000-0000-4000-8000-000000000029',
+        '10000000-0000-4000-8000-000000000001','linq_message','private',
+        '10000000-0000-4000-8000-000000000002','unstarted-parent-reply',
+        '10000000-0000-4000-8000-000000000024','Unstarted reply','{}'::jsonb,
+        ${sqlLiteral(at(135_452))}
+      );
+      insert into messages (
+        source_id,channel_id,direction,sender_adult_id,move_kind,text,provider_event_id,
+        provider_message_id,turn_id,turn_part,not_before,status,images
+      ) values (
+        '10000000-0000-4000-8000-000000000024',
+        '10000000-0000-4000-8000-000000000004','inbound',
+        '10000000-0000-4000-8000-000000000002','message','Use the original plan.',
+        'effectful-parent-turn-event','effectful-parent-turn-message',
+        '10000000-0000-4000-8000-000000000024',0,${sqlLiteral(at(135_450))},'received',
+        '[]'::jsonb
+      );
+      insert into messages (
+        source_id,channel_id,direction,move_kind,text,turn_id,turn_part,not_before,status,images,
+        idempotency_key,sending_at
+      ) values (
+        '10000000-0000-4000-8000-000000000025',
+        '10000000-0000-4000-8000-000000000004','outbound','message','I started the original plan.',
+        'b4703d22-a5da-528c-9415-8c523f78fe72',0,${sqlLiteral(at(135_451))},'sending',
+        '[]'::jsonb,'started-parent-reply',${sqlLiteral(at(135_451))}
+      ),(
+        '10000000-0000-4000-8000-000000000029',
+        '10000000-0000-4000-8000-000000000004','outbound','message','Queued original-plan detail.',
+        'b4703d22-a5da-528c-9415-8c523f78fe72',1,${sqlLiteral(at(135_452))},'pending',
+        '[]'::jsonb,'unstarted-parent-reply',null
+      );
+      insert into calendar_actions (
+        id,household_id,basis_source_id,approval_source_id,payload,status,retry_at,last_error,created_at
+      ) values (
+        '10000000-0000-4000-8000-000000000026',
+        '10000000-0000-4000-8000-000000000001',
+        '10000000-0000-4000-8000-000000000024',
+        '10000000-0000-4000-8000-000000000024',
+        '{"operation":"create","event":{"intervalKind":"all_day","title":"Field day",
+          "startDate":"2026-09-10","endDate":"2026-09-11","location":null},"target":null}'::jsonb,
+        'pending',${sqlLiteral(at(1_035_450))},'calendar_action_execution_claim_v1',
+        ${sqlLiteral(at(135_451))}
+      ),(
+        '10000000-0000-4000-8000-000000000028',
+        '10000000-0000-4000-8000-000000000001',
+        '10000000-0000-4000-8000-000000000024',
+        '10000000-0000-4000-8000-000000000024',
+        '{"operation":"create","event":{"intervalKind":"all_day","title":"Backup field day",
+          "startDate":"2026-09-12","endDate":"2026-09-13","location":null},"target":null}'::jsonb,
+        'pending',${sqlLiteral(at(135_452))},null,${sqlLiteral(at(135_452))}
+      );
+      insert into people (
+        id,household_id,kind,role,adult_slot,display_name,status,invitation_approval_source_id,
+        invitation_approved_at,invitation_retry_at,invitation_last_error,profile,preferences
+      ) values (
+        '10000000-0000-4000-8000-000000000027',
+        '10000000-0000-4000-8000-000000000001','adult','steward',2,'Alex','planned',
+        '10000000-0000-4000-8000-000000000024',${sqlLiteral(at(135_451))},
+        ${sqlLiteral(at(255_451))},
+        'partner_invitation_send_started:10000000-0000-4000-8000-000000000031',
+        '{"firstName":"Alex","phoneNumber":"+15555550199"}'::jsonb,'{}'::jsonb
+      );`,
+    );
+    await migrateDatabase(databaseUrl, assertionFile);
+    const correction = await store.acceptInbound({
+      providerConversationId: "test-chat",
+      audience: "private",
+      participantIdentityDigests: ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+      senderIdentitySubjectDigest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      providerEventId: "effectful-parent-correction-event",
+      providerMessageId: "effectful-parent-correction-message",
+      text: "Actually, use next Tuesday instead.",
+      supersedesSourceId: "10000000-0000-4000-8000-000000000024",
+      occurredAt: at(135_500),
+    });
+    expect(correction?.disposition).toBe("accepted");
+    await assertDatabase(
+      "A parent correction discarded provider work that had already started",
+      `exists (select 1 from messages
+          where source_id='10000000-0000-4000-8000-000000000025'::uuid and status='sending')
+       and exists (select 1 from messages
+          where source_id='10000000-0000-4000-8000-000000000029'::uuid and status='failed')
+       and exists (select 1 from calendar_actions
+          where id='10000000-0000-4000-8000-000000000026'::uuid and status='pending'
+            and last_error='calendar_action_execution_claim_v1')
+       and exists (select 1 from calendar_actions
+          where id='10000000-0000-4000-8000-000000000028'::uuid and status='failed')
+       and exists (select 1 from people
+          where id='10000000-0000-4000-8000-000000000027'::uuid
+            and invitation_approval_source_id='10000000-0000-4000-8000-000000000024'::uuid
+            and invitation_last_error=
+              'partner_invitation_send_started:10000000-0000-4000-8000-000000000031')`,
+    );
+    expect(await store.outboundSendIsCurrent("10000000-0000-4000-8000-000000000025")).toBe(true);
+    await store.completeOutbound({
+      sourceId: "10000000-0000-4000-8000-000000000025",
+      providerMessageId: "provider-started-before-correction",
+      sentAt: at(135_501),
+    });
+    expect(
+      await store.retryPartnerInvitation({
+        adultId: "10000000-0000-4000-8000-000000000027",
+        approvalSourceId: "10000000-0000-4000-8000-000000000024",
+        claimId: "10000000-0000-4000-8000-000000000031",
+        retryAt: at(255_502),
+        error: "Provider result remains reconcilable",
+      }),
+    ).toBe(true);
+    await assertDatabase(
+      "Started effects could not reconcile their provider truth after the correction",
+      `exists (select 1 from messages
+          where source_id='10000000-0000-4000-8000-000000000025'::uuid and status='sent'
+            and provider_message_id='provider-started-before-correction')
+       and exists (select 1 from calendar_actions
+          where id='10000000-0000-4000-8000-000000000026'::uuid and status='pending'
+            and last_error='calendar_action_execution_claim_v1')
+       and exists (select 1 from people
+          where id='10000000-0000-4000-8000-000000000027'::uuid
+            and invitation_last_error like
+              'partner_invitation_send_started:10000000-0000-4000-8000-000000000031 %')`,
+    );
   });
 });
 
 release("Florence parent journeys", () => {
+  test("keeps another household responsive while one conversation is still thinking", async () => {
+    const slowRequest = "Can you think through our school-week logistics in detail?";
+    const slowReply = "I worked through the school-week logistics.";
+    const fastRequest = "What should I pack for tomorrow?";
+    const fastFirstReply = "Start with the school bag, water bottle, and lunch.";
+    const fastSecondReply = "I’d put anything that must leave the house beside the front door tonight.";
+    let markSlowStarted: () => void = () => undefined;
+    const slowStarted = new Promise<void>((resolve) => {
+      markSlowStarted = resolve;
+    });
+    let releaseSlow: () => void = () => undefined;
+    const slowRelease = new Promise<void>((resolve) => {
+      releaseSlow = resolve;
+    });
+    const harness = await createHarness(async (input) => {
+      if (input.currentMessage.text === slowRequest) {
+        markSlowStarted();
+        await slowRelease;
+        return decision({ bubbles: [{ text: slowReply, delayMs: 0 }] });
+      }
+      if (input.currentMessage.text === fastRequest) {
+        return decision({
+          bubbles: [
+            { text: fastFirstReply, delayMs: 0 },
+            { text: fastSecondReply, delayMs: 650 },
+          ],
+        });
+      }
+      return decision();
+    });
+    await harness.setupFounder();
+
+    const secondConversationId = "linq-private-second-household";
+    const secondIdentity = linqIdentitySubjectDigest("messages-second-household-founder");
+    harness.linq.authorities.set(secondConversationId, {
+      audience: "private",
+      participantIdentityDigests: [secondIdentity],
+    });
+    const secondSetup = harness.enrollmentCodes.issueFounderSetup({
+      providerConversationId: secondConversationId,
+      identitySubjectDigest: secondIdentity,
+      occurredAt: harness.iso(),
+    });
+    expect(
+      await harness.florence.redeemSetupLink({
+        setupToken: secondSetup.token,
+        profile: {
+          firstName: "Morgan",
+          lastName: "Lee",
+          timeZone: "America/Los_Angeles",
+          guardianAttested: true,
+          proactiveUseAccepted: true,
+          privateConflictBusySharingEnabled: false,
+        },
+      }),
+    ).toMatchObject({ disposition: "accepted", adultId: secondSetup.adultId });
+
+    harness.florence.start();
+    try {
+      await harness.accept("private", "slow-household-turn", slowRequest);
+      await slowStarted;
+      expect(harness.linq.messages.some((message) => message.text === slowReply)).toBe(false);
+
+      harness.state.now += 1;
+      const fastAccepted = await harness.florence.acceptInbound({
+        providerConversationId: secondConversationId,
+        audience: "private",
+        participantIdentityDigests: [secondIdentity],
+        senderIdentitySubjectDigest: secondIdentity,
+        providerEventId: "event-fast-second-household-turn",
+        providerMessageId: "message-fast-second-household-turn",
+        text: fastRequest,
+        occurredAt: harness.iso(),
+      });
+      expect(fastAccepted?.disposition).toBe("accepted");
+
+      for (
+        let attempt = 0;
+        attempt < 100 && !harness.linq.messages.some((message) => message.text === fastFirstReply);
+        attempt += 1
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(
+        harness.linq.messages.some(
+          (message) =>
+            message.providerConversationId === secondConversationId && message.text === fastFirstReply,
+        ),
+      ).toBe(true);
+      expect(harness.linq.messages.some((message) => message.text === slowReply)).toBe(false);
+
+      harness.state.now += 1_000;
+      for (
+        let attempt = 0;
+        attempt < 100 && !harness.linq.messages.some((message) => message.text === fastSecondReply);
+        attempt += 1
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(
+        harness.linq.messages.some(
+          (message) =>
+            message.providerConversationId === secondConversationId && message.text === fastSecondReply,
+        ),
+      ).toBe(true);
+      expect(harness.linq.messages.some((message) => message.text === slowReply)).toBe(false);
+    } finally {
+      releaseSlow();
+    }
+    for (
+      let attempt = 0;
+      attempt < 100 && !harness.linq.messages.some((message) => message.text === slowReply);
+      attempt += 1
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(
+      harness.linq.messages.some(
+        (message) => message.providerConversationId === PRIVATE_FOUNDER && message.text === slowReply,
+      ),
+    ).toBe(true);
+    await harness.florence.stop();
+  }, 20_000);
+
   test("retains every cross-page source supporting one initial Google fact", async () => {
     const harness = await createHarness(async () => decision());
     harness.state.completeFactSupportExercise = true;
@@ -1485,7 +1804,7 @@ release("Florence parent journeys", () => {
               sourceIds: [],
             },
           }),
-          policy: { retain: true, schedule: false, stopMessaging: false },
+          policy: { retain: true, schedule: false },
         };
       }
       if (input.currentMessage.text === "Stop legacy monitor 21.") {
@@ -1506,7 +1825,7 @@ release("Florence parent journeys", () => {
               sourceIds: [input.currentMessage.sourceId],
             },
           }),
-          policy: { retain: true, schedule: false, stopMessaging: false },
+          policy: { retain: true, schedule: false },
         };
       }
       return decision();
@@ -2523,7 +2842,7 @@ release("Florence parent journeys", () => {
       harness.linq.messages.filter(
         (message) => message.providerConversationId === PRIVATE_FOUNDER && message.text === sharingReview,
       ),
-    ).toHaveLength(2);
+    ).toHaveLength(1);
     const expansionWorkspace = await harness.florence.workspaceForAdult(harness.founderAdultId);
     expect(expansionWorkspace.workspace.setup).toMatchObject({
       secondAdultAdded: true,
@@ -2564,6 +2883,7 @@ release("Florence parent journeys", () => {
       "founder",
       currentReviewDelivery.providerReceiptId,
     );
+    expect(await harness.florence.runOnce()).toBe(true);
     await expect(harness.florence.runOnce()).rejects.toThrow(
       "simulated crash after the partner invitation send marker",
     );
@@ -2672,7 +2992,6 @@ release("Florence parent journeys", () => {
     const partnerSetupLinksBeforeClassifierFailure = harness.accessLinksFor(PRIVATE_PARTNER).length;
     const calendarExecutionsBeforeIncompletePartnerWork = harness.state.calendarExecutions.length;
     const interactiveGoogleReadsBeforeIncompletePartnerWork = harness.state.interactiveGoogleReads;
-    harness.state.setupConversationFailuresRemaining = 1;
     await harness.accept(
       "private",
       "solo-expansion-partner-pre-google-request",
@@ -2681,7 +3000,7 @@ release("Florence parent journeys", () => {
     );
     await harness.drain();
     expect(harness.accessLinksFor(PRIVATE_PARTNER)).toHaveLength(partnerSetupLinksBeforeClassifierFailure);
-    expect(preGoogleHarmlessReasonerCalls).toBe(1);
+    expect(preGoogleHarmlessReasonerCalls).toBe(2);
     expect(
       harness.linq.messages.some(
         (message) =>
@@ -2742,7 +3061,6 @@ release("Florence parent journeys", () => {
       .filter((message) => message.providerConversationId === PRIVATE_PARTNER)
       .slice(partnerMessagesBeforeSetupBoundary);
     expect(partnerSetupBoundaryMessages.map((message) => message.text)).toEqual([
-      "One sec—I hit a snag, but I’m trying that again.",
       PRE_GOOGLE_HARMLESS_REPLY,
       incompletePartnerTerminalText,
     ]);
@@ -3081,21 +3399,68 @@ release("Florence parent journeys", () => {
     let accessFollowUpHistory: readonly string[] = [];
     let accessFollowUpAuthoredText: string | null = null;
     let failNextReinviteConversation = false;
-    let customizeNextSuccessfulPartnerInvitation = false;
     let failNextGroupGreeting = false;
+    let failNextPrivateGreeting = false;
+    let hostAdmissionRepairAttempts = 0;
+    let hostAdmissionRepairReason: string | null = null;
     let transientRetryAttempts = 0;
     let retryCueLeakedIntoConversation = false;
     let activeReminderListSeen = false;
     let reminderBeyondFormerBoundaryCancelled = false;
     let pausedReminderListSeen = false;
-    const harness = await createHarness(async (input) => {
+    const harness = await createHarness(async (input, _reads, _signal, hooks) => {
+      if (
+        input.currentMessage.text === "How do I finish connecting Google?" ||
+        input.currentMessage.text === INCOMPLETE_SETUP_FRESH_LINK_REQUEST
+      ) {
+        return decision({
+          bubbles: [{ text: INCOMPLETE_SETUP_FRESH_LINK_ACKNOWLEDGEMENT, delayMs: 0 }],
+          webAccessPath: "/",
+        });
+      }
+      if (input.currentMessage.text === HOST_ADMISSION_REPAIR_REQUEST) {
+        const rejected = decision({
+          bubbles: [{ text: HOST_ADMISSION_REPAIR_REPLY, delayMs: 0 }],
+          familyWork: {
+            operation: "create",
+            responsibleAdultName: "Someone outside this family",
+            briefing: null,
+            workId: null,
+            objective: "Help organize the school week.",
+            completionCondition: "The parent has a useful school-week plan.",
+            schedule: null,
+            instruction: null,
+            candidateIds: [],
+          },
+        });
+        const admitDecision = (
+          hooks as
+            | {
+                admitDecision?: (candidate: FlorenceDecision) => Promise<void> | void;
+              }
+            | undefined
+        )?.admitDecision;
+        if (!admitDecision) return rejected;
+        try {
+          await admitDecision(rejected);
+          return rejected;
+        } catch (error) {
+          hostAdmissionRepairAttempts += 1;
+          hostAdmissionRepairReason = error instanceof Error ? error.message : String(error);
+          const repaired = decision({
+            bubbles: [{ text: HOST_ADMISSION_REPAIR_REPLY, delayMs: 0 }],
+          });
+          await admitDecision(repaired);
+          return repaired;
+        }
+      }
       if (input.currentMessage.text === TRANSIENT_RETRY_REQUEST) {
         transientRetryAttempts += 1;
         if (transientRetryAttempts === 1) {
           throw new FlorenceReasonerError("transient", "Fake temporary model failure");
         }
         retryCueLeakedIntoConversation = input.recentMessages.some(
-          (message) => message.text === TRANSIENT_RETRY_CUE,
+          (message) => message.text === FORBIDDEN_GENERIC_RETRY_CUE,
         );
         return decision({ bubbles: [{ text: TRANSIENT_RETRY_REPLY, delayMs: 0 }] });
       }
@@ -3110,8 +3475,16 @@ release("Florence parent journeys", () => {
           "Fake normal family-thread greeting returned no usable decision",
         );
       }
-      if (input.audience === "group" && input.currentMessage.text === "Hi Florence") {
-        return decision({ bubbles: [{ text: CONVERSATION_RECOVERY_REPLY, delayMs: 0 }] });
+      if (
+        failNextPrivateGreeting &&
+        input.audience === "private" &&
+        input.currentMessage.text === "Hi Florence"
+      ) {
+        failNextPrivateGreeting = false;
+        throw new FlorenceReasonerError("invalid_output", PRIVATE_REASONER_FAILURE);
+      }
+      if (input.currentMessage.text === "Hi Florence") {
+        return decision({ bubbles: [{ text: GREETING_REPLY, delayMs: 0 }] });
       }
       if (failNextReinviteConversation && input.currentMessage.text === REINVITE_APPROVAL) {
         failNextReinviteConversation = false;
@@ -3120,17 +3493,8 @@ release("Florence parent journeys", () => {
           "Fake normal conversation output failed after isolated invitation approval",
         );
       }
-      if (customizeNextSuccessfulPartnerInvitation && input.currentMessage.text === REINVITE_APPROVAL) {
-        customizeNextSuccessfulPartnerInvitation = false;
-        return decision({
-          reaction: "emphasize",
-          bubbles: [{ text: PARTNER_INVITATION_CONTRADICTION, delayMs: 0 }],
-        });
-      }
       if (input.currentMessage.text === INVITE_APPROVAL || input.currentMessage.text === REINVITE_APPROVAL) {
-        return decision({
-          bubbles: [{ text: PARTNER_INVITATION_CONTRADICTION, delayMs: 0 }],
-        });
+        return decision();
       }
       if (input.currentMessage.text === NO_RETENTION_OR_SCHEDULING_REQUEST) {
         return {
@@ -3144,7 +3508,7 @@ release("Florence parent journeys", () => {
               ),
             ],
           }),
-          policy: { retain: false, schedule: false, stopMessaging: false },
+          policy: { retain: false, schedule: false },
         };
       }
       if (input.currentMessage.text === WEB_CALENDAR_ACCESS_REQUEST) {
@@ -3311,15 +3675,9 @@ release("Florence parent journeys", () => {
     await harness.accept("private", "fresh-incomplete-setup-link", INCOMPLETE_SETUP_FRESH_LINK_REQUEST);
     await harness.drain();
     const freshSetupMessages = harness.linq.messages.slice(setupMessagesBeforeFreshLinkRequest);
-    expect(harness.state.setupConversations.at(-1)).toMatchObject({
-      stage: "connect_google",
-      currentMessage: { text: INCOMPLETE_SETUP_FRESH_LINK_REQUEST },
-      nextStep: "connect_google",
-    });
     expect(freshSetupMessages.map((message) => message.text)).toContain(
       INCOMPLETE_SETUP_FRESH_LINK_ACKNOWLEDGEMENT,
     );
-    expect(freshSetupMessages.some((message) => message.text === INCOMPLETE_SETUP_FALSE_DENIAL)).toBe(false);
     expect(harness.accessLinksFor(PRIVATE_FOUNDER)).toHaveLength(setupLinksBeforeFreshLinkRequest + 1);
     expect(harness.accessLinkFor(PRIVATE_FOUNDER)).toMatchObject({ pathname: "/" });
     expect(harness.accessLinkFor(PRIVATE_FOUNDER).toString()).not.toBe(priorSetupAccessUrl);
@@ -3568,6 +3926,13 @@ release("Florence parent journeys", () => {
     expect(
       harness.linq.messages
         .filter((message) => message.providerConversationId === PRIVATE_FOUNDER)
+        .slice(founderMessagesBeforeReinvite),
+    ).toEqual([]);
+    harness.state.now += 15_001;
+    await harness.drain();
+    expect(
+      harness.linq.messages
+        .filter((message) => message.providerConversationId === PRIVATE_FOUNDER)
         .slice(founderMessagesBeforeReinvite)
         .map((message) => message.text),
     ).toEqual([expect.stringMatching(/^Before I invite Alex:.*Want me to text Alex at ••••0202\?$/)]);
@@ -3619,7 +3984,6 @@ release("Florence parent journeys", () => {
       )`,
     );
 
-    customizeNextSuccessfulPartnerInvitation = true;
     const founderMessagesBeforeSuccessfulReinvite = harness.linq.messages.filter(
       (message) => message.providerConversationId === PRIVATE_FOUNDER,
     ).length;
@@ -4388,6 +4752,71 @@ release("Florence parent journeys", () => {
         )} and status='cancelled' and next_check_at is null)`,
     );
 
+    failNextPrivateGreeting = true;
+    expect(await harness.accept("private", "private-greeting-invalid-output", "Hi Florence")).toMatchObject({
+      disposition: "accepted",
+    });
+    await harness.drain();
+    expect(
+      harness.linq.messages.filter(
+        (message) =>
+          message.providerConversationId === PRIVATE_FOUNDER && message.text === CONVERSATION_RECOVERY_REPLY,
+      ),
+    ).toHaveLength(0);
+    expect(
+      harness.linq.messages.filter(
+        (message) =>
+          message.providerConversationId === PRIVATE_FOUNDER && message.text === FORBIDDEN_GENERIC_RETRY_CUE,
+      ),
+    ).toHaveLength(0);
+    harness.state.now += 16_000;
+    await harness.drain();
+    expect(
+      harness.linq.messages.filter(
+        (message) => message.providerConversationId === PRIVATE_FOUNDER && message.text === GREETING_REPLY,
+      ),
+    ).toHaveLength(1);
+    await harness.assertDatabase(
+      "A repaired ordinary private turn was not handled exactly once",
+      `exists (
+        select 1 from messages
+        where source_id=${sqlLiteral(inboundSourceId("event-private-greeting-invalid-output"))}::uuid
+          and direction='inbound' and status='handled' and retry_at is null
+          and last_error is null
+      )`,
+    );
+
+    expect(
+      await harness.accept("private", "private-host-admission-repair", HOST_ADMISSION_REPAIR_REQUEST),
+    ).toMatchObject({ disposition: "accepted" });
+    await harness.drain();
+    expect(hostAdmissionRepairAttempts).toBe(1);
+    expect(hostAdmissionRepairReason).toContain(
+      "Only household family work or its requested participant can assign",
+    );
+    expect(
+      harness.linq.messages.filter(
+        (message) =>
+          message.providerConversationId === PRIVATE_FOUNDER && message.text === HOST_ADMISSION_REPAIR_REPLY,
+      ),
+    ).toHaveLength(1);
+    expect(
+      harness.linq.messages.filter(
+        (message) =>
+          message.providerConversationId === PRIVATE_FOUNDER &&
+          message.replyTo?.providerMessageId === "message-private-host-admission-repair" &&
+          message.text === CONVERSATION_RECOVERY_REPLY,
+      ),
+    ).toHaveLength(0);
+    await harness.assertDatabase(
+      "A host-admitted natural-language turn retained an internal failure",
+      `exists (
+        select 1 from messages
+        where source_id=${sqlLiteral(inboundSourceId("event-private-host-admission-repair"))}::uuid
+          and direction='inbound' and status='handled' and retry_at is null and last_error is null
+      )`,
+    );
+
     failNextGroupGreeting = true;
     expect(await harness.accept("group", "group-greeting-invalid-output", "Hi Florence")).toMatchObject({
       disposition: "accepted",
@@ -4395,16 +4824,14 @@ release("Florence parent journeys", () => {
     await harness.drain();
     expect(
       harness.linq.messages.filter(
-        (message) =>
-          message.providerConversationId === FAMILY_GROUP && message.text === CONVERSATION_RECOVERY_REPLY,
+        (message) => message.providerConversationId === FAMILY_GROUP && message.text === GREETING_REPLY,
       ),
     ).toHaveLength(0);
     harness.state.now += 16_000;
     await harness.drain();
     expect(
       harness.linq.messages.filter(
-        (message) =>
-          message.providerConversationId === FAMILY_GROUP && message.text === CONVERSATION_RECOVERY_REPLY,
+        (message) => message.providerConversationId === FAMILY_GROUP && message.text === GREETING_REPLY,
       ),
     ).toHaveLength(1);
     await harness.assertDatabase(
@@ -4420,7 +4847,8 @@ release("Florence parent journeys", () => {
     await harness.drain();
     expect(
       harness.linq.messages.filter(
-        (message) => message.providerConversationId === FAMILY_GROUP && message.text === TRANSIENT_RETRY_CUE,
+        (message) =>
+          message.providerConversationId === FAMILY_GROUP && message.text === FORBIDDEN_GENERIC_RETRY_CUE,
       ),
     ).toHaveLength(0);
     expect(harness.linq.messages.some((message) => message.text === TRANSIENT_RETRY_REPLY)).toBe(false);
@@ -4430,7 +4858,8 @@ release("Florence parent journeys", () => {
     expect(retryCueLeakedIntoConversation).toBe(false);
     expect(
       harness.linq.messages.filter(
-        (message) => message.providerConversationId === FAMILY_GROUP && message.text === TRANSIENT_RETRY_CUE,
+        (message) =>
+          message.providerConversationId === FAMILY_GROUP && message.text === FORBIDDEN_GENERIC_RETRY_CUE,
       ),
     ).toHaveLength(0);
     expect(harness.linq.messages.some((message) => message.text === TRANSIENT_RETRY_REPLY)).toBe(true);
@@ -4943,55 +5372,51 @@ release("Florence parent journeys", () => {
             },
           });
         }
-        if (
-          input.currentMessage.text === reassignmentAnswer ||
-          input.currentMessage.text === completionAnswer
-        ) {
+        const participantReply =
+          input.currentMessage.text === reassignmentAnswer || input.currentMessage.text === completionAnswer
+            ? input.currentMessage.text
+            : input.currentMessage.text === laterUnrelated
+              ? (input.recentMessages.find((message) => message.text === reassignmentAnswer)?.text ?? null)
+              : null;
+        const alsoHandlesUnrelated =
+          input.currentMessage.text === unrelated || input.currentMessage.text === laterUnrelated;
+        if (participantReply) {
           ordinaryReasonerSawParticipantReply = true;
+          if (alsoHandlesUnrelated) ordinaryReasonerUnrelatedMessages += 1;
+          const pendingWork = input.visibleFamilyWork.find(
+            (work) => work.objective === objective && work.privateParticipantReply === true,
+          );
+          if (!pendingWork) {
+            throw new Error("The responsible parent's pending household question was not visible");
+          }
+          const reassigned = participantReply === reassignmentAnswer;
+          expect(pendingWork.responsibleAdultName).toBe(reassigned ? "Alex Anbarasu" : "Hari Anbarasu");
+          return decision({
+            bubbles: [
+              {
+                text: reassigned ? reassignmentAcknowledgement : completionAcknowledgement,
+                delayMs: 0,
+              },
+              ...(alsoHandlesUnrelated ? [{ text: unrelatedReply, delayMs: 0 }] : []),
+            ],
+            familyWork: {
+              operation: "steer",
+              workId: pendingWork.workId,
+              objective: null,
+              completionCondition: null,
+              responsibleAdultName: reassigned ? "Hari Anbarasu" : null,
+              schedule: null,
+              instruction: participantReply,
+            },
+          });
         }
-        if (input.currentMessage.text === unrelated || input.currentMessage.text === laterUnrelated) {
+        if (alsoHandlesUnrelated) {
           ordinaryReasonerUnrelatedMessages += 1;
           return decision({ bubbles: [{ text: unrelatedReply, delayMs: 0 }] });
         }
         return decision();
       },
       {
-        interpretParticipantReply: async (input) => {
-          if (input.currentMessage.text === unrelated) {
-            return {
-              belongsToRequest: false,
-              acknowledgement: null,
-              reassignToAdultName: null,
-            };
-          }
-          if (input.currentMessage.text === reassignmentAnswer) {
-            expect(input.pendingRequest).toMatchObject({
-              targetAdultName: "Alex Anbarasu",
-              question,
-              taskObjective: objective,
-            });
-            expect(input.currentMessage.explicitlyRepliesToQuestion).toBe(false);
-            return {
-              belongsToRequest: true,
-              reassignToAdultName: "Hari Anbarasu",
-              acknowledgement: { kind: "text", text: reassignmentAcknowledgement },
-            };
-          }
-          expect(input.pendingRequest).toMatchObject({
-            targetAdultName: "Hari Anbarasu",
-            question: reassignedQuestion,
-            taskObjective: objective,
-          });
-          expect(input.currentMessage).toMatchObject({
-            text: completionAnswer,
-            explicitlyRepliesToQuestion: false,
-          });
-          return {
-            belongsToRequest: true,
-            reassignToAdultName: null,
-            acknowledgement: { kind: "text", text: completionAcknowledgement },
-          };
-        },
         continueFamilyWork: async (input, reads) => {
           durableRuns += 1;
           expect(input.visibility).toBe("household");
@@ -5139,14 +5564,12 @@ release("Florence parent journeys", () => {
     await harness.accept("private", "participant-request-reassignment", reassignmentAnswer, "partner");
     await harness.accept("private", "participant-request-later-unrelated", laterUnrelated, "partner");
     await harness.drain();
-    expect(ordinaryReasonerSawParticipantReply).toBe(false);
+    expect(ordinaryReasonerSawParticipantReply).toBe(true);
     expect(ordinaryReasonerUnrelatedMessages).toBe(2);
     expect(
       harness.linq.messages.filter(
         (message) =>
-          message.providerConversationId === PRIVATE_PARTNER &&
-          message.replyTo?.providerMessageId === "message-participant-request-reassignment" &&
-          message.text === reassignmentAcknowledgement,
+          message.providerConversationId === PRIVATE_PARTNER && message.text === reassignmentAcknowledgement,
       ),
     ).toHaveLength(1);
     expect(
@@ -5180,9 +5603,7 @@ release("Florence parent journeys", () => {
     expect(
       harness.linq.messages.filter(
         (message) =>
-          message.providerConversationId === PRIVATE_FOUNDER &&
-          message.replyTo?.providerMessageId === "message-participant-request-completion" &&
-          message.text === completionAcknowledgement,
+          message.providerConversationId === PRIVATE_FOUNDER && message.text === completionAcknowledgement,
       ),
     ).toHaveLength(1);
     expect(
@@ -5291,6 +5712,18 @@ release("Florence parent journeys", () => {
         if (input.currentMessage.text === parentQuestion) {
           parentQuestionAttempts += 1;
           pendingCalendarOfferCount = input.pendingCalendarOffers.length;
+          parentQuestionContextSeen =
+            input.audience === "group" &&
+            input.currentMessage.senderName === "Hari Anbarasu" &&
+            input.currentMessage.replyTo === null;
+          const pendingOffer = input.pendingCalendarOffers.find(
+            (offer) => offer.event.title === offeredEvent.title,
+          );
+          expect(pendingOffer).toMatchObject({
+            event: offeredEvent,
+            approvalPromptCurrent: false,
+          });
+          calendarApprovalContextSeen = true;
           if (parentQuestionAttempts === 1) {
             throw new FlorenceReasonerError(
               "transient",
@@ -5329,69 +5762,6 @@ release("Florence parent journeys", () => {
         return decision();
       },
       {
-        interpretCalendarApproval: async (input) => {
-          if (input.currentMessage.text === parentQuestion) {
-            calendarApprovalContextSeen = true;
-            expect(input).toMatchObject({
-              audience: "group",
-              adultNames: ["Hari Anbarasu", "Alex Anbarasu"],
-              approvalPromptCurrent: false,
-              currentMessage: {
-                senderName: "Hari Anbarasu",
-                replyTo: null,
-              },
-              event: offeredEvent,
-            });
-            return { approve: true, standaloneExplicit: false };
-          }
-          return { approve: false, standaloneExplicit: false };
-        },
-        interpretParticipantReply: async (input) => {
-          expect(input.pendingRequest).toMatchObject({
-            replyContext: "waiting",
-            question,
-            taskObjective: objective,
-          });
-          expect(input.audience).toBe("group");
-          expect(input.adultNames).toEqual(["Hari Anbarasu", "Alex Anbarasu"]);
-          expect(input.currentMessage.explicitlyRepliesToQuestion).toBe(
-            input.currentMessage.text === redirectToAlex,
-          );
-          if (input.currentMessage.text === unrelated) {
-            expect(input.currentMessage.text).toBe(unrelated);
-          }
-          if (input.currentMessage.text === parentQuestion) {
-            parentQuestionContextSeen = true;
-            expect(input.currentMessage).toMatchObject({
-              senderName: "Hari Anbarasu",
-              replyTo: null,
-            });
-          }
-          if (input.currentMessage.text === parentAnswer) {
-            expect(input.currentMessage).toMatchObject({
-              senderName: "Alex Anbarasu",
-              replyTo: {
-                senderName: "Hari Anbarasu",
-                text: parentQuestion,
-              },
-            });
-          }
-          if (input.currentMessage.text === redirectToAlex) {
-            expect(input.currentMessage).toMatchObject({
-              senderName: "Hari Anbarasu",
-              explicitlyRepliesToQuestion: true,
-              replyTo: {
-                senderName: "Florence",
-                text: question,
-              },
-            });
-          }
-          return {
-            belongsToRequest: false,
-            acknowledgement: null,
-            reassignToAdultName: null,
-          };
-        },
         continueFamilyWork: async (input) => {
           durableRuns += 1;
           return {
@@ -5600,91 +5970,96 @@ release("Florence parent journeys", () => {
     let completeCalendarReads = 0;
     const contextualApprovals = new Set<string>();
     let duplicateSeen = false;
-    const harness = await createHarness(
-      async (input, reads) => {
-        const currentSourceId = input.currentMessage.sourceId;
-        const currentEvent =
-          currentSourceId === inboundSourceId(`event-${flyerKey}`) ||
-          currentSourceId === inboundSourceId(`event-${duplicateFlyerKey}`)
-            ? event
-            : currentSourceId === inboundSourceId(`event-${typedGroupFlyerKey}`)
-              ? typedGroupEvent
-              : currentSourceId === inboundSourceId(`event-${typedPrivateFlyerKey}`)
-                ? typedPrivateEvent
-                : null;
-        if (!currentEvent) return decision();
-        const captionless =
-          currentSourceId === inboundSourceId(`event-${flyerKey}`) ||
-          currentSourceId === inboundSourceId(`event-${duplicateFlyerKey}`);
-        if (captionless) {
-          expect(input.currentMessage).toMatchObject({
-            text: "Shared a family attachment.",
-            authoredText: null,
-            voiceTranscriptPresent: false,
-          });
-        } else {
-          expect(input.currentMessage).toMatchObject({
-            authoredText:
-              currentEvent === typedGroupEvent
-                ? "Add this school flyer to the Florence Calendar."
-                : "Please add this flyer to my Florence Calendar.",
-            voiceTranscriptPresent: false,
-          });
+    const harness = await createHarness(async (input, reads) => {
+      if (input.currentMessage.text === approvalText) {
+        const pendingOffer = input.pendingCalendarOffers.find(
+          (offer) => offer.approvalPromptCurrent === true,
+        );
+        const expectedEvent = [event, typedGroupEvent, typedPrivateEvent].find(
+          (candidate) => candidate.title === pendingOffer?.event.title,
+        );
+        if (!pendingOffer || !expectedEvent) {
+          throw new Error("The current Calendar review was not available to the broad decision");
         }
-        if (currentEvent === typedPrivateEvent) {
-          expect(input).toMatchObject({ audience: "private" });
-          expect(input.googleConnections[0]).toMatchObject({ kind: "family", calendarAvailable: true });
-        }
-        const imageReference = input.currentMessage.images[0];
-        const pdfReference = input.currentMessage.pdfs?.[0];
-        if (!imageReference || !pdfReference || !reads.readCurrentPdf) {
-          throw new Error("The school flyer lost its current image or PDF reader");
-        }
-        const [image, pdf] = await Promise.all([
-          reads.readCurrentImage(imageReference),
-          reads.readCurrentPdf(pdfReference),
-        ]);
-        expect([...image.bytes]).toEqual([...JPEG_BYTES]);
-        expect([...pdf.bytes]).toEqual([...flyerPdfBytes]);
-        exactAttachmentReads += 1;
-        const calendar = await reads.readCalendarWindow(window);
-        expect(calendar.status).toBe("complete");
-        completeCalendarReads += 1;
-        if (
-          currentSourceId === inboundSourceId(`event-${duplicateFlyerKey}`) &&
-          calendar.events.some((candidate) => candidate.title === event.title)
-        ) {
-          duplicateSeen = true;
-        }
-        return decision({
-          calendar: {
-            mode: currentEvent === event ? "offer" : "direct",
-            proposalId: null,
-            mutation: { operation: "create", event: currentEvent, target: null },
-            sourceIds: [currentSourceId],
-          },
+        expect(input).toMatchObject({
+          audience: expectedEvent === typedPrivateEvent ? "private" : "group",
+          currentMessage: { text: approvalText, replyTo: null },
         });
-      },
-      {
-        interpretCalendarApproval: async (input) => {
-          if (input.currentMessage.text !== approvalText) {
-            return { approve: false, standaloneExplicit: false };
-          }
-          const expectedEvent = [event, typedGroupEvent, typedPrivateEvent].find(
-            (candidate) => candidate.title === input.event.title,
-          );
-          if (!expectedEvent) throw new Error(`Unexpected Calendar offer ${input.event.title}`);
-          expect(input).toMatchObject({
-            audience: expectedEvent === typedPrivateEvent ? "private" : "group",
-            approvalPromptCurrent: true,
-            currentMessage: { text: approvalText, replyTo: null },
-            event: expectedEvent,
-          });
-          contextualApprovals.add(input.event.title);
-          return { approve: true, standaloneExplicit: false };
+        expect(pendingOffer.event).toEqual(expectedEvent);
+        contextualApprovals.add(expectedEvent.title);
+        return decision({
+          approvals: [
+            {
+              kind: "calendar_offer",
+              proposalId: pendingOffer.proposalId,
+              standaloneExplicit: false,
+            },
+          ],
+        });
+      }
+      const currentSourceId = input.currentMessage.sourceId;
+      const currentEvent =
+        currentSourceId === inboundSourceId(`event-${flyerKey}`) ||
+        currentSourceId === inboundSourceId(`event-${duplicateFlyerKey}`)
+          ? event
+          : currentSourceId === inboundSourceId(`event-${typedGroupFlyerKey}`)
+            ? typedGroupEvent
+            : currentSourceId === inboundSourceId(`event-${typedPrivateFlyerKey}`)
+              ? typedPrivateEvent
+              : null;
+      if (!currentEvent) return decision();
+      const captionless =
+        currentSourceId === inboundSourceId(`event-${flyerKey}`) ||
+        currentSourceId === inboundSourceId(`event-${duplicateFlyerKey}`);
+      if (captionless) {
+        expect(input.currentMessage).toMatchObject({
+          text: "Shared a family attachment.",
+          authoredText: null,
+          voiceTranscriptPresent: false,
+        });
+      } else {
+        expect(input.currentMessage).toMatchObject({
+          authoredText:
+            currentEvent === typedGroupEvent
+              ? "Add this school flyer to the Florence Calendar."
+              : "Please add this flyer to my Florence Calendar.",
+          voiceTranscriptPresent: false,
+        });
+      }
+      if (currentEvent === typedPrivateEvent) {
+        expect(input).toMatchObject({ audience: "private" });
+        expect(input.googleConnections[0]).toMatchObject({ kind: "family", calendarAvailable: true });
+      }
+      const imageReference = input.currentMessage.images[0];
+      const pdfReference = input.currentMessage.pdfs?.[0];
+      if (!imageReference || !pdfReference || !reads.readCurrentPdf) {
+        throw new Error("The school flyer lost its current image or PDF reader");
+      }
+      const [image, pdf] = await Promise.all([
+        reads.readCurrentImage(imageReference),
+        reads.readCurrentPdf(pdfReference),
+      ]);
+      expect([...image.bytes]).toEqual([...JPEG_BYTES]);
+      expect([...pdf.bytes]).toEqual([...flyerPdfBytes]);
+      exactAttachmentReads += 1;
+      const calendar = await reads.readCalendarWindow(window);
+      expect(calendar.status).toBe("complete");
+      completeCalendarReads += 1;
+      if (
+        currentSourceId === inboundSourceId(`event-${duplicateFlyerKey}`) &&
+        calendar.events.some((candidate) => candidate.title === event.title)
+      ) {
+        duplicateSeen = true;
+      }
+      return decision({
+        calendar: {
+          mode: currentEvent === event ? "offer" : "direct",
+          proposalId: null,
+          mutation: { operation: "create", event: currentEvent, target: null },
+          sourceIds: [currentSourceId],
         },
-      },
-    );
+      });
+    });
     await harness.readyHousehold();
     await harness.drain();
     const settledCalendarExecutionBaseline = harness.state.calendarExecutions.length;
@@ -5917,51 +6292,57 @@ release("Florence parent journeys", () => {
     };
     let privateFamilyCalendarRead = false;
     let contextualApprovalSeen = false;
-    const harness = await createHarness(
-      async (input, reads) => {
-        if (input.currentMessage.sourceId !== inboundSourceId(`event-${flyerKey}`)) {
-          return decision();
+    const harness = await createHarness(async (input, reads) => {
+      if (input.currentMessage.text === approvalText) {
+        const pendingOffer = input.pendingCalendarOffers.find(
+          (offer) => offer.approvalPromptCurrent === true && offer.event.title === event.title,
+        );
+        if (!pendingOffer) {
+          throw new Error("The solo Calendar review was not available to the broad decision");
         }
         expect(input).toMatchObject({
           audience: "private",
-          currentMessage: {
-            text: "Shared a family attachment.",
-            authoredText: null,
-            voiceTranscriptPresent: false,
-          },
+          currentMessage: { text: approvalText, replyTo: null },
         });
-        expect(input.googleConnections[0]).toMatchObject({ kind: "family", calendarAvailable: true });
-        const imageReference = input.currentMessage.images[0];
-        if (!imageReference) throw new Error("The private flyer lost its image reference");
-        expect([...(await reads.readCurrentImage(imageReference)).bytes]).toEqual([...JPEG_BYTES]);
-        const calendar = await reads.readCalendarWindow(window);
-        expect(calendar.status).toBe("complete");
-        privateFamilyCalendarRead = true;
+        expect(pendingOffer.event).toEqual(event);
+        contextualApprovalSeen = true;
         return decision({
-          calendar: {
-            mode: "offer",
-            proposalId: null,
-            mutation: { operation: "create", event, target: null },
-            sourceIds: [input.currentMessage.sourceId],
-          },
+          approvals: [
+            {
+              kind: "calendar_offer",
+              proposalId: pendingOffer.proposalId,
+              standaloneExplicit: false,
+            },
+          ],
         });
-      },
-      {
-        interpretCalendarApproval: async (input) => {
-          if (input.currentMessage.text !== approvalText) {
-            return { approve: false, standaloneExplicit: false };
-          }
-          expect(input).toMatchObject({
-            audience: "private",
-            approvalPromptCurrent: true,
-            currentMessage: { text: approvalText, replyTo: null },
-            event,
-          });
-          contextualApprovalSeen = true;
-          return { approve: true, standaloneExplicit: false };
+      }
+      if (input.currentMessage.sourceId !== inboundSourceId(`event-${flyerKey}`)) {
+        return decision();
+      }
+      expect(input).toMatchObject({
+        audience: "private",
+        currentMessage: {
+          text: "Shared a family attachment.",
+          authoredText: null,
+          voiceTranscriptPresent: false,
         },
-      },
-    );
+      });
+      expect(input.googleConnections[0]).toMatchObject({ kind: "family", calendarAvailable: true });
+      const imageReference = input.currentMessage.images[0];
+      if (!imageReference) throw new Error("The private flyer lost its image reference");
+      expect([...(await reads.readCurrentImage(imageReference)).bytes]).toEqual([...JPEG_BYTES]);
+      const calendar = await reads.readCalendarWindow(window);
+      expect(calendar.status).toBe("complete");
+      privateFamilyCalendarRead = true;
+      return decision({
+        calendar: {
+          mode: "offer",
+          proposalId: null,
+          mutation: { operation: "create", event, target: null },
+          sourceIds: [input.currentMessage.sourceId],
+        },
+      });
+    });
     await harness.setupFounder();
     await harness.activateFounderGoogle();
     await harness.florence.completeFamilyOnboarding(harness.founderAdultId, {
@@ -6089,34 +6470,27 @@ release("Florence parent journeys", () => {
             },
           });
         }
-        if (input.currentMessage.text === secondAnswer) answerReachedOrdinaryReasoner = true;
+        if (input.currentMessage.text === secondAnswer) {
+          answerReachedOrdinaryReasoner = true;
+          const pendingWork = input.visibleFamilyWork.find((work) => work.objective === secondObjective);
+          if (!pendingWork) throw new Error("The replied-to waiting task was not visible");
+          expect(input.currentMessage.replyTo).toMatchObject({ text: secondQuestion });
+          return decision({
+            bubbles: [{ text: acknowledgement, delayMs: 0 }],
+            familyWork: {
+              operation: "steer",
+              workId: pendingWork.workId,
+              objective: null,
+              completionCondition: null,
+              responsibleAdultName: null,
+              schedule: null,
+              instruction: secondAnswer,
+            },
+          });
+        }
         return decision();
       },
       {
-        interpretParticipantReply: async (input) => {
-          if (input.currentMessage.text === secondRequest) {
-            expect(input.pendingRequest.question).toBe(firstQuestion);
-            return {
-              belongsToRequest: false,
-              acknowledgement: null,
-              reassignToAdultName: null,
-            };
-          }
-          expect(input.pendingRequest).toMatchObject({
-            replyContext: "waiting",
-            question: secondQuestion,
-            taskObjective: secondObjective,
-          });
-          expect(input.currentMessage).toMatchObject({
-            text: secondAnswer,
-            explicitlyRepliesToQuestion: true,
-          });
-          return {
-            belongsToRequest: true,
-            reassignToAdultName: null,
-            acknowledgement: { kind: "text", text: acknowledgement },
-          };
-        },
         continueFamilyWork: async (input) => {
           if (input.state.steering.some((steering) => steering.text === secondAnswer)) {
             expect(input.objective).toBe(secondObjective);
@@ -6193,7 +6567,7 @@ release("Florence parent journeys", () => {
       secondQuestionReceipt.providerReceiptId,
     );
     await harness.drain();
-    expect(answerReachedOrdinaryReasoner).toBe(false);
+    expect(answerReachedOrdinaryReasoner).toBe(true);
     expect(
       harness.linq.messages.filter(
         (message) => message.providerConversationId === FAMILY_GROUP && message.text === acknowledgement,
@@ -6407,19 +6781,23 @@ release("Florence parent journeys", () => {
       now: harness.iso(),
     });
     if (!begunProgress) throw new Error("The pre-effect progress outbound could not enter sending");
-    await harness.florence.runOnce();
-    await effectStarted;
+    for (let attempt = 0; attempt < 20 && harness.state.workspaceExecutions.length === 0; attempt += 1) {
+      await harness.florence.runOnce();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
     expect(harness.state.workspaceExecutions).toHaveLength(1);
+    await effectStarted;
 
     await harness.accept("private", "effect-steering-correction", correction);
     await harness.drain();
     expect(harness.state.workspaceExecutions).toHaveLength(1);
-    expect(harness.linq.messages.filter((message) => message.text === acknowledgement)).toHaveLength(1);
-    expect(await harness.store.outboundSendIsCurrent(staleProgress.sourceId)).toBe(false);
+    expect(await harness.store.outboundSendIsCurrent(staleProgress.sourceId)).toBe(true);
     await harness.store.failSendingOutbound(
       staleProgress.sourceId,
-      "The corrected family-work progress was suppressed before provider delivery",
+      "The earlier family-work progress failed at the provider before delivery",
     );
+    await harness.drain();
+    expect(harness.linq.messages.filter((message) => message.text === acknowledgement)).toHaveLength(1);
 
     releaseEffectResolve();
     await harness.drain();
@@ -6752,9 +7130,13 @@ release("Florence parent journeys", () => {
     );
     expect(
       harness.linq.messages.filter(
+        (message) => message.providerConversationId === FAMILY_GROUP && message.text === acknowledgement,
+      ),
+    ).toHaveLength(1);
+    expect(
+      harness.linq.messages.filter(
         (message) =>
           message.providerConversationId === FAMILY_GROUP &&
-          message.text.startsWith(acknowledgement) &&
           message.text.includes("I can add this to the family calendar:") &&
           message.text.includes(offeredBreakfast.title),
       ),
@@ -10055,6 +10437,9 @@ release("Florence parent journeys", () => {
           watch.objective === "Watch for confirmation that Maya’s emergency card is signed.",
       ),
     ).toBe(false);
+    expect(harness.linq.messages.some((message) => message.text === GOOGLE_DELETION_PRIVATE_ALERT)).toBe(
+      false,
+    );
     await harness.assertDatabase(
       "Deleting one adult's Google-derived data crossed its boundary or left linked data behind",
       `not exists (
@@ -10082,10 +10467,6 @@ release("Florence parent journeys", () => {
               and text like ${sqlLiteral(`%${GOOGLE_DELETION_FAMILY_DATE.title}%`)}
             )
         )
-      ) and exists (
-        select 1 from messages
-        where direction='outbound' and status='sent'
-          and text=${sqlLiteral(GOOGLE_DELETION_PRIVATE_ALERT)}
       ) and exists (
         select 1 from sources
         where owner_adult_id=${sqlLiteral(harness.partnerAdultId)}::uuid and kind='gmail'
@@ -10992,9 +11373,7 @@ release("Florence parent journeys", () => {
         });
       }
       if (text === PRIVATE_CALENDAR_OWNER_APPROVAL) {
-        return decision({
-          bubbles: [{ text: PRIVATE_CALENDAR_OWNER_CONTRADICTION, delayMs: 0 }],
-        });
+        return decision();
       }
       if (text === "Add Maya pickup to the family calendar.") {
         return decision({
@@ -11196,9 +11575,6 @@ release("Florence parent journeys", () => {
           message.text === PRIVATE_CALENDAR_OWNER_APPROVAL_REPLY,
       ),
     ).toHaveLength(1);
-    expect(ownerApprovedMessages.map((message) => message.text)).not.toContain(
-      PRIVATE_CALENDAR_OWNER_CONTRADICTION,
-    );
     const groupCalendarConfirmation = ownerApprovedMessages.find(
       (message) =>
         message.providerConversationId === FAMILY_GROUP &&
@@ -11498,7 +11874,7 @@ release("Florence parent journeys", () => {
       harness.linq.messages.filter(
         (message) => message.providerConversationId === PRIVATE_FOUNDER && message.text === "I told Alex.",
       ),
-    ).toHaveLength(0);
+    ).toHaveLength(1);
     expect(
       (await harness.florence.workspaceForAdult(harness.partnerAdultId)).vault?.facts.some((fact) =>
         fact.statement.includes("pickup is at 3:15"),
@@ -12553,8 +12929,6 @@ async function createHarness(
     linqLedger?: FakeLinqLedger;
     browser?: FlorenceBrowserClient;
     continueFamilyWork?: FlorenceReasoner["continueFamilyWork"];
-    interpretParticipantReply?: FlorenceReasoner["interpretParticipantReply"];
-    interpretCalendarApproval?: FlorenceReasoner["interpretCalendarApproval"];
     researchInterest?: FlorenceReasoner["researchInterest"];
   } = {},
 ): Promise<Harness> {
@@ -12609,7 +12983,6 @@ async function createHarness(
     silentMonitorSourceId: null,
     voicedMonitorSourceId: null,
     cancelledMonitorSourceId: null,
-    setupConversationFailuresRemaining: 0,
     founderProductRecenterReview: false,
     googleRecipeArtifactExercise: false,
     proactiveFamilyWorkExercise: false,
@@ -12651,14 +13024,7 @@ async function createHarness(
     encryptionKey: new Uint8Array(32).fill(7),
   });
   const enrollmentCodes = new EnrollmentCodes(ENROLLMENT_SECRET);
-  const reasoner = createReasoner(
-    reason,
-    state,
-    options.continueFamilyWork,
-    options.interpretParticipantReply,
-    options.interpretCalendarApproval,
-    options.researchInterest,
-  );
+  const reasoner = createReasoner(reason, state, options.continueFamilyWork, options.researchInterest);
   const google = createGoogle(store, state);
   const florence = new Florence({
     store,
@@ -12688,33 +13054,59 @@ function createReasoner(
   reason: Reason,
   state: HarnessState,
   continueFamilyWork?: FlorenceReasoner["continueFamilyWork"],
-  interpretParticipantReply?: FlorenceReasoner["interpretParticipantReply"],
-  interpretCalendarApproval?: FlorenceReasoner["interpretCalendarApproval"],
   researchInterest?: FlorenceReasoner["researchInterest"],
 ): FlorenceReasoner {
-  const decide: Reason = (input, reads, signal, hooks) =>
-    input.currentMessage.text === FIXTURE_PLAN_SECOND_ADULT_REQUEST
-      ? Promise.resolve(
-          decision({
+  const decide: Reason = async (input, reads, signal, hooks) => {
+    const base =
+      input.currentMessage.text === FIXTURE_PLAN_SECOND_ADULT_REQUEST
+        ? decision({
             secondAdultPlan: {
               operation: "plan",
               firstName: "Alex",
               phoneNumber: PARTNER_PHONE,
               sourceIds: [input.currentMessage.sourceId],
             },
-          }),
-        )
-      : reason(input, reads, signal, hooks);
+          })
+        : await reason(input, reads, signal, hooks);
+    const approvals = [...(base.approvals ?? [])];
+    if (!approvals.some((approval) => approval.kind === "partner_invitation")) {
+      const pending = input.pendingPartnerInvitation ?? null;
+      const text = input.currentMessage.text;
+      const contextualApproval = text === CONTEXTUAL_INVITE_APPROVAL;
+      const explicitApproval = text === INVITE_APPROVAL || text === REINVITE_APPROVAL;
+      const repliesToStaleReview = input.currentMessage.replyTo !== null && !pending?.approvalPromptCurrent;
+      if (
+        pending &&
+        !repliesToStaleReview &&
+        ((contextualApproval && pending.approvalPromptCurrent) || explicitApproval)
+      ) {
+        approvals.push({
+          kind: "partner_invitation",
+          adultId: pending.adultId,
+          standaloneExplicit: !pending.approvalPromptCurrent,
+        });
+      }
+    }
+    if (
+      !approvals.some((approval) => approval.kind === "calendar_offer") &&
+      input.currentMessage.text === PRIVATE_CALENDAR_OWNER_APPROVAL
+    ) {
+      const pending = input.pendingCalendarOffers.find(
+        (offer) => offer.event.title === PRIVATE_CALENDAR_ANNIVERSARY_TITLE,
+      );
+      if (pending) {
+        approvals.push({
+          kind: "calendar_offer",
+          proposalId: pending.proposalId,
+          standaloneExplicit: !pending.approvalPromptCurrent,
+        });
+      }
+    }
+    return approvals.length === 0 ? base : { ...base, approvals };
+  };
   return {
     decide,
     ...(continueFamilyWork ? { continueFamilyWork } : {}),
-    interpretParticipantReply:
-      interpretParticipantReply ??
-      (async () => ({
-        belongsToRequest: false as const,
-        acknowledgement: null,
-        reassignToAdultName: null,
-      })),
     transcribeVoiceNote: async (input: Parameters<FlorenceReasoner["transcribeVoiceNote"]>[0]) => {
       state.voiceTranscriptions += 1;
       expect(input).toMatchObject({ filename: "teacher-note.wav", mimeType: "audio/wav" });
@@ -12723,42 +13115,11 @@ function createReasoner(
     },
     converseDuringSetup: async (input: Parameters<FlorenceReasoner["converseDuringSetup"]>[0]) => {
       state.setupConversations.push(input);
-      if (
-        input.currentMessage.text === PRE_GOOGLE_HARMLESS_REQUEST &&
-        state.setupConversationFailuresRemaining > 0
-      ) {
-        state.setupConversationFailuresRemaining -= 1;
-        throw new Error("Fake setup interpreter is temporarily unavailable");
-      }
-      if (input.currentMessage.text === PRE_GOOGLE_HARMLESS_REQUEST) {
-        return {
-          stopMessaging: false,
-          declineInvitation: false,
-          requestsFreshLink: false,
-          continueWithAvailableWork: true,
-          bubbles: [],
-        };
-      }
-      if (input.stage === "partner_invited" && state.setupConversationFailuresRemaining > 0) {
-        state.setupConversationFailuresRemaining -= 1;
-        throw new Error("Fake setup interpreter is temporarily unavailable");
-      }
-      if (input.currentMessage.text === INCOMPLETE_SETUP_FRESH_LINK_REQUEST) {
-        return {
-          stopMessaging: false,
-          declineInvitation: false,
-          requestsFreshLink: true,
-          continueWithAvailableWork: false,
-          bubbles: [{ text: INCOMPLETE_SETUP_FALSE_DENIAL, delayMs: 0 }],
-        };
-      }
       const declineInvitation =
         input.stage === "partner_invited" && input.currentMessage.text === PARTNER_SETUP_REFUSAL;
       return {
-        stopMessaging: false,
         declineInvitation,
         requestsFreshLink: false,
-        continueWithAvailableWork: false,
         bubbles: declineInvitation
           ? []
           : [
@@ -12773,22 +13134,6 @@ function createReasoner(
               },
             ],
       };
-    },
-    interpretCalendarApproval:
-      interpretCalendarApproval ??
-      (async (input: Parameters<FlorenceReasoner["interpretCalendarApproval"]>[0]) => {
-        const approve = input.currentMessage.text === PRIVATE_CALENDAR_OWNER_APPROVAL;
-        return { approve, standaloneExplicit: approve };
-      }),
-    interpretPartnerInvitationApproval: async (
-      input: Parameters<FlorenceReasoner["interpretPartnerInvitationApproval"]>[0],
-    ) => {
-      if (input.currentMessage.text === CONTEXTUAL_INVITE_APPROVAL) {
-        return { sendInvitation: true, standaloneExplicit: false };
-      }
-      const sendInvitation =
-        input.currentMessage.text === INVITE_APPROVAL || input.currentMessage.text === REINVITE_APPROVAL;
-      return { sendInvitation, standaloneExplicit: sendInvitation };
     },
     classifyPrivateGoogleBatch: async (
       input: Parameters<FlorenceReasoner["classifyPrivateGoogleBatch"]>[0],
@@ -15032,6 +15377,7 @@ function decision(
     calendar?: FlorenceDecision["calendar"];
     secondAdultPlan?: FlorenceDecision["secondAdultPlan"];
     householdUpdate?: FlorenceDecision["householdUpdate"];
+    approvals?: FlorenceDecision["approvals"];
     webAccessPath?: FlorenceDecision["webAccessPath"];
     researchUrls?: FlorenceDecision["researchUrls"];
   } = {},
@@ -15039,9 +15385,7 @@ function decision(
   const participation = input.participation ?? "respond";
   return {
     policy:
-      participation === "observe"
-        ? { retain: false, schedule: false, stopMessaging: false }
-        : { retain: true, schedule: true, stopMessaging: false },
+      participation === "observe" ? { retain: false, schedule: false } : { retain: true, schedule: true },
     conversation: {
       participation,
       replyToCurrentMessage: false,
@@ -15059,6 +15403,7 @@ function decision(
     calendar: input.calendar ?? null,
     secondAdultPlan: input.secondAdultPlan ?? null,
     householdUpdate: input.householdUpdate ?? null,
+    approvals: input.approvals ?? [],
     webAccessPath: input.webAccessPath ?? null,
     researchUrls: input.researchUrls ?? null,
   };

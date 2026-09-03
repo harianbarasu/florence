@@ -20,10 +20,8 @@ describe("expired partner setup", () => {
     const refreshMessagesEnrollment = vi.fn(async () => ({ id: PARTNER_ID }));
     const confirmMessagesEnrollmentDelivery = vi.fn(async () => ({ id: PARTNER_ID }));
     const converseDuringSetup = vi.fn(async () => ({
-      stopMessaging: false,
       declineInvitation: false,
       requestsFreshLink: true,
-      continueWithAvailableWork: false,
       bubbles: [],
     }));
     const invitation = {
@@ -162,10 +160,8 @@ describe("expired partner setup", () => {
   test("ignores pre-handshake events and honors a delayed refusal without issuing a link", async () => {
     const declinePartnerInvitation = vi.fn(async () => true);
     const converseDuringSetup = vi.fn(async () => ({
-      stopMessaging: false,
       declineInvitation: true,
       requestsFreshLink: false,
-      continueWithAvailableWork: false,
       bubbles: [{ text: "Understood.", delayMs: 0 }],
     }));
     const store = {

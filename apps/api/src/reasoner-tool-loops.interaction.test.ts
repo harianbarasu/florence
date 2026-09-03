@@ -3,6 +3,7 @@ import { describe, expect, test } from "vitest";
 import {
   type FlorenceHouseholdNextActionInput,
   FlorenceReasoner,
+  FlorenceReasonerError,
   florenceDecisionSchema,
   florenceHouseholdBriefingInputSchema,
   florenceHouseholdSafeCandidateSchema,
@@ -88,6 +89,35 @@ describe("Florence reasoner capability cutover", () => {
     expect(result.researchUrls).toEqual([PUBLIC_URL]);
   });
 
+  test("an invalid-only native draft is repaired into a visible natural reply", async () => {
+    const invalid = ordinaryDecision();
+    invalid.conversation.bubbles = [];
+    invalid.conversation.nativeMoves = [{ type: "rich_link", url: PUBLIC_URL }];
+    const repaired = ordinaryDecision({
+      bubbleText: "I couldn’t verify that link, but I can keep looking if you want.",
+    });
+    const requests: Record<string, unknown>[] = [];
+    let turn = 0;
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        stream: (request: Record<string, unknown>) => {
+          requests.push(request);
+          turn += 1;
+          const output = turn === 1 ? invalid : repaired;
+          return fakeStream({
+            status: "completed",
+            output_parsed: output,
+            output: [decisionMessage(`native-repair-${turn}`, output)],
+          });
+        },
+      },
+    } as never);
+
+    await expect(reasoner.decide(foregroundInput(), inertReads())).resolves.toEqual(repaired);
+    expect(requests).toHaveLength(2);
+    expect(JSON.stringify(requests[1]?.input)).toContain("no visible conversational move");
+  });
+
   test("a natural reaction can be the whole visible move for a low-content acknowledgement", async () => {
     const decision = ordinaryDecision();
     decision.conversation.reaction = "like";
@@ -106,9 +136,13 @@ describe("Florence reasoner capability cutover", () => {
   test("only intentional family-group observation can be totally silent", async () => {
     const silentResponse = ordinaryDecision();
     silentResponse.conversation.bubbles = [];
+    let privateTurns = 0;
     const privateReasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
       responses: {
-        stream: () => fakeStream({ status: "completed", output_parsed: silentResponse, output: [] }),
+        stream: () => {
+          privateTurns += 1;
+          return fakeStream({ status: "completed", output_parsed: silentResponse, output: [] });
+        },
       },
     } as never);
 
@@ -116,6 +150,7 @@ describe("Florence reasoner capability cutover", () => {
       code: "invalid_output",
       message: expect.stringContaining("no visible conversational move"),
     });
+    expect(privateTurns).toBe(3);
 
     const observation = ordinaryDecision({ participation: "observe" });
     let groupRequest: Record<string, unknown> | null = null;
@@ -151,100 +186,867 @@ describe("Florence reasoner capability cutover", () => {
         stream: () => fakeStream({ status: "completed", output_parsed: noisyObservation, output: [] }),
       },
     } as never);
-    await expect(noisyReasoner.decide(groupInput, inertReads())).rejects.toMatchObject({
-      code: "invalid_output",
-      message: expect.stringContaining("observed"),
+    await expect(noisyReasoner.decide(groupInput, inertReads())).resolves.toMatchObject({
+      conversation: {
+        participation: "respond",
+        bubbles: [{ text: "I’m listening.", delayMs: 0 }],
+      },
     });
-  });
 
-  test("an unbacked future commitment is reviewed and repaired once in the same tool transcript", async () => {
-    const input = foregroundInput();
-    input.currentMessage.text = "Can you compare the options and tell me which one is best?";
-    input.currentMessage.authoredText = input.currentMessage.text;
-    const promised = ordinaryDecision({
-      bubbleText: "I’ll compare them and get back to you with the best one.",
-    });
-    const repaired = ordinaryDecision({
-      bubbleText: "I’m on it—I’ll compare them and bring the best option back here.",
-    });
-    repaired.familyWork = {
+    const workingObservation = ordinaryDecision({ participation: "observe" });
+    workingObservation.familyWork = {
       operation: "create",
       workId: null,
-      objective: "Compare the supplied options and report the best one with the reasons.",
-      completionCondition:
-        "The supplied options are compared and the best one is identified with supporting reasons.",
+      objective: "Find a family-friendly dinner option for tonight.",
+      completionCondition: "A suitable dinner option is reported to the family.",
       responsibleAdultName: null,
-      briefing: null,
       schedule: null,
+      briefing: null,
       instruction: null,
       candidateIds: [],
     };
-    const modelRequests: Record<string, unknown>[] = [];
-    const reviewRequests: Record<string, unknown>[] = [];
-    let modelTurn = 0;
-    let reviewTurn = 0;
+    const repairedObservation = ordinaryDecision({ participation: "observe" });
+    const observationRequests: Record<string, unknown>[] = [];
+    let observationTurn = 0;
+    const workingReasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        stream: (request: Record<string, unknown>) => {
+          observationRequests.push(request);
+          observationTurn += 1;
+          const output = observationTurn === 1 ? workingObservation : repairedObservation;
+          return fakeStream({
+            status: "completed",
+            output_parsed: output,
+            output: [decisionMessage(`observed-parent-talk-${observationTurn}`, output)],
+          });
+        },
+      },
+    } as never);
+    groupInput.currentMessage.text = "Jackson, can you pick up milk on your way home?";
+    groupInput.currentMessage.authoredText = groupInput.currentMessage.text;
+    await expect(workingReasoner.decide(groupInput, inertReads())).resolves.toMatchObject({
+      conversation: { participation: "observe" },
+      familyWork: null,
+    });
+    expect(observationRequests).toHaveLength(2);
+    expect(JSON.stringify(observationRequests[1]?.input)).toContain(
+      "observed parent-to-parent Message cannot perform work",
+    );
+  });
+
+  test("a natural answer is repaired in-transcript when its retention and scheduling fields contradict it", async () => {
+    const contradictory = ordinaryDecision({
+      bubbleText: "The temporary code is blue. I won’t save it or schedule anything.",
+    });
+    contradictory.policy = { retain: false, schedule: false };
+    contradictory.facts = [
+      {
+        operation: "remember",
+        factId: null,
+        statement: "The temporary code is blue.",
+        visibility: "private",
+        memory: {
+          memoryKind: "fact",
+          artifactKind: null,
+          title: null,
+          details: "The temporary code is blue.",
+          tags: ["temporary code"],
+        },
+        sourceIds: ["turn-1"],
+      },
+    ];
+    contradictory.reminder = {
+      operation: "create",
+      reminderId: null,
+      action: "Check the temporary code",
+      schedule: { kind: "once", at: "2026-08-28T20:00:00.000Z" },
+    };
+    const repaired = ordinaryDecision({
+      bubbleText: "The temporary code is blue. I won’t save it or schedule anything.",
+    });
+    repaired.policy = { retain: false, schedule: false };
+    const requests: Record<string, unknown>[] = [];
+    let turn = 0;
     const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
       responses: {
         stream: (request: Record<string, unknown>) => {
-          modelRequests.push(request);
-          modelTurn += 1;
-          if (modelTurn === 1) {
-            return fakeStream({
-              status: "completed",
-              output_parsed: null,
-              output: [
-                functionCall("commitment-context-read", "search_gmail", {
-                  query: "supplied options",
-                  limit: 3,
-                }),
-              ],
-            });
-          }
-          const decision = modelTurn === 2 ? promised : repaired;
+          requests.push(request);
+          turn += 1;
+          const output = turn === 1 ? contradictory : repaired;
           return fakeStream({
             status: "completed",
-            output_parsed: decision,
-            output: [decisionMessage(`commitment-${modelTurn}`, decision)],
+            output_parsed: output,
+            output: [decisionMessage(`policy-repair-${turn}`, output)],
           });
         },
-        parse: async (request: Record<string, unknown>) => {
-          reviewRequests.push(request);
-          reviewTurn += 1;
-          return {
+      },
+    } as never);
+    const input = foregroundInput();
+    input.currentMessage.text =
+      "Answer this, but don’t remember it or schedule anything: the temporary code is blue.";
+    input.currentMessage.authoredText = input.currentMessage.text;
+
+    await expect(reasoner.decide(input, inertReads())).resolves.toMatchObject({
+      policy: { retain: false, schedule: false },
+      conversation: {
+        bubbles: [{ text: "The temporary code is blue. I won’t save it or schedule anything.", delayMs: 0 }],
+      },
+      facts: [],
+      reminder: null,
+    });
+    expect(requests).toHaveLength(2);
+    expect(JSON.stringify(requests[1]?.input)).toContain("words and consequences agree");
+  });
+
+  test("one unreadable attachment does not discard the parent's text or other readable media", async () => {
+    const requests: Record<string, unknown>[] = [];
+    const decision = ordinaryDecision({
+      bubbleText: "I can use the note and the readable flyer; the other image didn’t come through.",
+    });
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        stream: (request: Record<string, unknown>) => {
+          requests.push(request);
+          return fakeStream({ status: "completed", output_parsed: decision, output: [] });
+        },
+      },
+    } as never);
+    const input = foregroundInput();
+    input.currentMessage.text = "Please use my note and whichever flyer attachments you can read.";
+    input.currentMessage.authoredText = input.currentMessage.text;
+    input.currentMessage.images = [
+      { assetId: "unreadable-image", mimeType: "image/jpeg" },
+      { assetId: "readable-image", mimeType: "image/png" },
+    ];
+    input.currentMessage.pdfs = [
+      {
+        documentId: "readable-pdf",
+        filename: "school-flyer.pdf",
+        mimeType: "application/pdf",
+        contentDigest: "a".repeat(64),
+      },
+      {
+        documentId: "unreadable-pdf",
+        filename: "missing-flyer.pdf",
+        mimeType: "application/pdf",
+        contentDigest: "b".repeat(64),
+      },
+    ];
+    const reads = {
+      ...inertReads(),
+      async readCurrentImage(image: (typeof input.currentMessage.images)[number]) {
+        if (image.assetId === "unreadable-image") {
+          throw new Error("private adapter detail that must not enter the model transcript");
+        }
+        return { mimeType: image.mimeType, bytes: Uint8Array.from([1, 2, 3]) };
+      },
+      async readCurrentPdf(document: NonNullable<typeof input.currentMessage.pdfs>[number]) {
+        if (document.documentId === "unreadable-pdf") {
+          throw new Error("private PDF adapter detail that must not enter the model transcript");
+        }
+        return {
+          mimeType: document.mimeType,
+          bytes: Uint8Array.from([0x25, 0x50, 0x44, 0x46, 0x2d]),
+        };
+      },
+    };
+
+    await expect(reasoner.decide(input, reads)).resolves.toEqual(decision);
+
+    const modelContent = (
+      requests[0]?.input as Array<{
+        content?: Array<{ type?: string; text?: string }>;
+      }>
+    )?.[0]?.content;
+    expect(modelContent?.filter((part) => part.type === "input_image")).toHaveLength(1);
+    expect(modelContent?.filter((part) => part.type === "input_file")).toHaveLength(1);
+    const availability = modelContent?.find((part) => part.text?.includes("current_attachment_availability"));
+    expect(availability?.text).toContain('"reference":"unreadable-image"');
+    expect(availability?.text).toContain('"reference":"unreadable-pdf"');
+    expect(availability?.text).toContain("Do not infer their contents");
+    expect(availability?.text).not.toContain("private adapter detail");
+    expect(JSON.stringify(modelContent)).toContain(input.currentMessage.text);
+  });
+
+  test("an unreadable PDF cannot substantiate a retained claim", async () => {
+    const unsupported = ordinaryDecision({ bubbleText: "I saved the deadline from the flyer." });
+    unsupported.facts = [
+      {
+        operation: "remember",
+        factId: null,
+        statement: "The school deadline is Friday.",
+        visibility: "private",
+        memory: {
+          memoryKind: "fact",
+          artifactKind: null,
+          title: null,
+          details: "The school deadline is Friday.",
+          tags: ["school deadline"],
+        },
+        sourceIds: ["unreadable-pdf"],
+      },
+    ];
+    const repaired = ordinaryDecision({
+      bubbleText: "That flyer didn’t come through clearly. Please resend it and I’ll pull out the deadline.",
+    });
+    const requests: Record<string, unknown>[] = [];
+    let turn = 0;
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        stream: (request: Record<string, unknown>) => {
+          requests.push(request);
+          turn += 1;
+          const output = turn === 1 ? unsupported : repaired;
+          return fakeStream({
             status: "completed",
-            output_parsed:
-              reviewTurn === 1
-                ? {
-                    verdict: "repair",
-                    reason: "Florence promises a later comparison without starting matching work.",
-                  }
-                : { verdict: "accept", reason: null },
-            output: [],
-          };
+            output_parsed: output,
+            output: [decisionMessage(`unreadable-pdf-${turn}`, output)],
+          });
+        },
+      },
+    } as never);
+    const input = foregroundInput();
+    input.currentMessage.text = "Please save the deadline from this flyer.";
+    input.currentMessage.authoredText = input.currentMessage.text;
+    input.currentMessage.pdfs = [
+      {
+        documentId: "unreadable-pdf",
+        filename: "school-flyer.pdf",
+        mimeType: "application/pdf",
+        contentDigest: "c".repeat(64),
+      },
+    ];
+    const reads = {
+      ...inertReads(),
+      async readCurrentPdf() {
+        throw new Error("provider read failed");
+      },
+    };
+
+    await expect(reasoner.decide(input, reads)).resolves.toEqual(repaired);
+    expect(requests).toHaveLength(2);
+    expect(JSON.stringify(requests[1]?.input)).toContain("cited a source it did not receive");
+  });
+
+  test("duplicate projections and a stale task reply are normalized before interpretation", async () => {
+    const requests: Record<string, unknown>[] = [];
+    const decision = ordinaryDecision({ bubbleText: "I understand—I'll use the quoted update." });
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        stream: (request: Record<string, unknown>) => {
+          requests.push(request);
+          return fakeStream({ status: "completed", output_parsed: decision, output: [] });
+        },
+      },
+    } as never);
+    const input = foregroundInput();
+    const monitor = {
+      followUpId: "monitor-1",
+      objective: "Watch for the school update.",
+      currentConclusion: "No update yet.",
+      endCondition: "The school posts the update.",
+      nextCheck: "2026-08-28T20:00:00.000Z",
+      why: "The family asked Florence to watch.",
+      sourceIds: ["turn-1"],
+    };
+    const reminder = {
+      reminderId: "reminder-1",
+      action: "Pack the school bag",
+      schedule: {
+        kind: "weekly" as const,
+        everyWeeks: 1,
+        weekdays: [1, 1, 3],
+        localTime: "19:00",
+        startsOn: "2026-08-31",
+      },
+      status: "active" as const,
+      nextAt: "2026-08-31T19:00:00.000Z",
+      lastRunAt: null,
+      createdAt: NOW,
+    };
+    const work = {
+      workId: "work-1",
+      objective: "Handle the school paperwork.",
+      completionCondition: "The school confirms the paperwork was received.",
+      candidateIds: ["candidate-1", "candidate-1"],
+      responsibleAdultName: null,
+      currentProgress: "Reviewing the form.",
+      schedule: null,
+      briefing: null,
+      paused: false,
+      status: "active" as const,
+      nextAt: null,
+      lastRunAt: null,
+      lastResult: null,
+      createdAt: NOW,
+    };
+    input.pendingFollowUps = [monitor, { ...monitor }];
+    input.visibleReminders = [reminder, { ...reminder }];
+    input.visibleFamilyWork = [work, { ...work }];
+    input.visibleInterests = [
+      {
+        interestWorkId: "interest-bad",
+        status: "active",
+        genericTerms: ["Hari soccer"],
+        objective: "Find soccer opportunities for Hari.",
+        why: "This stale projection contains a private name.",
+      },
+      {
+        interestWorkId: "interest-good",
+        status: "active",
+        genericTerms: ["Soccer", "soccer", "children's theater"],
+        objective: "Find family-friendly activities.",
+        why: "The family asked Florence to keep looking.",
+      },
+      {
+        interestWorkId: "interest-good",
+        status: "paused",
+        genericTerms: ["soccer"],
+        objective: "Duplicate stale projection.",
+        why: "This duplicate should not reach interpretation.",
+      },
+    ];
+    input.currentMessage.moveKind = "reply";
+    input.currentMessage.replyTo = {
+      sourceId: "quoted-update",
+      familyWorkId: "stale-work",
+      senderName: "Florence",
+      text: "I found the revised school form.",
+      occurredAt: NOW,
+    };
+
+    await expect(reasoner.decide(input, inertReads())).resolves.toEqual(decision);
+
+    const requestContent = (
+      requests[0]?.input as Array<{ content?: Array<{ type?: string; text?: string }> }>
+    )?.[0]?.content;
+    const modelInputText = requestContent?.find((part) => part.type === "input_text")?.text;
+    if (!modelInputText) throw new Error("The normalized foreground input was not sent to the model");
+    const modelInput = JSON.parse(modelInputText) as typeof input;
+    expect(modelInput.pendingFollowUps).toHaveLength(1);
+    expect(modelInput.visibleReminders).toHaveLength(1);
+    expect(modelInput.visibleReminders[0]?.schedule).toMatchObject({ weekdays: [1, 3] });
+    expect(modelInput.visibleFamilyWork).toHaveLength(1);
+    expect(modelInput.visibleFamilyWork[0]?.candidateIds).toEqual(["candidate-1"]);
+    expect(modelInput.visibleInterests).toEqual([
+      expect.objectContaining({
+        interestWorkId: "interest-good",
+        genericTerms: ["Soccer", "children's theater"],
+      }),
+    ]);
+    expect(modelInput.currentMessage.replyTo).toMatchObject({
+      sourceId: "quoted-update",
+      familyWorkId: null,
+      text: "I found the revised school form.",
+    });
+  });
+
+  test("consequence-free output bookkeeping and presentation are compacted without a repair turn", async () => {
+    const decision = ordinaryDecision();
+    decision.conversation.bubbles = [
+      { text: "I found it.", delayMs: -100 },
+      { text: "I found it.", delayMs: 100 },
+      { text: "I’m taking care of the school item now.", delayMs: 9_000 },
+      { text: "I’ll bring the result back here.", delayMs: 5.8 },
+      { text: "This extra draft bubble is unnecessary.", delayMs: 0 },
+    ];
+    decision.followUp = {
+      operation: "list",
+      followUpId: null,
+      objective: null,
+      currentConclusion: null,
+      endCondition: null,
+      nextCheck: null,
+      why: null,
+      sourceIds: ["turn-1", "turn-1"],
+    };
+    decision.interest = {
+      operation: "create",
+      interestWorkId: null,
+      genericTerms: ["Soccer", "soccer", "children's theater"],
+      objective: "Find family-friendly soccer and theater opportunities.",
+      why: "The parent wants useful local opportunities.",
+      sourceIds: ["turn-1", "turn-1"],
+    };
+    decision.familyWork = {
+      operation: "create",
+      workId: null,
+      objective: "Take care of the school form.",
+      completionCondition: "The school confirms the form was received.",
+      responsibleAdultName: null,
+      schedule: null,
+      briefing: null,
+      instruction: null,
+      candidateIds: ["candidate-1", "candidate-1"],
+    };
+    const requests: Record<string, unknown>[] = [];
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        stream: (request: Record<string, unknown>) => {
+          requests.push(request);
+          return fakeStream({ status: "completed", output_parsed: decision, output: [] });
+        },
+      },
+    } as never);
+    const input = foregroundInput();
+    input.householdDocket = {
+      totalItems: 1,
+      items: [
+        {
+          candidateId: "candidate-1",
+          visibility: "private",
+          category: "deadline",
+          summary: "The school form still needs to be submitted.",
+          urgency: "soon",
+          dueAt: null,
+          owner: "Florence",
+          nextAction: "Submit the school form.",
+          waitingOn: null,
+          completionCondition: "The school confirms the form was received.",
+          needsAnswer: false,
+        },
+      ],
+    };
+
+    const result = await reasoner.decide(input, inertReads());
+
+    expect(requests).toHaveLength(1);
+    expect(result.followUp).toMatchObject({ operation: "list", sourceIds: [] });
+    expect(result.interest).toMatchObject({
+      genericTerms: ["Soccer", "children's theater"],
+      sourceIds: ["turn-1"],
+    });
+    expect(result.familyWork).toMatchObject({ candidateIds: ["candidate-1"] });
+    expect(result.conversation.bubbles).toEqual([
+      { text: "I found it.", delayMs: 0 },
+      { text: "I’m taking care of the school item now.", delayMs: 5_000 },
+      {
+        text: "I’ll bring the result back here.\n\nThis extra draft bubble is unnecessary.",
+        delayMs: 0,
+      },
+    ]);
+  });
+
+  test("a non-delivering family-work control is repaired until it has a visible acknowledgement", async () => {
+    const silentList = ordinaryDecision();
+    silentList.conversation.bubbles = [];
+    silentList.familyWork = {
+      operation: "list",
+      workId: null,
+      objective: null,
+      schedule: null,
+      instruction: null,
+    };
+    const repaired = ordinaryDecision({ bubbleText: "Here’s what I’m currently handling for you." });
+    repaired.familyWork = { ...silentList.familyWork };
+    const requests: Record<string, unknown>[] = [];
+    let turn = 0;
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        stream: (request: Record<string, unknown>) => {
+          requests.push(request);
+          turn += 1;
+          const output = turn === 1 ? silentList : repaired;
+          return fakeStream({
+            status: "completed",
+            output_parsed: output,
+            output: [decisionMessage(`family-work-list-${turn}`, output)],
+          });
         },
       },
     } as never);
 
-    const result = await reasoner.decide(input, inertReads());
+    await expect(reasoner.decide(foregroundInput(), inertReads())).resolves.toEqual(repaired);
+    expect(requests).toHaveLength(2);
+    expect(JSON.stringify(requests[1]?.input)).toContain("no visible conversational move");
+  });
 
-    expect(result.familyWork).toEqual(repaired.familyWork);
-    expect(modelRequests).toHaveLength(3);
-    expect(reviewRequests).toHaveLength(2);
-    expect(modelRequests.every((request) => !("max_tool_calls" in request))).toBe(true);
-    const repairedTranscript = JSON.stringify(modelRequests[2]?.input);
-    expect(repairedTranscript).toContain("commitment-context-read");
-    expect(repairedTranscript).toContain("function_call_output");
-    expect(repairedTranscript).toContain(promised.conversation.bubbles[0]?.text);
-    expect(repairedTranscript).toContain("foreground_commitment_repair");
-    const firstReview = JSON.stringify(reviewRequests[0]?.input);
-    const secondReview = JSON.stringify(reviewRequests[1]?.input);
-    expect(firstReview).toContain(input.currentMessage.text);
-    expect(firstReview).toContain(promised.conversation.bubbles[0]?.text);
-    expect(firstReview).toContain('\\"familyWork\\":null');
-    if (!repaired.familyWork) throw new Error("Commitment repair did not create durable work");
-    expect(secondReview).toContain(repaired.familyWork.objective);
-    expect(String(reviewRequests[0]?.instructions)).toContain("An unrelated mutation never backs");
-    expect(String(reviewRequests[0]?.instructions)).toContain("conditional offer or capability statement");
+  test("a no-op family-work update is repaired instead of claiming false success", async () => {
+    const noOp = ordinaryDecision({ bubbleText: "Done—I updated it." });
+    noOp.familyWork = {
+      operation: "update",
+      workId: "work-1",
+      objective: null,
+      completionCondition: null,
+      responsibleAdultName: null,
+      schedule: null,
+      briefing: null,
+      instruction: null,
+    };
+    const repaired = ordinaryDecision({
+      bubbleText: "I don’t have a change to apply yet—what should I update?",
+    });
+    const requests: Record<string, unknown>[] = [];
+    let turn = 0;
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        stream: (request: Record<string, unknown>) => {
+          requests.push(request);
+          turn += 1;
+          const output = turn === 1 ? noOp : repaired;
+          return fakeStream({
+            status: "completed",
+            output_parsed: output,
+            output: [decisionMessage(`family-work-no-op-${turn}`, output)],
+          });
+        },
+      },
+    } as never);
+
+    await expect(reasoner.decide(foregroundInput(), inertReads())).resolves.toEqual(repaired);
+    expect(requests).toHaveLength(2);
+    expect(JSON.stringify(requests[1]?.input)).toContain("must change at least one supplied field");
+  });
+
+  test("duplicate approvals collapse only when their authority claim agrees", async () => {
+    const exact = ordinaryDecision({ bubbleText: "Yes—I’ll use that sharing review." });
+    exact.approvals = [
+      { kind: "partner_invitation", adultId: "adult-2", standaloneExplicit: false },
+      { kind: "partner_invitation", adultId: "adult-2", standaloneExplicit: false },
+      { kind: "partner_invitation", adultId: "adult-2", standaloneExplicit: false },
+    ];
+    const input = foregroundInput();
+    input.pendingPartnerInvitation = {
+      adultId: "adult-2",
+      firstName: "Jackson",
+      maskedPhoneNumber: "••••1234",
+      approvalPromptCurrent: true,
+      requiresFreshReview: false,
+    };
+    const exactReasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        stream: () => fakeStream({ status: "completed", output_parsed: exact, output: [] }),
+      },
+    } as never);
+
+    await expect(exactReasoner.decide(input, inertReads())).resolves.toMatchObject({
+      approvals: [{ kind: "partner_invitation", adultId: "adult-2", standaloneExplicit: false }],
+    });
+
+    const contradictory = ordinaryDecision({ bubbleText: "Yes—I’ll send it." });
+    contradictory.approvals = [
+      { kind: "partner_invitation", adultId: "adult-2", standaloneExplicit: true },
+      { kind: "partner_invitation", adultId: "adult-2", standaloneExplicit: false },
+    ];
+    const repaired = ordinaryDecision({ bubbleText: "Yes—I’ll use the review you just approved." });
+    repaired.approvals = [{ kind: "partner_invitation", adultId: "adult-2", standaloneExplicit: false }];
+    const requests: Record<string, unknown>[] = [];
+    let turn = 0;
+    const conflictReasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        stream: (request: Record<string, unknown>) => {
+          requests.push(request);
+          turn += 1;
+          const output = turn === 1 ? contradictory : repaired;
+          return fakeStream({
+            status: "completed",
+            output_parsed: output,
+            output: [decisionMessage(`approval-authority-${turn}`, output)],
+          });
+        },
+      },
+    } as never);
+
+    await expect(conflictReasoner.decide(input, inertReads())).resolves.toEqual(repaired);
+    expect(requests).toHaveLength(2);
+    expect(JSON.stringify(requests[1]?.input)).toContain(
+      "disagree about whether the parent explicitly authorized",
+    );
+  });
+
+  test("repairs an invalid ordinary partner-planning reply before it reaches the parent fallback", async () => {
+    const invalid = ordinaryDecision();
+    invalid.conversation.bubbles = [];
+    const repaired = ordinaryDecision({
+      bubbleText: "Absolutely—what’s your partner’s first name?",
+    });
+    const requests: Record<string, unknown>[] = [];
+    let turn = 0;
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        stream: (request: Record<string, unknown>) => {
+          requests.push(request);
+          turn += 1;
+          const decision = turn === 1 ? invalid : repaired;
+          return fakeStream({
+            status: "completed",
+            output_parsed: decision,
+            output: [decisionMessage(`partner-plan-${turn}`, decision)],
+          });
+        },
+      },
+    } as never);
+    const input = foregroundInput();
+    input.currentMessage.text = "Let’s add my partner";
+    input.currentMessage.authoredText = input.currentMessage.text;
+    input.household.adultNames = ["Jackson"];
+    input.household.familyProfile = JSON.stringify({
+      florenceCalendarAudience: "owner_private",
+      florenceCalendarReady: true,
+      setupAttention: null,
+      members: [
+        {
+          id: input.currentAdultId,
+          kind: "adult",
+          status: "verified",
+          adultSlot: 1,
+        },
+      ],
+    });
+
+    await expect(reasoner.decide(input, inertReads())).resolves.toMatchObject({
+      conversation: { bubbles: [{ text: expect.stringContaining("first name") }] },
+      secondAdultPlan: null,
+    });
+    expect(requests).toHaveLength(2);
+    expect(JSON.stringify(requests[1]?.input)).toContain("foreground_decision_repair");
+    expect(JSON.stringify(requests[1]?.input)).toContain("no visible conversational move");
+  });
+
+  test("repairs a host-rejected draft inside the same natural-language turn", async () => {
+    const rejected = ordinaryDecision({
+      bubbleText: "I’ll put that on someone outside this family.",
+    });
+    const repaired = ordinaryDecision({
+      bubbleText: "Absolutely—what part of the school week should we tackle first?",
+    });
+    const requests: Record<string, unknown>[] = [];
+    const admitted: string[] = [];
+    let turn = 0;
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        stream: (request: Record<string, unknown>) => {
+          requests.push(request);
+          turn += 1;
+          const decision = turn === 1 ? rejected : repaired;
+          return fakeStream({
+            status: "completed",
+            output_parsed: decision,
+            output: [decisionMessage(`host-admission-${turn}`, decision)],
+          });
+        },
+        parse: async () => ({
+          status: "completed",
+          output_parsed: { verdict: "accept", reason: null },
+          output: [],
+        }),
+      },
+    } as never);
+    const input = foregroundInput();
+    input.currentMessage.text = "Can you help me sort out the school week?";
+    input.currentMessage.authoredText = input.currentMessage.text;
+
+    const result = await reasoner.decide(input, inertReads(), undefined, {
+      admitDecision: (decision) => {
+        admitted.push(decision.conversation.bubbles[0]?.text ?? "");
+        if (admitted.length === 1) {
+          throw new FlorenceReasonerError(
+            "invalid_output",
+            "Only household family work can assign responsibility to a family member",
+          );
+        }
+      },
+    });
+
+    expect(result).toEqual(repaired);
+    expect(admitted).toEqual([
+      "I’ll put that on someone outside this family.",
+      "Absolutely—what part of the school week should we tackle first?",
+    ]);
+    expect(requests).toHaveLength(2);
+    expect(JSON.stringify(requests[1]?.input)).toContain("foreground_decision_repair");
+    expect(JSON.stringify(requests[1]?.input)).toContain(
+      "Only household family work can assign responsibility to a family member",
+    );
+    expect(JSON.stringify(requests[1]?.input)).toContain("I’ll put that on someone outside this family.");
+    expect(JSON.stringify(requests[1]?.input)).toContain("Never expose validator language");
+  });
+
+  test("recovers a mixed draft failure without blaming the parent", async () => {
+    const malformedDraft = ordinaryDecision();
+    malformedDraft.conversation.bubbles = [];
+    const firstHostRejectedDraft = ordinaryDecision({
+      bubbleText: "I’ll put that on someone outside this family.",
+    });
+    const recoveredConversation = ordinaryDecision({
+      bubbleText: "Absolutely—what part of the school week should we tackle first?",
+    });
+    recoveredConversation.policy = { retain: false, schedule: false };
+    const requests: Record<string, unknown>[] = [];
+    let turn = 0;
+    let admissions = 0;
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        stream: (request: Record<string, unknown>) => {
+          requests.push(request);
+          turn += 1;
+          const decision =
+            turn === 1 ? malformedDraft : turn === 2 ? firstHostRejectedDraft : recoveredConversation;
+          return fakeStream({
+            status: "completed",
+            output_parsed: decision,
+            output: [decisionMessage(`mixed-admission-${turn}`, decision)],
+          });
+        },
+        parse: async () => ({
+          status: "completed",
+          output_parsed: { verdict: "accept", reason: null },
+          output: [],
+        }),
+      },
+    } as never);
+    const input = foregroundInput();
+    input.currentMessage.text = "Can you help me sort out the school week?";
+    input.currentMessage.authoredText = input.currentMessage.text;
+
+    await expect(
+      reasoner.decide(input, inertReads(), undefined, {
+        admitDecision: () => {
+          admissions += 1;
+          if (admissions === 1) {
+            throw new FlorenceReasonerError(
+              "invalid_output",
+              "Only household family work can assign responsibility to a family member",
+            );
+          }
+        },
+      }),
+    ).resolves.toEqual(recoveredConversation);
+
+    expect(admissions).toBe(2);
+    expect(requests).toHaveLength(3);
+    expect(JSON.stringify(requests[1]?.input)).toContain("foreground_decision_repair");
+    expect(JSON.stringify(requests[2]?.input)).toContain("foreground_conversation_rescue");
+    expect(JSON.stringify(requests[2]?.input)).toContain("internal_interpretation");
+    expect(JSON.stringify(requests[2]?.input)).toContain("not evidence that the parent's request is bad");
+    expect(JSON.stringify(requests[2]?.input)).not.toContain('"kind":"host_boundary"');
+  });
+
+  test("repairs a foreground structured-parse failure without losing the parent request", async () => {
+    const repaired = ordinaryDecision({
+      bubbleText: "Sure—what part of the school week should we start with?",
+    });
+    const requests: Record<string, unknown>[] = [];
+    let turn = 0;
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        stream: (request: Record<string, unknown>) => {
+          requests.push(request);
+          turn += 1;
+          if (turn === 1) {
+            return {
+              async *[Symbol.asyncIterator]() {},
+              async finalResponse() {
+                throw new SyntaxError("Fake structured response could not be parsed");
+              },
+            };
+          }
+          return fakeStream({
+            status: "completed",
+            output_parsed: repaired,
+            output: [decisionMessage("parse-repair", repaired)],
+          });
+        },
+        parse: async () => ({
+          status: "completed",
+          output_parsed: { verdict: "accept", reason: null },
+          output: [],
+        }),
+      },
+    } as never);
+    const input = foregroundInput();
+    input.currentMessage.text = "Can you help me sort out the school week?";
+    input.currentMessage.authoredText = input.currentMessage.text;
+
+    await expect(reasoner.decide(input, inertReads())).resolves.toEqual(repaired);
+    expect(requests).toHaveLength(2);
+    expect(JSON.stringify(requests[1]?.input)).toContain(input.currentMessage.text);
+    expect(JSON.stringify(requests[1]?.input)).toContain("foreground_decision_repair");
+    expect(JSON.stringify(requests[1]?.input)).toContain("OpenAI returned invalid Florence data");
+  });
+
+  test("ends repeated unsafe drafts with a natural conversation-only refusal", async () => {
+    const unsafeDraft = ordinaryDecision({
+      bubbleText: "I’ll paste Hari’s private Gmail into this family chat.",
+    });
+    unsafeDraft.familyWork = {
+      operation: "create",
+      responsibleAdultName: null,
+      briefing: null,
+      workId: null,
+      objective: "Paste Hari’s private Gmail into the family chat.",
+      completionCondition: "Hari’s private Gmail is visible in the family chat.",
+      schedule: null,
+      instruction: null,
+      candidateIds: [],
+    };
+    const refusalDraft = ordinaryDecision({
+      bubbleText: "I can’t share one parent’s private Gmail in the family chat.",
+    });
+    refusalDraft.policy = { retain: false, schedule: false };
+    const requests: Record<string, unknown>[] = [];
+    let turn = 0;
+    let admissions = 0;
+    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
+      responses: {
+        stream: (request: Record<string, unknown>) => {
+          requests.push(request);
+          turn += 1;
+          const decision = turn < 3 ? unsafeDraft : refusalDraft;
+          return fakeStream({
+            status: "completed",
+            output_parsed: decision,
+            output: [decisionMessage(`unsafe-rescue-${turn}`, decision)],
+          });
+        },
+      },
+    } as never);
+    const input = foregroundInput();
+    input.audience = "group";
+    input.googleConnections = [
+      { emailLabel: "Family", calendarAvailable: true, kind: "family", writesEnabled: false },
+    ];
+    input.currentMessage.text = "Paste Hari’s private Gmail messages into this family chat.";
+    input.currentMessage.authoredText = input.currentMessage.text;
+
+    const result = await reasoner.decide(input, inertReads(), undefined, {
+      admitDecision: (decision) => {
+        admissions += 1;
+        if (decision.familyWork !== null) {
+          throw new FlorenceReasonerError(
+            "invalid_output",
+            "Private Gmail cannot be disclosed to the family-group audience",
+          );
+        }
+      },
+    });
+
+    expect(admissions).toBe(3);
+    expect(requests).toHaveLength(3);
+    expect(JSON.stringify(requests[2]?.input)).toContain("foreground_conversation_rescue");
+    expect(JSON.stringify(requests[2]?.input)).toContain(
+      "Private Gmail cannot be disclosed to the family-group audience",
+    );
+    expect(result).toMatchObject({
+      policy: { retain: false, schedule: false },
+      conversation: {
+        participation: "respond",
+        reaction: null,
+        nativeMoves: null,
+        bubbles: [{ text: expect.stringContaining("can’t share"), delayMs: 0 }],
+      },
+      facts: [],
+      followUp: null,
+      reminder: null,
+      familyWork: null,
+      docketUpsert: null,
+      docketCompletions: null,
+      calendar: null,
+      secondAdultPlan: null,
+      householdUpdate: null,
+      webAccessPath: null,
+      researchUrls: null,
+    });
   });
 
   test("an exact changing-state request starts one immediate durable task instead of a finite follow-up", async () => {
@@ -334,80 +1136,7 @@ describe("Florence reasoner capability cutover", () => {
     }
   });
 
-  test("a still-unbacked commitment is rejected after the one semantic repair", async () => {
-    const promised = ordinaryDecision({
-      bubbleText: "I’ll keep checking and let you know what I find.",
-    });
-    let modelTurns = 0;
-    let reviewTurns = 0;
-    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
-      responses: {
-        stream: () => {
-          modelTurns += 1;
-          return fakeStream({
-            status: "completed",
-            output_parsed: promised,
-            output: [decisionMessage(`still-unbacked-${modelTurns}`, promised)],
-          });
-        },
-        parse: async () => {
-          reviewTurns += 1;
-          return {
-            status: "completed",
-            output_parsed: {
-              verdict: "repair",
-              reason: "Florence still promises later monitoring without matching durable work.",
-            },
-            output: [],
-          };
-        },
-      },
-    } as never);
-
-    await expect(reasoner.decide(foregroundInput(), inertReads())).rejects.toMatchObject({
-      code: "invalid_output",
-      message: expect.stringContaining("without matching durable work"),
-    });
-    expect(modelTurns).toBe(2);
-    expect(reviewTurns).toBe(2);
-  });
-
-  test("a reaction cannot replace the spoken acknowledgement for work Florence starts", async () => {
-    const decision = ordinaryDecision();
-    decision.conversation.bubbles = [];
-    decision.conversation.nativeMoves = [
-      {
-        type: "reaction",
-        operation: "add",
-        targetSourceId: "turn-1",
-        partIndex: 0,
-        reaction: { type: "tapback", reaction: "like" },
-      },
-    ];
-    decision.familyWork = {
-      operation: "create",
-      workId: null,
-      objective: "Find three good dinner options for Saturday and compare them.",
-      completionCondition: "Three suitable Saturday dinner options and their tradeoffs are reported.",
-      responsibleAdultName: null,
-      briefing: null,
-      schedule: null,
-      instruction: null,
-      candidateIds: [],
-    };
-    const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
-      responses: {
-        stream: () => fakeStream({ status: "completed", output_parsed: decision, output: [] }),
-      },
-    } as never);
-
-    await expect(reasoner.decide(foregroundInput(), inertReads())).rejects.toMatchObject({
-      code: "invalid_output",
-      message: expect.stringContaining("spoken acknowledgement"),
-    });
-  });
-
-  test("a docket change needs a spoken acknowledgement and cannot duplicate tracked work", async () => {
+  test("a docket change accepts a reaction and requires its real dependency", async () => {
     const reactionOnly = ordinaryDecision();
     reactionOnly.conversation.bubbles = [];
     reactionOnly.conversation.reaction = "like";
@@ -433,33 +1162,9 @@ describe("Florence reasoner capability cutover", () => {
       },
     } as never);
 
-    await expect(reactionReasoner.decide(foregroundInput(), inertReads())).rejects.toMatchObject({
-      code: "invalid_output",
-      message: expect.stringContaining("spoken acknowledgement bubble"),
-    });
-
-    const duplicateTracking = ordinaryDecision();
-    duplicateTracking.docketUpsert = reactionOnly.docketUpsert;
-    duplicateTracking.familyWork = {
-      operation: "create",
-      workId: null,
-      objective: "Keep checking until the signed field-trip form is confirmed received by the school.",
-      completionCondition: "The signed form is confirmed received by the school.",
-      responsibleAdultName: null,
-      briefing: null,
-      schedule: null,
-      instruction: null,
-      candidateIds: [],
-    };
-    const duplicateReasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
-      responses: {
-        stream: () => fakeStream({ status: "completed", output_parsed: duplicateTracking, output: [] }),
-      },
-    } as never);
-
-    await expect(duplicateReasoner.decide(foregroundInput(), inertReads())).rejects.toMatchObject({
-      code: "invalid_output",
-      message: expect.stringContaining("already doing or tracking"),
+    await expect(reactionReasoner.decide(foregroundInput(), inertReads())).resolves.toMatchObject({
+      conversation: { reaction: "like", bubbles: [] },
+      docketUpsert: { operation: "create" },
     });
 
     const missingDependency = ordinaryDecision();
@@ -809,6 +1514,7 @@ describe("Florence reasoner capability cutover", () => {
       {
         workId: "work-1",
         objective: "Handle the school paperwork.",
+        completionCondition: "The school confirms the form was received.",
         candidateIds: ["candidate-1"],
         responsibleAdultName: null,
         briefing: null,
@@ -830,6 +1536,7 @@ describe("Florence reasoner capability cutover", () => {
   });
 
   test("an inline task reply cannot steer a different visible task", async () => {
+    const requests: Record<string, unknown>[] = [];
     const decision = ordinaryDecision();
     decision.familyWork = {
       operation: "steer",
@@ -842,7 +1549,10 @@ describe("Florence reasoner capability cutover", () => {
     };
     const reasoner = new FlorenceReasoner({ apiKey: "test-key", model: "test-model" }, {
       responses: {
-        stream: () => fakeStream({ status: "completed", output_parsed: decision, output: [] }),
+        stream: (request: Record<string, unknown>) => {
+          requests.push(request);
+          return fakeStream({ status: "completed", output_parsed: decision, output: [] });
+        },
       },
     } as never);
     const input = foregroundInput();
@@ -858,6 +1568,7 @@ describe("Florence reasoner capability cutover", () => {
       {
         workId: "work-1",
         objective: "Compare the morning camp options.",
+        completionCondition: "The best morning camp option is identified.",
         candidateIds: [],
         responsibleAdultName: null,
         briefing: null,
@@ -873,6 +1584,7 @@ describe("Florence reasoner capability cutover", () => {
       {
         workId: "work-2",
         objective: "Compare the afternoon camp options.",
+        completionCondition: "The best afternoon camp option is identified.",
         candidateIds: [],
         responsibleAdultName: null,
         briefing: null,
@@ -891,6 +1603,7 @@ describe("Florence reasoner capability cutover", () => {
       code: "invalid_output",
       message: expect.stringContaining("direct task reply"),
     });
+    expect(JSON.stringify(requests[0]?.input)).toContain("The best afternoon camp option is identified.");
   });
 
   test("a verified voice note can relay a concise derived household conclusion with a large Vault", async () => {

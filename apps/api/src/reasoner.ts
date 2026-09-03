@@ -7151,7 +7151,7 @@ function foregroundCapabilityRegistry(): CapabilityRegistry<ForegroundCapability
           context,
           baseModelSchema,
           ["gmail_search", "gmail_get", "gmail_thread_get", "gmail_labels"],
-          "Search the current parent's Gmail, get one exact message, read every message in one exact thread, or list labels. Gmail search returns one page with complete and nextCursor; continue an exhaustive search with the identical query and each returned cursor until complete is true. Exact reads include textStatus and per-message app-scoped attachmentAccess references. Open a relevant supported attachment with read_gmail_attachment using its sourceId and attachmentRef. Set fields unused by the chosen operation to null or empty arrays.",
+          "Search the current parent's Gmail, get one exact message, read every message in one exact thread, or list labels. Gmail search returns one page with complete and nextCursor; continue an exhaustive search with the identical query and each returned cursor until complete is true. Exact reads include textStatus and per-message app-scoped attachmentAccess references. Open a relevant supported attachment with read_gmail_attachment using its sourceId and attachmentRef. Set fields unused by the chosen operation to null or empty arrays. For a requested Gmail send, reply, label change, or provider draft, create familyWork for the actual outcome; those capabilities are available during durable work. Do not say they are unavailable.",
         ),
       admit: ({ context, canonicalArguments }) => workspaceCapabilityAdmitted(context, canonicalArguments),
       execute: ({ callId, arguments: args, context, signal }) =>
@@ -7191,7 +7191,7 @@ function foregroundCapabilityRegistry(): CapabilityRegistry<ForegroundCapability
           context,
           baseModelSchema,
           ["drive_search", "drive_get"],
-          "Search the current parent's Drive metadata or get metadata for one file. This tool does not read file contents.",
+          "Search the current parent's Drive metadata or get metadata for one file. This tool does not read file contents. For a requested folder creation, share, trash, or file-content change, create familyWork for the actual outcome; those capabilities are available during durable work. Do not say they are unavailable.",
         ),
       admit: ({ context, canonicalArguments }) => workspaceCapabilityAdmitted(context, canonicalArguments),
       execute: ({ arguments: args, context, signal }) =>
@@ -7214,7 +7214,7 @@ function foregroundCapabilityRegistry(): CapabilityRegistry<ForegroundCapability
           context,
           baseModelSchema,
           ["contacts_search"],
-          "Search the current parent's Google Contacts.",
+          "Search the current parent's Google Contacts. For a requested contact creation or update, create familyWork for the actual outcome; those capabilities are available during durable work. Do not say they are unavailable.",
         ),
       admit: ({ context, canonicalArguments }) => workspaceCapabilityAdmitted(context, canonicalArguments),
       execute: ({ arguments: args, context, signal }) =>
@@ -7237,7 +7237,7 @@ function foregroundCapabilityRegistry(): CapabilityRegistry<ForegroundCapability
           context,
           baseModelSchema,
           ["docs_get"],
-          "Read a Google Doc, including its tabs.",
+          "Read a Google Doc, including its tabs. For a requested document creation or append, create familyWork for the actual outcome; those capabilities are available during durable work. Do not say they are unavailable.",
         ),
       admit: ({ context, canonicalArguments }) => workspaceCapabilityAdmitted(context, canonicalArguments),
       execute: ({ arguments: args, context, signal }) =>
@@ -7260,7 +7260,7 @@ function foregroundCapabilityRegistry(): CapabilityRegistry<ForegroundCapability
           context,
           baseModelSchema,
           ["sheets_get"],
-          "Read a range from the current parent's Google Sheets.",
+          "Read a range from the current parent's Google Sheets. For a requested spreadsheet creation, range update, or row append, create familyWork for the actual outcome; those capabilities are available during durable work. Do not say they are unavailable.",
         ),
       admit: ({ context, canonicalArguments }) => workspaceCapabilityAdmitted(context, canonicalArguments),
       execute: ({ arguments: args, context, signal }) =>
@@ -7283,7 +7283,7 @@ function foregroundCapabilityRegistry(): CapabilityRegistry<ForegroundCapability
           context,
           baseModelSchema,
           ["slides_get"],
-          "Read a Google Slides presentation.",
+          "Read a Google Slides presentation. For a requested presentation creation or slide addition, create familyWork for the actual outcome; those capabilities are available during durable work. Do not say they are unavailable.",
         ),
       admit: ({ context, canonicalArguments }) => workspaceCapabilityAdmitted(context, canonicalArguments),
       execute: ({ arguments: args, context, signal }) =>
@@ -7306,7 +7306,7 @@ function foregroundCapabilityRegistry(): CapabilityRegistry<ForegroundCapability
           context,
           baseModelSchema,
           ["tasklists_list", "tasks_list"],
-          "List the current parent's Google task lists or tasks.",
+          "List the current parent's Google task lists or tasks. For a requested task creation or update, create familyWork for the actual outcome; those capabilities are available during durable work. Do not say they are unavailable.",
         ),
       admit: ({ context, canonicalArguments }) => workspaceCapabilityAdmitted(context, canonicalArguments),
       execute: ({ arguments: args, context, signal }) =>
